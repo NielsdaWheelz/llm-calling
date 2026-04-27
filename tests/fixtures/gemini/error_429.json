@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": 429,
+    "message": "RESOURCE_EXHAUSTED: Quota exceeded for quota metric 'Generate content API requests per minute' and limit 'GenerateContent request limit per minute for a region' of service 'generativelanguage.googleapis.com' for consumer 'project_number:123456789'.",
+    "status": "RESOURCE_EXHAUSTED"
+  }
+}

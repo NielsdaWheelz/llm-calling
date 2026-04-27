@@ -1,0 +1,16 @@
+{
+  "id": "chatcmpl-test-123",
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "content": "Hello from DeepSeek."
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 9,
+    "completion_tokens": 5,
+    "total_tokens": 14
+  }
+}

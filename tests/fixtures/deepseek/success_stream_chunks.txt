@@ -1,0 +1,4 @@
+data: {"choices":[{"delta":{"content":"Hello"}}]}
+data: {"choices":[{"delta":{"content":" from"}}]}
+data: {"choices":[{"delta":{"content":" DeepSeek."}}],"usage":{"prompt_tokens":9,"completion_tokens":5,"total_tokens":14}}
+data: [DONE]

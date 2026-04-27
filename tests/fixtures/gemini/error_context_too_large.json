@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": 400,
+    "message": "Request payload exceeds the maximum limit of 2097152 bytes. Your request has 3000000 bytes.",
+    "status": "INVALID_ARGUMENT"
+  }
+}

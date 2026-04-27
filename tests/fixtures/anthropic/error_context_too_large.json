@@ -1,0 +1,7 @@
+{
+  "type": "error",
+  "error": {
+    "type": "invalid_request_error",
+    "message": "Your input is too long. The maximum prompt length is 100000 tokens."
+  }
+}
