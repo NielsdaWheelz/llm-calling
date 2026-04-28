@@ -215,6 +215,9 @@ class GeminiClient:
         if req.temperature is not None:
             body["generationConfig"]["temperature"] = req.temperature
 
+        if req.reasoning_effort == "default":
+            return body
+
         if req.model_name == GEMINI_31_PRO_PREVIEW:
             if req.reasoning_effort in ("none", "minimal", "low"):
                 body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}

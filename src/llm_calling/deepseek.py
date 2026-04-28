@@ -132,11 +132,13 @@ class DeepSeekClient:
             "stream": stream,
         }
 
-        uses_v4_thinking = req.model_name in DEEPSEEK_V4_MODELS and req.reasoning_effort != "none"
+        uses_v4_thinking = req.model_name in DEEPSEEK_V4_MODELS and (
+            req.reasoning_effort not in ("default", "none")
+        )
         if req.temperature is not None and not uses_v4_thinking:
             body["temperature"] = req.temperature
 
-        if req.model_name in DEEPSEEK_V4_MODELS:
+        if req.model_name in DEEPSEEK_V4_MODELS and req.reasoning_effort != "default":
             body["thinking"] = {"type": "disabled" if req.reasoning_effort == "none" else "enabled"}
 
         return body

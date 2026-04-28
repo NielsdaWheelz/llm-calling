@@ -204,11 +204,14 @@ class AnthropicClient:
         if system_prompt:
             body["system"] = system_prompt
 
-        uses_adaptive_thinking = (
-            req.model_name in ANTHROPIC_ADAPTIVE_THINKING_MODELS and req.reasoning_effort != "none"
+        uses_adaptive_thinking = req.model_name in ANTHROPIC_ADAPTIVE_THINKING_MODELS and (
+            req.reasoning_effort not in ("default", "none")
         )
         if req.temperature is not None and not uses_adaptive_thinking:
             body["temperature"] = req.temperature
+
+        if req.reasoning_effort == "default":
+            return body
 
         if req.reasoning_effort == "none":
             body["thinking"] = {"type": "disabled"}

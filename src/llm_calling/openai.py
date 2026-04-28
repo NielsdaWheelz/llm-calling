@@ -4,6 +4,7 @@ Endpoint:
 - POST https://api.openai.com/v1/responses
 
 Request body:
+- reasoning is omitted when reasoning_effort="default"
 {
   "model": "<model_name>",
   "input": [
@@ -19,7 +20,10 @@ Request body:
 
 Response (non-stream):
 - text: extracted from output[*].content[*].text where type=output_text
-- usage: usage.input_tokens / usage.output_tokens / usage.total_tokens
+- usage: usage.input_tokens / usage.output_tokens / usage.total_tokens /
+  usage.output_tokens_details.reasoning_tokens
+- status: status
+- incomplete_details: incomplete_details
 - provider_request_id: x-request-id header or response id
 """
 
@@ -94,6 +98,7 @@ class OpenAIClient:
                             done=True,
                             usage=accumulated_usage,
                             provider_request_id=provider_request_id,
+                            status="completed",
                         )
                     emitted_terminal = True
                     break
@@ -122,13 +127,13 @@ class OpenAIClient:
                     if provider_request_id is None:
                         provider_request_id = event_response.get("id")
 
+                    status = event_response.get("status") or (
+                        "completed" if event_type == "response.completed" else "incomplete"
+                    )
+                    incomplete_details = event_response.get("incomplete_details")
                     usage_data = event_response.get("usage") or data.get("usage")
                     if usage_data:
-                        accumulated_usage = LLMUsage(
-                            prompt_tokens=usage_data.get("input_tokens"),
-                            completion_tokens=usage_data.get("output_tokens"),
-                            total_tokens=usage_data.get("total_tokens"),
-                        )
+                        accumulated_usage = self._parse_usage(usage_data)
 
                     if not emitted_terminal:
                         emitted_terminal = True
@@ -137,6 +142,8 @@ class OpenAIClient:
                             done=True,
                             usage=accumulated_usage,
                             provider_request_id=provider_request_id,
+                            status=status,
+                            incomplete_details=incomplete_details,
                         )
                     break
 
@@ -167,6 +174,9 @@ class OpenAIClient:
             "stream": stream,
         }
 
+        if req.reasoning_effort == "default":
+            return body
+
         if req.reasoning_effort == "none":
             body["reasoning"] = {"effort": "none"}
         elif req.reasoning_effort == "minimal":
@@ -193,19 +203,23 @@ class OpenAIClient:
                 if content_item.get("type") == "output_text":
                     text_parts.append(content_item.get("text", ""))
 
-        usage = None
-        usage_data = data.get("usage")
-        if usage_data:
-            usage = LLMUsage(
-                prompt_tokens=usage_data.get("input_tokens"),
-                completion_tokens=usage_data.get("output_tokens"),
-                total_tokens=usage_data.get("total_tokens"),
-            )
-
+        status = data.get("status")
+        incomplete_details = data.get("incomplete_details")
         provider_request_id = headers.get("x-request-id") or data.get("id")
 
         return LLMResponse(
             text="".join(text_parts),
-            usage=usage,
+            usage=self._parse_usage(data["usage"]) if data.get("usage") else None,
             provider_request_id=provider_request_id,
+            status=status,
+            incomplete_details=incomplete_details,
+        )
+
+    def _parse_usage(self, usage_data: dict) -> LLMUsage:
+        output_tokens_details = usage_data.get("output_tokens_details") or {}
+        return LLMUsage(
+            prompt_tokens=usage_data.get("input_tokens"),
+            completion_tokens=usage_data.get("output_tokens"),
+            total_tokens=usage_data.get("total_tokens"),
+            reasoning_tokens=output_tokens_details.get("reasoning_tokens"),
         )

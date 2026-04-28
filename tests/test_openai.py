@@ -36,9 +36,12 @@ def request(reasoning_effort: ReasoningEffort = "none") -> LLMRequest:
 
 @respx.mock
 async def test_nonstream_success() -> None:
+    response_json = load_json("success_nonstream.json")
+    response_json["incomplete_details"] = None
+    response_json["usage"]["output_tokens_details"] = {"reasoning_tokens": 3}
     respx.post("https://api.openai.com/v1/responses").respond(
         200,
-        json=load_json("success_nonstream.json"),
+        json=response_json,
         headers={"x-request-id": "req-test-123"},
     )
 
@@ -50,7 +53,10 @@ async def test_nonstream_success() -> None:
     assert response.usage.prompt_tokens == 10
     assert response.usage.completion_tokens == 8
     assert response.usage.total_tokens == 18
+    assert response.usage.reasoning_tokens == 3
     assert response.provider_request_id == "req-test-123"
+    assert response.status == "completed"
+    assert response.incomplete_details is None
 
 
 @respx.mock
@@ -71,8 +77,27 @@ async def test_stream_success() -> None:
 
     assert chunks[-1].done is True
     assert chunks[-1].provider_request_id == "req-test-123"
+    assert chunks[-1].status == "completed"
     assert all(chunk.usage is None for chunk in chunks[:-1])
     assert "Hello" in "".join(chunk.delta_text for chunk in chunks)
+
+
+@respx.mock
+async def test_payload_omits_default_reasoning() -> None:
+    route = respx.post("https://api.openai.com/v1/responses").respond(
+        200,
+        json=load_json("success_nonstream.json"),
+    )
+
+    async with httpx.AsyncClient() as http:
+        response = await OpenAIClient(http).generate(
+            request("default"), api_key="sk-test", timeout_s=30
+        )
+
+    assert route.called
+    body = json.loads(route.calls.last.request.content)
+    assert "reasoning" not in body
+    assert response.provider_request_id == "resp-test123"
 
 
 @respx.mock
@@ -89,3 +114,57 @@ async def test_gpt5_payload_omits_temperature_and_maps_max_reasoning() -> None:
     body = json.loads(route.calls.last.request.content)
     assert body["reasoning"] == {"effort": "xhigh"}
     assert "temperature" not in body
+
+
+@respx.mock
+async def test_nonstream_incomplete_preserves_status_and_usage() -> None:
+    response_json = load_json("success_nonstream.json")
+    response_json["status"] = "incomplete"
+    response_json["incomplete_details"] = {"reason": "max_output_tokens"}
+    response_json["usage"]["output_tokens_details"] = {"reasoning_tokens": 11}
+    respx.post("https://api.openai.com/v1/responses").respond(
+        200,
+        json=response_json,
+        headers={"x-request-id": "req-incomplete-123"},
+    )
+
+    async with httpx.AsyncClient() as http:
+        response = await OpenAIClient(http).generate(request(), api_key="sk-test", timeout_s=30)
+
+    assert response.status == "incomplete"
+    assert response.incomplete_details == {"reason": "max_output_tokens"}
+    assert response.provider_request_id == "req-incomplete-123"
+    assert response.usage is not None
+    assert response.usage.reasoning_tokens == 11
+
+
+@respx.mock
+async def test_stream_incomplete_yields_terminal_chunk() -> None:
+    respx.post("https://api.openai.com/v1/responses").respond(
+        200,
+        content=(
+            'data: {"type":"response.output_text.delta","delta":"partial"}\n\n'
+            'data: {"type":"response.incomplete","response":{'
+            '"id":"resp-incomplete",'
+            '"status":"incomplete",'
+            '"incomplete_details":{"reason":"max_output_tokens"},'
+            '"usage":{"input_tokens":10,"output_tokens":8,'
+            '"output_tokens_details":{"reasoning_tokens":4},"total_tokens":18}'
+            "}}\n\n"
+        ),
+        headers={"content-type": "text/event-stream"},
+    )
+
+    chunks = []
+    async with httpx.AsyncClient() as http:
+        async for chunk in OpenAIClient(http).generate_stream(
+            request(), api_key="sk-test", timeout_s=30
+        ):
+            chunks.append(chunk)
+
+    assert [chunk.done for chunk in chunks] == [False, True]
+    assert chunks[-1].status == "incomplete"
+    assert chunks[-1].incomplete_details == {"reason": "max_output_tokens"}
+    assert chunks[-1].provider_request_id == "resp-incomplete"
+    assert chunks[-1].usage is not None
+    assert chunks[-1].usage.reasoning_tokens == 4

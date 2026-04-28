@@ -36,6 +36,17 @@ async with httpx.AsyncClient() as http:
     print(response.text)
 ```
 
+## Reasoning
+
+`reasoning_effort="default"` leaves OpenAI `reasoning` unset. Pass it explicitly when product
+policy should use the OpenAI API default. Explicit OpenAI reasoning values map directly for
+`"none"`, `"minimal"`, `"low"`, `"medium"`, and `"high"`; product `"max"` maps to OpenAI
+`"xhigh"`.
+
+OpenAI responses preserve `status`, `incomplete_details`, `provider_request_id`, and
+`usage.output_tokens_details.reasoning_tokens`. A `response.incomplete` result is returned
+with `status="incomplete"` instead of being marked as a successful completion.
+
 ## Router
 
 ```python
