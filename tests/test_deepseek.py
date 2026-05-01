@@ -43,8 +43,8 @@ async def test_nonstream_success() -> None:
 
     assert response.text == "Hello from DeepSeek."
     assert response.usage is not None
-    assert response.usage.prompt_tokens == 9
-    assert response.usage.completion_tokens == 5
+    assert response.usage.input_tokens == 9
+    assert response.usage.output_tokens == 5
     assert response.usage.total_tokens == 14
     assert response.provider_request_id == "req-deepseek-123"
 

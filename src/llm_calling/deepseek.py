@@ -85,9 +85,10 @@ class DeepSeekClient:
                     if "usage" in data:
                         usage_data = data["usage"]
                         accumulated_usage = LLMUsage(
-                            prompt_tokens=usage_data.get("prompt_tokens"),
-                            completion_tokens=usage_data.get("completion_tokens"),
+                            input_tokens=usage_data.get("prompt_tokens"),
+                            output_tokens=usage_data.get("completion_tokens"),
                             total_tokens=usage_data.get("total_tokens"),
+                            provider_usage=dict(usage_data),
                         )
                     continue
 
@@ -97,9 +98,10 @@ class DeepSeekClient:
                 if "usage" in data:
                     usage_data = data["usage"]
                     accumulated_usage = LLMUsage(
-                        prompt_tokens=usage_data.get("prompt_tokens"),
-                        completion_tokens=usage_data.get("completion_tokens"),
+                        input_tokens=usage_data.get("prompt_tokens"),
+                        output_tokens=usage_data.get("completion_tokens"),
                         total_tokens=usage_data.get("total_tokens"),
+                        provider_usage=dict(usage_data),
                     )
 
                 if delta_text:
@@ -119,6 +121,15 @@ class DeepSeekClient:
         }
 
     def _build_request_body(self, req: LLMRequest, stream: bool) -> dict:
+        if req.prompt_cache_key is not None or any(
+            turn.cache_ttl != "none" for turn in req.messages
+        ):
+            raise LLMError(
+                LLMErrorCode.BAD_REQUEST,
+                "DeepSeek does not support required prompt caching",
+                provider="deepseek",
+            )
+
         body: dict = {
             "model": req.model_name,
             "messages": [
@@ -158,9 +169,10 @@ class DeepSeekClient:
         usage_data = data.get("usage")
         if usage_data:
             usage = LLMUsage(
-                prompt_tokens=usage_data.get("prompt_tokens"),
-                completion_tokens=usage_data.get("completion_tokens"),
+                input_tokens=usage_data.get("prompt_tokens"),
+                output_tokens=usage_data.get("completion_tokens"),
                 total_tokens=usage_data.get("total_tokens"),
+                provider_usage=dict(usage_data),
             )
 
         provider_request_id = headers.get("x-request-id") or data.get("id")

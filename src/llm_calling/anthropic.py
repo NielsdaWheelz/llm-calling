@@ -105,6 +105,7 @@ class AnthropicClient:
             provider_request_id: str | None = None
             usage: LLMUsage | None = None
             received_stop = False
+            usage_data: dict[str, object] = {}
 
             async for line in response.aiter_lines():
                 if not line:
@@ -140,6 +141,10 @@ class AnthropicClient:
                 if event_type == "message_start":
                     message = data.get("message", {})
                     provider_request_id = message.get("id")
+                    start_usage = message.get("usage")
+                    if isinstance(start_usage, dict):
+                        usage_data.update(start_usage)
+                        usage = self._parse_usage(usage_data)
                     continue
 
                 # Handle content_block_delta - extract text
@@ -153,14 +158,10 @@ class AnthropicClient:
 
                 # Handle message_delta - extract usage at end
                 if event_type == "message_delta":
-                    usage_data = data.get("usage", {})
-                    if usage_data:
-                        # Anthropic provides output_tokens in message_delta
-                        usage = LLMUsage(
-                            prompt_tokens=None,  # Not in delta
-                            completion_tokens=usage_data.get("output_tokens"),
-                            total_tokens=None,  # Compute later if needed
-                        )
+                    delta_usage = data.get("usage")
+                    if isinstance(delta_usage, dict):
+                        usage_data.update(delta_usage)
+                        usage = self._parse_usage(usage_data)
                     continue
 
             if not received_stop:
@@ -183,14 +184,21 @@ class AnthropicClient:
 
         Extracts system turn to separate field.
         """
+        if req.prompt_cache_key is not None:
+            raise LLMError(
+                LLMErrorCode.BAD_REQUEST,
+                "Anthropic does not support prompt_cache_key",
+                provider="anthropic",
+            )
+
         # Extract system prompt and non-system messages
-        system_prompt = None
+        system_blocks = []
         messages = []
 
         for turn in req.messages:
             if turn.role == "system":
                 # Anthropic uses a separate system field
-                system_prompt = turn.content
+                system_blocks.append(self._turn_to_text_block(turn))
             else:
                 messages.append(self._turn_to_message(turn))
 
@@ -201,8 +209,8 @@ class AnthropicClient:
             "stream": stream,
         }
 
-        if system_prompt:
-            body["system"] = system_prompt
+        if system_blocks:
+            body["system"] = system_blocks
 
         uses_adaptive_thinking = req.model_name in ANTHROPIC_ADAPTIVE_THINKING_MODELS and (
             req.reasoning_effort not in ("default", "none")
@@ -257,11 +265,30 @@ class AnthropicClient:
 
         return body
 
+    def _turn_to_text_block(self, turn: Turn) -> dict[str, object]:
+        block: dict[str, object] = {"type": "text", "text": turn.content}
+        if turn.cache_ttl == "none":
+            return block
+        if turn.cache_ttl not in ("5m", "1h"):
+            raise LLMError(
+                LLMErrorCode.BAD_REQUEST,
+                f"Unknown prompt cache ttl: {turn.cache_ttl}",
+                provider="anthropic",
+            )
+        block["cache_control"] = {"type": "ephemeral", "ttl": turn.cache_ttl}
+        return block
+
     def _turn_to_message(self, turn: Turn) -> dict[str, str]:
         """Convert Turn to Anthropic message format.
 
         Note: System turns are handled separately in _build_request_body.
         """
+        if turn.cache_ttl != "none":
+            raise LLMError(
+                LLMErrorCode.BAD_REQUEST,
+                "Anthropic prompt cache is only supported on system turns",
+                provider="anthropic",
+            )
         return {
             "role": turn.role,
             "content": turn.content,
@@ -281,17 +308,7 @@ class AnthropicClient:
         usage = None
         usage_data = data.get("usage")
         if usage_data:
-            input_tokens = usage_data.get("input_tokens")
-            output_tokens = usage_data.get("output_tokens")
-            total = None
-            if input_tokens is not None and output_tokens is not None:
-                total = input_tokens + output_tokens
-
-            usage = LLMUsage(
-                prompt_tokens=input_tokens,
-                completion_tokens=output_tokens,
-                total_tokens=total,
-            )
+            usage = self._parse_usage(usage_data)
 
         # Extract request ID from body
         provider_request_id = data.get("id")
@@ -301,3 +318,26 @@ class AnthropicClient:
             usage=usage,
             provider_request_id=provider_request_id,
         )
+
+    def _parse_usage(self, usage_data: dict[str, object]) -> LLMUsage:
+        input_tokens = _int_or_none(usage_data.get("input_tokens"))
+        output_tokens = _int_or_none(usage_data.get("output_tokens"))
+        cache_creation = _int_or_none(usage_data.get("cache_creation_input_tokens"))
+        cache_read = _int_or_none(usage_data.get("cache_read_input_tokens"))
+        total = sum(
+            value
+            for value in (input_tokens, output_tokens, cache_creation, cache_read)
+            if value is not None
+        )
+        return LLMUsage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total,
+            cache_creation_input_tokens=cache_creation,
+            cache_read_input_tokens=cache_read,
+            provider_usage=dict(usage_data),
+        )
+
+
+def _int_or_none(value: object) -> int | None:
+    return value if isinstance(value, int) else None

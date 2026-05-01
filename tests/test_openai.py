@@ -50,8 +50,8 @@ async def test_nonstream_success() -> None:
 
     assert response.text == "Hello! How can I help you today?"
     assert response.usage is not None
-    assert response.usage.prompt_tokens == 10
-    assert response.usage.completion_tokens == 8
+    assert response.usage.input_tokens == 10
+    assert response.usage.output_tokens == 8
     assert response.usage.total_tokens == 18
     assert response.usage.reasoning_tokens == 3
     assert response.provider_request_id == "req-test-123"
@@ -98,6 +98,29 @@ async def test_payload_omits_default_reasoning() -> None:
     body = json.loads(route.calls.last.request.content)
     assert "reasoning" not in body
     assert response.provider_request_id == "resp-test123"
+
+
+@respx.mock
+async def test_payload_includes_prompt_cache_key() -> None:
+    route = respx.post("https://api.openai.com/v1/responses").respond(
+        200,
+        json=load_json("success_nonstream.json"),
+    )
+    req = LLMRequest(
+        model_name="gpt-5.4-mini",
+        messages=[
+            Turn(role="system", content="You are helpful.", cache_ttl="5m"),
+            Turn(role="user", content="Hello!"),
+        ],
+        max_tokens=100,
+        prompt_cache_key="scope:abc123",
+    )
+
+    async with httpx.AsyncClient() as http:
+        await OpenAIClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["prompt_cache_key"] == "scope:abc123"
 
 
 @respx.mock

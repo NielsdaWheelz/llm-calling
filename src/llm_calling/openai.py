@@ -161,6 +161,15 @@ class OpenAIClient:
         }
 
     def _build_request_body(self, req: LLMRequest, stream: bool) -> dict:
+        if req.prompt_cache_key is None and any(
+            turn.cache_ttl != "none" for turn in req.messages
+        ):
+            raise LLMError(
+                LLMErrorCode.BAD_REQUEST,
+                "OpenAI prompt cache turns require prompt_cache_key",
+                provider="openai",
+            )
+
         body: dict = {
             "model": req.model_name,
             "input": [
@@ -173,6 +182,9 @@ class OpenAIClient:
             "max_output_tokens": req.max_tokens,
             "stream": stream,
         }
+
+        if req.prompt_cache_key is not None:
+            body["prompt_cache_key"] = req.prompt_cache_key
 
         if req.reasoning_effort == "default":
             return body
@@ -217,9 +229,14 @@ class OpenAIClient:
 
     def _parse_usage(self, usage_data: dict) -> LLMUsage:
         output_tokens_details = usage_data.get("output_tokens_details") or {}
+        input_tokens_details = usage_data.get("input_tokens_details") or {}
+        cached_tokens = input_tokens_details.get("cached_tokens")
         return LLMUsage(
-            prompt_tokens=usage_data.get("input_tokens"),
-            completion_tokens=usage_data.get("output_tokens"),
+            input_tokens=usage_data.get("input_tokens"),
+            output_tokens=usage_data.get("output_tokens"),
             total_tokens=usage_data.get("total_tokens"),
             reasoning_tokens=output_tokens_details.get("reasoning_tokens"),
+            cached_tokens=cached_tokens,
+            cache_read_input_tokens=cached_tokens,
+            provider_usage=dict(usage_data),
         )

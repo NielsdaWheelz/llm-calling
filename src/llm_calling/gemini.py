@@ -149,9 +149,10 @@ class GeminiClient:
                     usage_metadata = data.get("usageMetadata")
                     if usage_metadata:
                         usage = LLMUsage(
-                            prompt_tokens=usage_metadata.get("promptTokenCount"),
-                            completion_tokens=usage_metadata.get("candidatesTokenCount"),
+                            input_tokens=usage_metadata.get("promptTokenCount"),
+                            output_tokens=usage_metadata.get("candidatesTokenCount"),
                             total_tokens=usage_metadata.get("totalTokenCount"),
+                            provider_usage=dict(usage_metadata),
                         )
 
                     if finish_reason == "STOP":
@@ -192,6 +193,15 @@ class GeminiClient:
 
         Extracts system turn to systemInstruction and maps roles.
         """
+        if req.prompt_cache_key is not None or any(
+            turn.cache_ttl != "none" for turn in req.messages
+        ):
+            raise LLMError(
+                LLMErrorCode.BAD_REQUEST,
+                "Gemini cached content is not implemented for this request",
+                provider="gemini",
+            )
+
         # Extract system prompt and non-system messages
         system_prompt = None
         contents = []
@@ -291,9 +301,10 @@ class GeminiClient:
         usage_metadata = data.get("usageMetadata")
         if usage_metadata:
             usage = LLMUsage(
-                prompt_tokens=usage_metadata.get("promptTokenCount"),
-                completion_tokens=usage_metadata.get("candidatesTokenCount"),
+                input_tokens=usage_metadata.get("promptTokenCount"),
+                output_tokens=usage_metadata.get("candidatesTokenCount"),
                 total_tokens=usage_metadata.get("totalTokenCount"),
+                provider_usage=dict(usage_metadata),
             )
 
         # Gemini doesn't return a request ID

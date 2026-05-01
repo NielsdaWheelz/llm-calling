@@ -5,20 +5,26 @@ from typing import Literal
 
 ReasoningEffort = Literal["default", "none", "minimal", "low", "medium", "high", "max"]
 ProviderName = Literal["openai", "anthropic", "gemini", "deepseek"]
+PromptCacheTTL = Literal["none", "5m", "1h"]
 
 
 @dataclass(frozen=True)
 class Turn:
     role: Literal["system", "user", "assistant"]
     content: str
+    cache_ttl: PromptCacheTTL = "none"
 
 
 @dataclass(frozen=True)
 class LLMUsage:
-    prompt_tokens: int | None
-    completion_tokens: int | None
+    input_tokens: int | None
+    output_tokens: int | None
     total_tokens: int | None
     reasoning_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    cached_tokens: int | None = None
+    provider_usage: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -28,6 +34,7 @@ class LLMRequest:
     max_tokens: int
     temperature: float | None = None
     reasoning_effort: ReasoningEffort = "none"
+    prompt_cache_key: str | None = None
 
 
 @dataclass(frozen=True)

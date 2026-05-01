@@ -8,7 +8,7 @@ def test_non_terminal_chunk_cannot_include_usage() -> None:
         LLMChunk(
             delta_text="x",
             done=False,
-            usage=LLMUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            usage=LLMUsage(input_tokens=1, output_tokens=1, total_tokens=2),
         )
 
 

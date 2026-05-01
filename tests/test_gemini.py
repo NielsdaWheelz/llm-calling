@@ -45,8 +45,8 @@ async def test_nonstream_success() -> None:
 
     assert response.text == "Hello! How can I help you today?"
     assert response.usage is not None
-    assert response.usage.prompt_tokens == 10
-    assert response.usage.completion_tokens == 8
+    assert response.usage.input_tokens == 10
+    assert response.usage.output_tokens == 8
     assert response.usage.total_tokens == 18
     assert response.provider_request_id is None
 
