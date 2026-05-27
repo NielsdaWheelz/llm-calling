@@ -6,7 +6,8 @@ import pytest
 import respx
 
 from llm_calling.deepseek import DeepSeekClient
-from llm_calling.types import LLMRequest, Turn
+from llm_calling.errors import LLMError, LLMErrorCode
+from llm_calling.types import LLMRequest, StructuredOutputSpec, Turn
 
 pytestmark = pytest.mark.asyncio
 
@@ -91,3 +92,21 @@ async def test_v4_reasoning_enables_thinking_and_omits_temperature() -> None:
     body = json.loads(route.calls.last.request.content)
     assert body["thinking"] == {"type": "enabled"}
     assert "temperature" not in body
+
+
+async def test_structured_output_rejected() -> None:
+    req = LLMRequest(
+        model_name="deepseek-chat",
+        messages=[Turn(role="user", content="Extract metadata.")],
+        max_tokens=100,
+        structured_output=StructuredOutputSpec(
+            name="metadata_enrichment",
+            schema={"type": "object", "properties": {}},
+        ),
+    )
+
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(LLMError) as exc_info:
+            await DeepSeekClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    assert exc_info.value.error_code == LLMErrorCode.BAD_REQUEST

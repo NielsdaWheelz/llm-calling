@@ -90,7 +90,7 @@ class GeminiClient:
         response.raise_for_status()
 
         data = response.json()
-        return self._parse_response(data)
+        return self._parse_response(data, structured=bool(req.structured_output))
 
     async def generate_stream(
         self,
@@ -100,6 +100,12 @@ class GeminiClient:
         timeout_s: int,
     ) -> AsyncIterator[LLMChunk]:
         """Streaming content generation using Server-Sent Events."""
+        if req.structured_output is not None:
+            raise LLMError(
+                LLMErrorCode.BAD_REQUEST,
+                "Gemini structured output streaming is not implemented",
+                provider="gemini",
+            )
         url = f"{GEMINI_BASE_URL}/{req.model_name}:streamGenerateContent?alt=sse"
         headers = self._build_headers(api_key)
         body = self._build_request_body(req)
@@ -224,6 +230,9 @@ class GeminiClient:
 
         if req.temperature is not None:
             body["generationConfig"]["temperature"] = req.temperature
+        if req.structured_output is not None:
+            body["generationConfig"]["responseMimeType"] = "application/json"
+            body["generationConfig"]["responseJsonSchema"] = req.structured_output.schema
 
         if req.reasoning_effort == "default":
             return body
@@ -280,7 +289,7 @@ class GeminiClient:
             "parts": [{"text": turn.content}],
         }
 
-    def _parse_response(self, data: dict) -> LLMResponse:
+    def _parse_response(self, data: dict, *, structured: bool) -> LLMResponse:
         """Parse non-streaming response."""
         # Extract text from candidates[0].content.parts[].text
         candidates = data.get("candidates", [])
@@ -295,6 +304,14 @@ class GeminiClient:
         parts = content.get("parts", [])
         text_parts = [part.get("text", "") for part in parts if "text" in part]
         text = "".join(text_parts)
+        structured_output = None
+        if structured and text.strip().startswith("{"):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                structured_output = parsed
 
         # Extract usage
         usage = None
@@ -312,4 +329,5 @@ class GeminiClient:
             text=text,
             usage=usage,
             provider_request_id=None,
+            structured_output=structured_output,
         )

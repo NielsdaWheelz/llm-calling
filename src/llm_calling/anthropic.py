@@ -90,6 +90,12 @@ class AnthropicClient:
         timeout_s: int,
     ) -> AsyncIterator[LLMChunk]:
         """Streaming message generation using Server-Sent Events."""
+        if req.structured_output is not None:
+            raise LLMError(
+                LLMErrorCode.BAD_REQUEST,
+                "Anthropic structured output streaming is not implemented",
+                provider="anthropic",
+            )
         headers = self._build_headers(api_key)
         body = self._build_request_body(req, stream=True)
 
@@ -190,6 +196,15 @@ class AnthropicClient:
                 "Anthropic does not support prompt_cache_key",
                 provider="anthropic",
             )
+        if req.structured_output is not None and req.reasoning_effort not in (
+            "default",
+            "none",
+        ):
+            raise LLMError(
+                LLMErrorCode.BAD_REQUEST,
+                "Anthropic forced structured output is incompatible with extended thinking",
+                provider="anthropic",
+            )
 
         # Extract system prompt and non-system messages
         system_blocks = []
@@ -211,6 +226,15 @@ class AnthropicClient:
 
         if system_blocks:
             body["system"] = system_blocks
+        if req.structured_output is not None:
+            body["tools"] = [
+                {
+                    "name": req.structured_output.name,
+                    "description": f"Return {req.structured_output.name}.",
+                    "input_schema": req.structured_output.schema,
+                }
+            ]
+            body["tool_choice"] = {"type": "tool", "name": req.structured_output.name}
 
         uses_adaptive_thinking = req.model_name in ANTHROPIC_ADAPTIVE_THINKING_MODELS and (
             req.reasoning_effort not in ("default", "none")
@@ -299,9 +323,12 @@ class AnthropicClient:
         # Extract text from content blocks
         content_blocks = data.get("content", [])
         text_parts = []
+        structured_output = None
         for block in content_blocks:
             if block.get("type") == "text":
                 text_parts.append(block.get("text", ""))
+            elif block.get("type") == "tool_use" and isinstance(block.get("input"), dict):
+                structured_output = block["input"]
         text = "".join(text_parts)
 
         # Extract usage - Anthropic uses input_tokens/output_tokens
@@ -317,6 +344,7 @@ class AnthropicClient:
             text=text,
             usage=usage,
             provider_request_id=provider_request_id,
+            structured_output=structured_output,
         )
 
     def _parse_usage(self, usage_data: dict[str, object]) -> LLMUsage:

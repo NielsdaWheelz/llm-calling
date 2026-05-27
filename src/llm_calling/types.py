@@ -28,6 +28,13 @@ class LLMUsage:
 
 
 @dataclass(frozen=True)
+class StructuredOutputSpec:
+    name: str
+    schema: dict[str, object]
+    strict: bool = True
+
+
+@dataclass(frozen=True)
 class LLMRequest:
     model_name: str
     messages: list[Turn]
@@ -35,6 +42,7 @@ class LLMRequest:
     temperature: float | None = None
     reasoning_effort: ReasoningEffort = "none"
     prompt_cache_key: str | None = None
+    structured_output: StructuredOutputSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -44,6 +52,7 @@ class LLMResponse:
     provider_request_id: str | None
     status: str | None = None
     incomplete_details: dict[str, object] | None = None
+    structured_output: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)

@@ -61,7 +61,7 @@ class OpenAIClient:
         response.raise_for_status()
 
         data = response.json()
-        return self._parse_response(data, response.headers)
+        return self._parse_response(data, response.headers, structured=bool(req.structured_output))
 
     async def generate_stream(
         self,
@@ -70,6 +70,12 @@ class OpenAIClient:
         api_key: str,
         timeout_s: int,
     ) -> AsyncIterator[LLMChunk]:
+        if req.structured_output is not None:
+            raise LLMError(
+                LLMErrorCode.BAD_REQUEST,
+                "OpenAI structured output streaming is not implemented",
+                provider="openai",
+            )
         headers = self._build_headers(api_key)
         body = self._build_request_body(req, stream=True)
 
@@ -161,9 +167,7 @@ class OpenAIClient:
         }
 
     def _build_request_body(self, req: LLMRequest, stream: bool) -> dict:
-        if req.prompt_cache_key is None and any(
-            turn.cache_ttl != "none" for turn in req.messages
-        ):
+        if req.prompt_cache_key is None and any(turn.cache_ttl != "none" for turn in req.messages):
             raise LLMError(
                 LLMErrorCode.BAD_REQUEST,
                 "OpenAI prompt cache turns require prompt_cache_key",
@@ -185,6 +189,15 @@ class OpenAIClient:
 
         if req.prompt_cache_key is not None:
             body["prompt_cache_key"] = req.prompt_cache_key
+        if req.structured_output is not None:
+            body["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": req.structured_output.name,
+                    "schema": req.structured_output.schema,
+                    "strict": req.structured_output.strict,
+                }
+            }
 
         if req.reasoning_effort == "default":
             return body
@@ -206,7 +219,9 @@ class OpenAIClient:
 
         return body
 
-    def _parse_response(self, data: dict, headers: httpx.Headers) -> LLMResponse:
+    def _parse_response(
+        self, data: dict, headers: httpx.Headers, *, structured: bool
+    ) -> LLMResponse:
         text_parts: list[str] = []
         for item in data.get("output", []):
             if item.get("type") != "message":
@@ -218,13 +233,23 @@ class OpenAIClient:
         status = data.get("status")
         incomplete_details = data.get("incomplete_details")
         provider_request_id = headers.get("x-request-id") or data.get("id")
+        text = "".join(text_parts)
+        structured_output = None
+        if structured and text.strip().startswith("{"):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                structured_output = parsed
 
         return LLMResponse(
-            text="".join(text_parts),
+            text=text,
             usage=self._parse_usage(data["usage"]) if data.get("usage") else None,
             provider_request_id=provider_request_id,
             status=status,
             incomplete_details=incomplete_details,
+            structured_output=structured_output,
         )
 
     def _parse_usage(self, usage_data: dict) -> LLMUsage:

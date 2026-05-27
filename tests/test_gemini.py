@@ -6,7 +6,7 @@ import pytest
 import respx
 
 from llm_calling.gemini import GeminiClient
-from llm_calling.types import LLMRequest, Turn
+from llm_calling.types import LLMRequest, StructuredOutputSpec, Turn
 
 pytestmark = pytest.mark.asyncio
 
@@ -32,6 +32,17 @@ def request() -> LLMRequest:
         max_tokens=100,
         temperature=0.7,
     )
+
+
+def metadata_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "language": {"type": "string"},
+        },
+        "required": ["title", "language"],
+    }
 
 
 @respx.mock
@@ -85,3 +96,31 @@ async def test_assistant_role_maps_to_model() -> None:
         {"role": "user", "parts": [{"text": "Hello!"}]},
         {"role": "model", "parts": [{"text": "Hi."}]},
     ]
+
+
+@respx.mock
+async def test_structured_output_uses_response_json_schema_and_parses_response() -> None:
+    response_json = load_json("success_nonstream.json")
+    response_json["candidates"][0]["content"]["parts"][0]["text"] = (
+        '{"title":"The Book","language":"en"}'
+    )
+    route = respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+    ).respond(200, json=response_json)
+    req = LLMRequest(
+        model_name="gemini-2.5-pro",
+        messages=[Turn(role="user", content="Extract metadata.")],
+        max_tokens=100,
+        structured_output=StructuredOutputSpec(
+            name="metadata_enrichment",
+            schema=metadata_schema(),
+        ),
+    )
+
+    async with httpx.AsyncClient() as http:
+        response = await GeminiClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["generationConfig"]["responseMimeType"] == "application/json"
+    assert body["generationConfig"]["responseJsonSchema"] == metadata_schema()
+    assert response.structured_output == {"title": "The Book", "language": "en"}

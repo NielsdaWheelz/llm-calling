@@ -6,7 +6,8 @@ import pytest
 import respx
 
 from llm_calling.anthropic import AnthropicClient
-from llm_calling.types import LLMRequest, Turn
+from llm_calling.errors import LLMError, LLMErrorCode
+from llm_calling.types import LLMRequest, StructuredOutputSpec, Turn
 
 pytestmark = pytest.mark.asyncio
 
@@ -31,6 +32,18 @@ def request() -> LLMRequest:
         max_tokens=100,
         temperature=0.7,
     )
+
+
+def metadata_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "language": {"type": "string"},
+        },
+        "required": ["title", "language"],
+        "additionalProperties": False,
+    }
 
 
 @respx.mock
@@ -116,6 +129,67 @@ async def test_system_turn_can_mark_prompt_cache_breakpoint() -> None:
         },
         {"type": "text", "text": "Dynamic."},
     ]
+
+
+@respx.mock
+async def test_structured_output_uses_forced_tool_and_parses_tool_input() -> None:
+    response_json = load_json("success_nonstream.json")
+    response_json["content"] = [
+        {
+            "type": "tool_use",
+            "id": "toolu_metadata",
+            "name": "metadata_enrichment",
+            "input": {"title": "The Book", "language": "en"},
+        }
+    ]
+    response_json["stop_reason"] = "tool_use"
+    route = respx.post("https://api.anthropic.com/v1/messages").respond(
+        200,
+        json=response_json,
+    )
+    req = LLMRequest(
+        model_name="claude-3-opus-20240229",
+        messages=[Turn(role="user", content="Extract metadata.")],
+        max_tokens=100,
+        structured_output=StructuredOutputSpec(
+            name="metadata_enrichment",
+            schema=metadata_schema(),
+        ),
+    )
+
+    async with httpx.AsyncClient() as http:
+        response = await AnthropicClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["tools"] == [
+        {
+            "name": "metadata_enrichment",
+            "description": "Return metadata_enrichment.",
+            "input_schema": metadata_schema(),
+        }
+    ]
+    assert body["tool_choice"] == {"type": "tool", "name": "metadata_enrichment"}
+    assert response.text == ""
+    assert response.structured_output == {"title": "The Book", "language": "en"}
+
+
+async def test_structured_output_rejects_extended_thinking() -> None:
+    req = LLMRequest(
+        model_name="claude-3-opus-20240229",
+        messages=[Turn(role="user", content="Extract metadata.")],
+        max_tokens=100,
+        reasoning_effort="high",
+        structured_output=StructuredOutputSpec(
+            name="metadata_enrichment",
+            schema=metadata_schema(),
+        ),
+    )
+
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(LLMError) as exc_info:
+            await AnthropicClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    assert exc_info.value.error_code == LLMErrorCode.BAD_REQUEST
 
 
 async def test_usage_parses_cache_tokens() -> None:

@@ -6,7 +6,7 @@ import pytest
 import respx
 
 from llm_calling.openai import OpenAIClient
-from llm_calling.types import LLMRequest, ReasoningEffort, Turn
+from llm_calling.types import LLMRequest, ReasoningEffort, StructuredOutputSpec, Turn
 
 pytestmark = pytest.mark.asyncio
 
@@ -32,6 +32,18 @@ def request(reasoning_effort: ReasoningEffort = "none") -> LLMRequest:
         temperature=0.7,
         reasoning_effort=reasoning_effort,
     )
+
+
+def metadata_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "language": {"type": "string"},
+        },
+        "required": ["title", "language"],
+        "additionalProperties": False,
+    }
 
 
 @respx.mock
@@ -121,6 +133,37 @@ async def test_payload_includes_prompt_cache_key() -> None:
 
     body = json.loads(route.calls.last.request.content)
     assert body["prompt_cache_key"] == "scope:abc123"
+
+
+@respx.mock
+async def test_structured_output_uses_json_schema_text_format_and_parses_response() -> None:
+    response_json = load_json("success_nonstream.json")
+    response_json["output"][0]["content"][0]["text"] = '{"title":"The Book","language":"en"}'
+    route = respx.post("https://api.openai.com/v1/responses").respond(
+        200,
+        json=response_json,
+    )
+    req = LLMRequest(
+        model_name="gpt-5.4-mini",
+        messages=[Turn(role="user", content="Extract metadata.")],
+        max_tokens=100,
+        structured_output=StructuredOutputSpec(
+            name="metadata_enrichment",
+            schema=metadata_schema(),
+        ),
+    )
+
+    async with httpx.AsyncClient() as http:
+        response = await OpenAIClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["text"]["format"] == {
+        "type": "json_schema",
+        "name": "metadata_enrichment",
+        "schema": metadata_schema(),
+        "strict": True,
+    }
+    assert response.structured_output == {"title": "The Book", "language": "en"}
 
 
 @respx.mock

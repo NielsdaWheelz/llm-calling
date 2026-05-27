@@ -121,6 +121,12 @@ class DeepSeekClient:
         }
 
     def _build_request_body(self, req: LLMRequest, stream: bool) -> dict:
+        if req.structured_output is not None:
+            raise LLMError(
+                LLMErrorCode.BAD_REQUEST,
+                "DeepSeek structured output is not implemented",
+                provider="deepseek",
+            )
         if req.prompt_cache_key is not None or any(
             turn.cache_ttl != "none" for turn in req.messages
         ):
