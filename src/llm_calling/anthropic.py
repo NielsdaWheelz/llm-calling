@@ -48,7 +48,7 @@ from collections.abc import AsyncIterator
 
 import httpx
 
-from llm_calling.errors import LLMError, LLMErrorCode
+from llm_calling.errors import LLMError, LLMErrorCode, raise_for_provider_error
 from llm_calling.types import LLMChunk, LLMRequest, LLMResponse, LLMUsage, ToolCall, Turn
 
 ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
@@ -77,7 +77,7 @@ class AnthropicClient:
             json=body,
             timeout=httpx.Timeout(timeout_s, connect=10.0),
         )
-        response.raise_for_status()
+        await raise_for_provider_error(response, "anthropic")
 
         data = response.json()
         return self._parse_response(data)
@@ -106,7 +106,7 @@ class AnthropicClient:
             json=body,
             timeout=httpx.Timeout(timeout_s, connect=10.0),
         ) as response:
-            response.raise_for_status()
+            await raise_for_provider_error(response, "anthropic")
 
             provider_request_id: str | None = None
             usage: LLMUsage | None = None

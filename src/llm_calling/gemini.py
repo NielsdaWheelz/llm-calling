@@ -57,7 +57,7 @@ from collections.abc import AsyncIterator
 
 import httpx
 
-from llm_calling.errors import LLMError, LLMErrorCode
+from llm_calling.errors import LLMError, LLMErrorCode, raise_for_provider_error
 from llm_calling.types import LLMChunk, LLMRequest, LLMResponse, LLMUsage, ToolCall, Turn
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -87,7 +87,7 @@ class GeminiClient:
             json=body,
             timeout=httpx.Timeout(timeout_s, connect=10.0),
         )
-        response.raise_for_status()
+        await raise_for_provider_error(response, "gemini")
 
         data = response.json()
         return self._parse_response(data, structured=bool(req.structured_output))
@@ -117,7 +117,7 @@ class GeminiClient:
             json=body,
             timeout=httpx.Timeout(timeout_s, connect=10.0),
         ) as response:
-            response.raise_for_status()
+            await raise_for_provider_error(response, "gemini")
 
             received_stop = False
             usage: LLMUsage | None = None

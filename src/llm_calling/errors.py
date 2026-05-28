@@ -2,6 +2,8 @@
 
 from enum import StrEnum
 
+import httpx
+
 
 class LLMErrorCode(StrEnum):
     INVALID_KEY = "invalid_key"
@@ -24,6 +26,38 @@ class LLMError(Exception):
         self.message = message
         self.provider = provider
         super().__init__(message)
+
+
+async def raise_for_provider_error(response: httpx.Response, provider: str) -> None:
+    """Raise LLMError with the provider's response body if status >= 400.
+
+    Stream contexts close their body after raise_for_status(), so error
+    detail is lost. Read explicitly here and surface it in the exception.
+    """
+    if response.status_code < 400:
+        return
+    try:
+        await response.aread()
+    except Exception:
+        pass
+    try:
+        json_body = response.json()
+    except Exception:
+        json_body = None
+    body_text = response.text if response.is_closed else ""
+    snippet = (body_text or "").strip()[:500]
+    code = classify_provider_error(
+        provider,
+        response.status_code,
+        json_body if isinstance(json_body, dict) else None,
+        None,
+    )
+    message = (
+        f"{provider} HTTP {response.status_code}: {snippet}"
+        if snippet
+        else f"{provider} HTTP {response.status_code}"
+    )
+    raise LLMError(code, message, provider=provider)
 
 
 def classify_provider_error(

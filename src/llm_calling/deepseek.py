@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 
 import httpx
 
-from llm_calling.errors import LLMError, LLMErrorCode
+from llm_calling.errors import LLMError, LLMErrorCode, raise_for_provider_error
 from llm_calling.types import LLMChunk, LLMRequest, LLMResponse, LLMUsage, ToolCall
 
 DEEPSEEK_CHAT_URL = "https://api.deepseek.com/chat/completions"
@@ -32,7 +32,7 @@ class DeepSeekClient:
             json=body,
             timeout=httpx.Timeout(timeout_s, connect=10.0),
         )
-        response.raise_for_status()
+        await raise_for_provider_error(response, "deepseek")
 
         data = response.json()
         return self._parse_response(data, response.headers)
@@ -54,7 +54,7 @@ class DeepSeekClient:
             json=body,
             timeout=httpx.Timeout(timeout_s, connect=10.0),
         ) as response:
-            response.raise_for_status()
+            await raise_for_provider_error(response, "deepseek")
 
             provider_request_id = response.headers.get("x-request-id")
             accumulated_usage: LLMUsage | None = None
