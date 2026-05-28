@@ -227,10 +227,11 @@ class OpenAIClient:
                     )
                 continue
             if turn.content or not turn.tool_calls:
+                content_type = "output_text" if turn.role == "assistant" else "input_text"
                 input_items.append(
                     {
                         "role": turn.role,
-                        "content": [{"type": "input_text", "text": turn.content}],
+                        "content": [{"type": content_type, "text": turn.content}],
                     }
                 )
             if turn.role == "assistant":
