@@ -7,7 +7,7 @@ import respx
 
 from llm_calling.deepseek import DeepSeekClient
 from llm_calling.errors import LLMError, LLMErrorCode
-from llm_calling.types import LLMRequest, StructuredOutputSpec, Turn
+from llm_calling.types import LLMRequest, StructuredOutputSpec, ToolSpec, Turn
 
 pytestmark = pytest.mark.asyncio
 
@@ -92,6 +92,122 @@ async def test_v4_reasoning_enables_thinking_and_omits_temperature() -> None:
     body = json.loads(route.calls.last.request.content)
     assert body["thinking"] == {"type": "enabled"}
     assert "temperature" not in body
+
+
+@respx.mock
+async def test_nonstream_tool_calls() -> None:
+    route = respx.post("https://api.deepseek.com/chat/completions").respond(
+        200,
+        json={
+            "id": "chatcmpl-tool-1",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_abc",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "arguments": '{"city": "Paris"}',
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+        },
+    )
+    req = LLMRequest(
+        model_name="deepseek-chat",
+        messages=[Turn(role="user", content="Weather?")],
+        max_tokens=100,
+        tools=(
+            ToolSpec(
+                name="get_weather",
+                description="Get weather",
+                parameters={
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            ),
+        ),
+        tool_choice="auto",
+    )
+
+    async with httpx.AsyncClient() as http:
+        response = await DeepSeekClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+    assert body["tool_choice"] == "auto"
+    assert response.text == ""
+    assert len(response.tool_calls) == 1
+    assert response.tool_calls[0].id == "call_abc"
+    assert response.tool_calls[0].name == "get_weather"
+    assert response.tool_calls[0].arguments == {"city": "Paris"}
+
+
+@respx.mock
+async def test_stream_tool_calls() -> None:
+    stream_body = (
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_xyz",'
+        '"function":{"name":"get_weather","arguments":"{\\"ci"}}]}}]}\n'
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+        '"function":{"arguments":"ty\\": \\"Paris\\"}"}}]},"finish_reason":"tool_calls"}],'
+        '"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}\n'
+        "data: [DONE]\n"
+    )
+    respx.post("https://api.deepseek.com/chat/completions").respond(
+        200,
+        content=stream_body,
+        headers={"x-request-id": "req-tool-1", "content-type": "text/event-stream"},
+    )
+    req = LLMRequest(
+        model_name="deepseek-chat",
+        messages=[Turn(role="user", content="Weather?")],
+        max_tokens=100,
+        tools=(
+            ToolSpec(
+                name="get_weather",
+                description="Get weather",
+                parameters={"type": "object", "properties": {}},
+            ),
+        ),
+    )
+
+    async with httpx.AsyncClient() as http:
+        chunks = [
+            chunk
+            async for chunk in DeepSeekClient(http).generate_stream(
+                req, api_key="sk-test", timeout_s=30
+            )
+        ]
+
+    tool_chunks = [c for c in chunks if c.tool_call is not None]
+    assert len(tool_chunks) == 1
+    assert tool_chunks[0].tool_call.id == "call_xyz"
+    assert tool_chunks[0].tool_call.name == "get_weather"
+    assert tool_chunks[0].tool_call.arguments == {"city": "Paris"}
+    assert chunks[-1].done is True
 
 
 async def test_structured_output_rejected() -> None:

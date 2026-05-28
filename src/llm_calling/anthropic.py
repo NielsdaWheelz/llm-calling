@@ -49,7 +49,7 @@ from collections.abc import AsyncIterator
 import httpx
 
 from llm_calling.errors import LLMError, LLMErrorCode
-from llm_calling.types import LLMChunk, LLMRequest, LLMResponse, LLMUsage, Turn
+from llm_calling.types import LLMChunk, LLMRequest, LLMResponse, LLMUsage, ToolCall, Turn
 
 ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_API_VERSION = "2023-06-01"
@@ -112,6 +112,7 @@ class AnthropicClient:
             usage: LLMUsage | None = None
             received_stop = False
             usage_data: dict[str, object] = {}
+            tool_blocks: dict[int, dict[str, object]] = {}
 
             async for line in response.aiter_lines():
                 if not line:
@@ -153,13 +154,52 @@ class AnthropicClient:
                         usage = self._parse_usage(usage_data)
                     continue
 
-                # Handle content_block_delta - extract text
+                # Handle content_block_start - track tool_use blocks
+                if event_type == "content_block_start":
+                    block = data.get("content_block", {})
+                    if block.get("type") == "tool_use":
+                        index = data.get("index")
+                        if isinstance(index, int):
+                            tool_blocks[index] = {
+                                "id": block.get("id", ""),
+                                "name": block.get("name", ""),
+                                "json": "",
+                            }
+                    continue
+
+                # Handle content_block_delta - extract text or tool_use input json
                 if event_type == "content_block_delta":
                     delta = data.get("delta", {})
                     if delta.get("type") == "text_delta":
                         delta_text = delta.get("text", "")
                         if delta_text:
                             yield LLMChunk(delta_text=delta_text, done=False)
+                    elif delta.get("type") == "input_json_delta":
+                        index = data.get("index")
+                        if isinstance(index, int) and index in tool_blocks:
+                            tool_blocks[index]["json"] += delta.get("partial_json", "")
+                    continue
+
+                # Handle content_block_stop - finalize tool_use blocks
+                if event_type == "content_block_stop":
+                    index = data.get("index")
+                    if isinstance(index, int) and index in tool_blocks:
+                        block_state = tool_blocks.pop(index)
+                        raw_json = block_state["json"] or "{}"
+                        try:
+                            arguments = json.loads(raw_json)
+                        except json.JSONDecodeError:
+                            arguments = {}
+                        if not isinstance(arguments, dict):
+                            arguments = {}
+                        yield LLMChunk(
+                            tool_call=ToolCall(
+                                id=str(block_state["id"]),
+                                name=str(block_state["name"]),
+                                arguments=arguments,
+                            ),
+                            done=False,
+                        )
                     continue
 
                 # Handle message_delta - extract usage at end
@@ -226,15 +266,33 @@ class AnthropicClient:
 
         if system_blocks:
             body["system"] = system_blocks
+        tools_payload: list[dict[str, object]] = []
         if req.structured_output is not None:
-            body["tools"] = [
+            tools_payload.append(
                 {
                     "name": req.structured_output.name,
                     "description": f"Return {req.structured_output.name}.",
                     "input_schema": req.structured_output.schema,
                 }
-            ]
+            )
             body["tool_choice"] = {"type": "tool", "name": req.structured_output.name}
+        for tool in req.tools:
+            tools_payload.append(
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.parameters,
+                }
+            )
+        if tools_payload:
+            body["tools"] = tools_payload
+        if req.tools and req.structured_output is None:
+            if req.tool_choice == "auto":
+                body["tool_choice"] = {"type": "auto"}
+            elif req.tool_choice == "none":
+                body["tool_choice"] = {"type": "none"}
+            elif req.tool_choice == "required":
+                body["tool_choice"] = {"type": "any"}
 
         uses_adaptive_thinking = req.model_name in ANTHROPIC_ADAPTIVE_THINKING_MODELS and (
             req.reasoning_effort not in ("default", "none")
@@ -302,7 +360,7 @@ class AnthropicClient:
         block["cache_control"] = {"type": "ephemeral", "ttl": turn.cache_ttl}
         return block
 
-    def _turn_to_message(self, turn: Turn) -> dict[str, str]:
+    def _turn_to_message(self, turn: Turn) -> dict[str, object]:
         """Convert Turn to Anthropic message format.
 
         Note: System turns are handled separately in _build_request_body.
@@ -313,6 +371,33 @@ class AnthropicClient:
                 "Anthropic prompt cache is only supported on system turns",
                 provider="anthropic",
             )
+        if turn.role == "tool":
+            return {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": result.call_id,
+                        "content": result.output,
+                        "is_error": result.is_error,
+                    }
+                    for result in turn.tool_results
+                ],
+            }
+        if turn.role == "assistant" and turn.tool_calls:
+            content: list[dict[str, object]] = []
+            if turn.content:
+                content.append({"type": "text", "text": turn.content})
+            for call in turn.tool_calls:
+                content.append(
+                    {
+                        "type": "tool_use",
+                        "id": call.id,
+                        "name": call.name,
+                        "input": call.arguments,
+                    }
+                )
+            return {"role": "assistant", "content": content}
         return {
             "role": turn.role,
             "content": turn.content,
@@ -324,11 +409,20 @@ class AnthropicClient:
         content_blocks = data.get("content", [])
         text_parts = []
         structured_output = None
+        tool_calls: list[ToolCall] = []
         for block in content_blocks:
             if block.get("type") == "text":
                 text_parts.append(block.get("text", ""))
             elif block.get("type") == "tool_use" and isinstance(block.get("input"), dict):
-                structured_output = block["input"]
+                if structured_output is None:
+                    structured_output = block["input"]
+                tool_calls.append(
+                    ToolCall(
+                        id=str(block.get("id", "")),
+                        name=str(block.get("name", "")),
+                        arguments=block["input"],
+                    )
+                )
         text = "".join(text_parts)
 
         # Extract usage - Anthropic uses input_tokens/output_tokens
@@ -345,6 +439,7 @@ class AnthropicClient:
             usage=usage,
             provider_request_id=provider_request_id,
             structured_output=structured_output,
+            tool_calls=tuple(tool_calls),
         )
 
     def _parse_usage(self, usage_data: dict[str, object]) -> LLMUsage:

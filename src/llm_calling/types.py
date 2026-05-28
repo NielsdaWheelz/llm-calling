@@ -1,18 +1,42 @@
 """Shared types for provider-level LLM calls."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 ReasoningEffort = Literal["default", "none", "minimal", "low", "medium", "high", "max"]
 ProviderName = Literal["openai", "anthropic", "gemini", "deepseek"]
 PromptCacheTTL = Literal["none", "5m", "1h"]
+ToolChoice = Literal["auto", "none", "required"]
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    description: str
+    parameters: dict[str, object]
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict[str, object]
+
+
+@dataclass(frozen=True)
+class ToolResult:
+    call_id: str
+    output: str
+    is_error: bool = False
 
 
 @dataclass(frozen=True)
 class Turn:
-    role: Literal["system", "user", "assistant"]
-    content: str
+    role: Literal["system", "user", "assistant", "tool"]
+    content: str = ""
     cache_ttl: PromptCacheTTL = "none"
+    tool_calls: tuple[ToolCall, ...] = ()
+    tool_results: tuple[ToolResult, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -43,6 +67,8 @@ class LLMRequest:
     reasoning_effort: ReasoningEffort = "none"
     prompt_cache_key: str | None = None
     structured_output: StructuredOutputSpec | None = None
+    tools: tuple[ToolSpec, ...] = ()
+    tool_choice: ToolChoice = "auto"
 
 
 @dataclass(frozen=True)
@@ -53,12 +79,14 @@ class LLMResponse:
     status: str | None = None
     incomplete_details: dict[str, object] | None = None
     structured_output: dict[str, object] | None = None
+    tool_calls: tuple[ToolCall, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
 class LLMChunk:
-    delta_text: str
-    done: bool
+    delta_text: str = ""
+    tool_call: ToolCall | None = None
+    done: bool = False
     usage: LLMUsage | None = None
     provider_request_id: str | None = None
     status: str | None = None

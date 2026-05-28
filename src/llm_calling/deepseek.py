@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 import httpx
 
 from llm_calling.errors import LLMError, LLMErrorCode
-from llm_calling.types import LLMChunk, LLMRequest, LLMResponse, LLMUsage
+from llm_calling.types import LLMChunk, LLMRequest, LLMResponse, LLMUsage, ToolCall
 
 DEEPSEEK_CHAT_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_V4_MODELS = {"deepseek-v4-pro", "deepseek-v4-flash"}
@@ -59,6 +59,7 @@ class DeepSeekClient:
             provider_request_id = response.headers.get("x-request-id")
             accumulated_usage: LLMUsage | None = None
             received_done = False
+            tool_call_acc: dict[int, dict] = {}
 
             async for line in response.aiter_lines():
                 if not line or not line.startswith("data: "):
@@ -67,6 +68,21 @@ class DeepSeekClient:
                 data_str = line[6:]
                 if data_str == "[DONE]":
                     received_done = True
+                    for idx in sorted(tool_call_acc):
+                        acc = tool_call_acc[idx]
+                        try:
+                            parsed_args = json.loads(acc["arguments"]) if acc["arguments"] else {}
+                        except json.JSONDecodeError:
+                            parsed_args = {}
+                        if not isinstance(parsed_args, dict):
+                            parsed_args = {}
+                        yield LLMChunk(
+                            tool_call=ToolCall(
+                                id=acc["id"], name=acc["name"], arguments=parsed_args
+                            ),
+                            done=False,
+                        )
+                    tool_call_acc.clear()
                     yield LLMChunk(
                         delta_text="",
                         done=True,
@@ -80,21 +96,6 @@ class DeepSeekClient:
                 except json.JSONDecodeError:
                     continue
 
-                choices = data.get("choices", [])
-                if not choices:
-                    if "usage" in data:
-                        usage_data = data["usage"]
-                        accumulated_usage = LLMUsage(
-                            input_tokens=usage_data.get("prompt_tokens"),
-                            output_tokens=usage_data.get("completion_tokens"),
-                            total_tokens=usage_data.get("total_tokens"),
-                            provider_usage=dict(usage_data),
-                        )
-                    continue
-
-                delta = choices[0].get("delta", {})
-                delta_text = delta.get("content", "")
-
                 if "usage" in data:
                     usage_data = data["usage"]
                     accumulated_usage = LLMUsage(
@@ -103,6 +104,44 @@ class DeepSeekClient:
                         total_tokens=usage_data.get("total_tokens"),
                         provider_usage=dict(usage_data),
                     )
+
+                choices = data.get("choices", [])
+                if not choices:
+                    continue
+
+                choice = choices[0]
+                delta = choice.get("delta", {})
+                delta_text = delta.get("content", "")
+
+                for tc_delta in delta.get("tool_calls") or []:
+                    idx = tc_delta.get("index", 0)
+                    acc = tool_call_acc.setdefault(
+                        idx, {"id": "", "name": "", "arguments": ""}
+                    )
+                    if tc_delta.get("id"):
+                        acc["id"] = tc_delta["id"]
+                    fn = tc_delta.get("function") or {}
+                    if fn.get("name"):
+                        acc["name"] = fn["name"]
+                    if "arguments" in fn and fn["arguments"]:
+                        acc["arguments"] += fn["arguments"]
+
+                if choice.get("finish_reason") == "tool_calls" and tool_call_acc:
+                    for idx in sorted(tool_call_acc):
+                        acc = tool_call_acc[idx]
+                        try:
+                            parsed_args = json.loads(acc["arguments"]) if acc["arguments"] else {}
+                        except json.JSONDecodeError:
+                            parsed_args = {}
+                        if not isinstance(parsed_args, dict):
+                            parsed_args = {}
+                        yield LLMChunk(
+                            tool_call=ToolCall(
+                                id=acc["id"], name=acc["name"], arguments=parsed_args
+                            ),
+                            done=False,
+                        )
+                    tool_call_acc.clear()
 
                 if delta_text:
                     yield LLMChunk(delta_text=delta_text, done=False)
@@ -136,18 +175,59 @@ class DeepSeekClient:
                 provider="deepseek",
             )
 
+        messages: list[dict] = []
+        for turn in req.messages:
+            if turn.role == "tool":
+                for tr in turn.tool_results:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tr.call_id,
+                            "content": tr.output,
+                        }
+                    )
+                continue
+            if turn.role == "assistant" and turn.tool_calls:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": turn.content or None,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": json.dumps(tc.arguments),
+                                },
+                            }
+                            for tc in turn.tool_calls
+                        ],
+                    }
+                )
+                continue
+            messages.append({"role": turn.role, "content": turn.content})
+
         body: dict = {
             "model": req.model_name,
-            "messages": [
-                {
-                    "role": turn.role,
-                    "content": turn.content,
-                }
-                for turn in req.messages
-            ],
+            "messages": messages,
             "max_tokens": req.max_tokens,
             "stream": stream,
         }
+
+        if req.tools:
+            body["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    },
+                }
+                for t in req.tools
+            ]
+            body["tool_choice"] = req.tool_choice
 
         uses_v4_thinking = req.model_name in DEEPSEEK_V4_MODELS and (
             req.reasoning_effort not in ("default", "none")
@@ -169,7 +249,22 @@ class DeepSeekClient:
                 provider="deepseek",
             )
 
-        text = choices[0].get("message", {}).get("content", "")
+        message = choices[0].get("message", {}) or {}
+        text = message.get("content") or ""
+
+        tool_calls: list[ToolCall] = []
+        for tc in message.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            args_str = fn.get("arguments") or ""
+            try:
+                parsed_args = json.loads(args_str) if args_str else {}
+            except json.JSONDecodeError:
+                parsed_args = {}
+            if not isinstance(parsed_args, dict):
+                parsed_args = {}
+            tool_calls.append(
+                ToolCall(id=tc.get("id") or "", name=fn.get("name") or "", arguments=parsed_args)
+            )
 
         usage = None
         usage_data = data.get("usage")
@@ -187,4 +282,5 @@ class DeepSeekClient:
             text=text,
             usage=usage,
             provider_request_id=provider_request_id,
+            tool_calls=tuple(tool_calls),
         )

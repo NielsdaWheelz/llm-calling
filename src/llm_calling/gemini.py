@@ -58,7 +58,7 @@ from collections.abc import AsyncIterator
 import httpx
 
 from llm_calling.errors import LLMError, LLMErrorCode
-from llm_calling.types import LLMChunk, LLMRequest, LLMResponse, LLMUsage, Turn
+from llm_calling.types import LLMChunk, LLMRequest, LLMResponse, LLMUsage, ToolCall, Turn
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_31_PRO_PREVIEW = "gemini-3.1-pro-preview"
@@ -144,9 +144,15 @@ class GeminiClient:
                     parts = content.get("parts", [])
 
                     delta_text = ""
+                    tool_calls: list[ToolCall] = []
                     for part in parts:
                         if "text" in part:
                             delta_text += part["text"]
+                        elif "functionCall" in part:
+                            fc = part["functionCall"]
+                            name = fc.get("name", "")
+                            args = fc.get("args") or {}
+                            tool_calls.append(ToolCall(id=name, name=name, arguments=args))
 
                     # Check for finish reason
                     finish_reason = candidate.get("finishReason")
@@ -166,6 +172,8 @@ class GeminiClient:
                         # Yield any remaining text as non-terminal
                         if delta_text:
                             yield LLMChunk(delta_text=delta_text, done=False)
+                        for tc in tool_calls:
+                            yield LLMChunk(tool_call=tc, done=False)
                         # Then yield terminal chunk
                         yield LLMChunk(
                             delta_text="",
@@ -174,8 +182,11 @@ class GeminiClient:
                             provider_request_id=None,  # Gemini doesn't provide request ID
                         )
                         break
-                    elif delta_text:
-                        yield LLMChunk(delta_text=delta_text, done=False)
+                    else:
+                        if delta_text:
+                            yield LLMChunk(delta_text=delta_text, done=False)
+                        for tc in tool_calls:
+                            yield LLMChunk(tool_call=tc, done=False)
 
             if not received_stop:
                 raise LLMError(
@@ -208,6 +219,14 @@ class GeminiClient:
                 provider="gemini",
             )
 
+        # Build call_id → tool name lookup from assistant turns (Gemini matches
+        # function responses by name, not call_id).
+        call_id_to_name: dict[str, str] = {}
+        for turn in req.messages:
+            if turn.role == "assistant":
+                for call in turn.tool_calls:
+                    call_id_to_name[call.id] = call.name
+
         # Extract system prompt and non-system messages
         system_prompt = None
         contents = []
@@ -216,7 +235,7 @@ class GeminiClient:
             if turn.role == "system":
                 system_prompt = turn.content
             else:
-                contents.append(self._turn_to_content(turn))
+                contents.append(self._turn_to_content(turn, call_id_to_name))
 
         body: dict = {
             "contents": contents,
@@ -233,6 +252,22 @@ class GeminiClient:
         if req.structured_output is not None:
             body["generationConfig"]["responseMimeType"] = "application/json"
             body["generationConfig"]["responseJsonSchema"] = req.structured_output.schema
+
+        if req.tools:
+            body["tools"] = [
+                {
+                    "functionDeclarations": [
+                        {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.parameters,
+                        }
+                        for tool in req.tools
+                    ]
+                }
+            ]
+            mode = {"auto": "AUTO", "none": "NONE", "required": "ANY"}[req.tool_choice]
+            body["toolConfig"] = {"functionCallingConfig": {"mode": mode}}
 
         if req.reasoning_effort == "default":
             return body
@@ -278,11 +313,32 @@ class GeminiClient:
             return body
         raise ValueError(f"Unknown reasoning_effort: {req.reasoning_effort}")
 
-    def _turn_to_content(self, turn: Turn) -> dict:
+    def _turn_to_content(self, turn: Turn, call_id_to_name: dict[str, str]) -> dict:
         """Convert Turn to Gemini content format.
 
-        Note: Gemini uses "model" instead of "assistant" for the role.
+        Note: Gemini uses "model" instead of "assistant" for the role, and
+        identifies tool responses by function name (not call_id).
         """
+        if turn.role == "tool":
+            return {
+                "role": "user",
+                "parts": [
+                    {
+                        "functionResponse": {
+                            "name": call_id_to_name.get(result.call_id, result.call_id),
+                            "response": {"output": result.output},
+                        }
+                    }
+                    for result in turn.tool_results
+                ],
+            }
+        if turn.role == "assistant" and turn.tool_calls:
+            parts: list[dict] = []
+            if turn.content:
+                parts.append({"text": turn.content})
+            for call in turn.tool_calls:
+                parts.append({"functionCall": {"name": call.name, "args": call.arguments}})
+            return {"role": "model", "parts": parts}
         role = "model" if turn.role == "assistant" else turn.role
         return {
             "role": role,
@@ -304,6 +360,13 @@ class GeminiClient:
         parts = content.get("parts", [])
         text_parts = [part.get("text", "") for part in parts if "text" in part]
         text = "".join(text_parts)
+        tool_calls: list[ToolCall] = []
+        for part in parts:
+            if "functionCall" in part:
+                fc = part["functionCall"]
+                name = fc.get("name", "")
+                args = fc.get("args") or {}
+                tool_calls.append(ToolCall(id=name, name=name, arguments=args))
         structured_output = None
         if structured and text.strip().startswith("{"):
             try:
@@ -330,4 +393,5 @@ class GeminiClient:
             usage=usage,
             provider_request_id=None,
             structured_output=structured_output,
+            tool_calls=tuple(tool_calls),
         )

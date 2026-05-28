@@ -33,7 +33,7 @@ from collections.abc import AsyncIterator
 import httpx
 
 from llm_calling.errors import LLMError, LLMErrorCode
-from llm_calling.types import LLMChunk, LLMRequest, LLMResponse, LLMUsage
+from llm_calling.types import LLMChunk, LLMRequest, LLMResponse, LLMUsage, ToolCall
 
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 
@@ -91,6 +91,7 @@ class OpenAIClient:
             provider_request_id = response.headers.get("x-request-id")
             accumulated_usage: LLMUsage | None = None
             emitted_terminal = False
+            tool_call_items: dict[str, dict] = {}
 
             async for line in response.aiter_lines():
                 if not line or not line.startswith("data: "):
@@ -120,6 +121,45 @@ class OpenAIClient:
                     delta_text = data.get("delta", "")
                     if delta_text:
                         yield LLMChunk(delta_text=delta_text, done=False)
+                    continue
+
+                if event_type == "response.output_item.added":
+                    item = data.get("item") or {}
+                    if item.get("type") == "function_call":
+                        item_id = data.get("item_id") or item.get("id") or ""
+                        tool_call_items[item_id] = {
+                            "call_id": item.get("call_id") or "",
+                            "name": item.get("name") or "",
+                            "arguments": "",
+                        }
+                    continue
+
+                if event_type == "response.function_call_arguments.delta":
+                    item_id = data.get("item_id") or ""
+                    if item_id in tool_call_items:
+                        tool_call_items[item_id]["arguments"] += data.get("delta", "")
+                    continue
+
+                if event_type == "response.output_item.done":
+                    item = data.get("item") or {}
+                    if item.get("type") == "function_call":
+                        item_id = data.get("item_id") or item.get("id") or ""
+                        acc = tool_call_items.pop(item_id, None)
+                        call_id = item.get("call_id") or (acc["call_id"] if acc else "")
+                        name = item.get("name") or (acc["name"] if acc else "")
+                        args_str = item.get("arguments")
+                        if args_str is None:
+                            args_str = acc["arguments"] if acc else ""
+                        try:
+                            parsed_args = json.loads(args_str) if args_str else {}
+                        except json.JSONDecodeError:
+                            parsed_args = {}
+                        if not isinstance(parsed_args, dict):
+                            parsed_args = {}
+                        yield LLMChunk(
+                            tool_call=ToolCall(id=call_id, name=name, arguments=parsed_args),
+                            done=False,
+                        )
                     continue
 
                 if event_type == "response.created":
@@ -174,15 +214,39 @@ class OpenAIClient:
                 provider="openai",
             )
 
+        input_items: list[dict] = []
+        for turn in req.messages:
+            if turn.role == "tool":
+                for tr in turn.tool_results:
+                    input_items.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": tr.call_id,
+                            "output": tr.output,
+                        }
+                    )
+                continue
+            if turn.content or not turn.tool_calls:
+                input_items.append(
+                    {
+                        "role": turn.role,
+                        "content": [{"type": "input_text", "text": turn.content}],
+                    }
+                )
+            if turn.role == "assistant":
+                for tc in turn.tool_calls:
+                    input_items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": tc.id,
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments),
+                        }
+                    )
+
         body: dict = {
             "model": req.model_name,
-            "input": [
-                {
-                    "role": turn.role,
-                    "content": [{"type": "input_text", "text": turn.content}],
-                }
-                for turn in req.messages
-            ],
+            "input": input_items,
             "max_output_tokens": req.max_tokens,
             "stream": stream,
         }
@@ -198,6 +262,17 @@ class OpenAIClient:
                     "strict": req.structured_output.strict,
                 }
             }
+        if req.tools:
+            body["tools"] = [
+                {
+                    "type": "function",
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                }
+                for t in req.tools
+            ]
+            body["tool_choice"] = req.tool_choice
 
         if req.reasoning_effort == "default":
             return body
@@ -223,12 +298,28 @@ class OpenAIClient:
         self, data: dict, headers: httpx.Headers, *, structured: bool
     ) -> LLMResponse:
         text_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
         for item in data.get("output", []):
-            if item.get("type") != "message":
-                continue
-            for content_item in item.get("content", []):
-                if content_item.get("type") == "output_text":
-                    text_parts.append(content_item.get("text", ""))
+            item_type = item.get("type")
+            if item_type == "message":
+                for content_item in item.get("content", []):
+                    if content_item.get("type") == "output_text":
+                        text_parts.append(content_item.get("text", ""))
+            elif item_type == "function_call":
+                args_str = item.get("arguments") or ""
+                try:
+                    parsed_args = json.loads(args_str) if args_str else {}
+                except json.JSONDecodeError:
+                    parsed_args = {}
+                if not isinstance(parsed_args, dict):
+                    parsed_args = {}
+                tool_calls.append(
+                    ToolCall(
+                        id=item.get("call_id") or "",
+                        name=item.get("name") or "",
+                        arguments=parsed_args,
+                    )
+                )
 
         status = data.get("status")
         incomplete_details = data.get("incomplete_details")
@@ -250,6 +341,7 @@ class OpenAIClient:
             status=status,
             incomplete_details=incomplete_details,
             structured_output=structured_output,
+            tool_calls=tuple(tool_calls),
         )
 
     def _parse_usage(self, usage_data: dict) -> LLMUsage:
