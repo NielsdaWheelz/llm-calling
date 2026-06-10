@@ -113,6 +113,7 @@ class AnthropicClient:
             received_stop = False
             usage_data: dict[str, object] = {}
             tool_blocks: dict[int, dict[str, object]] = {}
+            thinking_blocks: dict[int, dict[str, object]] = {}
 
             async for line in response.aiter_lines():
                 if not line:
@@ -154,7 +155,7 @@ class AnthropicClient:
                         usage = self._parse_usage(usage_data)
                     continue
 
-                # Handle content_block_start - track tool_use blocks
+                # Handle content_block_start - track tool_use and thinking blocks
                 if event_type == "content_block_start":
                     block = data.get("content_block", {})
                     if block.get("type") == "tool_use":
@@ -165,9 +166,14 @@ class AnthropicClient:
                                 "name": block.get("name", ""),
                                 "json": "",
                             }
+                    elif block.get("type") in ("thinking", "redacted_thinking"):
+                        index = data.get("index")
+                        if isinstance(index, int):
+                            thinking_blocks[index] = dict(block)
                     continue
 
-                # Handle content_block_delta - extract text or tool_use input json
+                # Handle content_block_delta - extract text, tool_use input json,
+                # or thinking/signature deltas
                 if event_type == "content_block_delta":
                     delta = data.get("delta", {})
                     if delta.get("type") == "text_delta":
@@ -178,14 +184,22 @@ class AnthropicClient:
                         index = data.get("index")
                         if isinstance(index, int) and index in tool_blocks:
                             tool_blocks[index]["json"] += delta.get("partial_json", "")
+                    elif delta.get("type") in ("thinking_delta", "signature_delta"):
+                        key = "thinking" if delta.get("type") == "thinking_delta" else "signature"
+                        index = data.get("index")
+                        if isinstance(index, int) and index in thinking_blocks:
+                            block_state = thinking_blocks[index]
+                            block_state[key] = str(block_state.get(key) or "") + str(
+                                delta.get(key) or ""
+                            )
                     continue
 
-                # Handle content_block_stop - finalize tool_use blocks
+                # Handle content_block_stop - finalize tool_use and thinking blocks
                 if event_type == "content_block_stop":
                     index = data.get("index")
                     if isinstance(index, int) and index in tool_blocks:
                         block_state = tool_blocks.pop(index)
-                        raw_json = block_state["json"] or "{}"
+                        raw_json = str(block_state["json"] or "{}")
                         try:
                             arguments = json.loads(raw_json)
                         except json.JSONDecodeError:
@@ -200,6 +214,9 @@ class AnthropicClient:
                             ),
                             done=False,
                         )
+                    elif isinstance(index, int) and index in thinking_blocks:
+                        # One complete thinking/redacted_thinking block, verbatim.
+                        yield LLMChunk(provider_item=thinking_blocks.pop(index), done=False)
                     continue
 
                 # Handle message_delta - extract usage at end
@@ -384,8 +401,9 @@ class AnthropicClient:
                     for result in turn.tool_results
                 ],
             }
-        if turn.role == "assistant" and turn.tool_calls:
-            content: list[dict[str, object]] = []
+        if turn.role == "assistant" and (turn.tool_calls or turn.provider_items):
+            # Thinking blocks must lead the assistant turn, unmodified, before tool_use.
+            content: list[dict[str, object]] = [dict(item) for item in turn.provider_items]
             if turn.content:
                 content.append({"type": "text", "text": turn.content})
             for call in turn.tool_calls:
@@ -410,9 +428,12 @@ class AnthropicClient:
         text_parts = []
         structured_output = None
         tool_calls: list[ToolCall] = []
+        provider_items: list[dict[str, object]] = []
         for block in content_blocks:
             if block.get("type") == "text":
                 text_parts.append(block.get("text", ""))
+            elif block.get("type") in ("thinking", "redacted_thinking"):
+                provider_items.append(block)
             elif block.get("type") == "tool_use" and isinstance(block.get("input"), dict):
                 if structured_output is None:
                     structured_output = block["input"]
@@ -440,6 +461,7 @@ class AnthropicClient:
             provider_request_id=provider_request_id,
             structured_output=structured_output,
             tool_calls=tuple(tool_calls),
+            provider_items=tuple(provider_items),
         )
 
     def _parse_usage(self, usage_data: dict[str, object]) -> LLMUsage:

@@ -91,6 +91,46 @@ async def test_generate_maps_timeout(provider: str) -> None:
     assert exc_info.value.error_code == LLMErrorCode.TIMEOUT
 
 
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.RemoteProtocolError("peer closed connection without sending complete message body"),
+        httpx.ResponseNotRead(),
+        httpx.DecodingError("bad content-encoding"),
+        TypeError("'NoneType' object is not subscriptable"),
+        AttributeError("'NoneType' object has no attribute 'get'"),
+    ],
+)
+@respx.mock
+async def test_generate_wraps_transport_and_payload_exceptions(exc: Exception) -> None:
+    req = request("openai")
+    respx.post(endpoint("openai", req.model_name)).mock(side_effect=exc)
+
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(LLMError) as exc_info:
+            await LLMRouter(http).generate("openai", req, "sk-test")
+
+    assert exc_info.value.error_code == LLMErrorCode.PROVIDER_DOWN
+    assert type(exc).__name__ in exc_info.value.message
+    assert str(exc) in exc_info.value.message
+
+
+@respx.mock
+async def test_generate_stream_wraps_protocol_error() -> None:
+    req = request("openai")
+    respx.post(endpoint("openai", req.model_name)).mock(
+        side_effect=httpx.RemoteProtocolError("peer closed connection")
+    )
+
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(LLMError) as exc_info:
+            async for _ in LLMRouter(http).generate_stream("openai", req, "sk-test"):
+                pass
+
+    assert exc_info.value.error_code == LLMErrorCode.PROVIDER_DOWN
+    assert "peer closed connection" in exc_info.value.message
+
+
 async def test_unknown_provider_is_model_not_available() -> None:
     async with httpx.AsyncClient() as http:
         with pytest.raises(LLMError) as exc_info:

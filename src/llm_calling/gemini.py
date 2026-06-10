@@ -146,13 +146,13 @@ class GeminiClient:
                     delta_text = ""
                     tool_calls: list[ToolCall] = []
                     for part in parts:
+                        if part.get("thought"):
+                            # Thought-summary parts are not visible output.
+                            continue
                         if "text" in part:
                             delta_text += part["text"]
                         elif "functionCall" in part:
-                            fc = part["functionCall"]
-                            name = fc.get("name", "")
-                            args = fc.get("args") or {}
-                            tool_calls.append(ToolCall(id=name, name=name, arguments=args))
+                            tool_calls.append(_part_to_tool_call(part))
 
                     # Check for finish reason
                     finish_reason = candidate.get("finishReason")
@@ -337,7 +337,13 @@ class GeminiClient:
             if turn.content:
                 parts.append({"text": turn.content})
             for call in turn.tool_calls:
-                parts.append({"functionCall": {"name": call.name, "args": call.arguments}})
+                part: dict[str, object] = {
+                    "functionCall": {"name": call.name, "args": call.arguments}
+                }
+                if call.provider_metadata and "thoughtSignature" in call.provider_metadata:
+                    # Echo the captured signature verbatim on the replayed part.
+                    part["thoughtSignature"] = call.provider_metadata["thoughtSignature"]
+                parts.append(part)
             return {"role": "model", "parts": parts}
         role = "model" if turn.role == "assistant" else turn.role
         return {
@@ -358,15 +364,14 @@ class GeminiClient:
 
         content = candidates[0].get("content", {})
         parts = content.get("parts", [])
-        text_parts = [part.get("text", "") for part in parts if "text" in part]
+        text_parts = [
+            part.get("text", "") for part in parts if "text" in part and not part.get("thought")
+        ]
         text = "".join(text_parts)
         tool_calls: list[ToolCall] = []
         for part in parts:
             if "functionCall" in part:
-                fc = part["functionCall"]
-                name = fc.get("name", "")
-                args = fc.get("args") or {}
-                tool_calls.append(ToolCall(id=name, name=name, arguments=args))
+                tool_calls.append(_part_to_tool_call(part))
         structured_output = None
         if structured and text.strip().startswith("{"):
             try:
@@ -395,3 +400,16 @@ class GeminiClient:
             structured_output=structured_output,
             tool_calls=tuple(tool_calls),
         )
+
+
+def _part_to_tool_call(part: dict) -> ToolCall:
+    """Parse a functionCall part, keeping its call id (when present) and thoughtSignature."""
+    fc = part["functionCall"]
+    name = fc.get("name", "")
+    signature = part.get("thoughtSignature")
+    return ToolCall(
+        id=fc.get("id") or name,
+        name=name,
+        arguments=fc.get("args") or {},
+        provider_metadata={"thoughtSignature": signature} if signature else None,
+    )

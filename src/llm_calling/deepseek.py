@@ -1,4 +1,10 @@
-"""DeepSeek chat completions client."""
+"""DeepSeek chat completions client.
+
+Reasoning invariant: DeepSeek reasoner `reasoning_content` must NOT be replayed on
+continuation requests. This client never reads it (stream and non-stream parsing
+consume only `content`/`tool_calls`), so assistant replays are stripped by
+construction — keep it that way.
+"""
 
 import json
 from collections.abc import AsyncIterator
@@ -115,9 +121,7 @@ class DeepSeekClient:
 
                 for tc_delta in delta.get("tool_calls") or []:
                     idx = tc_delta.get("index", 0)
-                    acc = tool_call_acc.setdefault(
-                        idx, {"id": "", "name": "", "arguments": ""}
-                    )
+                    acc = tool_call_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
                     if tc_delta.get("id"):
                         acc["id"] = tc_delta["id"]
                     fn = tc_delta.get("function") or {}
@@ -188,6 +192,7 @@ class DeepSeekClient:
                     )
                 continue
             if turn.role == "assistant" and turn.tool_calls:
+                # Deliberately no reasoning_content here (see module docstring).
                 messages.append(
                     {
                         "role": "assistant",

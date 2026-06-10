@@ -24,3 +24,9 @@ def test_non_terminal_chunk_cannot_include_incomplete_details() -> None:
             done=False,
             incomplete_details={"reason": "max_output_tokens"},
         )
+
+
+def test_non_terminal_chunk_may_carry_provider_item() -> None:
+    chunk = LLMChunk(provider_item={"type": "reasoning", "id": "rs_1"}, done=False)
+
+    assert chunk.provider_item == {"type": "reasoning", "id": "rs_1"}

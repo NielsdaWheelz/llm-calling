@@ -7,7 +7,14 @@ import respx
 
 from llm_calling.anthropic import AnthropicClient
 from llm_calling.errors import LLMError, LLMErrorCode
-from llm_calling.types import LLMRequest, StructuredOutputSpec, ToolSpec, Turn
+from llm_calling.types import (
+    LLMRequest,
+    StructuredOutputSpec,
+    ToolCall,
+    ToolResult,
+    ToolSpec,
+    Turn,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -253,27 +260,27 @@ async def test_tool_use_in_nonstream_response_populates_tool_calls() -> None:
 @respx.mock
 async def test_tool_use_streaming_emits_tool_call_chunk() -> None:
     stream = (
-        'event: message_start\n'
+        "event: message_start\n"
         'data: {"type":"message_start","message":{"id":"msg_tools","type":"message","role":"assistant","content":[],"model":"claude-3-opus-20240229","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":0}}}\n'
-        '\n'
-        'event: content_block_start\n'
+        "\n"
+        "event: content_block_start\n"
         'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_xyz","name":"get_weather","input":{}}}\n'
-        '\n'
-        'event: content_block_delta\n'
+        "\n"
+        "event: content_block_delta\n"
         'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"city\\":"}}\n'
-        '\n'
-        'event: content_block_delta\n'
+        "\n"
+        "event: content_block_delta\n"
         'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\\"SF\\"}"}}\n'
-        '\n'
-        'event: content_block_stop\n'
+        "\n"
+        "event: content_block_stop\n"
         'data: {"type":"content_block_stop","index":0}\n'
-        '\n'
-        'event: message_delta\n'
+        "\n"
+        "event: message_delta\n"
         'data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":4}}\n'
-        '\n'
-        'event: message_stop\n'
+        "\n"
+        "event: message_stop\n"
         'data: {"type":"message_stop"}\n'
-        '\n'
+        "\n"
     )
     respx.post("https://api.anthropic.com/v1/messages").respond(
         200,
@@ -303,10 +310,129 @@ async def test_tool_use_streaming_emits_tool_call_chunk() -> None:
 
     tool_chunks = [c for c in chunks if c.tool_call is not None]
     assert len(tool_chunks) == 1
-    assert tool_chunks[0].tool_call.id == "toolu_xyz"
-    assert tool_chunks[0].tool_call.name == "get_weather"
-    assert tool_chunks[0].tool_call.arguments == {"city": "SF"}
+    assert tool_chunks[0].tool_call == ToolCall(
+        id="toolu_xyz", name="get_weather", arguments={"city": "SF"}
+    )
     assert chunks[-1].done is True
+
+
+@respx.mock
+async def test_stream_thinking_blocks_yield_provider_item_chunks() -> None:
+    stream = (
+        "event: message_start\n"
+        'data: {"type":"message_start","message":{"id":"msg_think","type":"message","role":"assistant","content":[],"model":"claude-opus-4-7","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":0}}}\n'
+        "\n"
+        "event: content_block_start\n"
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}\n'
+        "\n"
+        "event: content_block_delta\n"
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me"}}\n'
+        "\n"
+        "event: content_block_delta\n"
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":" think."}}\n'
+        "\n"
+        "event: content_block_delta\n"
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-abc"}}\n'
+        "\n"
+        "event: content_block_stop\n"
+        'data: {"type":"content_block_stop","index":0}\n'
+        "\n"
+        "event: content_block_start\n"
+        'data: {"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"opaque-bytes"}}\n'
+        "\n"
+        "event: content_block_stop\n"
+        'data: {"type":"content_block_stop","index":1}\n'
+        "\n"
+        "event: content_block_start\n"
+        'data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}\n'
+        "\n"
+        "event: content_block_delta\n"
+        'data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"Answer."}}\n'
+        "\n"
+        "event: content_block_stop\n"
+        'data: {"type":"content_block_stop","index":2}\n'
+        "\n"
+        "event: message_stop\n"
+        'data: {"type":"message_stop"}\n'
+        "\n"
+    )
+    respx.post("https://api.anthropic.com/v1/messages").respond(
+        200,
+        content=stream,
+        headers={"content-type": "text/event-stream"},
+    )
+
+    async with httpx.AsyncClient() as http:
+        chunks = [
+            chunk
+            async for chunk in AnthropicClient(http).generate_stream(
+                request(), api_key="sk-test", timeout_s=30
+            )
+        ]
+
+    item_chunks = [chunk.provider_item for chunk in chunks if chunk.provider_item is not None]
+    assert item_chunks == [
+        {"type": "thinking", "thinking": "Let me think.", "signature": "sig-abc"},
+        {"type": "redacted_thinking", "data": "opaque-bytes"},
+    ]
+    assert "".join(chunk.delta_text for chunk in chunks) == "Answer."
+    assert chunks[-1].done is True
+
+
+@respx.mock
+async def test_assistant_provider_items_lead_replayed_content() -> None:
+    route = respx.post("https://api.anthropic.com/v1/messages").respond(
+        200,
+        json=load_json("success_nonstream.json"),
+    )
+    thinking = {"type": "thinking", "thinking": "Plan.", "signature": "sig-abc"}
+    redacted = {"type": "redacted_thinking", "data": "opaque-bytes"}
+    req = LLMRequest(
+        model_name="claude-opus-4-7",
+        messages=[
+            Turn(role="user", content="Weather?"),
+            Turn(
+                role="assistant",
+                content="Checking.",
+                tool_calls=(ToolCall(id="toolu_1", name="get_weather", arguments={"city": "SF"}),),
+                provider_items=(thinking, redacted),
+            ),
+            Turn(role="tool", tool_results=(ToolResult(call_id="toolu_1", output="sunny"),)),
+        ],
+        max_tokens=2000,
+        reasoning_effort="high",
+    )
+
+    async with httpx.AsyncClient() as http:
+        await AnthropicClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["messages"][1] == {
+        "role": "assistant",
+        "content": [
+            thinking,
+            redacted,
+            {"type": "text", "text": "Checking."},
+            {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "SF"}},
+        ],
+    }
+
+
+@respx.mock
+async def test_nonstream_thinking_blocks_exposed_as_provider_items() -> None:
+    response_json = load_json("success_nonstream.json")
+    thinking = {"type": "thinking", "thinking": "Plan.", "signature": "sig-abc"}
+    response_json["content"] = [
+        thinking,
+        {"type": "text", "text": "Answer."},
+    ]
+    respx.post("https://api.anthropic.com/v1/messages").respond(200, json=response_json)
+
+    async with httpx.AsyncClient() as http:
+        response = await AnthropicClient(http).generate(request(), api_key="sk-test", timeout_s=30)
+
+    assert response.provider_items == (thinking,)
+    assert response.text == "Answer."
 
 
 async def test_usage_parses_cache_tokens() -> None:

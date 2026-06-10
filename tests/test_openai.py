@@ -239,7 +239,9 @@ async def test_nonstream_tool_call_round_trip() -> None:
             Turn(role="user", content="Weather in Paris?"),
             Turn(
                 role="assistant",
-                tool_calls=(ToolCall(id="call_abc", name="get_weather", arguments={"city": "Paris"}),),
+                tool_calls=(
+                    ToolCall(id="call_abc", name="get_weather", arguments={"city": "Paris"}),
+                ),
             ),
             Turn(role="tool", tool_results=(ToolResult(call_id="call_abc", output="sunny"),)),
         ],
@@ -312,6 +314,145 @@ async def test_stream_tool_call_yields_tool_call_chunk() -> None:
     )
     assert chunks[-1].done is True
     assert chunks[-1].status == "completed"
+
+
+@respx.mock
+async def test_request_body_sets_store_false_and_includes_encrypted_reasoning() -> None:
+    route = respx.post("https://api.openai.com/v1/responses").respond(
+        200,
+        json=load_json("success_nonstream.json"),
+    )
+
+    async with httpx.AsyncClient() as http:
+        await OpenAIClient(http).generate(request("default"), api_key="sk-test", timeout_s=30)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["store"] is False
+    assert body["include"] == ["reasoning.encrypted_content"]
+
+
+@respx.mock
+async def test_reasoning_item_replayed_before_function_call() -> None:
+    route = respx.post("https://api.openai.com/v1/responses").respond(
+        200,
+        json=load_json("success_nonstream.json"),
+    )
+    reasoning_item = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [],
+        "encrypted_content": "gAAAA-opaque",
+    }
+    req = LLMRequest(
+        model_name="gpt-5.4-mini",
+        messages=[
+            Turn(role="user", content="Weather in Paris?"),
+            Turn(
+                role="assistant",
+                tool_calls=(
+                    ToolCall(
+                        id="call_abc",
+                        name="get_weather",
+                        arguments={"city": "Paris"},
+                        provider_metadata={"id": "fc_1"},
+                    ),
+                ),
+                provider_items=(reasoning_item,),
+            ),
+            Turn(role="tool", tool_results=(ToolResult(call_id="call_abc", output="sunny"),)),
+        ],
+        max_tokens=100,
+        reasoning_effort="high",
+    )
+
+    async with httpx.AsyncClient() as http:
+        await OpenAIClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["input"][1] == reasoning_item
+    assert body["input"][2] == {
+        "type": "function_call",
+        "id": "fc_1",
+        "call_id": "call_abc",
+        "name": "get_weather",
+        "arguments": '{"city": "Paris"}',
+    }
+    assert body["input"][3] == {
+        "type": "function_call_output",
+        "call_id": "call_abc",
+        "output": "sunny",
+    }
+
+
+@respx.mock
+async def test_nonstream_reasoning_items_exposed_on_response() -> None:
+    response_json = load_json("success_nonstream.json")
+    reasoning_item = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [],
+        "encrypted_content": "gAAAA-opaque",
+    }
+    response_json["output"] = [
+        reasoning_item,
+        {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_abc",
+            "name": "get_weather",
+            "arguments": '{"city":"Paris"}',
+        },
+    ]
+    respx.post("https://api.openai.com/v1/responses").respond(200, json=response_json)
+
+    async with httpx.AsyncClient() as http:
+        response = await OpenAIClient(http).generate(
+            request("high"), api_key="sk-test", timeout_s=30
+        )
+
+    assert response.provider_items == (reasoning_item,)
+    assert response.tool_calls == (
+        ToolCall(
+            id="call_abc",
+            name="get_weather",
+            arguments={"city": "Paris"},
+            provider_metadata={"id": "fc_1"},
+        ),
+    )
+
+
+@respx.mock
+async def test_stream_reasoning_item_yields_provider_item_chunk() -> None:
+    respx.post("https://api.openai.com/v1/responses").respond(
+        200,
+        content=(
+            'data: {"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1",'
+            '"summary":[],"encrypted_content":"gAAAA-opaque"}}\n\n'
+            'data: {"type":"response.output_item.done","item":{"type":"function_call",'
+            '"id":"fc_1","call_id":"call_xyz","name":"get_weather","arguments":"{}"}}\n\n'
+            'data: {"type":"response.completed","response":{"id":"resp-rs",'
+            '"status":"completed","usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}\n\n'
+        ),
+        headers={"content-type": "text/event-stream"},
+    )
+
+    async with httpx.AsyncClient() as http:
+        chunks = [
+            chunk
+            async for chunk in OpenAIClient(http).generate_stream(
+                request("high"), api_key="sk-test", timeout_s=30
+            )
+        ]
+
+    item_chunks = [chunk for chunk in chunks if chunk.provider_item is not None]
+    assert [chunk.provider_item for chunk in item_chunks] == [
+        {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "gAAAA-opaque"}
+    ]
+    tool_chunks = [chunk for chunk in chunks if chunk.tool_call is not None]
+    assert tool_chunks[0].tool_call == ToolCall(
+        id="call_xyz", name="get_weather", arguments={}, provider_metadata={"id": "fc_1"}
+    )
+    assert chunks[-1].done is True
 
 
 @respx.mock

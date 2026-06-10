@@ -80,6 +80,15 @@ class LLMRouter:
                 f"Response parsing error: {type(exc).__name__}",
                 provider=provider,
             ) from exc
+        except (httpx.HTTPError, httpx.StreamError, TypeError, AttributeError) as exc:
+            # Outermost net: no transport/payload exception escapes unclassified.
+            # httpx.StreamError (e.g. ResponseNotRead) derives from RuntimeError,
+            # not httpx.HTTPError, so it must be named explicitly.
+            raise LLMError(
+                LLMErrorCode.PROVIDER_DOWN,
+                f"Transport error: {type(exc).__name__}: {exc}",
+                provider=provider,
+            ) from exc
 
     async def generate_stream(
         self,
@@ -119,6 +128,14 @@ class LLMRouter:
             raise LLMError(
                 LLMErrorCode.PROVIDER_DOWN,
                 f"Stream parsing error: {type(exc).__name__}",
+                provider=provider,
+            ) from exc
+        except (httpx.HTTPError, httpx.StreamError, TypeError, AttributeError) as exc:
+            # Outermost net: no transport/payload exception escapes unclassified
+            # (see the identical net in generate()).
+            raise LLMError(
+                LLMErrorCode.PROVIDER_DOWN,
+                f"Stream transport error: {type(exc).__name__}: {exc}",
                 provider=provider,
             ) from exc
 

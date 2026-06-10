@@ -142,7 +142,10 @@ class OpenAIClient:
 
                 if event_type == "response.output_item.done":
                     item = data.get("item") or {}
-                    if item.get("type") == "function_call":
+                    if item.get("type") == "reasoning":
+                        # Full reasoning item (incl. id and encrypted_content), verbatim.
+                        yield LLMChunk(provider_item=item, done=False)
+                    elif item.get("type") == "function_call":
                         item_id = data.get("item_id") or item.get("id") or ""
                         acc = tool_call_items.pop(item_id, None)
                         call_id = item.get("call_id") or (acc["call_id"] if acc else "")
@@ -157,7 +160,12 @@ class OpenAIClient:
                         if not isinstance(parsed_args, dict):
                             parsed_args = {}
                         yield LLMChunk(
-                            tool_call=ToolCall(id=call_id, name=name, arguments=parsed_args),
+                            tool_call=ToolCall(
+                                id=call_id,
+                                name=name,
+                                arguments=parsed_args,
+                                provider_metadata={"id": item["id"]} if item.get("id") else None,
+                            ),
                             done=False,
                         )
                     continue
@@ -226,6 +234,11 @@ class OpenAIClient:
                         }
                     )
                 continue
+            if turn.role == "assistant":
+                # Replay captured reasoning items verbatim, in emission order: they must
+                # precede the message/function_call items they originally preceded.
+                for item in turn.provider_items:
+                    input_items.append(dict(item))
             if turn.content or not turn.tool_calls:
                 content_type = "output_text" if turn.role == "assistant" else "input_text"
                 input_items.append(
@@ -236,20 +249,29 @@ class OpenAIClient:
                 )
             if turn.role == "assistant":
                 for tc in turn.tool_calls:
-                    input_items.append(
-                        {
-                            "type": "function_call",
-                            "call_id": tc.id,
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments),
-                        }
-                    )
+                    fc_item: dict[str, object] = {
+                        "type": "function_call",
+                        "call_id": tc.id,
+                        "name": tc.name,
+                        "arguments": json.dumps(tc.arguments),
+                    }
+                    if tc.provider_metadata and "id" in tc.provider_metadata:
+                        fc_item["id"] = tc.provider_metadata["id"]
+                    input_items.append(fc_item)
 
         body: dict = {
             "model": req.model_name,
             "input": input_items,
             "max_output_tokens": req.max_tokens,
             "stream": stream,
+            # Stateless reasoning continuity: never rely on server-stored state, and
+            # request encrypted reasoning content so reasoning items can be replayed
+            # verbatim across tool continuations. Sent unconditionally: reasoning-family
+            # models emit reasoning items even when "reasoning" is omitted ("default"),
+            # this client has no model-family registry, and both keys are no-ops for
+            # non-reasoning models.
+            "store": False,
+            "include": ["reasoning.encrypted_content"],
         }
 
         if req.prompt_cache_key is not None:
@@ -300,12 +322,15 @@ class OpenAIClient:
     ) -> LLMResponse:
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
+        provider_items: list[dict[str, object]] = []
         for item in data.get("output", []):
             item_type = item.get("type")
             if item_type == "message":
                 for content_item in item.get("content", []):
                     if content_item.get("type") == "output_text":
                         text_parts.append(content_item.get("text", ""))
+            elif item_type == "reasoning":
+                provider_items.append(item)
             elif item_type == "function_call":
                 args_str = item.get("arguments") or ""
                 try:
@@ -319,6 +344,7 @@ class OpenAIClient:
                         id=item.get("call_id") or "",
                         name=item.get("name") or "",
                         arguments=parsed_args,
+                        provider_metadata={"id": item["id"]} if item.get("id") else None,
                     )
                 )
 
@@ -343,6 +369,7 @@ class OpenAIClient:
             incomplete_details=incomplete_details,
             structured_output=structured_output,
             tool_calls=tuple(tool_calls),
+            provider_items=tuple(provider_items),
         )
 
     def _parse_usage(self, usage_data: dict) -> LLMUsage:

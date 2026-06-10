@@ -139,9 +139,7 @@ async def test_tool_call_nonstream_and_request_body() -> None:
         "candidates": [
             {
                 "content": {
-                    "parts": [
-                        {"functionCall": {"name": "get_weather", "args": {"city": "Paris"}}}
-                    ],
+                    "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "Paris"}}}],
                     "role": "model",
                 },
                 "finishReason": "STOP",
@@ -164,7 +162,9 @@ async def test_tool_call_nonstream_and_request_body() -> None:
             Turn(
                 role="assistant",
                 content="",
-                tool_calls=(ToolCall(id="call_1", name="get_weather", arguments={"city": "Paris"}),),
+                tool_calls=(
+                    ToolCall(id="call_1", name="get_weather", arguments={"city": "Paris"}),
+                ),
             ),
             Turn(
                 role="tool",
@@ -214,6 +214,142 @@ async def test_tool_call_nonstream_and_request_body() -> None:
     assert response.tool_calls == (
         ToolCall(id="get_weather", name="get_weather", arguments={"city": "Paris"}),
     )
+
+
+@respx.mock
+async def test_thought_signature_and_call_id_captured_then_echoed_on_replay() -> None:
+    response_json = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "id": "fc-123",
+                                "name": "get_weather",
+                                "args": {"city": "Paris"},
+                            },
+                            "thoughtSignature": "sig-abc",
+                        }
+                    ],
+                    "role": "model",
+                },
+                "finishReason": "STOP",
+                "index": 0,
+            }
+        ],
+        "usageMetadata": {
+            "promptTokenCount": 5,
+            "candidatesTokenCount": 3,
+            "totalTokenCount": 8,
+        },
+    }
+    route = respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+    ).respond(200, json=response_json)
+    req = LLMRequest(
+        model_name="gemini-2.5-pro",
+        messages=[
+            Turn(role="user", content="What's the weather?"),
+            Turn(
+                role="assistant",
+                tool_calls=(
+                    ToolCall(
+                        id="fc-123",
+                        name="get_weather",
+                        arguments={"city": "Paris"},
+                        provider_metadata={"thoughtSignature": "sig-abc"},
+                    ),
+                ),
+            ),
+            Turn(role="tool", tool_results=(ToolResult(call_id="fc-123", output="sunny"),)),
+        ],
+        max_tokens=100,
+        tools=(
+            ToolSpec(
+                name="get_weather",
+                description="Get the weather.",
+                parameters={"type": "object", "properties": {"city": {"type": "string"}}},
+            ),
+        ),
+    )
+
+    async with httpx.AsyncClient() as http:
+        response = await GeminiClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["contents"][1] == {
+        "role": "model",
+        "parts": [
+            {
+                "functionCall": {"name": "get_weather", "args": {"city": "Paris"}},
+                "thoughtSignature": "sig-abc",
+            }
+        ],
+    }
+    # functionResponse still resolves the tool name through the call-id map.
+    assert body["contents"][2] == {
+        "role": "user",
+        "parts": [{"functionResponse": {"name": "get_weather", "response": {"output": "sunny"}}}],
+    }
+    assert response.tool_calls == (
+        ToolCall(
+            id="fc-123",
+            name="get_weather",
+            arguments={"city": "Paris"},
+            provider_metadata={"thoughtSignature": "sig-abc"},
+        ),
+    )
+
+
+@respx.mock
+async def test_nonstream_thought_parts_excluded_from_text() -> None:
+    response_json = load_json("success_nonstream.json")
+    response_json["candidates"][0]["content"]["parts"] = [
+        {"text": "Pondering...", "thought": True},
+        {"text": "Visible answer."},
+    ]
+    respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+    ).respond(200, json=response_json)
+
+    async with httpx.AsyncClient() as http:
+        response = await GeminiClient(http).generate(request(), api_key="sk-test", timeout_s=30)
+
+    assert response.text == "Visible answer."
+
+
+@respx.mock
+async def test_stream_thought_parts_excluded_and_signature_captured() -> None:
+    stream = (
+        'data: {"candidates":[{"content":{"parts":[{"text":"Pondering...","thought":true},'
+        '{"text":"Visible"}],"role":"model"},"index":0}]}\n\n'
+        'data: {"candidates":[{"content":{"parts":[{"text":" answer."},'
+        '{"functionCall":{"id":"fc-123","name":"get_weather","args":{"city":"Paris"}},'
+        '"thoughtSignature":"sig-abc"}],"role":"model"},"index":0,"finishReason":"STOP"}],'
+        '"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3,"totalTokenCount":8}}\n\n'
+    )
+    respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+    ).respond(200, content=stream)
+
+    async with httpx.AsyncClient() as http:
+        chunks = [
+            chunk
+            async for chunk in GeminiClient(http).generate_stream(
+                request(), api_key="sk-test", timeout_s=30
+            )
+        ]
+
+    assert "".join(chunk.delta_text for chunk in chunks) == "Visible answer."
+    tool_chunks = [chunk for chunk in chunks if chunk.tool_call is not None]
+    assert tool_chunks[0].tool_call == ToolCall(
+        id="fc-123",
+        name="get_weather",
+        arguments={"city": "Paris"},
+        provider_metadata={"thoughtSignature": "sig-abc"},
+    )
+    assert chunks[-1].done is True
 
 
 @respx.mock

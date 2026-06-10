@@ -7,7 +7,14 @@ import respx
 
 from llm_calling.deepseek import DeepSeekClient
 from llm_calling.errors import LLMError, LLMErrorCode
-from llm_calling.types import LLMRequest, StructuredOutputSpec, ToolSpec, Turn
+from llm_calling.types import (
+    LLMRequest,
+    StructuredOutputSpec,
+    ToolCall,
+    ToolResult,
+    ToolSpec,
+    Turn,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -204,9 +211,77 @@ async def test_stream_tool_calls() -> None:
 
     tool_chunks = [c for c in chunks if c.tool_call is not None]
     assert len(tool_chunks) == 1
-    assert tool_chunks[0].tool_call.id == "call_xyz"
-    assert tool_chunks[0].tool_call.name == "get_weather"
-    assert tool_chunks[0].tool_call.arguments == {"city": "Paris"}
+    assert tool_chunks[0].tool_call == ToolCall(
+        id="call_xyz", name="get_weather", arguments={"city": "Paris"}
+    )
+    assert chunks[-1].done is True
+
+
+@respx.mock
+async def test_reasoning_content_not_read_and_not_replayed() -> None:
+    response_json = load_json("success_nonstream.json")
+    response_json["choices"][0]["message"]["reasoning_content"] = "secret chain of thought"
+    route = respx.post("https://api.deepseek.com/chat/completions").respond(
+        200,
+        json=response_json,
+    )
+    req = LLMRequest(
+        model_name="deepseek-v4-pro",
+        messages=[
+            Turn(role="user", content="Weather?"),
+            Turn(
+                role="assistant",
+                content="Checking.",
+                tool_calls=(
+                    ToolCall(id="call_1", name="get_weather", arguments={"city": "Paris"}),
+                ),
+            ),
+            Turn(role="tool", tool_results=(ToolResult(call_id="call_1", output="sunny"),)),
+        ],
+        max_tokens=100,
+        reasoning_effort="high",
+    )
+
+    async with httpx.AsyncClient() as http:
+        response = await DeepSeekClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["messages"][1] == {
+        "role": "assistant",
+        "content": "Checking.",
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'},
+            }
+        ],
+    }
+    assert response.text == "Hello from DeepSeek."
+
+
+@respx.mock
+async def test_stream_reasoning_content_not_in_delta_text() -> None:
+    stream_body = (
+        'data: {"choices":[{"delta":{"reasoning_content":"secret thought"}}]}\n'
+        'data: {"choices":[{"delta":{"content":"Visible."}}]}\n'
+        "data: [DONE]\n"
+    )
+    respx.post("https://api.deepseek.com/chat/completions").respond(
+        200,
+        content=stream_body,
+        headers={"content-type": "text/event-stream"},
+    )
+
+    async with httpx.AsyncClient() as http:
+        chunks = [
+            chunk
+            async for chunk in DeepSeekClient(http).generate_stream(
+                request(), api_key="sk-test", timeout_s=30
+            )
+        ]
+
+    assert "".join(chunk.delta_text for chunk in chunks) == "Visible."
     assert chunks[-1].done is True
 
 
