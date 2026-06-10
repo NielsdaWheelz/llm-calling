@@ -13,6 +13,7 @@ class LLMErrorCode(StrEnum):
     PROVIDER_DOWN = "provider_down"
     BAD_REQUEST = "bad_request"
     MODEL_NOT_AVAILABLE = "model_not_available"
+    QUOTA_EXCEEDED = "quota_exceeded"
 
 
 class LLMError(Exception):
@@ -90,6 +91,10 @@ def _classify_openai_error(status_code: int, json_body: dict | None) -> LLMError
         return LLMErrorCode.INVALID_KEY
 
     if status_code == 429:
+        error = (json_body or {}).get("error", {})
+        # Billing exhaustion, not throughput: distinct because it is not retryable.
+        if "insufficient_quota" in (error.get("code", ""), error.get("type", "")):
+            return LLMErrorCode.QUOTA_EXCEEDED
         return LLMErrorCode.RATE_LIMIT
 
     if status_code == 404:
@@ -136,6 +141,9 @@ def _classify_anthropic_error(status_code: int, json_body: dict | None) -> LLMEr
 
         if error_type == "invalid_request_error" and "too long" in error_message:
             return LLMErrorCode.CONTEXT_TOO_LARGE
+        # Out-of-credit is a 400 invalid_request_error on this provider.
+        if "credit balance is too low" in error_message:
+            return LLMErrorCode.QUOTA_EXCEEDED
 
     if status_code is not None and status_code < 500:
         return LLMErrorCode.BAD_REQUEST
