@@ -4,7 +4,7 @@
     {
       "message": {
         "role": "assistant",
-        "content": "Hello from DeepSeek."
+        "content": "Hello from OpenAI-compatible."
       }
     }
   ],

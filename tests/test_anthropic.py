@@ -5,15 +5,17 @@ import httpx
 import pytest
 import respx
 
-from llm_calling.anthropic import AnthropicClient
-from llm_calling.errors import LLMError, LLMErrorCode
-from llm_calling.types import (
-    LLMRequest,
+from provider_runtime.anthropic import AnthropicClient
+from provider_runtime.errors import ModelCallError, ModelCallErrorCode
+from provider_runtime.types import (
+    ModelCall,
+    ModelMessage,
+    ModelRef,
+    ReasoningConfig,
     StructuredOutputSpec,
     ToolCall,
     ToolResult,
     ToolSpec,
-    Turn,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -29,14 +31,14 @@ def load_text(name: str) -> str:
     return (FIXTURES / name).read_text()
 
 
-def request() -> LLMRequest:
-    return LLMRequest(
-        model_name="claude-3-opus-20240229",
+def request() -> ModelCall:
+    return ModelCall(
+        model=ModelRef(provider="anthropic", model="claude-3-opus-20240229"),
         messages=[
-            Turn(role="system", content="You are helpful."),
-            Turn(role="user", content="Hello!"),
+            ModelMessage(role="system", content="You are helpful."),
+            ModelMessage(role="user", content="Hello!"),
         ],
-        max_tokens=100,
+        max_output_tokens=100,
         temperature=0.7,
     )
 
@@ -114,14 +116,14 @@ async def test_system_turn_can_mark_prompt_cache_breakpoint() -> None:
         200,
         json=load_json("success_nonstream.json"),
     )
-    req = LLMRequest(
-        model_name="claude-3-opus-20240229",
+    req = ModelCall(
+        model=ModelRef(provider="anthropic", model="claude-3-opus-20240229"),
         messages=[
-            Turn(role="system", content="Stable.", cache_ttl="5m"),
-            Turn(role="system", content="Dynamic."),
-            Turn(role="user", content="Hello!"),
+            ModelMessage(role="system", content="Stable.", cache_ttl="5m"),
+            ModelMessage(role="system", content="Dynamic."),
+            ModelMessage(role="user", content="Hello!"),
         ],
-        max_tokens=100,
+        max_output_tokens=100,
     )
 
     async with httpx.AsyncClient() as http:
@@ -154,10 +156,10 @@ async def test_structured_output_uses_forced_tool_and_parses_tool_input() -> Non
         200,
         json=response_json,
     )
-    req = LLMRequest(
-        model_name="claude-3-opus-20240229",
-        messages=[Turn(role="user", content="Extract metadata.")],
-        max_tokens=100,
+    req = ModelCall(
+        model=ModelRef(provider="anthropic", model="claude-3-opus-20240229"),
+        messages=[ModelMessage(role="user", content="Extract metadata.")],
+        max_output_tokens=100,
         structured_output=StructuredOutputSpec(
             name="metadata_enrichment",
             schema=metadata_schema(),
@@ -181,11 +183,11 @@ async def test_structured_output_uses_forced_tool_and_parses_tool_input() -> Non
 
 
 async def test_structured_output_rejects_extended_thinking() -> None:
-    req = LLMRequest(
-        model_name="claude-3-opus-20240229",
-        messages=[Turn(role="user", content="Extract metadata.")],
-        max_tokens=100,
-        reasoning_effort="high",
+    req = ModelCall(
+        model=ModelRef(provider="anthropic", model="claude-3-opus-20240229"),
+        messages=[ModelMessage(role="user", content="Extract metadata.")],
+        max_output_tokens=100,
+        reasoning=ReasoningConfig(effort="high"),
         structured_output=StructuredOutputSpec(
             name="metadata_enrichment",
             schema=metadata_schema(),
@@ -193,10 +195,10 @@ async def test_structured_output_rejects_extended_thinking() -> None:
     )
 
     async with httpx.AsyncClient() as http:
-        with pytest.raises(LLMError) as exc_info:
+        with pytest.raises(ModelCallError) as exc_info:
             await AnthropicClient(http).generate(req, api_key="sk-test", timeout_s=30)
 
-    assert exc_info.value.error_code == LLMErrorCode.BAD_REQUEST
+    assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
 
 
 @respx.mock
@@ -216,10 +218,10 @@ async def test_tool_use_in_nonstream_response_populates_tool_calls() -> None:
         200,
         json=response_json,
     )
-    req = LLMRequest(
-        model_name="claude-3-opus-20240229",
-        messages=[Turn(role="user", content="Weather?")],
-        max_tokens=100,
+    req = ModelCall(
+        model=ModelRef(provider="anthropic", model="claude-3-opus-20240229"),
+        messages=[ModelMessage(role="user", content="Weather?")],
+        max_output_tokens=100,
         tools=(
             ToolSpec(
                 name="get_weather",
@@ -258,6 +260,31 @@ async def test_tool_use_in_nonstream_response_populates_tool_calls() -> None:
 
 
 @respx.mock
+async def test_tool_use_nonstream_non_object_arguments_raise_typed_error() -> None:
+    response_json = load_json("success_nonstream.json")
+    response_json["content"] = [
+        {
+            "type": "tool_use",
+            "id": "toolu_bad",
+            "name": "get_weather",
+            "input": ["not", "an", "object"],
+        }
+    ]
+    response_json["stop_reason"] = "tool_use"
+    respx.post("https://api.anthropic.com/v1/messages").respond(
+        200,
+        json=response_json,
+    )
+
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(ModelCallError) as exc_info:
+            await AnthropicClient(http).generate(request(), api_key="sk-test", timeout_s=30)
+
+    assert exc_info.value.error_code == ModelCallErrorCode.TOOL_ARGUMENTS_INVALID
+    assert exc_info.value.retryable is False
+
+
+@respx.mock
 async def test_tool_use_streaming_emits_tool_call_chunk() -> None:
     stream = (
         "event: message_start\n"
@@ -287,10 +314,10 @@ async def test_tool_use_streaming_emits_tool_call_chunk() -> None:
         content=stream,
         headers={"content-type": "text/event-stream"},
     )
-    req = LLMRequest(
-        model_name="claude-3-opus-20240229",
-        messages=[Turn(role="user", content="Weather?")],
-        max_tokens=100,
+    req = ModelCall(
+        model=ModelRef(provider="anthropic", model="claude-3-opus-20240229"),
+        messages=[ModelMessage(role="user", content="Weather?")],
+        max_output_tokens=100,
         tools=(
             ToolSpec(
                 name="get_weather",
@@ -317,7 +344,7 @@ async def test_tool_use_streaming_emits_tool_call_chunk() -> None:
 
 
 @respx.mock
-async def test_stream_thinking_blocks_yield_provider_item_chunks() -> None:
+async def test_stream_thinking_blocks_yield_provider_artifact_chunks() -> None:
     stream = (
         "event: message_start\n"
         'data: {"type":"message_start","message":{"id":"msg_think","type":"message","role":"assistant","content":[],"model":"claude-opus-4-7","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":0}}}\n'
@@ -370,7 +397,9 @@ async def test_stream_thinking_blocks_yield_provider_item_chunks() -> None:
             )
         ]
 
-    item_chunks = [chunk.provider_item for chunk in chunks if chunk.provider_item is not None]
+    item_chunks = [
+        chunk.provider_artifact for chunk in chunks if chunk.provider_artifact is not None
+    ]
     assert item_chunks == [
         {"type": "thinking", "thinking": "Let me think.", "signature": "sig-abc"},
         {"type": "redacted_thinking", "data": "opaque-bytes"},
@@ -380,27 +409,29 @@ async def test_stream_thinking_blocks_yield_provider_item_chunks() -> None:
 
 
 @respx.mock
-async def test_assistant_provider_items_lead_replayed_content() -> None:
+async def test_assistant_provider_artifacts_lead_replayed_content() -> None:
     route = respx.post("https://api.anthropic.com/v1/messages").respond(
         200,
         json=load_json("success_nonstream.json"),
     )
     thinking = {"type": "thinking", "thinking": "Plan.", "signature": "sig-abc"}
     redacted = {"type": "redacted_thinking", "data": "opaque-bytes"}
-    req = LLMRequest(
-        model_name="claude-opus-4-7",
+    req = ModelCall(
+        model=ModelRef(provider="anthropic", model="claude-opus-4-7"),
         messages=[
-            Turn(role="user", content="Weather?"),
-            Turn(
+            ModelMessage(role="user", content="Weather?"),
+            ModelMessage(
                 role="assistant",
                 content="Checking.",
                 tool_calls=(ToolCall(id="toolu_1", name="get_weather", arguments={"city": "SF"}),),
-                provider_items=(thinking, redacted),
+                provider_artifacts=(thinking, redacted),
             ),
-            Turn(role="tool", tool_results=(ToolResult(call_id="toolu_1", output="sunny"),)),
+            ModelMessage(
+                role="tool", tool_results=(ToolResult(call_id="toolu_1", output="sunny"),)
+            ),
         ],
-        max_tokens=2000,
-        reasoning_effort="high",
+        max_output_tokens=2000,
+        reasoning=ReasoningConfig(effort="high"),
     )
 
     async with httpx.AsyncClient() as http:
@@ -419,7 +450,7 @@ async def test_assistant_provider_items_lead_replayed_content() -> None:
 
 
 @respx.mock
-async def test_nonstream_thinking_blocks_exposed_as_provider_items() -> None:
+async def test_nonstream_thinking_blocks_exposed_as_provider_artifacts() -> None:
     response_json = load_json("success_nonstream.json")
     thinking = {"type": "thinking", "thinking": "Plan.", "signature": "sig-abc"}
     response_json["content"] = [
@@ -431,7 +462,7 @@ async def test_nonstream_thinking_blocks_exposed_as_provider_items() -> None:
     async with httpx.AsyncClient() as http:
         response = await AnthropicClient(http).generate(request(), api_key="sk-test", timeout_s=30)
 
-    assert response.provider_items == (thinking,)
+    assert response.provider_artifacts == (thinking,)
     assert response.text == "Answer."
 
 

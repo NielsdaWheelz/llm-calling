@@ -5,14 +5,16 @@ import httpx
 import pytest
 import respx
 
-from llm_calling.gemini import GeminiClient
-from llm_calling.types import (
-    LLMRequest,
+from provider_runtime.errors import ModelCallError, ModelCallErrorCode
+from provider_runtime.gemini import GeminiClient
+from provider_runtime.types import (
+    ModelCall,
+    ModelMessage,
+    ModelRef,
     StructuredOutputSpec,
     ToolCall,
     ToolResult,
     ToolSpec,
-    Turn,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -28,15 +30,15 @@ def load_text(name: str) -> str:
     return (FIXTURES / name).read_text()
 
 
-def request() -> LLMRequest:
-    return LLMRequest(
-        model_name="gemini-2.5-pro",
+def request() -> ModelCall:
+    return ModelCall(
+        model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
         messages=[
-            Turn(role="system", content="You are helpful."),
-            Turn(role="user", content="Hello!"),
-            Turn(role="assistant", content="Hi."),
+            ModelMessage(role="system", content="You are helpful."),
+            ModelMessage(role="user", content="Hello!"),
+            ModelMessage(role="assistant", content="Hi."),
         ],
-        max_tokens=100,
+        max_output_tokens=100,
         temperature=0.7,
     )
 
@@ -114,10 +116,10 @@ async def test_structured_output_uses_response_json_schema_and_parses_response()
     route = respx.post(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
     ).respond(200, json=response_json)
-    req = LLMRequest(
-        model_name="gemini-2.5-pro",
-        messages=[Turn(role="user", content="Extract metadata.")],
-        max_tokens=100,
+    req = ModelCall(
+        model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
+        messages=[ModelMessage(role="user", content="Extract metadata.")],
+        max_output_tokens=100,
         structured_output=StructuredOutputSpec(
             name="metadata_enrichment",
             schema=metadata_schema(),
@@ -155,23 +157,23 @@ async def test_tool_call_nonstream_and_request_body() -> None:
     route = respx.post(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
     ).respond(200, json=response_json)
-    req = LLMRequest(
-        model_name="gemini-2.5-pro",
+    req = ModelCall(
+        model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
         messages=[
-            Turn(role="user", content="What's the weather?"),
-            Turn(
+            ModelMessage(role="user", content="What's the weather?"),
+            ModelMessage(
                 role="assistant",
                 content="",
                 tool_calls=(
                     ToolCall(id="call_1", name="get_weather", arguments={"city": "Paris"}),
                 ),
             ),
-            Turn(
+            ModelMessage(
                 role="tool",
                 tool_results=(ToolResult(call_id="call_1", output="sunny"),),
             ),
         ],
-        max_tokens=100,
+        max_output_tokens=100,
         tools=(
             ToolSpec(
                 name="get_weather",
@@ -217,6 +219,34 @@ async def test_tool_call_nonstream_and_request_body() -> None:
 
 
 @respx.mock
+async def test_tool_call_nonstream_non_object_arguments_raise_typed_error() -> None:
+    response_json = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "get_weather", "args": ["not", "an", "object"]}}
+                    ],
+                    "role": "model",
+                },
+                "finishReason": "STOP",
+                "index": 0,
+            }
+        ],
+    }
+    respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+    ).respond(200, json=response_json)
+
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(ModelCallError) as exc_info:
+            await GeminiClient(http).generate(request(), api_key="sk-test", timeout_s=30)
+
+    assert exc_info.value.error_code == ModelCallErrorCode.TOOL_ARGUMENTS_INVALID
+    assert exc_info.value.retryable is False
+
+
+@respx.mock
 async def test_thought_signature_and_call_id_captured_then_echoed_on_replay() -> None:
     response_json = {
         "candidates": [
@@ -247,11 +277,11 @@ async def test_thought_signature_and_call_id_captured_then_echoed_on_replay() ->
     route = respx.post(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
     ).respond(200, json=response_json)
-    req = LLMRequest(
-        model_name="gemini-2.5-pro",
+    req = ModelCall(
+        model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
         messages=[
-            Turn(role="user", content="What's the weather?"),
-            Turn(
+            ModelMessage(role="user", content="What's the weather?"),
+            ModelMessage(
                 role="assistant",
                 tool_calls=(
                     ToolCall(
@@ -262,9 +292,9 @@ async def test_thought_signature_and_call_id_captured_then_echoed_on_replay() ->
                     ),
                 ),
             ),
-            Turn(role="tool", tool_results=(ToolResult(call_id="fc-123", output="sunny"),)),
+            ModelMessage(role="tool", tool_results=(ToolResult(call_id="fc-123", output="sunny"),)),
         ],
-        max_tokens=100,
+        max_output_tokens=100,
         tools=(
             ToolSpec(
                 name="get_weather",

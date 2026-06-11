@@ -32,28 +32,31 @@ from collections.abc import AsyncIterator
 
 import httpx
 
-from llm_calling.errors import LLMError, LLMErrorCode, raise_for_provider_error
-from llm_calling.types import LLMChunk, LLMRequest, LLMResponse, LLMUsage, ToolCall
+from provider_runtime.endpoints import OPENAI_BASE_URL
+from provider_runtime.errors import ModelCallError, ModelCallErrorCode, raise_for_provider_error
+from provider_runtime.tool_arguments import parse_tool_arguments
+from provider_runtime.types import ModelCall, ModelChunk, ModelResponse, TokenUsage, ToolCall
 
-OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+OPENAI_RESPONSES_URL = f"{OPENAI_BASE_URL}/responses"
 
 
 class OpenAIClient:
-    def __init__(self, client: httpx.AsyncClient):
+    def __init__(self, client: httpx.AsyncClient, *, base_url: str = OPENAI_BASE_URL):
         self._client = client
+        self._url = f"{base_url.rstrip('/')}/responses"
 
     async def generate(
         self,
-        req: LLMRequest,
+        req: ModelCall,
         *,
         api_key: str,
         timeout_s: int,
-    ) -> LLMResponse:
+    ) -> ModelResponse:
         headers = self._build_headers(api_key)
         body = self._build_request_body(req, stream=False)
 
         response = await self._client.post(
-            OPENAI_RESPONSES_URL,
+            self._url,
             headers=headers,
             json=body,
             timeout=httpx.Timeout(timeout_s, connect=10.0),
@@ -65,14 +68,14 @@ class OpenAIClient:
 
     async def generate_stream(
         self,
-        req: LLMRequest,
+        req: ModelCall,
         *,
         api_key: str,
         timeout_s: int,
-    ) -> AsyncIterator[LLMChunk]:
+    ) -> AsyncIterator[ModelChunk]:
         if req.structured_output is not None:
-            raise LLMError(
-                LLMErrorCode.BAD_REQUEST,
+            raise ModelCallError(
+                ModelCallErrorCode.BAD_REQUEST,
                 "OpenAI structured output streaming is not implemented",
                 provider="openai",
             )
@@ -81,7 +84,7 @@ class OpenAIClient:
 
         async with self._client.stream(
             "POST",
-            OPENAI_RESPONSES_URL,
+            self._url,
             headers=headers,
             json=body,
             timeout=httpx.Timeout(timeout_s, connect=10.0),
@@ -89,7 +92,7 @@ class OpenAIClient:
             await raise_for_provider_error(response, "openai")
 
             provider_request_id = response.headers.get("x-request-id")
-            accumulated_usage: LLMUsage | None = None
+            accumulated_usage: TokenUsage | None = None
             emitted_terminal = False
             tool_call_items: dict[str, dict] = {}
 
@@ -100,7 +103,7 @@ class OpenAIClient:
                 data_str = line[6:]
                 if data_str == "[DONE]":
                     if not emitted_terminal:
-                        yield LLMChunk(
+                        yield ModelChunk(
                             delta_text="",
                             done=True,
                             usage=accumulated_usage,
@@ -120,7 +123,7 @@ class OpenAIClient:
                 if event_type == "response.output_text.delta":
                     delta_text = data.get("delta", "")
                     if delta_text:
-                        yield LLMChunk(delta_text=delta_text, done=False)
+                        yield ModelChunk(delta_text=delta_text, done=False)
                     continue
 
                 if event_type == "response.output_item.added":
@@ -144,7 +147,7 @@ class OpenAIClient:
                     item = data.get("item") or {}
                     if item.get("type") == "reasoning":
                         # Full reasoning item (incl. id and encrypted_content), verbatim.
-                        yield LLMChunk(provider_item=item, done=False)
+                        yield ModelChunk(provider_artifact=item, done=False)
                     elif item.get("type") == "function_call":
                         item_id = data.get("item_id") or item.get("id") or ""
                         acc = tool_call_items.pop(item_id, None)
@@ -153,13 +156,13 @@ class OpenAIClient:
                         args_str = item.get("arguments")
                         if args_str is None:
                             args_str = acc["arguments"] if acc else ""
-                        try:
-                            parsed_args = json.loads(args_str) if args_str else {}
-                        except json.JSONDecodeError:
-                            parsed_args = {}
-                        if not isinstance(parsed_args, dict):
-                            parsed_args = {}
-                        yield LLMChunk(
+                        parsed_args = parse_tool_arguments(
+                            args_str,
+                            provider="openai",
+                            tool_name=name,
+                            call_id=call_id,
+                        )
+                        yield ModelChunk(
                             tool_call=ToolCall(
                                 id=call_id,
                                 name=name,
@@ -191,7 +194,7 @@ class OpenAIClient:
 
                     if not emitted_terminal:
                         emitted_terminal = True
-                        yield LLMChunk(
+                        yield ModelChunk(
                             delta_text="",
                             done=True,
                             usage=accumulated_usage,
@@ -202,10 +205,11 @@ class OpenAIClient:
                     break
 
             if not emitted_terminal:
-                raise LLMError(
-                    LLMErrorCode.PROVIDER_DOWN,
+                raise ModelCallError(
+                    ModelCallErrorCode.PROVIDER_DOWN,
                     "openai stream ended without terminal event",
                     provider="openai",
+                    retryable=False,
                 )
 
     def _build_headers(self, api_key: str) -> dict[str, str]:
@@ -214,10 +218,10 @@ class OpenAIClient:
             "Content-Type": "application/json",
         }
 
-    def _build_request_body(self, req: LLMRequest, stream: bool) -> dict:
+    def _build_request_body(self, req: ModelCall, stream: bool) -> dict:
         if req.prompt_cache_key is None and any(turn.cache_ttl != "none" for turn in req.messages):
-            raise LLMError(
-                LLMErrorCode.BAD_REQUEST,
+            raise ModelCallError(
+                ModelCallErrorCode.BAD_REQUEST,
                 "OpenAI prompt cache turns require prompt_cache_key",
                 provider="openai",
             )
@@ -237,7 +241,7 @@ class OpenAIClient:
             if turn.role == "assistant":
                 # Replay captured reasoning items verbatim, in emission order: they must
                 # precede the message/function_call items they originally preceded.
-                for item in turn.provider_items:
+                for item in turn.provider_artifacts:
                     input_items.append(dict(item))
             if turn.content or not turn.tool_calls:
                 content_type = "output_text" if turn.role == "assistant" else "input_text"
@@ -260,9 +264,9 @@ class OpenAIClient:
                     input_items.append(fc_item)
 
         body: dict = {
-            "model": req.model_name,
+            "model": req.model.model,
             "input": input_items,
-            "max_output_tokens": req.max_tokens,
+            "max_output_tokens": req.max_output_tokens,
             "stream": stream,
             # Stateless reasoning continuity: never rely on server-stored state, and
             # request encrypted reasoning content so reasoning items can be replayed
@@ -292,37 +296,38 @@ class OpenAIClient:
                     "name": t.name,
                     "description": t.description,
                     "parameters": t.parameters,
+                    "strict": t.strict,
                 }
                 for t in req.tools
             ]
             body["tool_choice"] = req.tool_choice
 
-        if req.reasoning_effort == "default":
+        if req.reasoning.effort == "default":
             return body
 
-        if req.reasoning_effort == "none":
+        if req.reasoning.effort == "none":
             body["reasoning"] = {"effort": "none"}
-        elif req.reasoning_effort == "minimal":
+        elif req.reasoning.effort == "minimal":
             body["reasoning"] = {"effort": "minimal"}
-        elif req.reasoning_effort == "low":
+        elif req.reasoning.effort == "low":
             body["reasoning"] = {"effort": "low"}
-        elif req.reasoning_effort == "medium":
+        elif req.reasoning.effort == "medium":
             body["reasoning"] = {"effort": "medium"}
-        elif req.reasoning_effort == "high":
+        elif req.reasoning.effort == "high":
             body["reasoning"] = {"effort": "high"}
-        elif req.reasoning_effort == "max":
+        elif req.reasoning.effort == "max":
             body["reasoning"] = {"effort": "xhigh"}
         else:
-            raise ValueError(f"Unknown reasoning_effort: {req.reasoning_effort}")
+            raise ValueError(f"Unknown reasoning_effort: {req.reasoning.effort}")
 
         return body
 
     def _parse_response(
         self, data: dict, headers: httpx.Headers, *, structured: bool
-    ) -> LLMResponse:
+    ) -> ModelResponse:
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
-        provider_items: list[dict[str, object]] = []
+        provider_artifacts: list[dict[str, object]] = []
         for item in data.get("output", []):
             item_type = item.get("type")
             if item_type == "message":
@@ -330,15 +335,15 @@ class OpenAIClient:
                     if content_item.get("type") == "output_text":
                         text_parts.append(content_item.get("text", ""))
             elif item_type == "reasoning":
-                provider_items.append(item)
+                provider_artifacts.append(item)
             elif item_type == "function_call":
                 args_str = item.get("arguments") or ""
-                try:
-                    parsed_args = json.loads(args_str) if args_str else {}
-                except json.JSONDecodeError:
-                    parsed_args = {}
-                if not isinstance(parsed_args, dict):
-                    parsed_args = {}
+                parsed_args = parse_tool_arguments(
+                    args_str,
+                    provider="openai",
+                    tool_name=item.get("name") or "",
+                    call_id=item.get("call_id") or "",
+                )
                 tool_calls.append(
                     ToolCall(
                         id=item.get("call_id") or "",
@@ -361,7 +366,7 @@ class OpenAIClient:
             if isinstance(parsed, dict):
                 structured_output = parsed
 
-        return LLMResponse(
+        return ModelResponse(
             text=text,
             usage=self._parse_usage(data["usage"]) if data.get("usage") else None,
             provider_request_id=provider_request_id,
@@ -369,14 +374,14 @@ class OpenAIClient:
             incomplete_details=incomplete_details,
             structured_output=structured_output,
             tool_calls=tuple(tool_calls),
-            provider_items=tuple(provider_items),
+            provider_artifacts=tuple(provider_artifacts),
         )
 
-    def _parse_usage(self, usage_data: dict) -> LLMUsage:
+    def _parse_usage(self, usage_data: dict) -> TokenUsage:
         output_tokens_details = usage_data.get("output_tokens_details") or {}
         input_tokens_details = usage_data.get("input_tokens_details") or {}
         cached_tokens = input_tokens_details.get("cached_tokens")
-        return LLMUsage(
+        return TokenUsage(
             input_tokens=usage_data.get("input_tokens"),
             output_tokens=usage_data.get("output_tokens"),
             total_tokens=usage_data.get("total_tokens"),

@@ -4,7 +4,7 @@ Per PR-04 spec section 4.2:
 - Endpoint: POST https://api.anthropic.com/v1/messages
 - Headers: x-api-key: <key>, anthropic-version: 2023-06-01, Content-Type: application/json
 
-Turn conversion:
+ModelMessage conversion:
 - System turn extracted to separate "system" field (Anthropic doesn't use system in messages array)
 - Remaining turns mapped to messages with role preserved
 
@@ -48,31 +48,40 @@ from collections.abc import AsyncIterator
 
 import httpx
 
-from llm_calling.errors import LLMError, LLMErrorCode, raise_for_provider_error
-from llm_calling.types import LLMChunk, LLMRequest, LLMResponse, LLMUsage, ToolCall, Turn
+from provider_runtime.endpoints import ANTHROPIC_BASE_URL
+from provider_runtime.errors import ModelCallError, ModelCallErrorCode, raise_for_provider_error
+from provider_runtime.tool_arguments import parse_tool_arguments
+from provider_runtime.types import (
+    ModelCall,
+    ModelChunk,
+    ModelMessage,
+    ModelResponse,
+    TokenUsage,
+    ToolCall,
+)
 
-ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_API_VERSION = "2023-06-01"
 ANTHROPIC_ADAPTIVE_THINKING_MODELS = {"claude-opus-4-7", "claude-sonnet-4-6"}
 
 
 class AnthropicClient:
-    def __init__(self, client: httpx.AsyncClient):
+    def __init__(self, client: httpx.AsyncClient, *, base_url: str = ANTHROPIC_BASE_URL):
         self._client = client
+        self._url = f"{base_url.rstrip('/')}/messages"
 
     async def generate(
         self,
-        req: LLMRequest,
+        req: ModelCall,
         *,
         api_key: str,
         timeout_s: int,
-    ) -> LLMResponse:
+    ) -> ModelResponse:
         """Non-streaming message generation."""
         headers = self._build_headers(api_key)
         body = self._build_request_body(req, stream=False)
 
         response = await self._client.post(
-            ANTHROPIC_MESSAGES_URL,
+            self._url,
             headers=headers,
             json=body,
             timeout=httpx.Timeout(timeout_s, connect=10.0),
@@ -84,15 +93,15 @@ class AnthropicClient:
 
     async def generate_stream(
         self,
-        req: LLMRequest,
+        req: ModelCall,
         *,
         api_key: str,
         timeout_s: int,
-    ) -> AsyncIterator[LLMChunk]:
+    ) -> AsyncIterator[ModelChunk]:
         """Streaming message generation using Server-Sent Events."""
         if req.structured_output is not None:
-            raise LLMError(
-                LLMErrorCode.BAD_REQUEST,
+            raise ModelCallError(
+                ModelCallErrorCode.BAD_REQUEST,
                 "Anthropic structured output streaming is not implemented",
                 provider="anthropic",
             )
@@ -101,7 +110,7 @@ class AnthropicClient:
 
         async with self._client.stream(
             "POST",
-            ANTHROPIC_MESSAGES_URL,
+            self._url,
             headers=headers,
             json=body,
             timeout=httpx.Timeout(timeout_s, connect=10.0),
@@ -109,7 +118,7 @@ class AnthropicClient:
             await raise_for_provider_error(response, "anthropic")
 
             provider_request_id: str | None = None
-            usage: LLMUsage | None = None
+            usage: TokenUsage | None = None
             received_stop = False
             usage_data: dict[str, object] = {}
             tool_blocks: dict[int, dict[str, object]] = {}
@@ -125,7 +134,7 @@ class AnthropicClient:
 
                     if event_type == "message_stop":
                         received_stop = True
-                        yield LLMChunk(
+                        yield ModelChunk(
                             delta_text="",
                             done=True,
                             usage=usage,
@@ -179,7 +188,7 @@ class AnthropicClient:
                     if delta.get("type") == "text_delta":
                         delta_text = delta.get("text", "")
                         if delta_text:
-                            yield LLMChunk(delta_text=delta_text, done=False)
+                            yield ModelChunk(delta_text=delta_text, done=False)
                     elif delta.get("type") == "input_json_delta":
                         index = data.get("index")
                         if isinstance(index, int) and index in tool_blocks:
@@ -200,13 +209,13 @@ class AnthropicClient:
                     if isinstance(index, int) and index in tool_blocks:
                         block_state = tool_blocks.pop(index)
                         raw_json = str(block_state["json"] or "{}")
-                        try:
-                            arguments = json.loads(raw_json)
-                        except json.JSONDecodeError:
-                            arguments = {}
-                        if not isinstance(arguments, dict):
-                            arguments = {}
-                        yield LLMChunk(
+                        arguments = parse_tool_arguments(
+                            raw_json,
+                            provider="anthropic",
+                            tool_name=str(block_state["name"]),
+                            call_id=str(block_state["id"]),
+                        )
+                        yield ModelChunk(
                             tool_call=ToolCall(
                                 id=str(block_state["id"]),
                                 name=str(block_state["name"]),
@@ -216,7 +225,7 @@ class AnthropicClient:
                         )
                     elif isinstance(index, int) and index in thinking_blocks:
                         # One complete thinking/redacted_thinking block, verbatim.
-                        yield LLMChunk(provider_item=thinking_blocks.pop(index), done=False)
+                        yield ModelChunk(provider_artifact=thinking_blocks.pop(index), done=False)
                     continue
 
                 # Handle message_delta - extract usage at end
@@ -228,10 +237,11 @@ class AnthropicClient:
                     continue
 
             if not received_stop:
-                raise LLMError(
-                    LLMErrorCode.PROVIDER_DOWN,
+                raise ModelCallError(
+                    ModelCallErrorCode.PROVIDER_DOWN,
                     "Anthropic stream ended without message_stop event",
                     provider="anthropic",
+                    retryable=False,
                 )
 
     def _build_headers(self, api_key: str) -> dict[str, str]:
@@ -242,23 +252,23 @@ class AnthropicClient:
             "Content-Type": "application/json",
         }
 
-    def _build_request_body(self, req: LLMRequest, stream: bool) -> dict:
-        """Build request body from LLMRequest.
+    def _build_request_body(self, req: ModelCall, stream: bool) -> dict:
+        """Build request body from ModelCall.
 
         Extracts system turn to separate field.
         """
         if req.prompt_cache_key is not None:
-            raise LLMError(
-                LLMErrorCode.BAD_REQUEST,
+            raise ModelCallError(
+                ModelCallErrorCode.BAD_REQUEST,
                 "Anthropic does not support prompt_cache_key",
                 provider="anthropic",
             )
-        if req.structured_output is not None and req.reasoning_effort not in (
+        if req.structured_output is not None and req.reasoning.effort not in (
             "default",
             "none",
         ):
-            raise LLMError(
-                LLMErrorCode.BAD_REQUEST,
+            raise ModelCallError(
+                ModelCallErrorCode.BAD_REQUEST,
                 "Anthropic forced structured output is incompatible with extended thinking",
                 provider="anthropic",
             )
@@ -275,8 +285,8 @@ class AnthropicClient:
                 messages.append(self._turn_to_message(turn))
 
         body: dict = {
-            "model": req.model_name,
-            "max_tokens": req.max_tokens,
+            "model": req.model.model,
+            "max_tokens": req.max_output_tokens,
             "messages": messages,
             "stream": stream,
         }
@@ -311,49 +321,49 @@ class AnthropicClient:
             elif req.tool_choice == "required":
                 body["tool_choice"] = {"type": "any"}
 
-        uses_adaptive_thinking = req.model_name in ANTHROPIC_ADAPTIVE_THINKING_MODELS and (
-            req.reasoning_effort not in ("default", "none")
+        uses_adaptive_thinking = req.model.model in ANTHROPIC_ADAPTIVE_THINKING_MODELS and (
+            req.reasoning.effort not in ("default", "none")
         )
         if req.temperature is not None and not uses_adaptive_thinking:
             body["temperature"] = req.temperature
 
-        if req.reasoning_effort == "default":
+        if req.reasoning.effort == "default":
             return body
 
-        if req.reasoning_effort == "none":
+        if req.reasoning.effort == "none":
             body["thinking"] = {"type": "disabled"}
             return body
 
-        if req.model_name in ANTHROPIC_ADAPTIVE_THINKING_MODELS:
-            if req.reasoning_effort in ("minimal", "low"):
+        if req.model.model in ANTHROPIC_ADAPTIVE_THINKING_MODELS:
+            if req.reasoning.effort in ("minimal", "low"):
                 effort = "low"
-            elif req.reasoning_effort == "medium":
+            elif req.reasoning.effort == "medium":
                 effort = "medium"
-            elif req.reasoning_effort == "high":
+            elif req.reasoning.effort == "high":
                 effort = "high"
-            elif req.reasoning_effort == "max":
+            elif req.reasoning.effort == "max":
                 effort = "xhigh"
             else:
-                raise ValueError(f"Unknown reasoning_effort: {req.reasoning_effort}")
+                raise ValueError(f"Unknown reasoning_effort: {req.reasoning.effort}")
 
             body["thinking"] = {"type": "adaptive"}
             body["output_config"] = {"effort": effort}
             return body
 
-        if req.reasoning_effort == "minimal":
+        if req.reasoning.effort == "minimal":
             budget_tokens = 1024
-        elif req.reasoning_effort == "low":
+        elif req.reasoning.effort == "low":
             budget_tokens = 1536
-        elif req.reasoning_effort == "medium":
+        elif req.reasoning.effort == "medium":
             budget_tokens = 2048
-        elif req.reasoning_effort == "high":
+        elif req.reasoning.effort == "high":
             budget_tokens = 3072
-        elif req.reasoning_effort == "max":
+        elif req.reasoning.effort == "max":
             budget_tokens = 4000
         else:
-            raise ValueError(f"Unknown reasoning_effort: {req.reasoning_effort}")
+            raise ValueError(f"Unknown reasoning_effort: {req.reasoning.effort}")
 
-        max_allowed_budget = req.max_tokens - 1
+        max_allowed_budget = req.max_output_tokens - 1
         if max_allowed_budget < 1024:
             body["thinking"] = {"type": "disabled"}
         else:
@@ -364,27 +374,27 @@ class AnthropicClient:
 
         return body
 
-    def _turn_to_text_block(self, turn: Turn) -> dict[str, object]:
+    def _turn_to_text_block(self, turn: ModelMessage) -> dict[str, object]:
         block: dict[str, object] = {"type": "text", "text": turn.content}
         if turn.cache_ttl == "none":
             return block
         if turn.cache_ttl not in ("5m", "1h"):
-            raise LLMError(
-                LLMErrorCode.BAD_REQUEST,
+            raise ModelCallError(
+                ModelCallErrorCode.BAD_REQUEST,
                 f"Unknown prompt cache ttl: {turn.cache_ttl}",
                 provider="anthropic",
             )
         block["cache_control"] = {"type": "ephemeral", "ttl": turn.cache_ttl}
         return block
 
-    def _turn_to_message(self, turn: Turn) -> dict[str, object]:
-        """Convert Turn to Anthropic message format.
+    def _turn_to_message(self, turn: ModelMessage) -> dict[str, object]:
+        """Convert ModelMessage to Anthropic message format.
 
         Note: System turns are handled separately in _build_request_body.
         """
         if turn.cache_ttl != "none":
-            raise LLMError(
-                LLMErrorCode.BAD_REQUEST,
+            raise ModelCallError(
+                ModelCallErrorCode.BAD_REQUEST,
                 "Anthropic prompt cache is only supported on system turns",
                 provider="anthropic",
             )
@@ -401,9 +411,9 @@ class AnthropicClient:
                     for result in turn.tool_results
                 ],
             }
-        if turn.role == "assistant" and (turn.tool_calls or turn.provider_items):
+        if turn.role == "assistant" and (turn.tool_calls or turn.provider_artifacts):
             # Thinking blocks must lead the assistant turn, unmodified, before tool_use.
-            content: list[dict[str, object]] = [dict(item) for item in turn.provider_items]
+            content: list[dict[str, object]] = [dict(item) for item in turn.provider_artifacts]
             if turn.content:
                 content.append({"type": "text", "text": turn.content})
             for call in turn.tool_calls:
@@ -421,27 +431,33 @@ class AnthropicClient:
             "content": turn.content,
         }
 
-    def _parse_response(self, data: dict) -> LLMResponse:
+    def _parse_response(self, data: dict) -> ModelResponse:
         """Parse non-streaming response."""
         # Extract text from content blocks
         content_blocks = data.get("content", [])
         text_parts = []
         structured_output = None
         tool_calls: list[ToolCall] = []
-        provider_items: list[dict[str, object]] = []
+        provider_artifacts: list[dict[str, object]] = []
         for block in content_blocks:
             if block.get("type") == "text":
                 text_parts.append(block.get("text", ""))
             elif block.get("type") in ("thinking", "redacted_thinking"):
-                provider_items.append(block)
-            elif block.get("type") == "tool_use" and isinstance(block.get("input"), dict):
+                provider_artifacts.append(block)
+            elif block.get("type") == "tool_use":
+                arguments = parse_tool_arguments(
+                    block.get("input"),
+                    provider="anthropic",
+                    tool_name=str(block.get("name", "")),
+                    call_id=str(block.get("id", "")),
+                )
                 if structured_output is None:
-                    structured_output = block["input"]
+                    structured_output = arguments
                 tool_calls.append(
                     ToolCall(
                         id=str(block.get("id", "")),
                         name=str(block.get("name", "")),
-                        arguments=block["input"],
+                        arguments=arguments,
                     )
                 )
         text = "".join(text_parts)
@@ -455,16 +471,16 @@ class AnthropicClient:
         # Extract request ID from body
         provider_request_id = data.get("id")
 
-        return LLMResponse(
+        return ModelResponse(
             text=text,
             usage=usage,
             provider_request_id=provider_request_id,
             structured_output=structured_output,
             tool_calls=tuple(tool_calls),
-            provider_items=tuple(provider_items),
+            provider_artifacts=tuple(provider_artifacts),
         )
 
-    def _parse_usage(self, usage_data: dict[str, object]) -> LLMUsage:
+    def _parse_usage(self, usage_data: dict[str, object]) -> TokenUsage:
         input_tokens = _int_or_none(usage_data.get("input_tokens"))
         output_tokens = _int_or_none(usage_data.get("output_tokens"))
         cache_creation = _int_or_none(usage_data.get("cache_creation_input_tokens"))
@@ -474,7 +490,7 @@ class AnthropicClient:
             for value in (input_tokens, output_tokens, cache_creation, cache_read)
             if value is not None
         )
-        return LLMUsage(
+        return TokenUsage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total,

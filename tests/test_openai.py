@@ -5,15 +5,18 @@ import httpx
 import pytest
 import respx
 
-from llm_calling.openai import OpenAIClient
-from llm_calling.types import (
-    LLMRequest,
+from provider_runtime.errors import ModelCallError, ModelCallErrorCode
+from provider_runtime.openai import OpenAIClient
+from provider_runtime.types import (
+    ModelCall,
+    ModelMessage,
+    ModelRef,
+    ReasoningConfig,
     ReasoningEffort,
     StructuredOutputSpec,
     ToolCall,
     ToolResult,
     ToolSpec,
-    Turn,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -29,16 +32,16 @@ def load_text(name: str) -> str:
     return (FIXTURES / name).read_text()
 
 
-def request(reasoning_effort: ReasoningEffort = "none") -> LLMRequest:
-    return LLMRequest(
-        model_name="gpt-5.4-mini",
+def request(reasoning_effort: ReasoningEffort = "none") -> ModelCall:
+    return ModelCall(
+        model=ModelRef(provider="openai", model="gpt-5.4-mini"),
         messages=[
-            Turn(role="system", content="You are helpful."),
-            Turn(role="user", content="Hello!"),
+            ModelMessage(role="system", content="You are helpful."),
+            ModelMessage(role="user", content="Hello!"),
         ],
-        max_tokens=100,
+        max_output_tokens=100,
         temperature=0.7,
-        reasoning_effort=reasoning_effort,
+        reasoning=ReasoningConfig(effort=reasoning_effort),
     )
 
 
@@ -126,13 +129,13 @@ async def test_payload_includes_prompt_cache_key() -> None:
         200,
         json=load_json("success_nonstream.json"),
     )
-    req = LLMRequest(
-        model_name="gpt-5.4-mini",
+    req = ModelCall(
+        model=ModelRef(provider="openai", model="gpt-5.4-mini"),
         messages=[
-            Turn(role="system", content="You are helpful.", cache_ttl="5m"),
-            Turn(role="user", content="Hello!"),
+            ModelMessage(role="system", content="You are helpful.", cache_ttl="5m"),
+            ModelMessage(role="user", content="Hello!"),
         ],
-        max_tokens=100,
+        max_output_tokens=100,
         prompt_cache_key="scope:abc123",
     )
 
@@ -151,10 +154,10 @@ async def test_structured_output_uses_json_schema_text_format_and_parses_respons
         200,
         json=response_json,
     )
-    req = LLMRequest(
-        model_name="gpt-5.4-mini",
-        messages=[Turn(role="user", content="Extract metadata.")],
-        max_tokens=100,
+    req = ModelCall(
+        model=ModelRef(provider="openai", model="gpt-5.4-mini"),
+        messages=[ModelMessage(role="user", content="Extract metadata.")],
+        max_output_tokens=100,
         structured_output=StructuredOutputSpec(
             name="metadata_enrichment",
             schema=metadata_schema(),
@@ -233,19 +236,21 @@ async def test_nonstream_tool_call_round_trip() -> None:
             "required": ["city"],
         },
     )
-    req = LLMRequest(
-        model_name="gpt-5.4-mini",
+    req = ModelCall(
+        model=ModelRef(provider="openai", model="gpt-5.4-mini"),
         messages=[
-            Turn(role="user", content="Weather in Paris?"),
-            Turn(
+            ModelMessage(role="user", content="Weather in Paris?"),
+            ModelMessage(
                 role="assistant",
                 tool_calls=(
                     ToolCall(id="call_abc", name="get_weather", arguments={"city": "Paris"}),
                 ),
             ),
-            Turn(role="tool", tool_results=(ToolResult(call_id="call_abc", output="sunny"),)),
+            ModelMessage(
+                role="tool", tool_results=(ToolResult(call_id="call_abc", output="sunny"),)
+            ),
         ],
-        max_tokens=100,
+        max_output_tokens=100,
         tools=(weather_tool,),
         tool_choice="required",
     )
@@ -260,6 +265,7 @@ async def test_nonstream_tool_call_round_trip() -> None:
             "name": "get_weather",
             "description": "Get weather for a city",
             "parameters": weather_tool.parameters,
+            "strict": True,
         }
     ]
     assert body["tool_choice"] == "required"
@@ -277,6 +283,27 @@ async def test_nonstream_tool_call_round_trip() -> None:
     assert response.tool_calls == (
         ToolCall(id="call_abc", name="get_weather", arguments={"city": "Paris"}),
     )
+
+
+@respx.mock
+async def test_nonstream_malformed_tool_arguments_raise_typed_error() -> None:
+    response_json = load_json("success_nonstream.json")
+    response_json["output"] = [
+        {
+            "type": "function_call",
+            "call_id": "call_bad",
+            "name": "get_weather",
+            "arguments": '{"city": ',
+        }
+    ]
+    respx.post("https://api.openai.com/v1/responses").respond(200, json=response_json)
+
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(ModelCallError) as exc_info:
+            await OpenAIClient(http).generate(request(), api_key="sk-test", timeout_s=30)
+
+    assert exc_info.value.error_code == ModelCallErrorCode.TOOL_ARGUMENTS_INVALID
+    assert exc_info.value.retryable is False
 
 
 @respx.mock
@@ -343,11 +370,11 @@ async def test_reasoning_item_replayed_before_function_call() -> None:
         "summary": [],
         "encrypted_content": "gAAAA-opaque",
     }
-    req = LLMRequest(
-        model_name="gpt-5.4-mini",
+    req = ModelCall(
+        model=ModelRef(provider="openai", model="gpt-5.4-mini"),
         messages=[
-            Turn(role="user", content="Weather in Paris?"),
-            Turn(
+            ModelMessage(role="user", content="Weather in Paris?"),
+            ModelMessage(
                 role="assistant",
                 tool_calls=(
                     ToolCall(
@@ -357,12 +384,14 @@ async def test_reasoning_item_replayed_before_function_call() -> None:
                         provider_metadata={"id": "fc_1"},
                     ),
                 ),
-                provider_items=(reasoning_item,),
+                provider_artifacts=(reasoning_item,),
             ),
-            Turn(role="tool", tool_results=(ToolResult(call_id="call_abc", output="sunny"),)),
+            ModelMessage(
+                role="tool", tool_results=(ToolResult(call_id="call_abc", output="sunny"),)
+            ),
         ],
-        max_tokens=100,
-        reasoning_effort="high",
+        max_output_tokens=100,
+        reasoning=ReasoningConfig(effort="high"),
     )
 
     async with httpx.AsyncClient() as http:
@@ -410,7 +439,7 @@ async def test_nonstream_reasoning_items_exposed_on_response() -> None:
             request("high"), api_key="sk-test", timeout_s=30
         )
 
-    assert response.provider_items == (reasoning_item,)
+    assert response.provider_artifacts == (reasoning_item,)
     assert response.tool_calls == (
         ToolCall(
             id="call_abc",
@@ -422,7 +451,7 @@ async def test_nonstream_reasoning_items_exposed_on_response() -> None:
 
 
 @respx.mock
-async def test_stream_reasoning_item_yields_provider_item_chunk() -> None:
+async def test_stream_reasoning_item_yields_provider_artifact_chunk() -> None:
     respx.post("https://api.openai.com/v1/responses").respond(
         200,
         content=(
@@ -444,8 +473,8 @@ async def test_stream_reasoning_item_yields_provider_item_chunk() -> None:
             )
         ]
 
-    item_chunks = [chunk for chunk in chunks if chunk.provider_item is not None]
-    assert [chunk.provider_item for chunk in item_chunks] == [
+    item_chunks = [chunk for chunk in chunks if chunk.provider_artifact is not None]
+    assert [chunk.provider_artifact for chunk in item_chunks] == [
         {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "gAAAA-opaque"}
     ]
     tool_chunks = [chunk for chunk in chunks if chunk.tool_call is not None]

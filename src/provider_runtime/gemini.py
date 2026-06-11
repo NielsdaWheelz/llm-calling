@@ -9,7 +9,7 @@ Auth:
 - NEVER put key in query param
 - NEVER log URL if key accidentally in query
 
-Turn conversion:
+ModelMessage conversion:
 - System turn → systemInstruction.parts[0].text
 - "assistant" role → "model" role in Gemini
 - Each turn's content → parts: [{"text": "..."}]
@@ -57,27 +57,36 @@ from collections.abc import AsyncIterator
 
 import httpx
 
-from llm_calling.errors import LLMError, LLMErrorCode, raise_for_provider_error
-from llm_calling.types import LLMChunk, LLMRequest, LLMResponse, LLMUsage, ToolCall, Turn
+from provider_runtime.endpoints import GEMINI_BASE_URL
+from provider_runtime.errors import ModelCallError, ModelCallErrorCode, raise_for_provider_error
+from provider_runtime.tool_arguments import parse_tool_arguments
+from provider_runtime.types import (
+    ModelCall,
+    ModelChunk,
+    ModelMessage,
+    ModelResponse,
+    TokenUsage,
+    ToolCall,
+)
 
-GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_31_PRO_PREVIEW = "gemini-3.1-pro-preview"
 GEMINI_3_FLASH_PREVIEW = "gemini-3-flash-preview"
 
 
 class GeminiClient:
-    def __init__(self, client: httpx.AsyncClient):
+    def __init__(self, client: httpx.AsyncClient, *, base_url: str = GEMINI_BASE_URL):
         self._client = client
+        self._base_url = base_url.rstrip("/")
 
     async def generate(
         self,
-        req: LLMRequest,
+        req: ModelCall,
         *,
         api_key: str,
         timeout_s: int,
-    ) -> LLMResponse:
+    ) -> ModelResponse:
         """Non-streaming content generation."""
-        url = f"{GEMINI_BASE_URL}/{req.model_name}:generateContent"
+        url = f"{self._base_url}/{req.model.model}:generateContent"
         headers = self._build_headers(api_key)
         body = self._build_request_body(req)
 
@@ -94,19 +103,19 @@ class GeminiClient:
 
     async def generate_stream(
         self,
-        req: LLMRequest,
+        req: ModelCall,
         *,
         api_key: str,
         timeout_s: int,
-    ) -> AsyncIterator[LLMChunk]:
+    ) -> AsyncIterator[ModelChunk]:
         """Streaming content generation using Server-Sent Events."""
         if req.structured_output is not None:
-            raise LLMError(
-                LLMErrorCode.BAD_REQUEST,
+            raise ModelCallError(
+                ModelCallErrorCode.BAD_REQUEST,
                 "Gemini structured output streaming is not implemented",
                 provider="gemini",
             )
-        url = f"{GEMINI_BASE_URL}/{req.model_name}:streamGenerateContent?alt=sse"
+        url = f"{self._base_url}/{req.model.model}:streamGenerateContent?alt=sse"
         headers = self._build_headers(api_key)
         body = self._build_request_body(req)
 
@@ -120,7 +129,7 @@ class GeminiClient:
             await raise_for_provider_error(response, "gemini")
 
             received_stop = False
-            usage: LLMUsage | None = None
+            usage: TokenUsage | None = None
 
             async for line in response.aiter_lines():
                 if not line:
@@ -160,7 +169,7 @@ class GeminiClient:
                     # Extract usage from final event
                     usage_metadata = data.get("usageMetadata")
                     if usage_metadata:
-                        usage = LLMUsage(
+                        usage = TokenUsage(
                             input_tokens=usage_metadata.get("promptTokenCount"),
                             output_tokens=usage_metadata.get("candidatesTokenCount"),
                             total_tokens=usage_metadata.get("totalTokenCount"),
@@ -171,11 +180,11 @@ class GeminiClient:
                         received_stop = True
                         # Yield any remaining text as non-terminal
                         if delta_text:
-                            yield LLMChunk(delta_text=delta_text, done=False)
+                            yield ModelChunk(delta_text=delta_text, done=False)
                         for tc in tool_calls:
-                            yield LLMChunk(tool_call=tc, done=False)
+                            yield ModelChunk(tool_call=tc, done=False)
                         # Then yield terminal chunk
-                        yield LLMChunk(
+                        yield ModelChunk(
                             delta_text="",
                             done=True,
                             usage=usage,
@@ -184,15 +193,16 @@ class GeminiClient:
                         break
                     else:
                         if delta_text:
-                            yield LLMChunk(delta_text=delta_text, done=False)
+                            yield ModelChunk(delta_text=delta_text, done=False)
                         for tc in tool_calls:
-                            yield LLMChunk(tool_call=tc, done=False)
+                            yield ModelChunk(tool_call=tc, done=False)
 
             if not received_stop:
-                raise LLMError(
-                    LLMErrorCode.PROVIDER_DOWN,
+                raise ModelCallError(
+                    ModelCallErrorCode.PROVIDER_DOWN,
                     "Gemini stream ended without STOP finish reason",
                     provider="gemini",
+                    retryable=False,
                 )
 
     def _build_headers(self, api_key: str) -> dict[str, str]:
@@ -205,16 +215,16 @@ class GeminiClient:
             "Content-Type": "application/json",
         }
 
-    def _build_request_body(self, req: LLMRequest) -> dict:
-        """Build request body from LLMRequest.
+    def _build_request_body(self, req: ModelCall) -> dict:
+        """Build request body from ModelCall.
 
         Extracts system turn to systemInstruction and maps roles.
         """
         if req.prompt_cache_key is not None or any(
             turn.cache_ttl != "none" for turn in req.messages
         ):
-            raise LLMError(
-                LLMErrorCode.BAD_REQUEST,
+            raise ModelCallError(
+                ModelCallErrorCode.BAD_REQUEST,
                 "Gemini cached content is not implemented for this request",
                 provider="gemini",
             )
@@ -240,7 +250,7 @@ class GeminiClient:
         body: dict = {
             "contents": contents,
             "generationConfig": {
-                "maxOutputTokens": req.max_tokens,
+                "maxOutputTokens": req.max_output_tokens,
             },
         }
 
@@ -269,52 +279,52 @@ class GeminiClient:
             mode = {"auto": "AUTO", "none": "NONE", "required": "ANY"}[req.tool_choice]
             body["toolConfig"] = {"functionCallingConfig": {"mode": mode}}
 
-        if req.reasoning_effort == "default":
+        if req.reasoning.effort == "default":
             return body
 
-        if req.model_name == GEMINI_31_PRO_PREVIEW:
-            if req.reasoning_effort in ("none", "minimal", "low"):
+        if req.model.model == GEMINI_31_PRO_PREVIEW:
+            if req.reasoning.effort in ("none", "minimal", "low"):
                 body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}
-            elif req.reasoning_effort in ("medium", "high", "max"):
+            elif req.reasoning.effort in ("medium", "high", "max"):
                 body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "high"}
             else:
-                raise ValueError(f"Unknown reasoning_effort: {req.reasoning_effort}")
+                raise ValueError(f"Unknown reasoning_effort: {req.reasoning.effort}")
             return body
 
-        if req.model_name == GEMINI_3_FLASH_PREVIEW:
-            if req.reasoning_effort in ("none", "minimal"):
+        if req.model.model == GEMINI_3_FLASH_PREVIEW:
+            if req.reasoning.effort in ("none", "minimal"):
                 body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "minimal"}
-            elif req.reasoning_effort == "low":
+            elif req.reasoning.effort == "low":
                 body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}
-            elif req.reasoning_effort == "medium":
+            elif req.reasoning.effort == "medium":
                 body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "medium"}
-            elif req.reasoning_effort in ("high", "max"):
+            elif req.reasoning.effort in ("high", "max"):
                 body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "high"}
             else:
-                raise ValueError(f"Unknown reasoning_effort: {req.reasoning_effort}")
+                raise ValueError(f"Unknown reasoning_effort: {req.reasoning.effort}")
             return body
 
-        if req.reasoning_effort == "none":
+        if req.reasoning.effort == "none":
             return body
-        if req.reasoning_effort == "minimal":
+        if req.reasoning.effort == "minimal":
             body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "minimal"}
             return body
-        if req.reasoning_effort == "low":
+        if req.reasoning.effort == "low":
             body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}
             return body
-        if req.reasoning_effort == "medium":
+        if req.reasoning.effort == "medium":
             body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "medium"}
             return body
-        if req.reasoning_effort == "high":
+        if req.reasoning.effort == "high":
             body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "high"}
             return body
-        if req.reasoning_effort == "max":
+        if req.reasoning.effort == "max":
             body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "high"}
             return body
-        raise ValueError(f"Unknown reasoning_effort: {req.reasoning_effort}")
+        raise ValueError(f"Unknown reasoning_effort: {req.reasoning.effort}")
 
-    def _turn_to_content(self, turn: Turn, call_id_to_name: dict[str, str]) -> dict:
-        """Convert Turn to Gemini content format.
+    def _turn_to_content(self, turn: ModelMessage, call_id_to_name: dict[str, str]) -> dict:
+        """Convert ModelMessage to Gemini content format.
 
         Note: Gemini uses "model" instead of "assistant" for the role, and
         identifies tool responses by function name (not call_id).
@@ -351,15 +361,16 @@ class GeminiClient:
             "parts": [{"text": turn.content}],
         }
 
-    def _parse_response(self, data: dict, *, structured: bool) -> LLMResponse:
+    def _parse_response(self, data: dict, *, structured: bool) -> ModelResponse:
         """Parse non-streaming response."""
         # Extract text from candidates[0].content.parts[].text
         candidates = data.get("candidates", [])
         if not candidates:
-            raise LLMError(
-                LLMErrorCode.PROVIDER_DOWN,
+            raise ModelCallError(
+                ModelCallErrorCode.PROVIDER_DOWN,
                 "Gemini response missing candidates",
                 provider="gemini",
+                retryable=False,
             )
 
         content = candidates[0].get("content", {})
@@ -385,7 +396,7 @@ class GeminiClient:
         usage = None
         usage_metadata = data.get("usageMetadata")
         if usage_metadata:
-            usage = LLMUsage(
+            usage = TokenUsage(
                 input_tokens=usage_metadata.get("promptTokenCount"),
                 output_tokens=usage_metadata.get("candidatesTokenCount"),
                 total_tokens=usage_metadata.get("totalTokenCount"),
@@ -393,7 +404,7 @@ class GeminiClient:
             )
 
         # Gemini doesn't return a request ID
-        return LLMResponse(
+        return ModelResponse(
             text=text,
             usage=usage,
             provider_request_id=None,
@@ -410,6 +421,6 @@ def _part_to_tool_call(part: dict) -> ToolCall:
     return ToolCall(
         id=fc.get("id") or name,
         name=name,
-        arguments=fc.get("args") or {},
+        arguments=parse_tool_arguments(fc.get("args"), provider="gemini", tool_name=name),
         provider_metadata={"thoughtSignature": signature} if signature else None,
     )

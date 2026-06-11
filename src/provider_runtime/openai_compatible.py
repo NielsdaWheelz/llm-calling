@@ -1,69 +1,72 @@
-"""DeepSeek chat completions client.
-
-Reasoning invariant: DeepSeek reasoner `reasoning_content` must NOT be replayed on
-continuation requests. This client never reads it (stream and non-stream parsing
-consume only `content`/`tool_calls`), so assistant replays are stripped by
-construction — keep it that way.
-"""
+"""OpenAI-compatible chat completions client."""
 
 import json
 from collections.abc import AsyncIterator
+from typing import Literal
 
 import httpx
 
-from llm_calling.errors import LLMError, LLMErrorCode, raise_for_provider_error
-from llm_calling.types import LLMChunk, LLMRequest, LLMResponse, LLMUsage, ToolCall
+from provider_runtime.errors import ModelCallError, ModelCallErrorCode, raise_for_provider_error
+from provider_runtime.tool_arguments import parse_tool_arguments
+from provider_runtime.types import ModelCall, ModelChunk, ModelResponse, TokenUsage, ToolCall
 
-DEEPSEEK_CHAT_URL = "https://api.deepseek.com/chat/completions"
-DEEPSEEK_V4_MODELS = {"deepseek-v4-pro", "deepseek-v4-flash"}
+OpenAICompatibleProvider = Literal["openrouter", "cloudflare"]
 
 
-class DeepSeekClient:
-    def __init__(self, client: httpx.AsyncClient):
+class OpenAICompatibleChatClient:
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        provider: OpenAICompatibleProvider,
+        base_url: str,
+    ):
         self._client = client
+        self._provider = provider
+        self._url = f"{base_url.rstrip('/')}/chat/completions"
 
     async def generate(
         self,
-        req: LLMRequest,
+        req: ModelCall,
         *,
         api_key: str,
         timeout_s: int,
-    ) -> LLMResponse:
+    ) -> ModelResponse:
         headers = self._build_headers(api_key)
         body = self._build_request_body(req, stream=False)
 
         response = await self._client.post(
-            DEEPSEEK_CHAT_URL,
+            self._url,
             headers=headers,
             json=body,
             timeout=httpx.Timeout(timeout_s, connect=10.0),
         )
-        await raise_for_provider_error(response, "deepseek")
+        await raise_for_provider_error(response, self._provider)
 
         data = response.json()
         return self._parse_response(data, response.headers)
 
     async def generate_stream(
         self,
-        req: LLMRequest,
+        req: ModelCall,
         *,
         api_key: str,
         timeout_s: int,
-    ) -> AsyncIterator[LLMChunk]:
+    ) -> AsyncIterator[ModelChunk]:
         headers = self._build_headers(api_key)
         body = self._build_request_body(req, stream=True)
 
         async with self._client.stream(
             "POST",
-            DEEPSEEK_CHAT_URL,
+            self._url,
             headers=headers,
             json=body,
             timeout=httpx.Timeout(timeout_s, connect=10.0),
         ) as response:
-            await raise_for_provider_error(response, "deepseek")
+            await raise_for_provider_error(response, self._provider)
 
             provider_request_id = response.headers.get("x-request-id")
-            accumulated_usage: LLMUsage | None = None
+            accumulated_usage: TokenUsage | None = None
             received_done = False
             tool_call_acc: dict[int, dict] = {}
 
@@ -76,20 +79,20 @@ class DeepSeekClient:
                     received_done = True
                     for idx in sorted(tool_call_acc):
                         acc = tool_call_acc[idx]
-                        try:
-                            parsed_args = json.loads(acc["arguments"]) if acc["arguments"] else {}
-                        except json.JSONDecodeError:
-                            parsed_args = {}
-                        if not isinstance(parsed_args, dict):
-                            parsed_args = {}
-                        yield LLMChunk(
+                        parsed_args = parse_tool_arguments(
+                            acc["arguments"],
+                            provider=self._provider,
+                            tool_name=acc["name"],
+                            call_id=acc["id"],
+                        )
+                        yield ModelChunk(
                             tool_call=ToolCall(
                                 id=acc["id"], name=acc["name"], arguments=parsed_args
                             ),
                             done=False,
                         )
                     tool_call_acc.clear()
-                    yield LLMChunk(
+                    yield ModelChunk(
                         delta_text="",
                         done=True,
                         usage=accumulated_usage,
@@ -104,7 +107,7 @@ class DeepSeekClient:
 
                 if "usage" in data:
                     usage_data = data["usage"]
-                    accumulated_usage = LLMUsage(
+                    accumulated_usage = TokenUsage(
                         input_tokens=usage_data.get("prompt_tokens"),
                         output_tokens=usage_data.get("completion_tokens"),
                         total_tokens=usage_data.get("total_tokens"),
@@ -133,13 +136,13 @@ class DeepSeekClient:
                 if choice.get("finish_reason") == "tool_calls" and tool_call_acc:
                     for idx in sorted(tool_call_acc):
                         acc = tool_call_acc[idx]
-                        try:
-                            parsed_args = json.loads(acc["arguments"]) if acc["arguments"] else {}
-                        except json.JSONDecodeError:
-                            parsed_args = {}
-                        if not isinstance(parsed_args, dict):
-                            parsed_args = {}
-                        yield LLMChunk(
+                        parsed_args = parse_tool_arguments(
+                            acc["arguments"],
+                            provider=self._provider,
+                            tool_name=acc["name"],
+                            call_id=acc["id"],
+                        )
+                        yield ModelChunk(
                             tool_call=ToolCall(
                                 id=acc["id"], name=acc["name"], arguments=parsed_args
                             ),
@@ -148,13 +151,14 @@ class DeepSeekClient:
                     tool_call_acc.clear()
 
                 if delta_text:
-                    yield LLMChunk(delta_text=delta_text, done=False)
+                    yield ModelChunk(delta_text=delta_text, done=False)
 
             if not received_done:
-                raise LLMError(
-                    LLMErrorCode.PROVIDER_DOWN,
-                    "deepseek stream ended without [DONE] marker",
-                    provider="deepseek",
+                raise ModelCallError(
+                    ModelCallErrorCode.PROVIDER_DOWN,
+                    f"{self._provider} stream ended without [DONE] marker",
+                    provider=self._provider,
+                    retryable=False,
                 )
 
     def _build_headers(self, api_key: str) -> dict[str, str]:
@@ -163,22 +167,7 @@ class DeepSeekClient:
             "Content-Type": "application/json",
         }
 
-    def _build_request_body(self, req: LLMRequest, stream: bool) -> dict:
-        if req.structured_output is not None:
-            raise LLMError(
-                LLMErrorCode.BAD_REQUEST,
-                "DeepSeek structured output is not implemented",
-                provider="deepseek",
-            )
-        if req.prompt_cache_key is not None or any(
-            turn.cache_ttl != "none" for turn in req.messages
-        ):
-            raise LLMError(
-                LLMErrorCode.BAD_REQUEST,
-                "DeepSeek does not support required prompt caching",
-                provider="deepseek",
-            )
-
+    def _build_request_body(self, req: ModelCall, stream: bool) -> dict:
         messages: list[dict] = []
         for turn in req.messages:
             if turn.role == "tool":
@@ -192,7 +181,6 @@ class DeepSeekClient:
                     )
                 continue
             if turn.role == "assistant" and turn.tool_calls:
-                # Deliberately no reasoning_content here (see module docstring).
                 messages.append(
                     {
                         "role": "assistant",
@@ -214,9 +202,9 @@ class DeepSeekClient:
             messages.append({"role": turn.role, "content": turn.content})
 
         body: dict = {
-            "model": req.model_name,
+            "model": req.model.model,
             "messages": messages,
-            "max_tokens": req.max_tokens,
+            "max_tokens": req.max_output_tokens,
             "stream": stream,
         }
 
@@ -228,45 +216,71 @@ class DeepSeekClient:
                         "name": t.name,
                         "description": t.description,
                         "parameters": t.parameters,
+                        "strict": t.strict,
                     },
                 }
                 for t in req.tools
             ]
             body["tool_choice"] = req.tool_choice
 
-        uses_v4_thinking = req.model_name in DEEPSEEK_V4_MODELS and (
-            req.reasoning_effort not in ("default", "none")
-        )
-        if req.temperature is not None and not uses_v4_thinking:
+        if req.temperature is not None:
             body["temperature"] = req.temperature
 
-        if req.model_name in DEEPSEEK_V4_MODELS and req.reasoning_effort != "default":
-            body["thinking"] = {"type": "disabled" if req.reasoning_effort == "none" else "enabled"}
+        if req.structured_output is not None:
+            body["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": req.structured_output.name,
+                    "schema": req.structured_output.schema,
+                    "strict": req.structured_output.strict,
+                },
+            }
+
+        if self._provider == "openrouter":
+            if req.reasoning.effort not in ("default", "none"):
+                effort = "high" if req.reasoning.effort == "max" else req.reasoning.effort
+                body["reasoning"] = {"effort": effort}
+        elif req.reasoning.effort not in ("default", "none"):
+            raise ModelCallError(
+                ModelCallErrorCode.BAD_REQUEST,
+                f"{self._provider} reasoning controls are not implemented",
+                provider=self._provider,
+            )
 
         return body
 
-    def _parse_response(self, data: dict, headers: httpx.Headers) -> LLMResponse:
+    def _parse_response(self, data: dict, headers: httpx.Headers) -> ModelResponse:
         choices = data.get("choices", [])
         if not choices:
-            raise LLMError(
-                LLMErrorCode.PROVIDER_DOWN,
-                "deepseek response missing choices",
-                provider="deepseek",
+            raise ModelCallError(
+                ModelCallErrorCode.PROVIDER_DOWN,
+                f"{self._provider} response missing choices",
+                provider=self._provider,
+                retryable=False,
             )
 
         message = choices[0].get("message", {}) or {}
         text = message.get("content") or ""
+        structured_output = None
+        if req_structured_text := text.strip():
+            if req_structured_text.startswith("{"):
+                try:
+                    parsed = json.loads(req_structured_text)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    structured_output = parsed
 
         tool_calls: list[ToolCall] = []
         for tc in message.get("tool_calls") or []:
             fn = tc.get("function") or {}
             args_str = fn.get("arguments") or ""
-            try:
-                parsed_args = json.loads(args_str) if args_str else {}
-            except json.JSONDecodeError:
-                parsed_args = {}
-            if not isinstance(parsed_args, dict):
-                parsed_args = {}
+            parsed_args = parse_tool_arguments(
+                args_str,
+                provider=self._provider,
+                tool_name=fn.get("name") or "",
+                call_id=tc.get("id") or "",
+            )
             tool_calls.append(
                 ToolCall(id=tc.get("id") or "", name=fn.get("name") or "", arguments=parsed_args)
             )
@@ -274,7 +288,7 @@ class DeepSeekClient:
         usage = None
         usage_data = data.get("usage")
         if usage_data:
-            usage = LLMUsage(
+            usage = TokenUsage(
                 input_tokens=usage_data.get("prompt_tokens"),
                 output_tokens=usage_data.get("completion_tokens"),
                 total_tokens=usage_data.get("total_tokens"),
@@ -283,9 +297,10 @@ class DeepSeekClient:
 
         provider_request_id = headers.get("x-request-id") or data.get("id")
 
-        return LLMResponse(
+        return ModelResponse(
             text=text,
             usage=usage,
             provider_request_id=provider_request_id,
+            structured_output=structured_output,
             tool_calls=tuple(tool_calls),
         )
