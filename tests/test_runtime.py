@@ -312,6 +312,9 @@ async def test_probe_key_uses_catalog_probe_model() -> None:
     assert result.ok is True
     assert result.model == "gpt-5.4-mini"
     assert result.provider_request_id == "req-probe"
+    assert result.usage is not None
+    assert result.usage.total_tokens == 18
+    assert result.attempts[-1].status == "success"
     assert route.calls.last.request.headers["authorization"] == "Bearer sk-test"
     assert json.loads(route.calls.last.request.content)["model"] == "gpt-5.4-mini"
 
