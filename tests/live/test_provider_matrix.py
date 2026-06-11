@@ -59,7 +59,9 @@ _REASONING_ORDER: tuple[ReasoningEffort, ...] = (
     "none",
     "default",
 )
-_ANTHROPIC_ADAPTIVE_THINKING_MODELS = frozenset(("claude-opus-4-7", "claude-sonnet-4-6"))
+_ANTHROPIC_ADAPTIVE_THINKING_MODELS = frozenset(
+    ("claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6")
+)
 _ToolChoice = Literal["auto", "none", "required"]
 
 
@@ -84,6 +86,12 @@ class ProviderCase:
     @property
     def model(self) -> str:
         return self.capability.model
+
+
+@dataclass(frozen=True)
+class ReasoningCase:
+    provider_case: ProviderCase
+    effort: ReasoningEffort
 
 
 @pytest.fixture(scope="session")
@@ -116,6 +124,24 @@ def _provider_cases() -> tuple[ProviderCase, ...]:
     )
 
 
+def _generation_cases() -> tuple[ProviderCase, ...]:
+    return tuple(
+        ProviderCase(provider=entry.provider, capability=entry)
+        for entry in DEFAULT_CATALOG.entries
+        if entry.generation
+    )
+
+
+def _reasoning_cases() -> tuple[ReasoningCase, ...]:
+    return tuple(
+        ReasoningCase(ProviderCase(provider=entry.provider, capability=entry), effort)
+        for entry in DEFAULT_CATALOG.entries
+        if entry.generation
+        for effort in entry.reasoning_modes
+        if effort != "default"
+    )
+
+
 def _embedding_cases() -> tuple[ProviderCase, ...]:
     return tuple(
         ProviderCase(provider=entry.provider, capability=entry)
@@ -137,7 +163,7 @@ def _representative_capability(provider: ProviderName) -> ModelCapability:
     entries = [
         entry
         for entry in DEFAULT_CATALOG.entries
-        if entry.provider == provider and not entry.embeddings and entry.max_output_tokens != 0
+        if entry.provider == provider and entry.generation
     ]
     if key_probe_model:
         for entry in entries:
@@ -152,7 +178,7 @@ def _reasoning_capability(provider: ProviderName) -> ModelCapability:
     entries = [
         entry
         for entry in DEFAULT_CATALOG.entries
-        if entry.provider == provider and not entry.embeddings and entry.max_output_tokens != 0
+        if entry.provider == provider and entry.generation
     ]
     if provider == "anthropic":
         for entry in entries:
@@ -217,6 +243,10 @@ def _highest_reasoning_effort(capability: ModelCapability) -> ReasoningEffort:
     )
 
 
+def _baseline_reasoning(capability: ModelCapability) -> ReasoningEffort:
+    return "none" if "none" in capability.reasoning_modes else "default"
+
+
 def _assert_text_response(case: ProviderCase, text: str) -> None:
     assert text.strip(), f"{case.provider}/{case.model} returned empty text"
 
@@ -236,7 +266,9 @@ def _silent_wav_bytes() -> bytes:
     return buffer.getvalue()
 
 
-@pytest.mark.parametrize("case", _provider_cases(), ids=lambda case: case.provider)
+@pytest.mark.parametrize(
+    "case", _generation_cases(), ids=lambda case: f"{case.provider}:{case.model}"
+)
 async def test_live_default_send(live_env: LiveEnv, case: ProviderCase) -> None:
     key = live_env.key_for(case.provider)
     async with httpx.AsyncClient() as http:
@@ -255,22 +287,26 @@ async def test_live_default_send(live_env: LiveEnv, case: ProviderCase) -> None:
     assert response.status not in {"failed", "incomplete", "error"}
 
 
-@pytest.mark.parametrize("provider", _PROVIDER_ORDER)
-async def test_live_highest_reasoning_send(live_env: LiveEnv, provider: ProviderName) -> None:
-    capability = _reasoning_capability(provider)
-    case = ProviderCase(provider=provider, capability=capability)
-    effort = _highest_reasoning_effort(capability)
-    if effort in ("default", "none"):
-        pytest.skip(f"{provider}/{case.model} has no explicit reasoning mode above none")
-
-    key = live_env.key_for(provider)
+@pytest.mark.parametrize(
+    "reasoning_case",
+    _reasoning_cases(),
+    ids=lambda reasoning_case: (
+        f"{reasoning_case.provider_case.provider}:"
+        f"{reasoning_case.provider_case.model}:{reasoning_case.effort}"
+    ),
+)
+async def test_live_declared_reasoning_send(
+    live_env: LiveEnv, reasoning_case: ReasoningCase
+) -> None:
+    case = reasoning_case.provider_case
+    key = live_env.key_for(case.provider)
     async with httpx.AsyncClient() as http:
         response = await _runtime(http).generate(
             _text_call(
                 case,
                 "Answer in one sentence: what is two plus two?",
                 max_output_tokens=160,
-                reasoning=effort,
+                reasoning=reasoning_case.effort,
             ),
             key=key,
             timeout_s=90,
@@ -279,7 +315,9 @@ async def test_live_highest_reasoning_send(live_env: LiveEnv, provider: Provider
     _assert_text_response(case, response.text)
 
 
-@pytest.mark.parametrize("case", _provider_cases(), ids=lambda case: case.provider)
+@pytest.mark.parametrize(
+    "case", _generation_cases(), ids=lambda case: f"{case.provider}:{case.model}"
+)
 async def test_live_cacheable_prompt(live_env: LiveEnv, case: ProviderCase) -> None:
     if not case.capability.prompt_cache.supported:
         pytest.skip(f"{case.provider}/{case.model} does not support prompt caching")
@@ -295,7 +333,12 @@ async def test_live_cacheable_prompt(live_env: LiveEnv, case: ProviderCase) -> N
     ]
     async with httpx.AsyncClient() as http:
         response = await _runtime(http).generate(
-            _call(case, messages, max_output_tokens=48, reasoning="none"),
+            _call(
+                case,
+                messages,
+                max_output_tokens=48,
+                reasoning=_baseline_reasoning(case.capability),
+            ),
             key=key,
             timeout_s=60,
         )
@@ -304,7 +347,9 @@ async def test_live_cacheable_prompt(live_env: LiveEnv, case: ProviderCase) -> N
     _assert_usage_if_claimed(case, response.usage)
 
 
-@pytest.mark.parametrize("case", _provider_cases(), ids=lambda case: case.provider)
+@pytest.mark.parametrize(
+    "case", _generation_cases(), ids=lambda case: f"{case.provider}:{case.model}"
+)
 async def test_live_streaming_text(live_env: LiveEnv, case: ProviderCase) -> None:
     if not case.capability.streaming:
         pytest.skip(f"{case.provider}/{case.model} does not support streaming")
@@ -328,7 +373,9 @@ async def test_live_streaming_text(live_env: LiveEnv, case: ProviderCase) -> Non
     _assert_text_response(case, "".join(chunks))
 
 
-@pytest.mark.parametrize("case", _provider_cases(), ids=lambda case: case.provider)
+@pytest.mark.parametrize(
+    "case", _generation_cases(), ids=lambda case: f"{case.provider}:{case.model}"
+)
 async def test_live_forced_tool_call_and_continuation(
     live_env: LiveEnv,
     case: ProviderCase,
@@ -355,7 +402,7 @@ async def test_live_forced_tool_call_and_continuation(
                 case,
                 [user_turn],
                 max_output_tokens=128,
-                reasoning="none",
+                reasoning=_baseline_reasoning(case.capability),
                 tools=(tool,),
                 tool_choice="required",
             ),
@@ -381,7 +428,7 @@ async def test_live_forced_tool_call_and_continuation(
                     ),
                 ],
                 max_output_tokens=96,
-                reasoning="none",
+                reasoning=_baseline_reasoning(case.capability),
             ),
             key=key,
             timeout_s=60,
@@ -390,7 +437,9 @@ async def test_live_forced_tool_call_and_continuation(
     _assert_text_response(case, final.text)
 
 
-@pytest.mark.parametrize("case", _provider_cases(), ids=lambda case: case.provider)
+@pytest.mark.parametrize(
+    "case", _generation_cases(), ids=lambda case: f"{case.provider}:{case.model}"
+)
 async def test_live_structured_output_where_supported(
     live_env: LiveEnv,
     case: ProviderCase,
@@ -414,7 +463,7 @@ async def test_live_structured_output_where_supported(
                 case,
                 [ModelMessage(role="user", content="Return ok=true and a two-word summary.")],
                 max_output_tokens=96,
-                reasoning="none",
+                reasoning=_baseline_reasoning(case.capability),
                 structured_output=StructuredOutputSpec(
                     name="live_provider_result",
                     schema=schema,

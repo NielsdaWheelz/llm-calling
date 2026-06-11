@@ -170,7 +170,7 @@ async def test_openrouter_reasoning_effort_is_forwarded() -> None:
 
 
 @respx.mock
-async def test_openrouter_sends_ephemeral_cache_control() -> None:
+async def test_openrouter_does_not_send_hidden_cache_control() -> None:
     route = respx.post("https://openrouter.test/v1/chat/completions").respond(
         200,
         json=load_json("success_nonstream.json"),
@@ -185,7 +185,7 @@ async def test_openrouter_sends_ephemeral_cache_control() -> None:
         await chat_client(http).generate(req, api_key="sk-test", timeout_s=30)
 
     body = json.loads(route.calls.last.request.content)
-    assert body["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in body
 
 
 @respx.mock

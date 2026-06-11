@@ -4,9 +4,10 @@ Small async Python package for provider-level model calls.
 
 The package owns the shared runtime contract: catalog validation, high-level request lowering,
 HTTP request formatting, response parsing, streaming chunks, bounded provider retries, normalized
-provider errors, key probes, embeddings, no-network test fakes, and deterministic cost estimates
+provider errors, key probes, embeddings, transcription, no-network test fakes, and deterministic cost estimates
 from explicit catalog pricing. It supports OpenAI, Anthropic, Gemini, OpenRouter,
-Cloudflare/OpenAI-compatible chat, and OpenAI-compatible embeddings.
+Cloudflare/OpenAI-compatible chat, OpenAI-compatible embeddings, and OpenAI
+audio transcription.
 
 Callers own prompts, API keys, HTTP client lifecycle, logging, persistence, application
 idempotency, and product behavior. Provider adapter modules are internal implementation details;
@@ -49,12 +50,29 @@ async with httpx.AsyncClient() as http:
     print(response.text)
 ```
 
+## Catalog And Cost
+
+`DEFAULT_CATALOG` is the hard provider contract. Each row declares its operation surface
+(`generation`, `embeddings`, `transcription`), provider-owned model ID, supported reasoning
+controls, prompt-cache shape, normalized usage claims, artifact support, and pricing provenance.
+The runtime rejects operation mismatches before provider I/O.
+
+Catalog pricing is advisory and fail-closed. A cost estimate is returned only when normalized usage
+and verified catalog rates are sufficient for the selected model and input size. Rates with provider
+thresholds use `Pricing.applies_up_to_input_tokens`; calls above that threshold return
+`missing_pricing` rather than a flattened under-estimate. Prices without a provider source URL and
+verification date are treated as absent.
+
 ## Reasoning
 
 `reasoning=ReasoningConfig(effort="default")` leaves OpenAI `reasoning` unset. Pass it explicitly when product
 policy should use the OpenAI API default. Explicit OpenAI reasoning values map directly for
 `"none"`, `"minimal"`, `"low"`, `"medium"`, and `"high"`; product `"max"` maps to OpenAI
 `"xhigh"`.
+
+Gemini lowering is model-specific. Gemini 2.5 models use `thinkingBudget`; Gemini 3 models use
+`thinkingLevel`. Unsupported thinking-off modes, such as `none` on Gemini Pro models, are rejected
+by catalog validation before a request reaches the provider adapter.
 
 OpenAI responses preserve `status`, `incomplete_details`, `provider_request_id`, and
 `usage.output_tokens_details.reasoning_tokens`. A `response.incomplete` result is returned
@@ -108,7 +126,8 @@ available:
 LLM_RUNTIME_LIVE=1 uv run pytest -v -m live_provider tests/live/test_provider_matrix.py
 ```
 
-By default it covers OpenAI, Anthropic, Gemini, OpenRouter, and Cloudflare.
+By default it covers every generation row in `DEFAULT_CATALOG`, every declared reasoning effort,
+OpenAI, Anthropic, Gemini, OpenRouter, Cloudflare, embeddings, and transcription.
 For focused diagnosis, set `LLM_RUNTIME_LIVE_PROVIDERS=openai,anthropic`.
 Required key env vars are `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
 `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and for Cloudflare both

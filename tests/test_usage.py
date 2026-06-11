@@ -116,6 +116,7 @@ def test_pricing_snapshot_preserves_provenance_and_decimal_rates() -> None:
         "cache_write_per_million_by_ttl": {"5m": "1.5"},
         "reasoning_per_million": None,
         "reasoning_billing_mode": "included_in_output",
+        "applies_up_to_input_tokens": None,
         "source_url": "https://example.invalid/pricing",
         "verified_at": "2026-06-11",
         "currency": "USD",
@@ -123,16 +124,37 @@ def test_pricing_snapshot_preserves_provenance_and_decimal_rates() -> None:
     }
 
 
-def test_default_catalog_does_not_guess_live_prices() -> None:
+def test_threshold_pricing_fails_closed_above_supported_context() -> None:
+    estimate = estimate_catalog_cost(
+        TokenUsage(input_tokens=2001, output_tokens=1, total_tokens=2002),
+        Pricing(
+            input_per_million=1,
+            output_per_million=2,
+            applies_up_to_input_tokens=2000,
+        ),
+    )
+
+    assert estimate.status == "missing_pricing"
+    assert estimate.breakdown.total_cost_usd_micros is None
+
+
+def test_default_catalog_prices_are_verified_or_missing() -> None:
     for capability in DEFAULT_CATALOG.entries:
-        assert (
-            estimate_catalog_cost(
-                TokenUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-                capability.pricing,
-            ).status
-            == "missing_pricing"
-        )
-        assert capability.pricing.to_json()["source_url"] is None
+        pricing_json = capability.pricing.to_json()
+        has_prices = any(
+            pricing_json[key] is not None
+            for key in (
+                "input_per_million",
+                "output_per_million",
+                "cached_input_per_million",
+                "reasoning_per_million",
+            )
+        ) or bool(pricing_json["cache_write_per_million_by_ttl"])
+        if has_prices:
+            assert pricing_json["source_url"]
+            assert pricing_json["verified_at"] == "2026-06-11"
+        else:
+            assert pricing_json["source_url"] is None
 
 
 def test_default_catalog_pricing_source_name_is_stable() -> None:

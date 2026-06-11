@@ -73,8 +73,25 @@ from provider_runtime.types import (
     ToolCall,
 )
 
+GEMINI_25_PRO = "gemini-2.5-pro"
+GEMINI_25_FLASH = "gemini-2.5-flash"
 GEMINI_31_PRO_PREVIEW = "gemini-3.1-pro-preview"
 GEMINI_3_FLASH_PREVIEW = "gemini-3-flash-preview"
+_GEMINI_25_PRO_BUDGET_BY_EFFORT = {
+    "minimal": 128,
+    "low": 1024,
+    "medium": 8192,
+    "high": 16384,
+    "max": 32768,
+}
+_GEMINI_25_FLASH_BUDGET_BY_EFFORT = {
+    "none": 0,
+    "minimal": 512,
+    "low": 1024,
+    "medium": 8192,
+    "high": 16384,
+    "max": 24576,
+}
 
 
 class GeminiClient:
@@ -297,48 +314,51 @@ class GeminiClient:
             mode = {"auto": "AUTO", "none": "NONE", "required": "ANY"}[req.tool_choice]
             body["toolConfig"] = {"functionCallingConfig": {"mode": mode}}
 
+        if req.model.model == GEMINI_25_PRO:
+            budget = req.reasoning.budget_tokens
+            if budget is None:
+                if req.reasoning.effort == "default":
+                    return body
+                budget = _GEMINI_25_PRO_BUDGET_BY_EFFORT.get(req.reasoning.effort)
+            if budget is None:
+                raise ValueError(f"Unknown reasoning_effort: {req.reasoning.effort}")
+            body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": budget}
+            return body
+
+        if req.model.model == GEMINI_25_FLASH:
+            budget = req.reasoning.budget_tokens
+            if budget is None:
+                if req.reasoning.effort == "default":
+                    return body
+                budget = _GEMINI_25_FLASH_BUDGET_BY_EFFORT.get(req.reasoning.effort)
+            if budget is None:
+                raise ValueError(f"Unknown reasoning_effort: {req.reasoning.effort}")
+            body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": budget}
+            return body
+
         if req.reasoning.effort == "default":
             return body
 
         if req.model.model == GEMINI_31_PRO_PREVIEW:
-            if req.reasoning.effort in ("none", "minimal", "low"):
-                body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}
-            elif req.reasoning.effort in ("medium", "high", "max"):
-                body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "high"}
+            if req.reasoning.effort in ("low", "medium"):
+                level = req.reasoning.effort
+            elif req.reasoning.effort in ("high", "max"):
+                level = "high"
             else:
                 raise ValueError(f"Unknown reasoning_effort: {req.reasoning.effort}")
+            body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": level}
             return body
 
         if req.model.model == GEMINI_3_FLASH_PREVIEW:
-            if req.reasoning.effort in ("none", "minimal"):
-                body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "minimal"}
-            elif req.reasoning.effort == "low":
-                body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}
-            elif req.reasoning.effort == "medium":
-                body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "medium"}
-            elif req.reasoning.effort in ("high", "max"):
-                body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "high"}
+            if req.reasoning.effort in ("minimal", "low", "medium", "high"):
+                level = req.reasoning.effort
+            elif req.reasoning.effort == "max":
+                level = "high"
             else:
                 raise ValueError(f"Unknown reasoning_effort: {req.reasoning.effort}")
+            body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": level}
             return body
 
-        if req.reasoning.effort == "none":
-            return body
-        if req.reasoning.effort == "minimal":
-            body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "minimal"}
-            return body
-        if req.reasoning.effort == "low":
-            body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}
-            return body
-        if req.reasoning.effort == "medium":
-            body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "medium"}
-            return body
-        if req.reasoning.effort == "high":
-            body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "high"}
-            return body
-        if req.reasoning.effort == "max":
-            body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "high"}
-            return body
         raise ValueError(f"Unknown reasoning_effort: {req.reasoning.effort}")
 
     def _turn_to_content(self, turn: ModelMessage, call_id_to_name: dict[str, str]) -> dict:

@@ -14,8 +14,11 @@ CF_KEY = ProviderApiKey("cf-test", source="test")
 
 
 def call(provider: str = "openai", *, retry: RetryPolicy | None = None) -> EmbeddingCall:
+    model = (
+        "@cf/qwen/qwen3-embedding-0.6b" if provider == "cloudflare" else "text-embedding-3-small"
+    )
     return EmbeddingCall(
-        model=ModelRef(provider=provider, model="text-embedding-3-small"),  # type: ignore[arg-type]
+        model=ModelRef(provider=provider, model=model),  # type: ignore[arg-type]
         inputs=["alpha", "beta"],
         dimensions=256,
         retry=retry or RetryPolicy(max_attempts=1),
@@ -150,7 +153,7 @@ async def test_runtime_rejects_unconfigured_embedding_provider() -> None:
         with pytest.raises(ModelCallError) as exc_info:
             await ModelRuntime(http).embed(
                 EmbeddingCall(
-                    model=ModelRef(provider="anthropic", model="claude-3-opus-20240229"),
+                    model=ModelRef(provider="anthropic", model="claude-opus-4-8"),
                     inputs=["x"],
                 ),
                 key=KEY,

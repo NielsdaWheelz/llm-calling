@@ -34,7 +34,7 @@ def load_text(name: str) -> str:
 
 def request() -> ModelCall:
     return ModelCall(
-        model=ModelRef(provider="anthropic", model="claude-3-opus-20240229"),
+        model=ModelRef(provider="anthropic", model="claude-opus-4-8"),
         messages=[
             ModelMessage(role="system", content="You are helpful."),
             ModelMessage(role="user", content="Hello!"),
@@ -118,7 +118,7 @@ async def test_system_turn_can_mark_prompt_cache_breakpoint() -> None:
         json=load_json("success_nonstream.json"),
     )
     req = ModelCall(
-        model=ModelRef(provider="anthropic", model="claude-3-opus-20240229"),
+        model=ModelRef(provider="anthropic", model="claude-opus-4-8"),
         messages=[
             ModelMessage(role="system", content="Stable.", cache_ttl="5m"),
             ModelMessage(role="system", content="Dynamic."),
@@ -148,7 +148,7 @@ async def test_user_turn_can_mark_prompt_cache_content_block() -> None:
         json=load_json("success_nonstream.json"),
     )
     req = ModelCall(
-        model=ModelRef(provider="anthropic", model="claude-3-opus-20240229"),
+        model=ModelRef(provider="anthropic", model="claude-opus-4-8"),
         messages=[
             ModelMessage(role="system", content="You are helpful."),
             ModelMessage(role="user", content="Stable context.", cache_ttl="1h"),
@@ -181,7 +181,7 @@ async def test_tool_turn_cache_ttl_marks_last_tool_result_block() -> None:
         json=load_json("success_nonstream.json"),
     )
     req = ModelCall(
-        model=ModelRef(provider="anthropic", model="claude-3-opus-20240229"),
+        model=ModelRef(provider="anthropic", model="claude-opus-4-8"),
         messages=[
             ModelMessage(role="user", content="Weather?"),
             ModelMessage(
@@ -241,7 +241,7 @@ async def test_structured_output_uses_forced_tool_and_parses_tool_input() -> Non
         json=response_json,
     )
     req = ModelCall(
-        model=ModelRef(provider="anthropic", model="claude-3-opus-20240229"),
+        model=ModelRef(provider="anthropic", model="claude-opus-4-8"),
         messages=[ModelMessage(role="user", content="Extract metadata.")],
         max_output_tokens=100,
         structured_output=StructuredOutputSpec(
@@ -268,7 +268,7 @@ async def test_structured_output_uses_forced_tool_and_parses_tool_input() -> Non
 
 async def test_structured_output_rejects_extended_thinking() -> None:
     req = ModelCall(
-        model=ModelRef(provider="anthropic", model="claude-3-opus-20240229"),
+        model=ModelRef(provider="anthropic", model="claude-opus-4-8"),
         messages=[ModelMessage(role="user", content="Extract metadata.")],
         max_output_tokens=100,
         reasoning=ReasoningConfig(effort="high"),
@@ -303,7 +303,7 @@ async def test_tool_use_in_nonstream_response_populates_tool_calls() -> None:
         json=response_json,
     )
     req = ModelCall(
-        model=ModelRef(provider="anthropic", model="claude-3-opus-20240229"),
+        model=ModelRef(provider="anthropic", model="claude-opus-4-8"),
         messages=[ModelMessage(role="user", content="Weather?")],
         max_output_tokens=100,
         tools=(
@@ -372,7 +372,7 @@ async def test_tool_use_nonstream_non_object_arguments_raise_typed_error() -> No
 async def test_tool_use_streaming_emits_tool_call_chunk() -> None:
     stream = (
         "event: message_start\n"
-        'data: {"type":"message_start","message":{"id":"msg_tools","type":"message","role":"assistant","content":[],"model":"claude-3-opus-20240229","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":0}}}\n'
+        'data: {"type":"message_start","message":{"id":"msg_tools","type":"message","role":"assistant","content":[],"model":"claude-opus-4-8","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":0}}}\n'
         "\n"
         "event: content_block_start\n"
         'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_xyz","name":"get_weather","input":{}}}\n'
@@ -399,7 +399,7 @@ async def test_tool_use_streaming_emits_tool_call_chunk() -> None:
         headers={"content-type": "text/event-stream"},
     )
     req = ModelCall(
-        model=ModelRef(provider="anthropic", model="claude-3-opus-20240229"),
+        model=ModelRef(provider="anthropic", model="claude-opus-4-8"),
         messages=[ModelMessage(role="user", content="Weather?")],
         max_output_tokens=100,
         tools=(
@@ -561,7 +561,7 @@ async def test_nonstream_thinking_blocks_exposed_as_provider_artifacts() -> None
     assert len(response.provider_artifacts) == 1
     artifact = response.provider_artifacts[0]
     assert artifact.provider == "anthropic"
-    assert artifact.model == "claude-3-opus-20240229"
+    assert artifact.model == "claude-opus-4-8"
     assert artifact.purpose == "thinking"
     assert artifact.to_provider_payload() == thinking
     assert response.text == "Answer."

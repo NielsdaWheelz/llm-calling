@@ -36,13 +36,18 @@ def _validate_generate_request(
     *,
     streaming: bool,
 ) -> None:
+    if not capabilities.generation:
+        raise _bad_request(capabilities, "generation is not supported")
     if streaming and not capabilities.streaming:
         raise _bad_request(capabilities, "streaming is not supported")
+    if call.max_output_tokens < 1:
+        raise _bad_request(capabilities, "max_output_tokens must be >= 1")
     if call.reasoning.effort not in capabilities.reasoning_modes:
         raise _bad_request(
             capabilities,
             f"reasoning effort {call.reasoning.effort!r} is not supported",
         )
+    _validate_reasoning_budget(call, capabilities)
     if capabilities.max_output_tokens is not None and (
         call.max_output_tokens > capabilities.max_output_tokens
     ):
@@ -67,6 +72,24 @@ def _validate_generate_request(
         and not capabilities.multimodal_input
     ):
         raise _bad_request(capabilities, "content parts are not supported")
+
+
+def _validate_reasoning_budget(call: ModelCall, capabilities: ModelCapability) -> None:
+    budget_tokens = call.reasoning.budget_tokens
+    if budget_tokens is None:
+        return
+    if budget_tokens == -1 and capabilities.reasoning_allows_dynamic_budget:
+        return
+    if budget_tokens in capabilities.reasoning_budget_tokens:
+        return
+    if capabilities.reasoning_budget_range is not None:
+        min_budget, max_budget = capabilities.reasoning_budget_range
+        if min_budget <= budget_tokens <= max_budget:
+            return
+    raise _bad_request(
+        capabilities,
+        f"reasoning budget {budget_tokens!r} is not supported",
+    )
 
 
 def _lower_prompt_cache(

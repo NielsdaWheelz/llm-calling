@@ -13,6 +13,7 @@ from provider_runtime.types import (
     ModelMessage,
     ModelRef,
     ProviderArtifact,
+    ReasoningConfig,
     StructuredOutputSpec,
     TextPart,
     ToolCall,
@@ -43,6 +44,7 @@ def request() -> ModelCall:
         ],
         max_output_tokens=100,
         temperature=0.7,
+        reasoning=ReasoningConfig(effort="default"),
     )
 
 
@@ -157,6 +159,7 @@ async def test_structured_output_uses_response_json_schema_and_parses_response()
         model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
         messages=[ModelMessage(role="user", content="Extract metadata.")],
         max_output_tokens=100,
+        reasoning=ReasoningConfig(effort="default"),
         structured_output=StructuredOutputSpec(
             name="metadata_enrichment",
             schema=metadata_schema(),
@@ -170,6 +173,63 @@ async def test_structured_output_uses_response_json_schema_and_parses_response()
     assert body["generationConfig"]["responseMimeType"] == "application/json"
     assert body["generationConfig"]["responseJsonSchema"] == metadata_schema()
     assert response.structured_output == {"title": "The Book", "language": "en"}
+
+
+@respx.mock
+async def test_gemini_25_reasoning_uses_thinking_budget() -> None:
+    route = respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+    ).respond(200, json=load_json("success_nonstream.json"))
+    req = ModelCall(
+        model=ModelRef(provider="gemini", model="gemini-2.5-flash"),
+        messages=[ModelMessage(role="user", content="Think briefly.")],
+        max_output_tokens=100,
+        reasoning=ReasoningConfig(effort="low"),
+    )
+
+    async with httpx.AsyncClient() as http:
+        await GeminiClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 1024}
+
+
+@respx.mock
+async def test_gemini_25_explicit_budget_overrides_effort_mapping() -> None:
+    route = respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+    ).respond(200, json=load_json("success_nonstream.json"))
+    req = ModelCall(
+        model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
+        messages=[ModelMessage(role="user", content="Think exactly this much.")],
+        max_output_tokens=100,
+        reasoning=ReasoningConfig(effort="default", budget_tokens=2048),
+    )
+
+    async with httpx.AsyncClient() as http:
+        await GeminiClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 2048}
+
+
+@respx.mock
+async def test_gemini_31_pro_reasoning_uses_thinking_level_without_off_mapping() -> None:
+    route = respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent"
+    ).respond(200, json=load_json("success_nonstream.json"))
+    req = ModelCall(
+        model=ModelRef(provider="gemini", model="gemini-3.1-pro-preview"),
+        messages=[ModelMessage(role="user", content="Think carefully.")],
+        max_output_tokens=100,
+        reasoning=ReasoningConfig(effort="max"),
+    )
+
+    async with httpx.AsyncClient() as http:
+        await GeminiClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "high"}
 
 
 @respx.mock
@@ -211,6 +271,7 @@ async def test_tool_call_nonstream_and_request_body() -> None:
             ),
         ],
         max_output_tokens=100,
+        reasoning=ReasoningConfig(effort="default"),
         tools=(
             ToolSpec(
                 name="get_weather",
@@ -344,6 +405,7 @@ async def test_thought_signature_and_call_id_captured_then_echoed_on_replay() ->
             ModelMessage(role="tool", tool_results=(ToolResult(call_id="fc-123", output="sunny"),)),
         ],
         max_output_tokens=100,
+        reasoning=ReasoningConfig(effort="default"),
         tools=(
             ToolSpec(
                 name="get_weather",

@@ -7,7 +7,7 @@ import respx
 
 from provider_runtime import ModelRuntime, ProviderApiKey, ProviderBaseUrls
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode
-from provider_runtime.types import ModelCall, ModelMessage, ModelRef, RetryPolicy
+from provider_runtime.types import ModelCall, ModelMessage, ModelRef, ReasoningConfig, RetryPolicy
 
 pytestmark = pytest.mark.asyncio
 
@@ -19,15 +19,16 @@ BAD_KEY = ProviderApiKey("bad-key", source="test")
 def request(provider: str, *, retry: RetryPolicy | None = None) -> ModelCall:
     model_name = {
         "openai": "gpt-5.4-mini",
-        "anthropic": "claude-3-opus-20240229",
+        "anthropic": "claude-opus-4-8",
         "gemini": "gemini-2.5-pro",
         "openrouter": "moonshotai/kimi-k2.6",
-        "cloudflare": "@cf/meta/llama-3.1-8b-instruct",
+        "cloudflare": "@cf/openai/gpt-oss-20b",
     }[provider]
     return ModelCall(
         model=ModelRef(provider=provider, model=model_name),  # type: ignore[arg-type]
         messages=[ModelMessage(role="user", content="Hello!")],
         max_output_tokens=100,
+        reasoning=ReasoningConfig(effort="default" if provider == "gemini" else "none"),
         retry=retry or RetryPolicy(max_attempts=1),
     )
 

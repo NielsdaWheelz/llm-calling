@@ -62,7 +62,7 @@ from provider_runtime.types import (
 )
 
 ANTHROPIC_API_VERSION = "2023-06-01"
-ANTHROPIC_ADAPTIVE_THINKING_MODELS = {"claude-opus-4-7", "claude-sonnet-4-6"}
+ANTHROPIC_ADAPTIVE_THINKING_MODELS = {"claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6"}
 
 
 class AnthropicClient:

@@ -65,7 +65,11 @@ def estimate_cost(
     Missing token counts or missing prices yield ``None`` for that component
     and for the total. Returned values are integer USD micros.
     """
-    if usage is None or pricing.unit != "per_million_tokens":
+    if (
+        usage is None
+        or pricing.unit != "per_million_tokens"
+        or not _pricing_applies_to_usage(usage, pricing)
+    ):
         return CostBreakdown(
             input_cost_usd_micros=None,
             output_cost_usd_micros=None,
@@ -135,6 +139,8 @@ def _cost_status(
         return "not_token_priced"
     if usage is None or not _has_any_usage_tokens(usage):
         return "missing_usage"
+    if not _pricing_applies_to_usage(usage, pricing):
+        return "missing_pricing"
     if _has_missing_pricing(usage, pricing, cache_write_ttl=cache_write_ttl):
         return "missing_pricing"
     return "estimated" if breakdown.total_cost_usd_micros is not None else "missing_pricing"
@@ -152,6 +158,12 @@ def _has_any_usage_tokens(usage: TokenUsage) -> bool:
             usage.cached_tokens,
         )
     )
+
+
+def _pricing_applies_to_usage(usage: TokenUsage, pricing: Pricing) -> bool:
+    if pricing.applies_up_to_input_tokens is None or usage.input_tokens is None:
+        return True
+    return usage.input_tokens <= pricing.applies_up_to_input_tokens
 
 
 def _has_missing_pricing(

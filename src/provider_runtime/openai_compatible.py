@@ -254,7 +254,6 @@ class OpenAICompatibleChatClient:
             }
 
         if self._provider == "openrouter":
-            body["cache_control"] = {"type": "ephemeral"}
             if req.reasoning.effort not in ("default", "none"):
                 effort = "high" if req.reasoning.effort == "max" else req.reasoning.effort
                 body["reasoning"] = {"effort": effort}

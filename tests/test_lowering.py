@@ -56,7 +56,7 @@ def test_unsupported_cache_intent_is_stripped_before_provider_io() -> None:
 
 def test_structured_output_unsupported_model_fails_before_provider_io() -> None:
     call = ModelCall(
-        model=ModelRef(provider="cloudflare", model="@cf/meta/llama-3.1-8b-instruct"),
+        model=ModelRef(provider="cloudflare", model="@cf/openai/gpt-oss-20b"),
         messages=[ModelMessage(role="user", content="json")],
         max_output_tokens=100,
         structured_output=StructuredOutputSpec(
@@ -73,7 +73,7 @@ def test_structured_output_unsupported_model_fails_before_provider_io() -> None:
     with pytest.raises(ModelCallError) as exc_info:
         lower_generate_request(
             call,
-            _cap("cloudflare", "@cf/meta/llama-3.1-8b-instruct"),
+            _cap("cloudflare", "@cf/openai/gpt-oss-20b"),
             streaming=False,
         )
 
@@ -83,7 +83,7 @@ def test_structured_output_unsupported_model_fails_before_provider_io() -> None:
 
 def test_reasoning_unsupported_model_fails_before_provider_io() -> None:
     call = ModelCall(
-        model=ModelRef(provider="cloudflare", model="@cf/meta/llama-3.1-8b-instruct"),
+        model=ModelRef(provider="cloudflare", model="@cf/openai/gpt-oss-20b"),
         messages=[ModelMessage(role="user", content="think")],
         max_output_tokens=100,
         reasoning=ReasoningConfig(effort="high"),
@@ -92,12 +92,67 @@ def test_reasoning_unsupported_model_fails_before_provider_io() -> None:
     with pytest.raises(ModelCallError) as exc_info:
         lower_generate_request(
             call,
-            _cap("cloudflare", "@cf/meta/llama-3.1-8b-instruct"),
+            _cap("cloudflare", "@cf/openai/gpt-oss-20b"),
             streaming=False,
         )
 
     assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
     assert "reasoning effort" in exc_info.value.message
+
+
+def test_generation_unsupported_model_fails_before_provider_io() -> None:
+    call = ModelCall(
+        model=ModelRef(provider="openai", model="text-embedding-3-small"),
+        messages=[ModelMessage(role="user", content="not an embedding call")],
+        max_output_tokens=1,
+    )
+
+    with pytest.raises(ModelCallError) as exc_info:
+        lower_generate_request(
+            call,
+            _cap("openai", "text-embedding-3-small"),
+            streaming=False,
+        )
+
+    assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
+    assert "generation is not supported" in exc_info.value.message
+
+
+def test_zero_generation_output_fails_before_provider_io() -> None:
+    call = ModelCall(
+        model=ModelRef(provider="openai", model="gpt-5.4-mini"),
+        messages=[ModelMessage(role="user", content="hello")],
+        max_output_tokens=0,
+    )
+
+    with pytest.raises(ModelCallError) as exc_info:
+        lower_generate_request(
+            call,
+            _cap("openai", "gpt-5.4-mini"),
+            streaming=False,
+        )
+
+    assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
+    assert "max_output_tokens" in exc_info.value.message
+
+
+def test_gemini_reasoning_budget_is_validated_before_provider_io() -> None:
+    call = ModelCall(
+        model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
+        messages=[ModelMessage(role="user", content="think")],
+        max_output_tokens=100,
+        reasoning=ReasoningConfig(effort="high", budget_tokens=0),
+    )
+
+    with pytest.raises(ModelCallError) as exc_info:
+        lower_generate_request(
+            call,
+            _cap("gemini", "gemini-2.5-pro"),
+            streaming=False,
+        )
+
+    assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
+    assert "reasoning budget" in exc_info.value.message
 
 
 def test_content_parts_unsupported_model_fails_before_provider_io() -> None:
