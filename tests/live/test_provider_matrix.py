@@ -59,9 +59,7 @@ _REASONING_ORDER: tuple[ReasoningEffort, ...] = (
     "none",
     "default",
 )
-_ANTHROPIC_ADAPTIVE_THINKING_MODELS = frozenset(
-    ("claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6")
-)
+_ANTHROPIC_ADAPTIVE_THINKING_MODELS = frozenset(("claude-opus-4-8", "claude-sonnet-4-6"))
 _ToolChoice = Literal["auto", "none", "required"]
 
 

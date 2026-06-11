@@ -431,7 +431,7 @@ async def test_tool_use_streaming_emits_tool_call_chunk() -> None:
 async def test_stream_thinking_blocks_yield_provider_artifact_chunks() -> None:
     stream = (
         "event: message_start\n"
-        'data: {"type":"message_start","message":{"id":"msg_think","type":"message","role":"assistant","content":[],"model":"claude-opus-4-7","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":0}}}\n'
+        'data: {"type":"message_start","message":{"id":"msg_think","type":"message","role":"assistant","content":[],"model":"claude-opus-4-8","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":0}}}\n'
         "\n"
         "event: content_block_start\n"
         'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}\n'
@@ -502,18 +502,18 @@ async def test_assistant_provider_artifacts_lead_replayed_content() -> None:
     redacted = {"type": "redacted_thinking", "data": "opaque-bytes"}
     thinking_artifact = ProviderArtifact(
         provider="anthropic",
-        model="claude-opus-4-7",
+        model="claude-opus-4-8",
         purpose="thinking",
         payload=thinking,
     )
     redacted_artifact = ProviderArtifact(
         provider="anthropic",
-        model="claude-opus-4-7",
+        model="claude-opus-4-8",
         purpose="thinking",
         payload=redacted,
     )
     req = ModelCall(
-        model=ModelRef(provider="anthropic", model="claude-opus-4-7"),
+        model=ModelRef(provider="anthropic", model="claude-opus-4-8"),
         messages=[
             ModelMessage(role="user", content="Weather?"),
             ModelMessage(
