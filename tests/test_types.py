@@ -5,6 +5,7 @@ from provider_runtime.types import (
     ModelChunk,
     ModelMessage,
     ModelResponse,
+    ProviderArtifact,
     TextPart,
     TokenUsage,
     ToolCall,
@@ -36,18 +37,30 @@ def test_non_terminal_chunk_cannot_include_incomplete_details() -> None:
 
 
 def test_non_terminal_chunk_may_carry_provider_artifact() -> None:
-    chunk = ModelChunk(provider_artifact={"type": "reasoning", "id": "rs_1"}, done=False)
+    artifact = ProviderArtifact(
+        provider="openai",
+        model="gpt-5.4-mini",
+        purpose="reasoning",
+        payload={"type": "reasoning", "id": "rs_1"},
+    )
+    chunk = ModelChunk(provider_artifact=artifact, done=False)
 
-    assert chunk.provider_artifact == {"type": "reasoning", "id": "rs_1"}
+    assert chunk.provider_artifact == artifact
+    assert artifact.to_provider_payload() == {"type": "reasoning", "id": "rs_1"}
 
 
 def test_provider_artifacts_are_excluded_from_dataclass_repr() -> None:
-    artifact = {
-        "type": "reasoning",
-        "encrypted_content": "opaque-provider-secret",
-        "signature": "sig-secret",
-        "thinking": "private thought",
-    }
+    artifact = ProviderArtifact(
+        provider="openai",
+        model="gpt-5.4-mini",
+        purpose="reasoning",
+        payload={
+            "type": "reasoning",
+            "encrypted_content": "opaque-provider-secret",
+            "signature": "sig-secret",
+            "thinking": "private thought",
+        },
+    )
 
     message = ModelMessage(role="assistant", provider_artifacts=(artifact,))
     response = ModelResponse(

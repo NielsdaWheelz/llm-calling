@@ -11,6 +11,7 @@ from provider_runtime.types import (
     ModelCall,
     ModelMessage,
     ModelRef,
+    ProviderArtifact,
     ReasoningConfig,
     StructuredOutputSpec,
     ToolCall,
@@ -400,7 +401,7 @@ async def test_stream_thinking_blocks_yield_provider_artifact_chunks() -> None:
     item_chunks = [
         chunk.provider_artifact for chunk in chunks if chunk.provider_artifact is not None
     ]
-    assert item_chunks == [
+    assert [artifact.to_provider_payload() for artifact in item_chunks] == [
         {"type": "thinking", "thinking": "Let me think.", "signature": "sig-abc"},
         {"type": "redacted_thinking", "data": "opaque-bytes"},
     ]
@@ -416,6 +417,18 @@ async def test_assistant_provider_artifacts_lead_replayed_content() -> None:
     )
     thinking = {"type": "thinking", "thinking": "Plan.", "signature": "sig-abc"}
     redacted = {"type": "redacted_thinking", "data": "opaque-bytes"}
+    thinking_artifact = ProviderArtifact(
+        provider="anthropic",
+        model="claude-opus-4-7",
+        purpose="thinking",
+        payload=thinking,
+    )
+    redacted_artifact = ProviderArtifact(
+        provider="anthropic",
+        model="claude-opus-4-7",
+        purpose="thinking",
+        payload=redacted,
+    )
     req = ModelCall(
         model=ModelRef(provider="anthropic", model="claude-opus-4-7"),
         messages=[
@@ -424,7 +437,7 @@ async def test_assistant_provider_artifacts_lead_replayed_content() -> None:
                 role="assistant",
                 content="Checking.",
                 tool_calls=(ToolCall(id="toolu_1", name="get_weather", arguments={"city": "SF"}),),
-                provider_artifacts=(thinking, redacted),
+                provider_artifacts=(thinking_artifact, redacted_artifact),
             ),
             ModelMessage(
                 role="tool", tool_results=(ToolResult(call_id="toolu_1", output="sunny"),)
@@ -462,7 +475,12 @@ async def test_nonstream_thinking_blocks_exposed_as_provider_artifacts() -> None
     async with httpx.AsyncClient() as http:
         response = await AnthropicClient(http).generate(request(), api_key="sk-test", timeout_s=30)
 
-    assert response.provider_artifacts == (thinking,)
+    assert len(response.provider_artifacts) == 1
+    artifact = response.provider_artifacts[0]
+    assert artifact.provider == "anthropic"
+    assert artifact.model == "claude-3-opus-20240229"
+    assert artifact.purpose == "thinking"
+    assert artifact.to_provider_payload() == thinking
     assert response.text == "Answer."
 
 

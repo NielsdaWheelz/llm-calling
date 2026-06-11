@@ -56,6 +56,7 @@ from provider_runtime.types import (
     ModelChunk,
     ModelMessage,
     ModelResponse,
+    ProviderArtifact,
     TokenUsage,
     ToolCall,
 )
@@ -89,7 +90,7 @@ class AnthropicClient:
         await raise_for_provider_error(response, "anthropic")
 
         data = response.json()
-        return self._parse_response(data)
+        return self._parse_response(data, model=req.model.model)
 
     async def generate_stream(
         self,
@@ -225,7 +226,16 @@ class AnthropicClient:
                         )
                     elif isinstance(index, int) and index in thinking_blocks:
                         # One complete thinking/redacted_thinking block, verbatim.
-                        yield ModelChunk(provider_artifact=thinking_blocks.pop(index), done=False)
+                        block = thinking_blocks.pop(index)
+                        yield ModelChunk(
+                            provider_artifact=ProviderArtifact(
+                                provider="anthropic",
+                                model=req.model.model,
+                                purpose="thinking",
+                                payload=block,
+                            ),
+                            done=False,
+                        )
                     continue
 
                 # Handle message_delta - extract usage at end
@@ -413,7 +423,9 @@ class AnthropicClient:
             }
         if turn.role == "assistant" and (turn.tool_calls or turn.provider_artifacts):
             # Thinking blocks must lead the assistant turn, unmodified, before tool_use.
-            content: list[dict[str, object]] = [dict(item) for item in turn.provider_artifacts]
+            content: list[dict[str, object]] = [
+                item.to_provider_payload() for item in turn.provider_artifacts
+            ]
             if turn.content:
                 content.append({"type": "text", "text": turn.content})
             for call in turn.tool_calls:
@@ -431,19 +443,26 @@ class AnthropicClient:
             "content": turn.content,
         }
 
-    def _parse_response(self, data: dict) -> ModelResponse:
+    def _parse_response(self, data: dict, *, model: str) -> ModelResponse:
         """Parse non-streaming response."""
         # Extract text from content blocks
         content_blocks = data.get("content", [])
         text_parts = []
         structured_output = None
         tool_calls: list[ToolCall] = []
-        provider_artifacts: list[dict[str, object]] = []
+        provider_artifacts: list[ProviderArtifact] = []
         for block in content_blocks:
             if block.get("type") == "text":
                 text_parts.append(block.get("text", ""))
             elif block.get("type") in ("thinking", "redacted_thinking"):
-                provider_artifacts.append(block)
+                provider_artifacts.append(
+                    ProviderArtifact(
+                        provider="anthropic",
+                        model=model,
+                        purpose="thinking",
+                        payload=dict(block),
+                    )
+                )
             elif block.get("type") == "tool_use":
                 arguments = parse_tool_arguments(
                     block.get("input"),

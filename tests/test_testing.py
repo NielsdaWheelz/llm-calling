@@ -51,9 +51,7 @@ async def test_scripted_runtime_returns_queued_generate_response_and_records_cal
 
 
 async def test_scripted_runtime_returns_queued_stream_chunks() -> None:
-    runtime = ScriptedRuntime(
-        stream_chunks=((ModelChunk(delta_text="a"), ModelChunk(done=True)),)
-    )
+    runtime = ScriptedRuntime(stream_chunks=((ModelChunk(delta_text="a"), ModelChunk(done=True)),))
 
     chunks = [chunk async for chunk in runtime.stream(_call(), key="sk-test")]
 
@@ -82,7 +80,9 @@ async def test_scripted_runtime_returns_queued_embeddings_and_key_probe() -> Non
     )
 
     embedding = await runtime.embed(
-        EmbeddingCall(model=ModelRef(provider="openai", model="text-embedding-3-small"), inputs=["x"]),
+        EmbeddingCall(
+            model=ModelRef(provider="openai", model="text-embedding-3-small"), inputs=["x"]
+        ),
         key="sk-test",
     )
     probe = await runtime.probe_key(provider="openai", key="sk-test")

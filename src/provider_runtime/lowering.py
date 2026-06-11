@@ -52,7 +52,9 @@ def _validate_generate_request(
         )
     if call.structured_output is not None:
         supported = (
-            capabilities.structured_output_streaming if streaming else capabilities.structured_output
+            capabilities.structured_output_streaming
+            if streaming
+            else capabilities.structured_output
         )
         if not supported:
             raise _bad_request(capabilities, "structured output is not supported")
@@ -60,6 +62,11 @@ def _validate_generate_request(
         raise _bad_request(capabilities, "tool calling is not supported")
     if call.tool_choice == "required" and not capabilities.tool_choice_required:
         raise _bad_request(capabilities, "required tool choice is not supported")
+    if (
+        any(message.content_parts for message in call.messages)
+        and not capabilities.multimodal_input
+    ):
+        raise _bad_request(capabilities, "content parts are not supported")
 
 
 def _lower_prompt_cache(
@@ -68,16 +75,16 @@ def _lower_prompt_cache(
 ) -> GenerateRequestPlan:
     cacheable_turns = [turn for turn in call.messages if turn.cache_ttl != "none"]
     if not cacheable_turns:
-        if call.prompt_cache_key is None:
-            return GenerateRequestPlan(call)
-        return GenerateRequestPlan(replace(call, prompt_cache_key=None), stripped_cache=True)
+        return GenerateRequestPlan(_with_prompt_cache_key(call, None))
 
     if not capabilities.prompt_cache.supported:
         return GenerateRequestPlan(
-            replace(
-                call,
-                messages=[_without_cache_ttl(turn) for turn in call.messages],
-                prompt_cache_key=None,
+            _with_prompt_cache_key(
+                replace(
+                    call,
+                    messages=[_without_cache_ttl(turn) for turn in call.messages],
+                ),
+                None,
             ),
             stripped_cache=True,
         )
@@ -91,26 +98,34 @@ def _lower_prompt_cache(
     ]
     if not any(turn.cache_ttl != "none" for turn in lowered_messages):
         return GenerateRequestPlan(
-            replace(call, messages=lowered_messages, prompt_cache_key=None),
+            _with_prompt_cache_key(
+                replace(call, messages=lowered_messages),
+                None,
+            ),
             stripped_cache=True,
         )
 
     if capabilities.prompt_cache.requires_key:
-        if call.prompt_cache_key is not None:
-            return GenerateRequestPlan(replace(call, messages=lowered_messages))
         return GenerateRequestPlan(
-            replace(
-                call,
-                messages=lowered_messages,
-                prompt_cache_key=_derive_prompt_cache_key(call, capabilities, lowered_messages),
+            _with_prompt_cache_key(
+                replace(call, messages=lowered_messages),
+                _derive_prompt_cache_key(call, capabilities, lowered_messages),
             ),
             derived_prompt_cache_key=True,
         )
 
     return GenerateRequestPlan(
-        replace(call, messages=lowered_messages, prompt_cache_key=None),
-        stripped_cache=call.prompt_cache_key is not None,
+        _with_prompt_cache_key(
+            replace(call, messages=lowered_messages),
+            None,
+        )
     )
+
+
+def _with_prompt_cache_key(call: ModelCall, prompt_cache_key: str | None) -> ModelCall:
+    lowered = replace(call)
+    object.__setattr__(lowered, "prompt_cache_key", prompt_cache_key)
+    return lowered
 
 
 def _without_cache_ttl(turn: ModelMessage) -> ModelMessage:

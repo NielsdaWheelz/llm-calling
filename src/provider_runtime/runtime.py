@@ -168,7 +168,9 @@ class ModelRuntime(_AdapterRuntime):
         *,
         streaming: bool,
     ) -> ModelCapability:
-        return self._require_capabilities(call.model, operation="stream" if streaming else "generate")
+        return self._require_capabilities(
+            call.model, operation="stream" if streaming else "generate"
+        )
 
     def _require_embedding_capabilities(self, call: EmbeddingCall) -> ModelCapability:
         return self._require_capabilities(call.model, operation="embed")

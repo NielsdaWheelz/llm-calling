@@ -95,7 +95,9 @@ class ModelCatalog:
     def require_capabilities(self, model: ModelRef) -> ModelCapability:
         capability = self.capabilities(model)
         if capability is None:
-            raise KeyError(f"Unknown model capability: {model.route or model.provider}/{model.model}")
+            raise KeyError(
+                f"Unknown model capability: {model.route or model.provider}/{model.model}"
+            )
         return capability
 
     def key_probe_model(self, provider: ProviderName) -> str | None:

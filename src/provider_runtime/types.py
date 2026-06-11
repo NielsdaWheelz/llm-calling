@@ -9,9 +9,22 @@ ProviderName = Literal["openai", "anthropic", "gemini", "openrouter", "cloudflar
 PromptCacheTTL = Literal["none", "5m", "1h"]
 ToolChoice = Literal["auto", "none", "required"]
 
-# Verbatim provider payload fragment. Opaque: captured from responses and
-# replayed unmodified on continuation requests, never interpreted.
-ProviderArtifact = Mapping[str, object]
+ProviderArtifactPurpose = Literal["reasoning", "thinking", "signature", "provider_item"]
+ProviderArtifactRetention = Literal["ephemeral", "durable"]
+
+
+@dataclass(frozen=True)
+class ProviderArtifact:
+    """Opaque provider replay payload with explicit classification metadata."""
+
+    provider: ProviderName
+    model: str
+    purpose: ProviderArtifactPurpose
+    payload: Mapping[str, object] = field(repr=False)
+    retention: ProviderArtifactRetention = "ephemeral"
+
+    def to_provider_payload(self) -> dict[str, object]:
+        return dict(self.payload)
 
 
 @dataclass(frozen=True)
@@ -71,7 +84,7 @@ class ToolCall:
     name: str
     arguments: dict[str, object]
     argument_status: Literal["valid", "repaired"] = "valid"
-    provider_metadata: Mapping[str, object] | None = field(default=None, repr=False)
+    provider_metadata: dict[str, object] | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -118,7 +131,7 @@ class ModelCall:
     max_output_tokens: int
     temperature: float | None = None
     reasoning: ReasoningConfig = field(default_factory=ReasoningConfig)
-    prompt_cache_key: str | None = None
+    prompt_cache_key: str | None = field(default=None, init=False, repr=False, compare=False)
     structured_output: StructuredOutputSpec | None = None
     tools: tuple[ToolSpec, ...] = ()
     tool_choice: ToolChoice = "auto"

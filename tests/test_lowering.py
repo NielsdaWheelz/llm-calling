@@ -9,6 +9,7 @@ from provider_runtime import (
     ModelRef,
     ReasoningConfig,
     StructuredOutputSpec,
+    TextPart,
     lower_generate_request,
 )
 
@@ -40,7 +41,6 @@ def test_unsupported_cache_intent_is_stripped_before_provider_io() -> None:
         model=ModelRef(provider="openrouter", model="moonshotai/kimi-k2.6"),
         messages=[ModelMessage(role="user", content="cache me", cache_ttl="1h")],
         max_output_tokens=100,
-        prompt_cache_key="stale-key",
     )
 
     plan = lower_generate_request(
@@ -98,3 +98,21 @@ def test_reasoning_unsupported_model_fails_before_provider_io() -> None:
 
     assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
     assert "reasoning effort" in exc_info.value.message
+
+
+def test_content_parts_unsupported_model_fails_before_provider_io() -> None:
+    call = ModelCall(
+        model=ModelRef(provider="openai", model="gpt-5.4-mini"),
+        messages=[ModelMessage(role="user", content_parts=(TextPart(text="hello"),))],
+        max_output_tokens=100,
+    )
+
+    with pytest.raises(ModelCallError) as exc_info:
+        lower_generate_request(
+            call,
+            _cap("openai", "gpt-5.4-mini"),
+            streaming=False,
+        )
+
+    assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
+    assert "content parts" in exc_info.value.message

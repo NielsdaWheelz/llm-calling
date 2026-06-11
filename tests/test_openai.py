@@ -5,12 +5,14 @@ import httpx
 import pytest
 import respx
 
+from provider_runtime import DEFAULT_CATALOG, lower_generate_request
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode
 from provider_runtime.openai import OpenAIClient
 from provider_runtime.types import (
     ModelCall,
     ModelMessage,
     ModelRef,
+    ProviderArtifact,
     ReasoningConfig,
     ReasoningEffort,
     StructuredOutputSpec,
@@ -136,14 +138,18 @@ async def test_payload_includes_prompt_cache_key() -> None:
             ModelMessage(role="user", content="Hello!"),
         ],
         max_output_tokens=100,
-        prompt_cache_key="scope:abc123",
+    )
+    plan = lower_generate_request(
+        req,
+        DEFAULT_CATALOG.require_capabilities(req.model),
+        streaming=False,
     )
 
     async with httpx.AsyncClient() as http:
-        await OpenAIClient(http).generate(req, api_key="sk-test", timeout_s=30)
+        await OpenAIClient(http).generate(plan.call, api_key="sk-test", timeout_s=30)
 
     body = json.loads(route.calls.last.request.content)
-    assert body["prompt_cache_key"] == "scope:abc123"
+    assert body["prompt_cache_key"].startswith("pr-")
 
 
 @respx.mock
@@ -370,6 +376,12 @@ async def test_reasoning_item_replayed_before_function_call() -> None:
         "summary": [],
         "encrypted_content": "gAAAA-opaque",
     }
+    artifact = ProviderArtifact(
+        provider="openai",
+        model="gpt-5.4-mini",
+        purpose="reasoning",
+        payload=reasoning_item,
+    )
     req = ModelCall(
         model=ModelRef(provider="openai", model="gpt-5.4-mini"),
         messages=[
@@ -384,7 +396,7 @@ async def test_reasoning_item_replayed_before_function_call() -> None:
                         provider_metadata={"id": "fc_1"},
                     ),
                 ),
-                provider_artifacts=(reasoning_item,),
+                provider_artifacts=(artifact,),
             ),
             ModelMessage(
                 role="tool", tool_results=(ToolResult(call_id="call_abc", output="sunny"),)
@@ -439,7 +451,12 @@ async def test_nonstream_reasoning_items_exposed_on_response() -> None:
             request("high"), api_key="sk-test", timeout_s=30
         )
 
-    assert response.provider_artifacts == (reasoning_item,)
+    assert len(response.provider_artifacts) == 1
+    artifact = response.provider_artifacts[0]
+    assert artifact.provider == "openai"
+    assert artifact.model == "gpt-5.4-mini"
+    assert artifact.purpose == "reasoning"
+    assert artifact.to_provider_payload() == reasoning_item
     assert response.tool_calls == (
         ToolCall(
             id="call_abc",
@@ -473,8 +490,10 @@ async def test_stream_reasoning_item_yields_provider_artifact_chunk() -> None:
             )
         ]
 
-    item_chunks = [chunk for chunk in chunks if chunk.provider_artifact is not None]
-    assert [chunk.provider_artifact for chunk in item_chunks] == [
+    provider_artifacts = [
+        chunk.provider_artifact for chunk in chunks if chunk.provider_artifact is not None
+    ]
+    assert [artifact.to_provider_payload() for artifact in provider_artifacts] == [
         {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "gAAAA-opaque"}
     ]
     tool_chunks = [chunk for chunk in chunks if chunk.tool_call is not None]

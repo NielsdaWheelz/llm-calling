@@ -74,7 +74,8 @@ async def raise_for_provider_error(response: httpx.Response, provider: str) -> N
         provider=provider,
         status_code=response.status_code,
         retry_after_seconds=_retry_after_seconds(response.headers.get("retry-after")),
-        provider_request_id=response.headers.get("x-request-id") or response.headers.get("request-id"),
+        provider_request_id=response.headers.get("x-request-id")
+        or response.headers.get("request-id"),
     )
 
 

@@ -35,7 +35,14 @@ import httpx
 from provider_runtime.endpoints import OPENAI_BASE_URL
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode, raise_for_provider_error
 from provider_runtime.tool_arguments import parse_tool_arguments
-from provider_runtime.types import ModelCall, ModelChunk, ModelResponse, TokenUsage, ToolCall
+from provider_runtime.types import (
+    ModelCall,
+    ModelChunk,
+    ModelResponse,
+    ProviderArtifact,
+    TokenUsage,
+    ToolCall,
+)
 
 OPENAI_RESPONSES_URL = f"{OPENAI_BASE_URL}/responses"
 
@@ -64,7 +71,12 @@ class OpenAIClient:
         await raise_for_provider_error(response, "openai")
 
         data = response.json()
-        return self._parse_response(data, response.headers, structured=bool(req.structured_output))
+        return self._parse_response(
+            data,
+            response.headers,
+            structured=bool(req.structured_output),
+            model=req.model.model,
+        )
 
     async def generate_stream(
         self,
@@ -147,7 +159,15 @@ class OpenAIClient:
                     item = data.get("item") or {}
                     if item.get("type") == "reasoning":
                         # Full reasoning item (incl. id and encrypted_content), verbatim.
-                        yield ModelChunk(provider_artifact=item, done=False)
+                        yield ModelChunk(
+                            provider_artifact=ProviderArtifact(
+                                provider="openai",
+                                model=req.model.model,
+                                purpose="reasoning",
+                                payload=dict(item),
+                            ),
+                            done=False,
+                        )
                     elif item.get("type") == "function_call":
                         item_id = data.get("item_id") or item.get("id") or ""
                         acc = tool_call_items.pop(item_id, None)
@@ -242,7 +262,7 @@ class OpenAIClient:
                 # Replay captured reasoning items verbatim, in emission order: they must
                 # precede the message/function_call items they originally preceded.
                 for item in turn.provider_artifacts:
-                    input_items.append(dict(item))
+                    input_items.append(item.to_provider_payload())
             if turn.content or not turn.tool_calls:
                 content_type = "output_text" if turn.role == "assistant" else "input_text"
                 input_items.append(
@@ -323,11 +343,16 @@ class OpenAIClient:
         return body
 
     def _parse_response(
-        self, data: dict, headers: httpx.Headers, *, structured: bool
+        self,
+        data: dict,
+        headers: httpx.Headers,
+        *,
+        structured: bool,
+        model: str,
     ) -> ModelResponse:
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
-        provider_artifacts: list[dict[str, object]] = []
+        provider_artifacts: list[ProviderArtifact] = []
         for item in data.get("output", []):
             item_type = item.get("type")
             if item_type == "message":
@@ -335,7 +360,14 @@ class OpenAIClient:
                     if content_item.get("type") == "output_text":
                         text_parts.append(content_item.get("text", ""))
             elif item_type == "reasoning":
-                provider_artifacts.append(item)
+                provider_artifacts.append(
+                    ProviderArtifact(
+                        provider="openai",
+                        model=model,
+                        purpose="reasoning",
+                        payload=dict(item),
+                    )
+                )
             elif item_type == "function_call":
                 args_str = item.get("arguments") or ""
                 parsed_args = parse_tool_arguments(

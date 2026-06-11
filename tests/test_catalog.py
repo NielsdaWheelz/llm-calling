@@ -4,9 +4,7 @@ from provider_runtime import DEFAULT_CATALOG, ModelRef
 
 
 def test_catalog_returns_per_model_capabilities() -> None:
-    openai = DEFAULT_CATALOG.require_capabilities(
-        ModelRef(provider="openai", model="gpt-5.5")
-    )
+    openai = DEFAULT_CATALOG.require_capabilities(ModelRef(provider="openai", model="gpt-5.5"))
     cloudflare = DEFAULT_CATALOG.require_capabilities(
         ModelRef(provider="cloudflare", model="@cf/meta/llama-3.1-8b-instruct")
     )

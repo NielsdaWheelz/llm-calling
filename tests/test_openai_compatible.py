@@ -119,7 +119,6 @@ async def test_openrouter_cache_intent_is_stripped() -> None:
         model=ModelRef(provider="openrouter", model="moonshotai/kimi-k2.6"),
         messages=[ModelMessage(role="system", content="Stable.", cache_ttl="5m")],
         max_output_tokens=100,
-        prompt_cache_key="cache-key",
     )
 
     async with httpx.AsyncClient() as http:
