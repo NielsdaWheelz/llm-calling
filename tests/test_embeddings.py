@@ -2,12 +2,15 @@ import httpx
 import pytest
 import respx
 
-from provider_runtime import ModelRuntime, ProviderBaseUrls
+from provider_runtime import ModelRuntime, ProviderApiKey, ProviderBaseUrls
 from provider_runtime.embeddings import EmbeddingsClient
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode
 from provider_runtime.types import EmbeddingCall, ModelRef, RetryPolicy
 
 pytestmark = pytest.mark.asyncio
+
+KEY = ProviderApiKey("sk-test", source="test")
+CF_KEY = ProviderApiKey("cf-test", source="test")
 
 
 def call(provider: str = "openai", *, retry: RetryPolicy | None = None) -> EmbeddingCall:
@@ -64,7 +67,7 @@ async def test_runtime_embeds_with_cloudflare_base_url() -> None:
 
     async with httpx.AsyncClient() as http:
         response = await ModelRuntime(http, cloudflare_base_url="https://cloudflare.test/v1").embed(
-            call("cloudflare"), key="cf-test"
+            call("cloudflare"), key=CF_KEY
         )
 
     assert response.embeddings == [[0.1, 0.2], [0.3, 0.4]]
@@ -87,7 +90,7 @@ async def test_runtime_embeds_with_openai_base_url() -> None:
         response = await ModelRuntime(
             http,
             base_urls=ProviderBaseUrls(openai="https://openai-proxy.test/v1"),
-        ).embed(call(), key="sk-test")
+        ).embed(call(), key=KEY)
 
     assert route.called
     assert response.embeddings == [[0.1, 0.2], [0.3, 0.4]]
@@ -114,11 +117,14 @@ async def test_runtime_retries_retryable_embedding_errors_before_success() -> No
     async with httpx.AsyncClient() as http:
         response = await ModelRuntime(http).embed(
             call(retry=RetryPolicy(max_attempts=2, initial_delay_s=0)),
-            key="sk-test",
+            key=KEY,
         )
 
     assert route.call_count == 2
     assert response.embeddings == [[0.1, 0.2], [0.3, 0.4]]
+    assert [attempt.status for attempt in response.attempts] == ["retryable_error", "success"]
+    assert response.attempts[0].error_code == ModelCallErrorCode.PROVIDER_DOWN.value
+    assert response.retry_count == 1
 
 
 async def test_runtime_rejects_unconfigured_embedding_provider() -> None:
@@ -129,7 +135,7 @@ async def test_runtime_rejects_unconfigured_embedding_provider() -> None:
                     model=ModelRef(provider="anthropic", model="claude-3-opus-20240229"),
                     inputs=["x"],
                 ),
-                key="sk-test",
+                key=KEY,
             )
 
     assert exc_info.value.error_code == ModelCallErrorCode.MODEL_NOT_AVAILABLE

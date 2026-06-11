@@ -17,6 +17,7 @@ from provider_runtime.types import (
     ModelChunk,
     ModelRef,
     ModelResponse,
+    ProviderApiKey,
     ProviderName,
 )
 
@@ -27,8 +28,8 @@ RuntimeOperation = Literal["generate", "stream", "embed", "probe_key"]
 class CapturedRuntimeCall:
     operation: RuntimeOperation
     call: ModelCall | EmbeddingCall | None
-    key: str
-    timeout_s: int
+    key: ProviderApiKey
+    timeout_s: float
     provider: ProviderName | None = None
 
 
@@ -48,8 +49,8 @@ class NoNetworkRuntime:
         self,
         call: ModelCall,
         *,
-        key: str,
-        timeout_s: int = 45,
+        key: ProviderApiKey,
+        timeout_s: float = 45,
     ) -> ModelResponse:
         raise AssertionError(_unexpected_network_message("generate", call.model))
 
@@ -57,8 +58,8 @@ class NoNetworkRuntime:
         self,
         call: ModelCall,
         *,
-        key: str,
-        timeout_s: int = 45,
+        key: ProviderApiKey,
+        timeout_s: float = 45,
     ) -> AsyncIterator[ModelChunk]:
         raise AssertionError(_unexpected_network_message("stream", call.model))
         yield ModelChunk(done=True)
@@ -67,8 +68,8 @@ class NoNetworkRuntime:
         self,
         call: EmbeddingCall,
         *,
-        key: str,
-        timeout_s: int = 45,
+        key: ProviderApiKey,
+        timeout_s: float = 45,
     ) -> EmbeddingResponse:
         raise AssertionError(_unexpected_network_message("embed", call.model))
 
@@ -76,8 +77,8 @@ class NoNetworkRuntime:
         self,
         *,
         provider: ProviderName,
-        key: str,
-        timeout_s: int = 45,
+        key: ProviderApiKey,
+        timeout_s: float = 45,
     ) -> KeyProbeResult:
         raise AssertionError(f"Unexpected provider key probe in test: {provider}")
 
@@ -105,8 +106,8 @@ class ScriptedRuntime(NoNetworkRuntime):
         self,
         call: ModelCall,
         *,
-        key: str,
-        timeout_s: int = 45,
+        key: ProviderApiKey,
+        timeout_s: float = 45,
     ) -> ModelResponse:
         self.calls.append(CapturedRuntimeCall("generate", call, key, timeout_s))
         return self._pop(self._generate_responses, "generate")
@@ -115,8 +116,8 @@ class ScriptedRuntime(NoNetworkRuntime):
         self,
         call: ModelCall,
         *,
-        key: str,
-        timeout_s: int = 45,
+        key: ProviderApiKey,
+        timeout_s: float = 45,
     ) -> AsyncIterator[ModelChunk]:
         self.calls.append(CapturedRuntimeCall("stream", call, key, timeout_s))
         for chunk in self._pop(self._stream_chunks, "stream"):
@@ -126,8 +127,8 @@ class ScriptedRuntime(NoNetworkRuntime):
         self,
         call: EmbeddingCall,
         *,
-        key: str,
-        timeout_s: int = 45,
+        key: ProviderApiKey,
+        timeout_s: float = 45,
     ) -> EmbeddingResponse:
         self.calls.append(CapturedRuntimeCall("embed", call, key, timeout_s))
         return self._pop(self._embed_responses, "embed")
@@ -136,8 +137,8 @@ class ScriptedRuntime(NoNetworkRuntime):
         self,
         *,
         provider: ProviderName,
-        key: str,
-        timeout_s: int = 45,
+        key: ProviderApiKey,
+        timeout_s: float = 45,
     ) -> KeyProbeResult:
         self.calls.append(CapturedRuntimeCall("probe_key", None, key, timeout_s, provider))
         return self._pop(self._probe_results, "probe_key")

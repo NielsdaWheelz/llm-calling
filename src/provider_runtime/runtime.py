@@ -23,6 +23,7 @@ from provider_runtime.types import (
     ModelMessage,
     ModelRef,
     ModelResponse,
+    ProviderApiKey,
     ProviderName,
     ReasoningConfig,
     RetryPolicy,
@@ -87,8 +88,8 @@ class ModelRuntime(_AdapterRuntime):
         self,
         *,
         provider: ProviderName,
-        key: str,
-        timeout_s: int = DEFAULT_TIMEOUT_S,
+        key: ProviderApiKey,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
     ) -> KeyProbeResult:
         model = self._catalog.key_probe_model(provider)
         if model is None:
@@ -114,20 +115,22 @@ class ModelRuntime(_AdapterRuntime):
                 ok=False,
                 error_code=exc.error_code.value,
                 provider_request_id=exc.provider_request_id,
+                attempts=exc.attempts,
             )
         return KeyProbeResult(
             provider=provider,
             model=model,
             ok=True,
             provider_request_id=response.provider_request_id,
+            attempts=response.attempts,
         )
 
     async def generate(
         self,
         call: ModelCall,
         *,
-        key: str,
-        timeout_s: int = DEFAULT_TIMEOUT_S,
+        key: ProviderApiKey,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
     ) -> ModelResponse:
         capabilities = self._require_generate_capabilities(call, streaming=False)
         plan = lower_generate_request(call, capabilities, streaming=False)
@@ -137,8 +140,8 @@ class ModelRuntime(_AdapterRuntime):
         self,
         call: ModelCall,
         *,
-        key: str,
-        timeout_s: int = DEFAULT_TIMEOUT_S,
+        key: ProviderApiKey,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
     ) -> AsyncIterator[ModelChunk]:
         capabilities = self._require_generate_capabilities(call, streaming=True)
         plan = lower_generate_request(call, capabilities, streaming=True)
@@ -149,8 +152,8 @@ class ModelRuntime(_AdapterRuntime):
         self,
         call: EmbeddingCall,
         *,
-        key: str,
-        timeout_s: int = DEFAULT_TIMEOUT_S,
+        key: ProviderApiKey,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
     ) -> EmbeddingResponse:
         capabilities = self._require_embedding_capabilities(call)
         if not capabilities.embeddings:

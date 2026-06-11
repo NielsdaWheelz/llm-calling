@@ -65,6 +65,7 @@ from provider_runtime.types import (
     ModelChunk,
     ModelMessage,
     ModelResponse,
+    ProviderArtifact,
     TokenUsage,
     ToolCall,
 )
@@ -83,7 +84,7 @@ class GeminiClient:
         req: ModelCall,
         *,
         api_key: str,
-        timeout_s: int,
+        timeout_s: float,
     ) -> ModelResponse:
         """Non-streaming content generation."""
         url = f"{self._base_url}/{req.model.model}:generateContent"
@@ -99,14 +100,18 @@ class GeminiClient:
         await raise_for_provider_error(response, "gemini")
 
         data = response.json()
-        return self._parse_response(data, structured=bool(req.structured_output))
+        return self._parse_response(
+            data,
+            structured=bool(req.structured_output),
+            model=req.model.model,
+        )
 
     async def generate_stream(
         self,
         req: ModelCall,
         *,
         api_key: str,
-        timeout_s: int,
+        timeout_s: float,
     ) -> AsyncIterator[ModelChunk]:
         """Streaming content generation using Server-Sent Events."""
         if req.structured_output is not None:
@@ -154,6 +159,7 @@ class GeminiClient:
 
                     delta_text = ""
                     tool_calls: list[ToolCall] = []
+                    provider_artifacts: list[ProviderArtifact] = []
                     for part in parts:
                         if part.get("thought"):
                             # Thought-summary parts are not visible output.
@@ -161,7 +167,12 @@ class GeminiClient:
                         if "text" in part:
                             delta_text += part["text"]
                         elif "functionCall" in part:
-                            tool_calls.append(_part_to_tool_call(part))
+                            tool_call, artifact = _part_to_tool_call_and_artifact(
+                                part, model=req.model.model
+                            )
+                            tool_calls.append(tool_call)
+                            if artifact is not None:
+                                provider_artifacts.append(artifact)
 
                     # Check for finish reason
                     finish_reason = candidate.get("finishReason")
@@ -181,6 +192,8 @@ class GeminiClient:
                         # Yield any remaining text as non-terminal
                         if delta_text:
                             yield ModelChunk(delta_text=delta_text, done=False)
+                        for artifact in provider_artifacts:
+                            yield ModelChunk(provider_artifact=artifact, done=False)
                         for tc in tool_calls:
                             yield ModelChunk(tool_call=tc, done=False)
                         # Then yield terminal chunk
@@ -194,6 +207,8 @@ class GeminiClient:
                     else:
                         if delta_text:
                             yield ModelChunk(delta_text=delta_text, done=False)
+                        for artifact in provider_artifacts:
+                            yield ModelChunk(provider_artifact=artifact, done=False)
                         for tc in tool_calls:
                             yield ModelChunk(tool_call=tc, done=False)
 
@@ -344,15 +359,16 @@ class GeminiClient:
             }
         if turn.role == "assistant" and turn.tool_calls:
             parts: list[dict] = []
+            signature_by_call = _gemini_signature_by_call(turn)
             if turn.content:
                 parts.append({"text": turn.content})
             for call in turn.tool_calls:
                 part: dict[str, object] = {
                     "functionCall": {"name": call.name, "args": call.arguments}
                 }
-                if call.provider_metadata and "thoughtSignature" in call.provider_metadata:
-                    # Echo the captured signature verbatim on the replayed part.
-                    part["thoughtSignature"] = call.provider_metadata["thoughtSignature"]
+                signature = signature_by_call.get(call.id) or signature_by_call.get(call.name)
+                if signature is not None:
+                    part["thoughtSignature"] = signature
                 parts.append(part)
             return {"role": "model", "parts": parts}
         role = "model" if turn.role == "assistant" else turn.role
@@ -361,7 +377,7 @@ class GeminiClient:
             "parts": [{"text": turn.content}],
         }
 
-    def _parse_response(self, data: dict, *, structured: bool) -> ModelResponse:
+    def _parse_response(self, data: dict, *, structured: bool, model: str) -> ModelResponse:
         """Parse non-streaming response."""
         # Extract text from candidates[0].content.parts[].text
         candidates = data.get("candidates", [])
@@ -380,9 +396,13 @@ class GeminiClient:
         ]
         text = "".join(text_parts)
         tool_calls: list[ToolCall] = []
+        provider_artifacts: list[ProviderArtifact] = []
         for part in parts:
             if "functionCall" in part:
-                tool_calls.append(_part_to_tool_call(part))
+                tool_call, artifact = _part_to_tool_call_and_artifact(part, model=model)
+                tool_calls.append(tool_call)
+                if artifact is not None:
+                    provider_artifacts.append(artifact)
         structured_output = None
         if structured and text.strip().startswith("{"):
             try:
@@ -410,17 +430,51 @@ class GeminiClient:
             provider_request_id=None,
             structured_output=structured_output,
             tool_calls=tuple(tool_calls),
+            provider_artifacts=tuple(provider_artifacts),
         )
 
 
-def _part_to_tool_call(part: dict) -> ToolCall:
-    """Parse a functionCall part, keeping its call id (when present) and thoughtSignature."""
+def _part_to_tool_call_and_artifact(
+    part: dict, *, model: str
+) -> tuple[ToolCall, ProviderArtifact | None]:
+    """Parse a functionCall part and capture Gemini thoughtSignature as an artifact."""
     fc = part["functionCall"]
     name = fc.get("name", "")
+    call_id = fc.get("id") or name
     signature = part.get("thoughtSignature")
-    return ToolCall(
-        id=fc.get("id") or name,
+    tool_call = ToolCall(
+        id=call_id,
         name=name,
         arguments=parse_tool_arguments(fc.get("args"), provider="gemini", tool_name=name),
-        provider_metadata={"thoughtSignature": signature} if signature else None,
     )
+    artifact = (
+        ProviderArtifact(
+            provider="gemini",
+            model=model,
+            purpose="signature",
+            payload={
+                "type": "gemini.thought_signature",
+                "function_call_id": call_id,
+                "function_name": name,
+                "thoughtSignature": signature,
+            },
+        )
+        if signature
+        else None
+    )
+    return tool_call, artifact
+
+
+def _gemini_signature_by_call(turn: ModelMessage) -> dict[str, str]:
+    signatures: dict[str, str] = {}
+    for artifact in turn.provider_artifacts:
+        if artifact.provider != "gemini" or artifact.purpose != "signature":
+            continue
+        payload = artifact.to_provider_payload()
+        signature = payload.get("thoughtSignature")
+        if not isinstance(signature, str):
+            continue
+        for key in (payload.get("function_call_id"), payload.get("function_name")):
+            if isinstance(key, str) and key:
+                signatures[key] = signature
+    return signatures

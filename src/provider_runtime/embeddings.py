@@ -19,7 +19,7 @@ class EmbeddingsClient:
         call: EmbeddingCall,
         *,
         api_key: str,
-        timeout_s: int,
+        timeout_s: float,
     ) -> EmbeddingResponse:
         payload: dict[str, object] = {"model": call.model.model, "input": call.inputs}
         if call.dimensions is not None:

@@ -2,7 +2,10 @@
 
 import asyncio
 import json
+import random
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import replace
 
 import httpx
 
@@ -20,7 +23,11 @@ from provider_runtime.types import (
     ModelCall,
     ModelChunk,
     ModelResponse,
+    ProviderApiKey,
     ProviderName,
+    RetryAttempt,
+    RetryAttemptStatus,
+    RetryPolicy,
 )
 
 DEFAULT_TIMEOUT_S = 45
@@ -86,16 +93,14 @@ class _AdapterRuntime:
         self,
         call: ModelCall,
         *,
-        key: str,
-        timeout_s: int = DEFAULT_TIMEOUT_S,
+        key: ProviderApiKey,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
     ) -> ModelResponse:
         provider = self._resolve_provider(call.model.route or call.model.provider)
         client = self._resolve_client(provider)
         return await _retry_call(
-            call.retry.max_attempts,
-            call.retry.initial_delay_s,
-            call.retry.max_delay_s,
-            lambda: client.generate(call, api_key=key, timeout_s=timeout_s),
+            call.retry,
+            lambda: client.generate(call, api_key=key.reveal(), timeout_s=timeout_s),
             wrap=lambda exc: _wrap_generate_error(provider, exc),
         )
 
@@ -103,36 +108,92 @@ class _AdapterRuntime:
         self,
         call: ModelCall,
         *,
-        key: str,
-        timeout_s: int = DEFAULT_TIMEOUT_S,
+        key: ProviderApiKey,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
     ) -> AsyncIterator[ModelChunk]:
         provider = self._resolve_provider(call.model.route or call.model.provider)
         client = self._resolve_client(provider)
         attempts = max(1, call.retry.max_attempts)
+        started = time.monotonic()
+        attempt_trace: list[RetryAttempt] = []
         for attempt in range(1, attempts + 1):
             emitted_chunk = False
             try:
-                async for chunk in client.generate_stream(call, api_key=key, timeout_s=timeout_s):
+                async for chunk in client.generate_stream(
+                    call, api_key=key.reveal(), timeout_s=timeout_s
+                ):
                     emitted_chunk = True
-                    yield chunk
+                    if chunk.done:
+                        success_attempt = RetryAttempt(
+                            attempt_number=attempt,
+                            max_attempts=attempts,
+                            status="success",
+                            provider_request_id=chunk.provider_request_id,
+                            streamed_output_started=emitted_chunk,
+                        )
+                        yield replace(
+                            chunk,
+                            attempts=tuple((*attempt_trace, success_attempt)),
+                        )
+                    else:
+                        yield chunk
                 return
             except Exception as raw_exc:
                 exc = _wrap_stream_error(provider, raw_exc)
-                if emitted_chunk or attempt >= attempts or not exc.retryable:
+                if emitted_chunk or attempt >= attempts or not _can_retry(exc, call.retry):
+                    exc.with_attempts(
+                        tuple(
+                            (
+                                *attempt_trace,
+                                _attempt_from_error(
+                                    exc,
+                                    attempt=attempt,
+                                    max_attempts=attempts,
+                                    status="terminal_error",
+                                    streamed_output_started=emitted_chunk,
+                                ),
+                            )
+                        )
+                    )
                     raise exc from raw_exc
-                await _sleep_before_retry(
+                delay_s = _retry_delay_s(
                     attempt=attempt,
                     error=exc,
-                    initial_delay_s=call.retry.initial_delay_s,
-                    max_delay_s=call.retry.max_delay_s,
+                    retry=call.retry,
                 )
+                if _deadline_exhausted(started=started, retry=call.retry, delay_s=delay_s):
+                    exc.with_attempts(
+                        tuple(
+                            (
+                                *attempt_trace,
+                                _attempt_from_error(
+                                    exc,
+                                    attempt=attempt,
+                                    max_attempts=attempts,
+                                    status="terminal_error",
+                                    streamed_output_started=emitted_chunk,
+                                ),
+                            )
+                        )
+                    )
+                    raise exc from raw_exc
+                attempt_trace.append(
+                    _attempt_from_error(
+                        exc,
+                        attempt=attempt,
+                        max_attempts=attempts,
+                        status="retryable_error",
+                        delay_s=delay_s,
+                    )
+                )
+                await _sleep_delay(delay_s)
 
     async def embed(
         self,
         call: EmbeddingCall,
         *,
-        key: str,
-        timeout_s: int = DEFAULT_TIMEOUT_S,
+        key: ProviderApiKey,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
     ) -> EmbeddingResponse:
         provider = self._resolve_provider(call.model.route or call.model.provider)
         if provider == "openai":
@@ -148,10 +209,8 @@ class _AdapterRuntime:
             )
 
         return await _retry_call(
-            call.retry.max_attempts,
-            call.retry.initial_delay_s,
-            call.retry.max_delay_s,
-            lambda: client.embed(call, api_key=key, timeout_s=timeout_s),
+            call.retry,
+            lambda: client.embed(call, api_key=key.reveal(), timeout_s=timeout_s),
             wrap=lambda exc: _wrap_embedding_error(provider, exc),
         )
 
@@ -200,27 +259,65 @@ class _AdapterRuntime:
 
 
 async def _retry_call[T](
-    max_attempts: int,
-    initial_delay_s: float,
-    max_delay_s: float,
+    retry: RetryPolicy,
     fn: Callable[[], Awaitable[T]],
     *,
     wrap: Callable[[Exception], ModelCallError],
 ) -> T:
-    attempts = max(1, max_attempts)
+    attempts = max(1, retry.max_attempts)
+    started = time.monotonic()
+    attempt_trace: list[RetryAttempt] = []
     for attempt in range(1, attempts + 1):
         try:
-            return await fn()
+            result = await fn()
+            return _attach_success_attempts(result, attempt_trace, attempt, attempts)
         except Exception as raw_exc:
             exc = wrap(raw_exc)
-            if attempt >= attempts or not exc.retryable:
+            if attempt >= attempts or not _can_retry(exc, retry):
+                exc.with_attempts(
+                    tuple(
+                        (
+                            *attempt_trace,
+                            _attempt_from_error(
+                                exc,
+                                attempt=attempt,
+                                max_attempts=attempts,
+                                status="terminal_error",
+                            ),
+                        )
+                    )
+                )
                 raise exc from raw_exc
-            await _sleep_before_retry(
+            delay_s = _retry_delay_s(
                 attempt=attempt,
                 error=exc,
-                initial_delay_s=initial_delay_s,
-                max_delay_s=max_delay_s,
+                retry=retry,
             )
+            if _deadline_exhausted(started=started, retry=retry, delay_s=delay_s):
+                exc.with_attempts(
+                    tuple(
+                        (
+                            *attempt_trace,
+                            _attempt_from_error(
+                                exc,
+                                attempt=attempt,
+                                max_attempts=attempts,
+                                status="terminal_error",
+                            ),
+                        )
+                    )
+                )
+                raise exc from raw_exc
+            attempt_trace.append(
+                _attempt_from_error(
+                    exc,
+                    attempt=attempt,
+                    max_attempts=attempts,
+                    status="retryable_error",
+                    delay_s=delay_s,
+                )
+            )
+            await _sleep_delay(delay_s)
 
     raise AssertionError("unreachable retry loop exit")
 
@@ -342,17 +439,73 @@ def _http_status_model_error(provider: ProviderName, exc: httpx.HTTPStatusError)
     )
 
 
-async def _sleep_before_retry(
+def _attempt_from_error(
+    error: ModelCallError,
+    *,
+    attempt: int,
+    max_attempts: int,
+    status: RetryAttemptStatus,
+    delay_s: float | None = None,
+    streamed_output_started: bool = False,
+) -> RetryAttempt:
+    if status not in ("retryable_error", "terminal_error"):
+        raise ValueError(f"Unsupported retry attempt status: {status}")
+    return RetryAttempt(
+        attempt_number=attempt,
+        max_attempts=max_attempts,
+        status=status,
+        error_code=error.error_code.value,
+        status_code=error.status_code,
+        retryable=error.retryable,
+        retry_after_seconds=error.retry_after_seconds,
+        delay_s=delay_s,
+        provider_request_id=error.provider_request_id,
+        streamed_output_started=streamed_output_started,
+    )
+
+
+def _attach_success_attempts[T](
+    result: T,
+    attempt_trace: list[RetryAttempt],
+    attempt: int,
+    max_attempts: int,
+) -> T:
+    if isinstance(result, (ModelResponse, EmbeddingResponse)):
+        success_attempt = RetryAttempt(
+            attempt_number=attempt,
+            max_attempts=max_attempts,
+            status="success",
+            provider_request_id=result.provider_request_id,
+        )
+        return replace(result, attempts=tuple((*attempt_trace, success_attempt)))
+    return result
+
+
+def _retry_delay_s(
     *,
     attempt: int,
     error: ModelCallError,
-    initial_delay_s: float,
-    max_delay_s: float,
-) -> None:
+    retry: RetryPolicy,
+) -> float:
     delay = error.retry_after_seconds
     if delay is None:
-        delay = initial_delay_s * (2 ** max(0, attempt - 1))
-    delay = min(delay, max_delay_s)
+        delay = retry.initial_delay_s * (2 ** max(0, attempt - 1))
+    if retry.jitter_s > 0:
+        delay += random.uniform(0, retry.jitter_s)
+    return min(delay, retry.max_delay_s)
+
+
+def _can_retry(error: ModelCallError, retry: RetryPolicy) -> bool:
+    return error.retryable and error.error_code.value in retry.retryable_error_codes
+
+
+def _deadline_exhausted(*, started: float, retry: RetryPolicy, delay_s: float) -> bool:
+    if retry.deadline_s is None:
+        return False
+    return time.monotonic() - started + delay_s > retry.deadline_s
+
+
+async def _sleep_delay(delay: float) -> None:
     if delay > 0:
         await asyncio.sleep(delay)
 

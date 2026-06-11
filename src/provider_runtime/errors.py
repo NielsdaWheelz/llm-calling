@@ -1,9 +1,13 @@
 """Provider error classification."""
 
+from __future__ import annotations
+
 import re
 from enum import StrEnum
 
 import httpx
+
+from provider_runtime.types import RetryAttempt
 
 
 class ModelCallErrorCode(StrEnum):
@@ -30,6 +34,7 @@ class ModelCallError(Exception):
         provider_request_id: str | None = None,
         retryable: bool | None = None,
         safe_body_snippet: str | None = None,
+        attempts: tuple[RetryAttempt, ...] = (),
     ):
         self.error_code = error_code
         self.message = message
@@ -39,7 +44,20 @@ class ModelCallError(Exception):
         self.provider_request_id = provider_request_id
         self.retryable = _is_retryable_error(error_code) if retryable is None else retryable
         self.safe_body_snippet = safe_body_snippet
+        self.attempts = attempts
         super().__init__(message)
+
+    @property
+    def attempt_count(self) -> int:
+        return len(self.attempts) if self.attempts else 1
+
+    @property
+    def retry_count(self) -> int:
+        return max(0, self.attempt_count - 1)
+
+    def with_attempts(self, attempts: tuple[RetryAttempt, ...]) -> ModelCallError:
+        self.attempts = attempts
+        return self
 
 
 async def raise_for_provider_error(response: httpx.Response, provider: str) -> None:

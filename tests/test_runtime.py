@@ -5,13 +5,15 @@ import httpx
 import pytest
 import respx
 
-from provider_runtime import ModelRuntime, ProviderBaseUrls
+from provider_runtime import ModelRuntime, ProviderApiKey, ProviderBaseUrls
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode
 from provider_runtime.types import ModelCall, ModelMessage, ModelRef, RetryPolicy
 
 pytestmark = pytest.mark.asyncio
 
 FIXTURES = Path(__file__).parent / "fixtures"
+KEY = ProviderApiKey("sk-test", source="test")
+BAD_KEY = ProviderApiKey("bad-key", source="test")
 
 
 def request(provider: str, *, retry: RetryPolicy | None = None) -> ModelCall:
@@ -94,7 +96,7 @@ async def test_generate_maps_provider_errors(
 
     async with httpx.AsyncClient() as http:
         with pytest.raises(ModelCallError) as exc_info:
-            await runtime(http).generate(req, key="sk-test")
+            await runtime(http).generate(req, key=KEY)
 
     assert exc_info.value.error_code == expected_code
     assert exc_info.value.provider == provider
@@ -109,7 +111,7 @@ async def test_generate_maps_timeout(provider: str) -> None:
 
     async with httpx.AsyncClient() as http:
         with pytest.raises(ModelCallError) as exc_info:
-            await runtime(http).generate(req, key="sk-test")
+            await runtime(http).generate(req, key=KEY)
 
     assert exc_info.value.error_code == ModelCallErrorCode.TIMEOUT
 
@@ -131,7 +133,7 @@ async def test_generate_wraps_transport_and_payload_exceptions(exc: Exception) -
 
     async with httpx.AsyncClient() as http:
         with pytest.raises(ModelCallError) as exc_info:
-            await runtime(http).generate(req, key="sk-test")
+            await runtime(http).generate(req, key=KEY)
 
     assert exc_info.value.error_code == ModelCallErrorCode.PROVIDER_DOWN
     assert type(exc).__name__ in exc_info.value.message
@@ -147,7 +149,7 @@ async def test_stream_wraps_protocol_error() -> None:
 
     async with httpx.AsyncClient() as http:
         with pytest.raises(ModelCallError) as exc_info:
-            async for _ in runtime(http).stream(req, key="sk-test"):
+            async for _ in runtime(http).stream(req, key=KEY):
                 pass
 
     assert exc_info.value.error_code == ModelCallErrorCode.PROVIDER_DOWN
@@ -169,10 +171,15 @@ async def test_generate_retries_retryable_errors_before_success() -> None:
     )
 
     async with httpx.AsyncClient() as http:
-        response = await runtime(http).generate(req, key="sk-test")
+        response = await runtime(http).generate(req, key=KEY)
 
     assert route.call_count == 2
     assert response.provider_request_id == "req-after-retry"
+    assert [attempt.status for attempt in response.attempts] == ["retryable_error", "success"]
+    assert response.attempts[0].error_code == ModelCallErrorCode.PROVIDER_DOWN.value
+    assert response.attempts[0].delay_s == 0
+    assert response.attempts[1].provider_request_id == "req-after-retry"
+    assert response.retry_count == 1
 
 
 @respx.mock
@@ -186,13 +193,16 @@ async def test_generate_does_not_retry_quota_exhaustion_429() -> None:
 
     async with httpx.AsyncClient() as http:
         with pytest.raises(ModelCallError) as exc_info:
-            await runtime(http).generate(req, key="sk-test")
+            await runtime(http).generate(req, key=KEY)
 
     assert route.call_count == 1
     assert exc_info.value.error_code == ModelCallErrorCode.QUOTA_EXCEEDED
     assert exc_info.value.retryable is False
     assert exc_info.value.retry_after_seconds == 30
     assert exc_info.value.provider_request_id == "req-quota"
+    assert [attempt.status for attempt in exc_info.value.attempts] == ["terminal_error"]
+    assert exc_info.value.attempts[0].error_code == ModelCallErrorCode.QUOTA_EXCEEDED.value
+    assert exc_info.value.retry_count == 0
 
 
 @respx.mock
@@ -210,11 +220,59 @@ async def test_stream_retries_only_before_first_chunk() -> None:
     )
 
     async with httpx.AsyncClient() as http:
-        chunks = [chunk async for chunk in runtime(http).stream(req, key="sk-test")]
+        chunks = [chunk async for chunk in runtime(http).stream(req, key=KEY)]
 
     assert route.call_count == 2
     assert "".join(chunk.delta_text for chunk in chunks) == "Hello! How can I help?"
     assert chunks[-1].done is True
+    assert [attempt.status for attempt in chunks[-1].attempts] == ["retryable_error", "success"]
+    assert chunks[-1].retry_count == 1
+
+
+@respx.mock
+async def test_generate_retry_policy_can_restrict_error_classes() -> None:
+    req = request(
+        "openai",
+        retry=RetryPolicy(
+            max_attempts=3,
+            initial_delay_s=0,
+            retryable_error_codes=("timeout",),
+        ),
+    )
+    route = respx.post(endpoint("openai", req.model.model)).respond(
+        500,
+        json=fixture("openai", "error_500.json"),
+        headers={"x-request-id": "req-no-retry"},
+    )
+
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(ModelCallError) as exc_info:
+            await runtime(http).generate(req, key=KEY)
+
+    assert route.call_count == 1
+    assert exc_info.value.error_code == ModelCallErrorCode.PROVIDER_DOWN
+    assert exc_info.value.retry_count == 0
+    assert exc_info.value.attempts[0].provider_request_id == "req-no-retry"
+
+
+@respx.mock
+async def test_generate_deadline_stops_retry_before_sleep() -> None:
+    req = request(
+        "openai",
+        retry=RetryPolicy(max_attempts=3, initial_delay_s=1, max_delay_s=1, deadline_s=0.1),
+    )
+    route = respx.post(endpoint("openai", req.model.model)).respond(
+        500,
+        json=fixture("openai", "error_500.json"),
+    )
+
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(ModelCallError) as exc_info:
+            await runtime(http).generate(req, key=KEY)
+
+    assert route.call_count == 1
+    assert exc_info.value.retry_count == 0
+    assert exc_info.value.attempts[0].status == "terminal_error"
 
 
 async def test_unknown_provider_is_model_not_available() -> None:
@@ -226,7 +284,7 @@ async def test_unknown_provider_is_model_not_available() -> None:
 
     async with httpx.AsyncClient() as http:
         with pytest.raises(ModelCallError) as exc_info:
-            await runtime(http).generate(req, key="sk-test")
+            await runtime(http).generate(req, key=KEY)
 
     assert exc_info.value.error_code == ModelCallErrorCode.MODEL_NOT_AVAILABLE
 
@@ -235,7 +293,7 @@ async def test_disabled_provider_is_model_not_available() -> None:
     async with httpx.AsyncClient() as http:
         runtime = ModelRuntime(http, enable_openai=False)
         with pytest.raises(ModelCallError) as exc_info:
-            await runtime.generate(request("openai"), key="sk-test")
+            await runtime.generate(request("openai"), key=KEY)
 
     assert exc_info.value.error_code == ModelCallErrorCode.MODEL_NOT_AVAILABLE
 
@@ -249,7 +307,7 @@ async def test_probe_key_uses_catalog_probe_model() -> None:
     )
 
     async with httpx.AsyncClient() as http:
-        result = await runtime(http).probe_key(provider="openai", key="sk-test")
+        result = await runtime(http).probe_key(provider="openai", key=KEY)
 
     assert result.ok is True
     assert result.model == "gpt-5.4-mini"
@@ -266,7 +324,7 @@ async def test_probe_key_returns_typed_invalid_key_result() -> None:
     )
 
     async with httpx.AsyncClient() as http:
-        result = await runtime(http).probe_key(provider="openai", key="bad-key")
+        result = await runtime(http).probe_key(provider="openai", key=BAD_KEY)
 
     assert result.ok is False
     assert result.error_code == ModelCallErrorCode.INVALID_KEY.value
@@ -306,7 +364,7 @@ async def test_runtime_uses_configured_provider_base_urls() -> None:
     async with httpx.AsyncClient() as http:
         configured_runtime = ModelRuntime(http, base_urls=base_urls)
         for provider in routes:
-            await configured_runtime.generate(request(provider), key="sk-test")
+            await configured_runtime.generate(request(provider), key=KEY)
 
     assert {provider: route.called for provider, route in routes.items()} == {
         "openai": True,

@@ -75,7 +75,7 @@ class AnthropicClient:
         req: ModelCall,
         *,
         api_key: str,
-        timeout_s: int,
+        timeout_s: float,
     ) -> ModelResponse:
         """Non-streaming message generation."""
         headers = self._build_headers(api_key)
@@ -97,7 +97,7 @@ class AnthropicClient:
         req: ModelCall,
         *,
         api_key: str,
-        timeout_s: int,
+        timeout_s: float,
     ) -> AsyncIterator[ModelChunk]:
         """Streaming message generation using Server-Sent Events."""
         if req.structured_output is not None:

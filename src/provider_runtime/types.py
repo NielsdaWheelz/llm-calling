@@ -6,11 +6,14 @@ from typing import Literal
 
 ReasoningEffort = Literal["default", "none", "minimal", "low", "medium", "high", "max"]
 ProviderName = Literal["openai", "anthropic", "gemini", "openrouter", "cloudflare"]
+ProviderApiKeySource = Literal["platform", "byok", "probe", "test"]
 PromptCacheTTL = Literal["none", "5m", "1h"]
 ToolChoice = Literal["auto", "none", "required"]
+RetryableErrorCode = Literal["rate_limit", "timeout", "provider_down"]
 
 ProviderArtifactPurpose = Literal["reasoning", "thinking", "signature", "provider_item"]
 ProviderArtifactRetention = Literal["ephemeral", "durable"]
+RetryAttemptStatus = Literal["success", "retryable_error", "terminal_error", "abandoned"]
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,24 @@ class ModelRef:
 
 
 @dataclass(frozen=True)
+class ProviderApiKey:
+    """Opaque provider credential passed across the public runtime boundary."""
+
+    value: str = field(repr=False)
+    source: ProviderApiKeySource
+
+    def __post_init__(self):
+        if not self.value:
+            raise ValueError("ProviderApiKey.value must be non-empty")
+
+    def reveal(self) -> str:
+        return self.value
+
+    def __str__(self) -> str:
+        return "<provider-api-key redacted>"
+
+
+@dataclass(frozen=True)
 class ReasoningConfig:
     effort: ReasoningEffort = "none"
     budget_tokens: int | None = None
@@ -45,6 +66,13 @@ class RetryPolicy:
     max_attempts: int = 2
     initial_delay_s: float = 0.25
     max_delay_s: float = 2.0
+    deadline_s: float | None = None
+    jitter_s: float = 0.0
+    retryable_error_codes: tuple[RetryableErrorCode, ...] = (
+        "rate_limit",
+        "timeout",
+        "provider_down",
+    )
 
     def __post_init__(self):
         if self.max_attempts < 1:
@@ -53,6 +81,64 @@ class RetryPolicy:
             raise ValueError("RetryPolicy.initial_delay_s must be >= 0")
         if self.max_delay_s < 0:
             raise ValueError("RetryPolicy.max_delay_s must be >= 0")
+        if self.deadline_s is not None and self.deadline_s <= 0:
+            raise ValueError("RetryPolicy.deadline_s must be > 0")
+        if self.jitter_s < 0:
+            raise ValueError("RetryPolicy.jitter_s must be >= 0")
+        allowed = {"rate_limit", "timeout", "provider_down"}
+        if any(code not in allowed for code in self.retryable_error_codes):
+            raise ValueError("RetryPolicy.retryable_error_codes contains an unsupported code")
+
+
+@dataclass(frozen=True)
+class RetryAttempt:
+    """Stable, redacted retry metadata for runtime-owned provider attempts."""
+
+    attempt_number: int
+    max_attempts: int
+    status: RetryAttemptStatus
+    error_code: str | None = None
+    status_code: int | None = None
+    retryable: bool | None = None
+    retry_after_seconds: float | None = None
+    delay_s: float | None = None
+    provider_request_id: str | None = None
+    streamed_output_started: bool = False
+
+    def __post_init__(self):
+        if self.attempt_number < 1:
+            raise ValueError("RetryAttempt.attempt_number must be >= 1")
+        if self.max_attempts < 1:
+            raise ValueError("RetryAttempt.max_attempts must be >= 1")
+        if self.attempt_number > self.max_attempts:
+            raise ValueError("RetryAttempt.attempt_number must be <= max_attempts")
+        if self.status == "success" and self.error_code is not None:
+            raise ValueError("Successful retry attempts must not carry error_code")
+        if self.delay_s is not None and self.delay_s < 0:
+            raise ValueError("RetryAttempt.delay_s must be >= 0")
+        if self.retry_after_seconds is not None and self.retry_after_seconds < 0:
+            raise ValueError("RetryAttempt.retry_after_seconds must be >= 0")
+
+    def to_json(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "attempt_number": self.attempt_number,
+            "max_attempts": self.max_attempts,
+            "status": self.status,
+            "streamed_output_started": self.streamed_output_started,
+        }
+        if self.error_code is not None:
+            payload["error_code"] = self.error_code
+        if self.status_code is not None:
+            payload["status_code"] = self.status_code
+        if self.retryable is not None:
+            payload["retryable"] = self.retryable
+        if self.retry_after_seconds is not None:
+            payload["retry_after_seconds"] = self.retry_after_seconds
+        if self.delay_s is not None:
+            payload["delay_s"] = self.delay_s
+        if self.provider_request_id is not None:
+            payload["provider_request_id"] = self.provider_request_id
+        return payload
 
 
 @dataclass(frozen=True)
@@ -148,6 +234,19 @@ class ModelResponse:
     structured_output: dict[str, object] | None = None
     tool_calls: tuple[ToolCall, ...] = field(default_factory=tuple)
     provider_artifacts: tuple[ProviderArtifact, ...] = field(default_factory=tuple, repr=False)
+    attempts: tuple[RetryAttempt, ...] = field(default_factory=tuple, repr=False)
+
+    @property
+    def attempt_count(self) -> int:
+        return len(self.attempts) if self.attempts else 1
+
+    @property
+    def retry_count(self) -> int:
+        return max(0, self.attempt_count - 1)
+
+    @property
+    def terminal_attempt_status(self) -> RetryAttemptStatus:
+        return self.attempts[-1].status if self.attempts else "success"
 
 
 @dataclass(frozen=True)
@@ -160,6 +259,7 @@ class ModelChunk:
     provider_request_id: str | None = None
     status: str | None = None
     incomplete_details: dict[str, object] | None = None
+    attempts: tuple[RetryAttempt, ...] = field(default_factory=tuple, repr=False)
 
     def __post_init__(self):
         if not self.done and self.usage is not None:
@@ -168,6 +268,20 @@ class ModelChunk:
             raise ValueError("Non-terminal chunks (done=False) must have status=None")
         if not self.done and self.incomplete_details is not None:
             raise ValueError("Non-terminal chunks (done=False) must have incomplete_details=None")
+        if not self.done and self.attempts:
+            raise ValueError("Non-terminal chunks (done=False) must have attempts=()")
+
+    @property
+    def attempt_count(self) -> int:
+        return len(self.attempts) if self.attempts else 1
+
+    @property
+    def retry_count(self) -> int:
+        return max(0, self.attempt_count - 1)
+
+    @property
+    def terminal_attempt_status(self) -> RetryAttemptStatus:
+        return self.attempts[-1].status if self.attempts else "success"
 
 
 @dataclass(frozen=True)
@@ -183,6 +297,19 @@ class EmbeddingResponse:
     embeddings: list[list[float]]
     usage: TokenUsage | None
     provider_request_id: str | None
+    attempts: tuple[RetryAttempt, ...] = field(default_factory=tuple, repr=False)
+
+    @property
+    def attempt_count(self) -> int:
+        return len(self.attempts) if self.attempts else 1
+
+    @property
+    def retry_count(self) -> int:
+        return max(0, self.attempt_count - 1)
+
+    @property
+    def terminal_attempt_status(self) -> RetryAttemptStatus:
+        return self.attempts[-1].status if self.attempts else "success"
 
 
 @dataclass(frozen=True)
@@ -192,3 +319,12 @@ class KeyProbeResult:
     ok: bool
     error_code: str | None = None
     provider_request_id: str | None = None
+    attempts: tuple[RetryAttempt, ...] = field(default_factory=tuple, repr=False)
+
+    @property
+    def attempt_count(self) -> int:
+        return len(self.attempts) if self.attempts else 1
+
+    @property
+    def retry_count(self) -> int:
+        return max(0, self.attempt_count - 1)

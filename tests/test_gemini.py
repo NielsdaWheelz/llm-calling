@@ -11,6 +11,7 @@ from provider_runtime.types import (
     ModelCall,
     ModelMessage,
     ModelRef,
+    ProviderArtifact,
     StructuredOutputSpec,
     ToolCall,
     ToolResult,
@@ -288,7 +289,19 @@ async def test_thought_signature_and_call_id_captured_then_echoed_on_replay() ->
                         id="fc-123",
                         name="get_weather",
                         arguments={"city": "Paris"},
-                        provider_metadata={"thoughtSignature": "sig-abc"},
+                    ),
+                ),
+                provider_artifacts=(
+                    ProviderArtifact(
+                        provider="gemini",
+                        model="gemini-2.5-pro",
+                        purpose="signature",
+                        payload={
+                            "type": "gemini.thought_signature",
+                            "function_call_id": "fc-123",
+                            "function_name": "get_weather",
+                            "thoughtSignature": "sig-abc",
+                        },
                     ),
                 ),
             ),
@@ -327,9 +340,16 @@ async def test_thought_signature_and_call_id_captured_then_echoed_on_replay() ->
             id="fc-123",
             name="get_weather",
             arguments={"city": "Paris"},
-            provider_metadata={"thoughtSignature": "sig-abc"},
         ),
     )
+    assert len(response.provider_artifacts) == 1
+    assert response.provider_artifacts[0].purpose == "signature"
+    assert response.provider_artifacts[0].to_provider_payload() == {
+        "type": "gemini.thought_signature",
+        "function_call_id": "fc-123",
+        "function_name": "get_weather",
+        "thoughtSignature": "sig-abc",
+    }
 
 
 @respx.mock
@@ -377,8 +397,16 @@ async def test_stream_thought_parts_excluded_and_signature_captured() -> None:
         id="fc-123",
         name="get_weather",
         arguments={"city": "Paris"},
-        provider_metadata={"thoughtSignature": "sig-abc"},
     )
+    artifact_chunks = [chunk for chunk in chunks if chunk.provider_artifact is not None]
+    assert len(artifact_chunks) == 1
+    assert artifact_chunks[0].provider_artifact is not None
+    assert artifact_chunks[0].provider_artifact.to_provider_payload() == {
+        "type": "gemini.thought_signature",
+        "function_call_id": "fc-123",
+        "function_name": "get_weather",
+        "thoughtSignature": "sig-abc",
+    }
     assert chunks[-1].done is True
 
 

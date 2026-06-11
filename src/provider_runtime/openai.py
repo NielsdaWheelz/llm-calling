@@ -57,7 +57,7 @@ class OpenAIClient:
         req: ModelCall,
         *,
         api_key: str,
-        timeout_s: int,
+        timeout_s: float,
     ) -> ModelResponse:
         headers = self._build_headers(api_key)
         body = self._build_request_body(req, stream=False)
@@ -83,7 +83,7 @@ class OpenAIClient:
         req: ModelCall,
         *,
         api_key: str,
-        timeout_s: int,
+        timeout_s: float,
     ) -> AsyncIterator[ModelChunk]:
         if req.structured_output is not None:
             raise ModelCallError(
