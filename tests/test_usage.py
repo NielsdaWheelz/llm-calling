@@ -1,7 +1,7 @@
 import pytest
 
-from provider_runtime import Pricing, TokenUsage
-from provider_runtime.usage import estimate_cost
+from provider_runtime import DEFAULT_PRICING_SOURCE, Pricing, TokenUsage
+from provider_runtime.usage import estimate_catalog_cost, estimate_cost
 
 
 def test_estimate_cost_uses_known_components_and_excludes_cached_input_from_full_price() -> None:
@@ -37,3 +37,29 @@ def test_estimate_cost_does_not_synthesize_zero_for_unknown_prices() -> None:
     assert cost.input_cost is None
     assert cost.output_cost is None
     assert cost.total_cost is None
+
+
+def test_estimate_catalog_cost_reports_estimated_when_any_catalog_component_is_known() -> None:
+    estimate = estimate_catalog_cost(
+        TokenUsage(input_tokens=1000, output_tokens=1000, total_tokens=2000),
+        Pricing(input_per_million=1.0),
+        pricing_source="test-catalog",
+    )
+
+    assert estimate.policy == "catalog_pricing"
+    assert estimate.status == "estimated"
+    assert estimate.pricing_source == "test-catalog"
+    assert estimate.breakdown.input_cost == 0.001
+    assert estimate.breakdown.total_cost == 0.001
+
+
+def test_estimate_catalog_cost_reports_unknown_without_verified_prices() -> None:
+    estimate = estimate_catalog_cost(
+        TokenUsage(input_tokens=1000, output_tokens=1000, total_tokens=2000),
+        Pricing(),
+    )
+
+    assert estimate.policy == "catalog_pricing"
+    assert estimate.status == "unknown"
+    assert estimate.pricing_source == DEFAULT_PRICING_SOURCE
+    assert estimate.breakdown.total_cost is None

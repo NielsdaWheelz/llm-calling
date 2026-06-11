@@ -45,14 +45,26 @@ from provider_runtime.types import (
     ToolResult,
     ToolSpec,
 )
-from provider_runtime.usage import CostBreakdown, estimate_cost
+from provider_runtime.usage import (
+    DEFAULT_PRICING_SOURCE,
+    CostBreakdown,
+    CostEstimate,
+    CostPolicy,
+    CostStatus,
+    estimate_catalog_cost,
+    estimate_cost,
+)
 
 __all__ = [
     "BinaryPart",
     "CapturedRuntimeCall",
     "ContentPart",
     "CostBreakdown",
+    "CostEstimate",
+    "CostPolicy",
+    "CostStatus",
     "DEFAULT_CATALOG",
+    "DEFAULT_PRICING_SOURCE",
     "EmbeddingCall",
     "EmbeddingResponse",
     "GenerateRequestPlan",
@@ -95,5 +107,6 @@ __all__ = [
     "ToolResult",
     "ToolSpec",
     "estimate_cost",
+    "estimate_catalog_cost",
     "lower_generate_request",
 ]

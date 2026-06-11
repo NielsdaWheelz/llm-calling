@@ -32,6 +32,11 @@ def test_target_surface_is_exported() -> None:
         "NoNetworkRuntime",
         "ScriptedRuntime",
         "CostBreakdown",
+        "CostEstimate",
+        "CostPolicy",
+        "CostStatus",
+        "DEFAULT_PRICING_SOURCE",
+        "estimate_catalog_cost",
         "estimate_cost",
     ):
         assert hasattr(provider_runtime, name)

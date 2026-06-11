@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from provider_runtime.catalog import Pricing
 from provider_runtime.types import TokenUsage
+
+CostPolicy = Literal["catalog_pricing"]
+CostStatus = Literal["estimated", "unknown"]
 
 
 @dataclass(frozen=True)
@@ -15,6 +19,35 @@ class CostBreakdown:
     cached_input_cost: float | None
     reasoning_cost: float | None
     total_cost: float | None
+
+
+@dataclass(frozen=True)
+class CostEstimate:
+    policy: CostPolicy
+    status: CostStatus
+    pricing_source: str
+    pricing: Pricing
+    breakdown: CostBreakdown
+
+
+DEFAULT_PRICING_SOURCE = "provider_runtime.catalog.DEFAULT_CATALOG"
+
+
+def estimate_catalog_cost(
+    usage: TokenUsage | None,
+    pricing: Pricing,
+    *,
+    pricing_source: str = DEFAULT_PRICING_SOURCE,
+) -> CostEstimate:
+    """Return the shared advisory cost policy for a catalog-priced call."""
+    breakdown = estimate_cost(usage, pricing)
+    return CostEstimate(
+        policy="catalog_pricing",
+        status="estimated" if breakdown.total_cost is not None else "unknown",
+        pricing_source=pricing_source,
+        pricing=pricing,
+        breakdown=breakdown,
+    )
 
 
 def estimate_cost(usage: TokenUsage | None, pricing: Pricing) -> CostBreakdown:
