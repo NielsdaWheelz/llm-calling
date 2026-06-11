@@ -142,6 +142,89 @@ async def test_system_turn_can_mark_prompt_cache_breakpoint() -> None:
 
 
 @respx.mock
+async def test_user_turn_can_mark_prompt_cache_content_block() -> None:
+    route = respx.post("https://api.anthropic.com/v1/messages").respond(
+        200,
+        json=load_json("success_nonstream.json"),
+    )
+    req = ModelCall(
+        model=ModelRef(provider="anthropic", model="claude-3-opus-20240229"),
+        messages=[
+            ModelMessage(role="system", content="You are helpful."),
+            ModelMessage(role="user", content="Stable context.", cache_ttl="1h"),
+        ],
+        max_output_tokens=100,
+    )
+
+    async with httpx.AsyncClient() as http:
+        await AnthropicClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Stable context.",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                }
+            ],
+        }
+    ]
+
+
+@respx.mock
+async def test_tool_turn_cache_ttl_marks_last_tool_result_block() -> None:
+    route = respx.post("https://api.anthropic.com/v1/messages").respond(
+        200,
+        json=load_json("success_nonstream.json"),
+    )
+    req = ModelCall(
+        model=ModelRef(provider="anthropic", model="claude-3-opus-20240229"),
+        messages=[
+            ModelMessage(role="user", content="Weather?"),
+            ModelMessage(
+                role="assistant",
+                tool_calls=(ToolCall(id="toolu_1", name="get_weather", arguments={}),),
+            ),
+            ModelMessage(
+                role="tool",
+                tool_results=(
+                    ToolResult(call_id="toolu_1", output="sunny"),
+                    ToolResult(call_id="toolu_2", output="windy"),
+                ),
+                cache_ttl="5m",
+            ),
+        ],
+        max_output_tokens=100,
+    )
+
+    async with httpx.AsyncClient() as http:
+        await AnthropicClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["messages"][2] == {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": "sunny",
+                "is_error": False,
+            },
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_2",
+                "content": "windy",
+                "is_error": False,
+                "cache_control": {"type": "ephemeral", "ttl": "5m"},
+            },
+        ],
+    }
+
+
+@respx.mock
 async def test_structured_output_uses_forced_tool_and_parses_tool_input() -> None:
     response_json = load_json("success_nonstream.json")
     response_json["content"] = [

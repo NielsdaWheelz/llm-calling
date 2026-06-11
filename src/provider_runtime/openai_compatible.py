@@ -2,13 +2,21 @@
 
 import json
 from collections.abc import AsyncIterator
-from typing import Literal
+from typing import Literal, cast
 
 import httpx
 
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode, raise_for_provider_error
 from provider_runtime.tool_arguments import parse_tool_arguments
-from provider_runtime.types import ModelCall, ModelChunk, ModelResponse, TokenUsage, ToolCall
+from provider_runtime.types import (
+    ModelCall,
+    ModelChunk,
+    ModelResponse,
+    ProviderArtifact,
+    ProviderName,
+    TokenUsage,
+    ToolCall,
+)
 
 OpenAICompatibleProvider = Literal["openrouter", "cloudflare"]
 
@@ -22,7 +30,7 @@ class OpenAICompatibleChatClient:
         base_url: str,
     ):
         self._client = client
-        self._provider = provider
+        self._provider: OpenAICompatibleProvider = provider
         self._url = f"{base_url.rstrip('/')}/chat/completions"
 
     async def generate(
@@ -44,7 +52,12 @@ class OpenAICompatibleChatClient:
         await raise_for_provider_error(response, self._provider)
 
         data = response.json()
-        return self._parse_response(data, response.headers)
+        return self._parse_response(
+            data,
+            response.headers,
+            structured=bool(req.structured_output),
+            model=req.model.model,
+        )
 
     async def generate_stream(
         self,
@@ -106,13 +119,7 @@ class OpenAICompatibleChatClient:
                     continue
 
                 if "usage" in data:
-                    usage_data = data["usage"]
-                    accumulated_usage = TokenUsage(
-                        input_tokens=usage_data.get("prompt_tokens"),
-                        output_tokens=usage_data.get("completion_tokens"),
-                        total_tokens=usage_data.get("total_tokens"),
-                        provider_usage=dict(usage_data),
-                    )
+                    accumulated_usage = self._parse_usage(data["usage"])
 
                 choices = data.get("choices", [])
                 if not choices:
@@ -121,6 +128,9 @@ class OpenAICompatibleChatClient:
                 choice = choices[0]
                 delta = choice.get("delta", {})
                 delta_text = delta.get("content", "")
+
+                for artifact in self._message_provider_artifacts(delta, model=req.model.model):
+                    yield ModelChunk(provider_artifact=artifact, done=False)
 
                 for tc_delta in delta.get("tool_calls") or []:
                     idx = tc_delta.get("index", 0)
@@ -180,24 +190,25 @@ class OpenAICompatibleChatClient:
                         }
                     )
                 continue
-            if turn.role == "assistant" and turn.tool_calls:
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": turn.content or None,
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.name,
-                                    "arguments": json.dumps(tc.arguments),
-                                },
-                            }
-                            for tc in turn.tool_calls
-                        ],
-                    }
-                )
+            if turn.role == "assistant" and (turn.tool_calls or turn.provider_artifacts):
+                message: dict[str, object] = {
+                    "role": "assistant",
+                    "content": turn.content or None,
+                }
+                if turn.tool_calls:
+                    message["tool_calls"] = [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments),
+                            },
+                        }
+                        for tc in turn.tool_calls
+                    ]
+                message.update(self._provider_artifact_message_fields(turn.provider_artifacts))
+                messages.append(message)
                 continue
             messages.append({"role": turn.role, "content": turn.content})
 
@@ -249,7 +260,14 @@ class OpenAICompatibleChatClient:
 
         return body
 
-    def _parse_response(self, data: dict, headers: httpx.Headers) -> ModelResponse:
+    def _parse_response(
+        self,
+        data: dict,
+        headers: httpx.Headers,
+        *,
+        structured: bool,
+        model: str,
+    ) -> ModelResponse:
         choices = data.get("choices", [])
         if not choices:
             raise ModelCallError(
@@ -261,8 +279,10 @@ class OpenAICompatibleChatClient:
 
         message = choices[0].get("message", {}) or {}
         text = message.get("content") or ""
+        provider_artifacts = self._message_provider_artifacts(message, model=model)
         structured_output = None
-        if req_structured_text := text.strip():
+        if structured:
+            req_structured_text = text.strip()
             if req_structured_text.startswith("{"):
                 try:
                     parsed = json.loads(req_structured_text)
@@ -288,12 +308,7 @@ class OpenAICompatibleChatClient:
         usage = None
         usage_data = data.get("usage")
         if usage_data:
-            usage = TokenUsage(
-                input_tokens=usage_data.get("prompt_tokens"),
-                output_tokens=usage_data.get("completion_tokens"),
-                total_tokens=usage_data.get("total_tokens"),
-                provider_usage=dict(usage_data),
-            )
+            usage = self._parse_usage(usage_data)
 
         provider_request_id = headers.get("x-request-id") or data.get("id")
 
@@ -303,4 +318,91 @@ class OpenAICompatibleChatClient:
             provider_request_id=provider_request_id,
             structured_output=structured_output,
             tool_calls=tuple(tool_calls),
+            provider_artifacts=tuple(provider_artifacts),
         )
+
+    def _parse_usage(self, usage_data: dict) -> TokenUsage:
+        prompt_details = usage_data.get("prompt_tokens_details") or {}
+        completion_details = usage_data.get("completion_tokens_details") or {}
+        cached_tokens = prompt_details.get("cached_tokens")
+        cache_write_tokens = prompt_details.get("cache_write_tokens")
+        return TokenUsage(
+            input_tokens=usage_data.get("prompt_tokens"),
+            output_tokens=usage_data.get("completion_tokens"),
+            total_tokens=usage_data.get("total_tokens"),
+            reasoning_tokens=completion_details.get("reasoning_tokens"),
+            cache_creation_input_tokens=cache_write_tokens,
+            cached_tokens=cached_tokens,
+            cache_read_input_tokens=cached_tokens,
+            provider_usage=dict(usage_data),
+        )
+
+    def _message_provider_artifacts(
+        self,
+        message: dict,
+        *,
+        model: str,
+    ) -> list[ProviderArtifact]:
+        artifacts: list[ProviderArtifact] = []
+        reasoning_details = message.get("reasoning_details")
+        if isinstance(reasoning_details, list):
+            for detail in reasoning_details:
+                if isinstance(detail, dict):
+                    artifacts.append(
+                        ProviderArtifact(
+                            provider=cast(ProviderName, self._provider),
+                            model=model,
+                            purpose="reasoning",
+                            payload=dict(detail),
+                        )
+                    )
+        for field_name in ("reasoning", "reasoning_content"):
+            value = message.get(field_name)
+            if isinstance(value, str) and value:
+                artifacts.append(
+                    ProviderArtifact(
+                        provider=cast(ProviderName, self._provider),
+                        model=model,
+                        purpose="reasoning",
+                        payload={field_name: value},
+                    )
+                )
+        return artifacts
+
+    def _provider_artifact_message_fields(
+        self,
+        artifacts: tuple[ProviderArtifact, ...],
+    ) -> dict[str, object]:
+        reasoning_details: list[dict[str, object]] = []
+        reasoning_parts: list[str] = []
+        reasoning_content_parts: list[str] = []
+        for artifact in artifacts:
+            if artifact.provider != self._provider or artifact.purpose != "reasoning":
+                continue
+            payload = artifact.to_provider_payload()
+            if _is_reasoning_detail(payload):
+                reasoning_details.append(payload)
+                continue
+            details = payload.get("reasoning_details")
+            if isinstance(details, list):
+                reasoning_details.extend(detail for detail in details if isinstance(detail, dict))
+                continue
+            reasoning = payload.get("reasoning")
+            if isinstance(reasoning, str):
+                reasoning_parts.append(reasoning)
+                continue
+            reasoning_content = payload.get("reasoning_content")
+            if isinstance(reasoning_content, str):
+                reasoning_content_parts.append(reasoning_content)
+
+        if reasoning_details:
+            return {"reasoning_details": reasoning_details}
+        if reasoning_parts:
+            return {"reasoning": "".join(reasoning_parts)}
+        if reasoning_content_parts:
+            return {"reasoning_content": "".join(reasoning_content_parts)}
+        return {}
+
+
+def _is_reasoning_detail(payload: dict[str, object]) -> bool:
+    return isinstance(payload.get("type"), str) and str(payload["type"]).startswith("reasoning.")

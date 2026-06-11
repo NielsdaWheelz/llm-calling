@@ -1,5 +1,6 @@
 """Provider error classification."""
 
+import re
 from enum import StrEnum
 
 import httpx
@@ -28,6 +29,7 @@ class ModelCallError(Exception):
         retry_after_seconds: float | None = None,
         provider_request_id: str | None = None,
         retryable: bool | None = None,
+        safe_body_snippet: str | None = None,
     ):
         self.error_code = error_code
         self.message = message
@@ -36,6 +38,7 @@ class ModelCallError(Exception):
         self.retry_after_seconds = retry_after_seconds
         self.provider_request_id = provider_request_id
         self.retryable = _is_retryable_error(error_code) if retryable is None else retryable
+        self.safe_body_snippet = safe_body_snippet
         super().__init__(message)
 
 
@@ -56,18 +59,14 @@ async def raise_for_provider_error(response: httpx.Response, provider: str) -> N
     except Exception:
         json_body = None
     body_text = response.text if response.is_closed else ""
-    snippet = (body_text or "").strip()[:500]
+    snippet = _safe_body_snippet(body_text)
     code = classify_provider_error(
         provider,
         response.status_code,
         json_body if isinstance(json_body, dict) else None,
         None,
     )
-    message = (
-        f"{provider} HTTP {response.status_code}: {snippet}"
-        if snippet
-        else f"{provider} HTTP {response.status_code}"
-    )
+    message = f"{provider} HTTP {response.status_code}"
     raise ModelCallError(
         code,
         message,
@@ -76,6 +75,7 @@ async def raise_for_provider_error(response: httpx.Response, provider: str) -> N
         retry_after_seconds=_retry_after_seconds(response.headers.get("retry-after")),
         provider_request_id=response.headers.get("x-request-id")
         or response.headers.get("request-id"),
+        safe_body_snippet=snippet or None,
     )
 
 
@@ -120,6 +120,23 @@ def _retry_after_seconds(raw: str | None) -> float | None:
     except ValueError:
         return None
     return parsed if parsed >= 0 else None
+
+
+_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"), "...redacted"),
+    (re.compile(r"\bAIza[A-Za-z0-9_-]{20,}\b"), "...redacted"),
+    (
+        re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{10,}\b", re.IGNORECASE),
+        "Bearer ...redacted",
+    ),
+)
+
+
+def _safe_body_snippet(body_text: str) -> str:
+    snippet = (body_text or "").strip()[:500]
+    for pattern, replacement in _SECRET_PATTERNS:
+        snippet = pattern.sub(replacement, snippet)
+    return snippet
 
 
 def _classify_openai_error(status_code: int, json_body: dict | None) -> ModelCallErrorCode:

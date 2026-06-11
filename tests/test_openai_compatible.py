@@ -11,6 +11,7 @@ from provider_runtime.types import (
     ModelCall,
     ModelMessage,
     ModelRef,
+    ProviderArtifact,
     ReasoningConfig,
     StructuredOutputSpec,
     ToolCall,
@@ -66,6 +67,34 @@ async def test_nonstream_success() -> None:
 
 
 @respx.mock
+async def test_usage_normalizes_reasoning_and_cache_token_details() -> None:
+    response_json = load_json("success_nonstream.json")
+    response_json["usage"] = {
+        "prompt_tokens": 20,
+        "completion_tokens": 9,
+        "total_tokens": 29,
+        "prompt_tokens_details": {"cached_tokens": 12, "cache_write_tokens": 6},
+        "completion_tokens_details": {"reasoning_tokens": 4},
+    }
+    respx.post("https://openrouter.test/v1/chat/completions").respond(
+        200,
+        json=response_json,
+    )
+
+    async with httpx.AsyncClient() as http:
+        response = await chat_client(http).generate(request(), api_key="sk-test", timeout_s=30)
+
+    assert response.usage is not None
+    assert response.usage.input_tokens == 20
+    assert response.usage.output_tokens == 9
+    assert response.usage.total_tokens == 29
+    assert response.usage.cached_tokens == 12
+    assert response.usage.cache_read_input_tokens == 12
+    assert response.usage.cache_creation_input_tokens == 6
+    assert response.usage.reasoning_tokens == 4
+
+
+@respx.mock
 async def test_stream_success() -> None:
     respx.post("https://openrouter.test/v1/chat/completions").respond(
         200,
@@ -85,6 +114,37 @@ async def test_stream_success() -> None:
     assert chunks[-1].provider_request_id == "req-openrouter-123"
     assert all(chunk.usage is None for chunk in chunks[:-1])
     assert "Hello from OpenAI-compatible." in "".join(chunk.delta_text for chunk in chunks)
+
+
+@respx.mock
+async def test_stream_usage_normalizes_reasoning_and_cache_token_details() -> None:
+    stream_body = (
+        'data: {"choices":[{"delta":{"content":"Visible."}}]}\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+        '"usage":{"prompt_tokens":20,"completion_tokens":9,"total_tokens":29,'
+        '"prompt_tokens_details":{"cached_tokens":12,"cache_write_tokens":6},'
+        '"completion_tokens_details":{"reasoning_tokens":4}}}\n'
+        "data: [DONE]\n"
+    )
+    respx.post("https://openrouter.test/v1/chat/completions").respond(
+        200,
+        content=stream_body,
+        headers={"content-type": "text/event-stream"},
+    )
+
+    async with httpx.AsyncClient() as http:
+        chunks = [
+            chunk
+            async for chunk in chat_client(http).generate_stream(
+                request(), api_key="sk-test", timeout_s=30
+            )
+        ]
+
+    assert chunks[-1].usage is not None
+    assert chunks[-1].usage.cached_tokens == 12
+    assert chunks[-1].usage.cache_read_input_tokens == 12
+    assert chunks[-1].usage.cache_creation_input_tokens == 6
+    assert chunks[-1].usage.reasoning_tokens == 4
 
 
 @respx.mock
@@ -287,12 +347,60 @@ async def test_stream_tool_calls() -> None:
 
 
 @respx.mock
-async def test_reasoning_content_not_read_and_not_replayed() -> None:
+async def test_nonstream_reasoning_details_are_preserved_as_provider_artifacts() -> None:
     response_json = load_json("success_nonstream.json")
-    response_json["choices"][0]["message"]["reasoning_content"] = "secret chain of thought"
-    route = respx.post("https://openrouter.test/v1/chat/completions").respond(
+    reasoning_detail = {
+        "type": "reasoning.encrypted",
+        "data": "opaque-reasoning",
+        "id": "reasoning-1",
+        "format": "anthropic-claude-v1",
+        "index": 0,
+    }
+    response_json["choices"][0]["message"]["reasoning_details"] = [reasoning_detail]
+    respx.post("https://openrouter.test/v1/chat/completions").respond(
         200,
         json=response_json,
+    )
+
+    async with httpx.AsyncClient() as http:
+        response = await chat_client(http).generate(
+            ModelCall(
+                model=ModelRef(provider="openrouter", model="openai/gpt-oss-120b"),
+                messages=[ModelMessage(role="user", content="Weather?")],
+                max_output_tokens=100,
+                reasoning=ReasoningConfig(effort="high"),
+            ),
+            api_key="sk-test",
+            timeout_s=30,
+        )
+
+    assert response.text == "Hello from OpenAI-compatible."
+    assert len(response.provider_artifacts) == 1
+    artifact = response.provider_artifacts[0]
+    assert artifact.provider == "openrouter"
+    assert artifact.model == "openai/gpt-oss-120b"
+    assert artifact.purpose == "reasoning"
+    assert artifact.to_provider_payload() == reasoning_detail
+
+
+@respx.mock
+async def test_reasoning_details_are_replayed_on_assistant_turn() -> None:
+    route = respx.post("https://openrouter.test/v1/chat/completions").respond(
+        200,
+        json=load_json("success_nonstream.json"),
+    )
+    reasoning_detail = {
+        "type": "reasoning.encrypted",
+        "data": "opaque-reasoning",
+        "id": "reasoning-1",
+        "format": "anthropic-claude-v1",
+        "index": 0,
+    }
+    artifact = ProviderArtifact(
+        provider="openrouter",
+        model="openai/gpt-oss-120b",
+        purpose="reasoning",
+        payload=reasoning_detail,
     )
     req = ModelCall(
         model=ModelRef(provider="openrouter", model="openai/gpt-oss-120b"),
@@ -304,6 +412,7 @@ async def test_reasoning_content_not_read_and_not_replayed() -> None:
                 tool_calls=(
                     ToolCall(id="call_1", name="get_weather", arguments={"city": "Paris"}),
                 ),
+                provider_artifacts=(artifact,),
             ),
             ModelMessage(role="tool", tool_results=(ToolResult(call_id="call_1", output="sunny"),)),
         ],
@@ -312,12 +421,13 @@ async def test_reasoning_content_not_read_and_not_replayed() -> None:
     )
 
     async with httpx.AsyncClient() as http:
-        response = await chat_client(http).generate(req, api_key="sk-test", timeout_s=30)
+        await chat_client(http).generate(req, api_key="sk-test", timeout_s=30)
 
     body = json.loads(route.calls.last.request.content)
     assert body["messages"][1] == {
         "role": "assistant",
         "content": "Checking.",
+        "reasoning_details": [reasoning_detail],
         "tool_calls": [
             {
                 "id": "call_1",
@@ -326,13 +436,14 @@ async def test_reasoning_content_not_read_and_not_replayed() -> None:
             }
         ],
     }
-    assert response.text == "Hello from OpenAI-compatible."
 
 
 @respx.mock
-async def test_stream_reasoning_content_not_in_delta_text() -> None:
+async def test_stream_reasoning_details_emit_provider_artifact_not_delta_text() -> None:
     stream_body = (
-        'data: {"choices":[{"delta":{"reasoning_content":"secret thought"}}]}\n'
+        'data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text",'
+        '"text":"secret thought","signature":"sig-1","id":"reasoning-1",'
+        '"format":"anthropic-claude-v1","index":0}]}}]}\n'
         'data: {"choices":[{"delta":{"content":"Visible."}}]}\n'
         "data: [DONE]\n"
     )
@@ -351,6 +462,17 @@ async def test_stream_reasoning_content_not_in_delta_text() -> None:
         ]
 
     assert "".join(chunk.delta_text for chunk in chunks) == "Visible."
+    artifact_chunks = [chunk.provider_artifact for chunk in chunks if chunk.provider_artifact]
+    assert [artifact.to_provider_payload() for artifact in artifact_chunks] == [
+        {
+            "type": "reasoning.text",
+            "text": "secret thought",
+            "signature": "sig-1",
+            "id": "reasoning-1",
+            "format": "anthropic-claude-v1",
+            "index": 0,
+        }
+    ]
     assert chunks[-1].done is True
 
 
@@ -395,3 +517,28 @@ async def test_structured_output_uses_json_schema_response_format() -> None:
         },
     }
     assert response.structured_output == {"title": "The Book"}
+
+
+@respx.mock
+async def test_json_text_without_structured_request_is_plain_text() -> None:
+    respx.post("https://openrouter.test/v1/chat/completions").respond(
+        200,
+        json={
+            "id": "chatcmpl-json-text",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": '{"note":"plain JSON-looking text"}',
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+    )
+
+    async with httpx.AsyncClient() as http:
+        response = await chat_client(http).generate(request(), api_key="sk-test", timeout_s=30)
+
+    assert response.text == '{"note":"plain JSON-looking text"}'
+    assert response.structured_output is None

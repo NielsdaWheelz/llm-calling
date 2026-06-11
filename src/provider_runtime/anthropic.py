@@ -386,50 +386,35 @@ class AnthropicClient:
 
     def _turn_to_text_block(self, turn: ModelMessage) -> dict[str, object]:
         block: dict[str, object] = {"type": "text", "text": turn.content}
-        if turn.cache_ttl == "none":
-            return block
-        if turn.cache_ttl not in ("5m", "1h"):
-            raise ModelCallError(
-                ModelCallErrorCode.BAD_REQUEST,
-                f"Unknown prompt cache ttl: {turn.cache_ttl}",
-                provider="anthropic",
-            )
-        block["cache_control"] = {"type": "ephemeral", "ttl": turn.cache_ttl}
-        return block
+        return self._with_cache_control(block, turn.cache_ttl)
 
     def _turn_to_message(self, turn: ModelMessage) -> dict[str, object]:
         """Convert ModelMessage to Anthropic message format.
 
         Note: System turns are handled separately in _build_request_body.
         """
-        if turn.cache_ttl != "none":
-            raise ModelCallError(
-                ModelCallErrorCode.BAD_REQUEST,
-                "Anthropic prompt cache is only supported on system turns",
-                provider="anthropic",
-            )
         if turn.role == "tool":
-            return {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": result.call_id,
-                        "content": result.output,
-                        "is_error": result.is_error,
-                    }
-                    for result in turn.tool_results
-                ],
-            }
+            tool_content: list[dict[str, object]] = [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": result.call_id,
+                    "content": result.output,
+                    "is_error": result.is_error,
+                }
+                for result in turn.tool_results
+            ]
+            if tool_content:
+                tool_content[-1] = self._with_cache_control(tool_content[-1], turn.cache_ttl)
+            return {"role": "user", "content": tool_content}
         if turn.role == "assistant" and (turn.tool_calls or turn.provider_artifacts):
             # Thinking blocks must lead the assistant turn, unmodified, before tool_use.
-            content: list[dict[str, object]] = [
+            assistant_content: list[dict[str, object]] = [
                 item.to_provider_payload() for item in turn.provider_artifacts
             ]
             if turn.content:
-                content.append({"type": "text", "text": turn.content})
+                assistant_content.append({"type": "text", "text": turn.content})
             for call in turn.tool_calls:
-                content.append(
+                assistant_content.append(
                     {
                         "type": "tool_use",
                         "id": call.id,
@@ -437,10 +422,37 @@ class AnthropicClient:
                         "input": call.arguments,
                     }
                 )
-            return {"role": "assistant", "content": content}
+            if assistant_content:
+                assistant_content[-1] = self._with_cache_control(
+                    assistant_content[-1], turn.cache_ttl
+                )
+            return {"role": "assistant", "content": assistant_content}
+        message_content: str | list[dict[str, object]]
+        if turn.cache_ttl == "none":
+            message_content = turn.content
+        else:
+            message_content = [self._turn_to_text_block(turn)]
         return {
             "role": turn.role,
-            "content": turn.content,
+            "content": message_content,
+        }
+
+    def _with_cache_control(
+        self,
+        block: dict[str, object],
+        cache_ttl: str,
+    ) -> dict[str, object]:
+        if cache_ttl == "none":
+            return block
+        if cache_ttl not in ("5m", "1h"):
+            raise ModelCallError(
+                ModelCallErrorCode.BAD_REQUEST,
+                f"Unknown prompt cache ttl: {cache_ttl}",
+                provider="anthropic",
+            )
+        return {
+            **block,
+            "cache_control": {"type": "ephemeral", "ttl": cache_ttl},
         }
 
     def _parse_response(self, data: dict, *, model: str) -> ModelResponse:
