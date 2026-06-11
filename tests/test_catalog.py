@@ -34,6 +34,19 @@ def test_catalog_key_probe_models_are_provider_owned() -> None:
     assert DEFAULT_CATALOG.key_probe_model("cloudflare") == "@cf/meta/llama-3.1-8b-instruct"
 
 
+def test_catalog_covers_ariel_research_and_vision_models() -> None:
+    research = DEFAULT_CATALOG.require_capabilities(
+        ModelRef(provider="openrouter", model="deepseek/deepseek-v3.2")
+    )
+    vision = DEFAULT_CATALOG.require_capabilities(
+        ModelRef(provider="gemini", model="gemini-2.5-flash")
+    )
+
+    assert research.provider == "openrouter"
+    assert vision.provider == "gemini"
+    assert vision.multimodal_input is True
+
+
 def test_catalog_rejects_unknown_models() -> None:
     with pytest.raises(KeyError):
         DEFAULT_CATALOG.require_capabilities(ModelRef(provider="openai", model="missing"))

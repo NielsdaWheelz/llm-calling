@@ -8,11 +8,13 @@ import respx
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode
 from provider_runtime.gemini import GeminiClient
 from provider_runtime.types import (
+    BinaryPart,
     ModelCall,
     ModelMessage,
     ModelRef,
     ProviderArtifact,
     StructuredOutputSpec,
+    TextPart,
     ToolCall,
     ToolResult,
     ToolSpec,
@@ -105,6 +107,40 @@ async def test_assistant_role_maps_to_model() -> None:
     assert body["contents"] == [
         {"role": "user", "parts": [{"text": "Hello!"}]},
         {"role": "model", "parts": [{"text": "Hi."}]},
+    ]
+
+
+@respx.mock
+async def test_multimodal_content_parts_lower_to_inline_data() -> None:
+    route = respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+    ).respond(200, json=load_json("success_nonstream.json"))
+    req = ModelCall(
+        model=ModelRef(provider="gemini", model="gemini-2.5-flash"),
+        messages=[
+            ModelMessage(
+                role="user",
+                content_parts=(
+                    TextPart("Extract text."),
+                    BinaryPart(data=b"image-bytes", media_type="image/png"),
+                ),
+            )
+        ],
+        max_output_tokens=100,
+    )
+
+    async with httpx.AsyncClient() as http:
+        await GeminiClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["contents"] == [
+        {
+            "role": "user",
+            "parts": [
+                {"text": "Extract text."},
+                {"inlineData": {"mimeType": "image/png", "data": "aW1hZ2UtYnl0ZXM="}},
+            ],
+        }
     ]
 
 

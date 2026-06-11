@@ -52,6 +52,7 @@ Streaming:
 - Usage in final event's usageMetadata
 """
 
+import base64
 import json
 from collections.abc import AsyncIterator
 
@@ -59,13 +60,15 @@ import httpx
 
 from provider_runtime.endpoints import GEMINI_BASE_URL
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode, raise_for_provider_error
-from provider_runtime.tool_arguments import parse_tool_arguments
+from provider_runtime.tool_arguments import parse_tool_arguments_with_status
 from provider_runtime.types import (
+    BinaryPart,
     ModelCall,
     ModelChunk,
     ModelMessage,
     ModelResponse,
     ProviderArtifact,
+    TextPart,
     TokenUsage,
     ToolCall,
 )
@@ -374,7 +377,7 @@ class GeminiClient:
         role = "model" if turn.role == "assistant" else turn.role
         return {
             "role": role,
-            "parts": [{"text": turn.content}],
+            "parts": _turn_parts(turn),
         }
 
     def _parse_response(self, data: dict, *, structured: bool, model: str) -> ModelResponse:
@@ -442,10 +445,14 @@ def _part_to_tool_call_and_artifact(
     name = fc.get("name", "")
     call_id = fc.get("id") or name
     signature = part.get("thoughtSignature")
+    parsed_args = parse_tool_arguments_with_status(
+        fc.get("args"), provider="gemini", tool_name=name
+    )
     tool_call = ToolCall(
         id=call_id,
         name=name,
-        arguments=parse_tool_arguments(fc.get("args"), provider="gemini", tool_name=name),
+        arguments=parsed_args.arguments,
+        argument_status=parsed_args.status,
     )
     artifact = (
         ProviderArtifact(
@@ -463,6 +470,25 @@ def _part_to_tool_call_and_artifact(
         else None
     )
     return tool_call, artifact
+
+
+def _turn_parts(turn: ModelMessage) -> list[dict[str, object]]:
+    parts: list[dict[str, object]] = []
+    if turn.content:
+        parts.append({"text": turn.content})
+    for part in turn.content_parts:
+        if isinstance(part, TextPart):
+            parts.append({"text": part.text})
+        elif isinstance(part, BinaryPart):
+            parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": part.media_type,
+                        "data": base64.b64encode(part.data).decode("ascii"),
+                    }
+                }
+            )
+    return parts or [{"text": ""}]
 
 
 def _gemini_signature_by_call(turn: ModelMessage) -> dict[str, str]:

@@ -34,7 +34,7 @@ import httpx
 
 from provider_runtime.endpoints import OPENAI_BASE_URL
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode, raise_for_provider_error
-from provider_runtime.tool_arguments import parse_tool_arguments
+from provider_runtime.tool_arguments import parse_tool_arguments_with_status
 from provider_runtime.types import (
     ModelCall,
     ModelChunk,
@@ -176,7 +176,7 @@ class OpenAIClient:
                         args_str = item.get("arguments")
                         if args_str is None:
                             args_str = acc["arguments"] if acc else ""
-                        parsed_args = parse_tool_arguments(
+                        parsed_args = parse_tool_arguments_with_status(
                             args_str,
                             provider="openai",
                             tool_name=name,
@@ -186,7 +186,8 @@ class OpenAIClient:
                             tool_call=ToolCall(
                                 id=call_id,
                                 name=name,
-                                arguments=parsed_args,
+                                arguments=parsed_args.arguments,
+                                argument_status=parsed_args.status,
                                 provider_metadata={"id": item["id"]} if item.get("id") else None,
                             ),
                             done=False,
@@ -370,7 +371,7 @@ class OpenAIClient:
                 )
             elif item_type == "function_call":
                 args_str = item.get("arguments") or ""
-                parsed_args = parse_tool_arguments(
+                parsed_args = parse_tool_arguments_with_status(
                     args_str,
                     provider="openai",
                     tool_name=item.get("name") or "",
@@ -380,7 +381,8 @@ class OpenAIClient:
                     ToolCall(
                         id=item.get("call_id") or "",
                         name=item.get("name") or "",
-                        arguments=parsed_args,
+                        arguments=parsed_args.arguments,
+                        argument_status=parsed_args.status,
                         provider_metadata={"id": item["id"]} if item.get("id") else None,
                     )
                 )

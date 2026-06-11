@@ -50,7 +50,7 @@ import httpx
 
 from provider_runtime.endpoints import ANTHROPIC_BASE_URL
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode, raise_for_provider_error
-from provider_runtime.tool_arguments import parse_tool_arguments
+from provider_runtime.tool_arguments import parse_tool_arguments_with_status
 from provider_runtime.types import (
     ModelCall,
     ModelChunk,
@@ -210,7 +210,7 @@ class AnthropicClient:
                     if isinstance(index, int) and index in tool_blocks:
                         block_state = tool_blocks.pop(index)
                         raw_json = str(block_state["json"] or "{}")
-                        arguments = parse_tool_arguments(
+                        arguments = parse_tool_arguments_with_status(
                             raw_json,
                             provider="anthropic",
                             tool_name=str(block_state["name"]),
@@ -220,7 +220,8 @@ class AnthropicClient:
                             tool_call=ToolCall(
                                 id=str(block_state["id"]),
                                 name=str(block_state["name"]),
-                                arguments=arguments,
+                                arguments=arguments.arguments,
+                                argument_status=arguments.status,
                             ),
                             done=False,
                         )
@@ -476,19 +477,20 @@ class AnthropicClient:
                     )
                 )
             elif block.get("type") == "tool_use":
-                arguments = parse_tool_arguments(
+                arguments = parse_tool_arguments_with_status(
                     block.get("input"),
                     provider="anthropic",
                     tool_name=str(block.get("name", "")),
                     call_id=str(block.get("id", "")),
                 )
                 if structured_output is None:
-                    structured_output = arguments
+                    structured_output = arguments.arguments
                 tool_calls.append(
                     ToolCall(
                         id=str(block.get("id", "")),
                         name=str(block.get("name", "")),
-                        arguments=arguments,
+                        arguments=arguments.arguments,
+                        argument_status=arguments.status,
                     )
                 )
         text = "".join(text_parts)

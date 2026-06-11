@@ -7,7 +7,7 @@ from typing import Literal, cast
 import httpx
 
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode, raise_for_provider_error
-from provider_runtime.tool_arguments import parse_tool_arguments
+from provider_runtime.tool_arguments import parse_tool_arguments_with_status
 from provider_runtime.types import (
     ModelCall,
     ModelChunk,
@@ -92,7 +92,7 @@ class OpenAICompatibleChatClient:
                     received_done = True
                     for idx in sorted(tool_call_acc):
                         acc = tool_call_acc[idx]
-                        parsed_args = parse_tool_arguments(
+                        parsed_args = parse_tool_arguments_with_status(
                             acc["arguments"],
                             provider=self._provider,
                             tool_name=acc["name"],
@@ -100,7 +100,10 @@ class OpenAICompatibleChatClient:
                         )
                         yield ModelChunk(
                             tool_call=ToolCall(
-                                id=acc["id"], name=acc["name"], arguments=parsed_args
+                                id=acc["id"],
+                                name=acc["name"],
+                                arguments=parsed_args.arguments,
+                                argument_status=parsed_args.status,
                             ),
                             done=False,
                         )
@@ -146,7 +149,7 @@ class OpenAICompatibleChatClient:
                 if choice.get("finish_reason") == "tool_calls" and tool_call_acc:
                     for idx in sorted(tool_call_acc):
                         acc = tool_call_acc[idx]
-                        parsed_args = parse_tool_arguments(
+                        parsed_args = parse_tool_arguments_with_status(
                             acc["arguments"],
                             provider=self._provider,
                             tool_name=acc["name"],
@@ -154,7 +157,10 @@ class OpenAICompatibleChatClient:
                         )
                         yield ModelChunk(
                             tool_call=ToolCall(
-                                id=acc["id"], name=acc["name"], arguments=parsed_args
+                                id=acc["id"],
+                                name=acc["name"],
+                                arguments=parsed_args.arguments,
+                                argument_status=parsed_args.status,
                             ),
                             done=False,
                         )
@@ -248,6 +254,7 @@ class OpenAICompatibleChatClient:
             }
 
         if self._provider == "openrouter":
+            body["cache_control"] = {"type": "ephemeral"}
             if req.reasoning.effort not in ("default", "none"):
                 effort = "high" if req.reasoning.effort == "max" else req.reasoning.effort
                 body["reasoning"] = {"effort": effort}
@@ -295,14 +302,19 @@ class OpenAICompatibleChatClient:
         for tc in message.get("tool_calls") or []:
             fn = tc.get("function") or {}
             args_str = fn.get("arguments") or ""
-            parsed_args = parse_tool_arguments(
+            parsed_args = parse_tool_arguments_with_status(
                 args_str,
                 provider=self._provider,
                 tool_name=fn.get("name") or "",
                 call_id=tc.get("id") or "",
             )
             tool_calls.append(
-                ToolCall(id=tc.get("id") or "", name=fn.get("name") or "", arguments=parsed_args)
+                ToolCall(
+                    id=tc.get("id") or "",
+                    name=fn.get("name") or "",
+                    arguments=parsed_args.arguments,
+                    argument_status=parsed_args.status,
+                )
             )
 
         usage = None

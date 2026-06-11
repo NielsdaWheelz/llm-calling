@@ -170,7 +170,7 @@ async def test_openrouter_reasoning_effort_is_forwarded() -> None:
 
 
 @respx.mock
-async def test_openrouter_cache_intent_is_stripped() -> None:
+async def test_openrouter_sends_ephemeral_cache_control() -> None:
     route = respx.post("https://openrouter.test/v1/chat/completions").respond(
         200,
         json=load_json("success_nonstream.json"),
@@ -185,7 +185,7 @@ async def test_openrouter_cache_intent_is_stripped() -> None:
         await chat_client(http).generate(req, api_key="sk-test", timeout_s=30)
 
     body = json.loads(route.calls.last.request.content)
-    assert "cache_control" not in body
+    assert body["cache_control"] == {"type": "ephemeral"}
 
 
 @respx.mock
@@ -278,7 +278,7 @@ async def test_nonstream_malformed_tool_arguments_raise_typed_error() -> None:
                                 "type": "function",
                                 "function": {
                                     "name": "get_weather",
-                                    "arguments": '{"city": ',
+                                    "arguments": "{not-json",
                                 },
                             }
                         ],
@@ -300,6 +300,47 @@ async def test_nonstream_malformed_tool_arguments_raise_typed_error() -> None:
 
     assert exc_info.value.error_code == ModelCallErrorCode.TOOL_ARGUMENTS_INVALID
     assert exc_info.value.retryable is False
+
+
+@respx.mock
+async def test_nonstream_repairable_tool_arguments_are_marked_repaired() -> None:
+    respx.post("https://openrouter.test/v1/chat/completions").respond(
+        200,
+        json={
+            "id": "chatcmpl-tool-repaired",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_repaired",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "arguments": '{"city": "Paris",}',
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        },
+    )
+
+    async with httpx.AsyncClient() as http:
+        response = await chat_client(http).generate(request(), api_key="sk-test", timeout_s=30)
+
+    assert response.tool_calls == (
+        ToolCall(
+            id="call_repaired",
+            name="get_weather",
+            arguments={"city": "Paris"},
+            argument_status="repaired",
+        ),
+    )
 
 
 @respx.mock

@@ -299,7 +299,7 @@ async def test_nonstream_malformed_tool_arguments_raise_typed_error() -> None:
             "type": "function_call",
             "call_id": "call_bad",
             "name": "get_weather",
-            "arguments": '{"city": ',
+            "arguments": "{not-json",
         }
     ]
     respx.post("https://api.openai.com/v1/responses").respond(200, json=response_json)
@@ -310,6 +310,32 @@ async def test_nonstream_malformed_tool_arguments_raise_typed_error() -> None:
 
     assert exc_info.value.error_code == ModelCallErrorCode.TOOL_ARGUMENTS_INVALID
     assert exc_info.value.retryable is False
+
+
+@respx.mock
+async def test_nonstream_repairable_tool_arguments_are_marked_repaired() -> None:
+    response_json = load_json("success_nonstream.json")
+    response_json["output"] = [
+        {
+            "type": "function_call",
+            "call_id": "call_repaired",
+            "name": "get_weather",
+            "arguments": '{"city": "Paris",}',
+        }
+    ]
+    respx.post("https://api.openai.com/v1/responses").respond(200, json=response_json)
+
+    async with httpx.AsyncClient() as http:
+        response = await OpenAIClient(http).generate(request(), api_key="sk-test", timeout_s=30)
+
+    assert response.tool_calls == (
+        ToolCall(
+            id="call_repaired",
+            name="get_weather",
+            arguments={"city": "Paris"},
+            argument_status="repaired",
+        ),
+    )
 
 
 @respx.mock
