@@ -319,6 +319,7 @@ class KeyProbeResult:
     ok: bool
     error_code: str | None = None
     provider_request_id: str | None = None
+    status: str | None = None
     usage: TokenUsage | None = None
     attempts: tuple[RetryAttempt, ...] = field(default_factory=tuple, repr=False)
 

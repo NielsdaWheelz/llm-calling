@@ -122,6 +122,7 @@ class ModelRuntime(_AdapterRuntime):
             model=model,
             ok=True,
             provider_request_id=response.provider_request_id,
+            status=response.status,
             usage=response.usage,
             attempts=response.attempts,
         )
