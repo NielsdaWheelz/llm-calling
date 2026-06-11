@@ -42,6 +42,8 @@ from provider_runtime.types import (
     ProviderArtifact,
     TokenUsage,
     ToolCall,
+    TranscriptionCall,
+    TranscriptionResponse,
 )
 
 OPENAI_RESPONSES_URL = f"{OPENAI_BASE_URL}/responses"
@@ -50,7 +52,9 @@ OPENAI_RESPONSES_URL = f"{OPENAI_BASE_URL}/responses"
 class OpenAIClient:
     def __init__(self, client: httpx.AsyncClient, *, base_url: str = OPENAI_BASE_URL):
         self._client = client
-        self._url = f"{base_url.rstrip('/')}/responses"
+        base = base_url.rstrip("/")
+        self._url = f"{base}/responses"
+        self._transcriptions_url = f"{base}/audio/transcriptions"
 
     async def generate(
         self,
@@ -232,6 +236,40 @@ class OpenAIClient:
                     provider="openai",
                     retryable=False,
                 )
+
+    async def transcribe(
+        self,
+        req: TranscriptionCall,
+        *,
+        api_key: str,
+        timeout_s: float,
+    ) -> TranscriptionResponse:
+        response = await self._client.post(
+            self._transcriptions_url,
+            headers=self._build_auth_headers(api_key),
+            data={"model": req.model.model, "response_format": "json"},
+            files={"file": (req.filename, req.audio, req.media_type)},
+            timeout=httpx.Timeout(timeout_s, connect=10.0),
+        )
+        await raise_for_provider_error(response, "openai")
+        data = response.json()
+        text = data.get("text") if isinstance(data, dict) else None
+        if not isinstance(text, str):
+            raise ModelCallError(
+                ModelCallErrorCode.PROVIDER_DOWN,
+                "OpenAI transcription response did not include text",
+                provider="openai",
+                retryable=False,
+            )
+        return TranscriptionResponse(
+            text=text,
+            usage=_parse_transcription_usage(data),
+            provider_request_id=response.headers.get("x-request-id")
+            or (data.get("id") if isinstance(data, dict) else None),
+        )
+
+    def _build_auth_headers(self, api_key: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {api_key}"}
 
     def _build_headers(self, api_key: str) -> dict[str, str]:
         return {
@@ -424,3 +462,24 @@ class OpenAIClient:
             cache_read_input_tokens=cached_tokens,
             provider_usage=dict(usage_data),
         )
+
+
+def _parse_transcription_usage(data: dict) -> TokenUsage | None:
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = _int_or_none(usage.get("input_tokens"))
+    output_tokens = _int_or_none(usage.get("output_tokens"))
+    total_tokens = _int_or_none(usage.get("total_tokens"))
+    if total_tokens is None and (input_tokens is not None or output_tokens is not None):
+        total_tokens = (input_tokens or 0) + (output_tokens or 0)
+    return TokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        provider_usage=dict(usage),
+    )
+
+
+def _int_or_none(value: object) -> int | None:
+    return value if isinstance(value, int) else None

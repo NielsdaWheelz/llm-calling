@@ -47,6 +47,8 @@ from provider_runtime.types import (
     ToolChoice,
     ToolResult,
     ToolSpec,
+    TranscriptionCall,
+    TranscriptionResponse,
 )
 from provider_runtime.usage import (
     DEFAULT_PRICING_SOURCE,
@@ -112,6 +114,8 @@ __all__ = [
     "ToolChoice",
     "ToolResult",
     "ToolSpec",
+    "TranscriptionCall",
+    "TranscriptionResponse",
     "estimate_cost",
     "estimate_catalog_cost",
     "lower_generate_request",

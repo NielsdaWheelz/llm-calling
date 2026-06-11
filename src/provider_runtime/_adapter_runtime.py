@@ -28,6 +28,8 @@ from provider_runtime.types import (
     RetryAttempt,
     RetryAttemptStatus,
     RetryPolicy,
+    TranscriptionCall,
+    TranscriptionResponse,
 )
 
 DEFAULT_TIMEOUT_S = 45
@@ -212,6 +214,28 @@ class _AdapterRuntime:
             call.retry,
             lambda: client.embed(call, api_key=key.reveal(), timeout_s=timeout_s),
             wrap=lambda exc: _wrap_embedding_error(provider, exc),
+        )
+
+    async def transcribe(
+        self,
+        call: TranscriptionCall,
+        *,
+        key: ProviderApiKey,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
+    ) -> TranscriptionResponse:
+        provider = self._resolve_provider(call.model.route or call.model.provider)
+        if provider != "openai":
+            raise ModelCallError(
+                ModelCallErrorCode.MODEL_NOT_AVAILABLE,
+                f"Transcription is not configured for provider {provider}",
+                provider=provider,
+                retryable=False,
+            )
+
+        return await _retry_call(
+            call.retry,
+            lambda: self._openai.transcribe(call, api_key=key.reveal(), timeout_s=timeout_s),
+            wrap=lambda exc: _wrap_transcription_error(provider, exc),
         )
 
     def _resolve_provider(self, provider: str) -> ProviderName:
@@ -413,6 +437,37 @@ def _wrap_embedding_error(provider: ProviderName, exc: Exception) -> ModelCallEr
     )
 
 
+def _wrap_transcription_error(provider: ProviderName, exc: Exception) -> ModelCallError:
+    if isinstance(exc, httpx.TimeoutException):
+        return ModelCallError(
+            ModelCallErrorCode.TIMEOUT,
+            "Transcription request timed out",
+            provider=provider,
+        )
+    if isinstance(exc, httpx.HTTPStatusError):
+        return _http_status_model_error(provider, exc)
+    if isinstance(exc, ModelCallError):
+        return exc
+    if isinstance(exc, (json.JSONDecodeError, KeyError, IndexError, ValueError)):
+        return ModelCallError(
+            ModelCallErrorCode.PROVIDER_DOWN,
+            f"Transcription response parsing error: {type(exc).__name__}",
+            provider=provider,
+            retryable=False,
+        )
+    if isinstance(exc, (httpx.HTTPError, httpx.StreamError, TypeError, AttributeError)):
+        return ModelCallError(
+            ModelCallErrorCode.PROVIDER_DOWN,
+            f"Transcription transport error: {type(exc).__name__}: {exc}",
+            provider=provider,
+        )
+    return ModelCallError(
+        ModelCallErrorCode.PROVIDER_DOWN,
+        f"Unexpected transcription error: {type(exc).__name__}: {exc}",
+        provider=provider,
+    )
+
+
 def _http_status_model_error(provider: ProviderName, exc: httpx.HTTPStatusError) -> ModelCallError:
     response = exc.response
     code = classify_provider_error(
@@ -470,7 +525,7 @@ def _attach_success_attempts[T](
     attempt: int,
     max_attempts: int,
 ) -> T:
-    if isinstance(result, (ModelResponse, EmbeddingResponse)):
+    if isinstance(result, (ModelResponse, EmbeddingResponse, TranscriptionResponse)):
         success_attempt = RetryAttempt(
             attempt_number=attempt,
             max_attempts=max_attempts,

@@ -313,6 +313,35 @@ class EmbeddingResponse:
 
 
 @dataclass(frozen=True)
+class TranscriptionCall:
+    model: ModelRef
+    audio: bytes = field(repr=False)
+    filename: str
+    media_type: str
+    retry: RetryPolicy = field(default_factory=RetryPolicy)
+
+
+@dataclass(frozen=True)
+class TranscriptionResponse:
+    text: str
+    usage: TokenUsage | None
+    provider_request_id: str | None
+    attempts: tuple[RetryAttempt, ...] = field(default_factory=tuple, repr=False)
+
+    @property
+    def attempt_count(self) -> int:
+        return len(self.attempts) if self.attempts else 1
+
+    @property
+    def retry_count(self) -> int:
+        return max(0, self.attempt_count - 1)
+
+    @property
+    def terminal_attempt_status(self) -> RetryAttemptStatus:
+        return self.attempts[-1].status if self.attempts else "success"
+
+
+@dataclass(frozen=True)
 class KeyProbeResult:
     provider: ProviderName
     model: str

@@ -27,6 +27,8 @@ from provider_runtime.types import (
     ProviderName,
     ReasoningConfig,
     RetryPolicy,
+    TranscriptionCall,
+    TranscriptionResponse,
 )
 
 _PROVIDERS: frozenset[str] = frozenset(
@@ -167,6 +169,23 @@ class ModelRuntime(_AdapterRuntime):
             )
         return await super().embed(call, key=key, timeout_s=timeout_s)
 
+    async def transcribe(
+        self,
+        call: TranscriptionCall,
+        *,
+        key: ProviderApiKey,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
+    ) -> TranscriptionResponse:
+        capabilities = self._require_transcription_capabilities(call)
+        if not capabilities.transcription:
+            raise ModelCallError(
+                ModelCallErrorCode.MODEL_NOT_AVAILABLE,
+                f"Transcription is not configured for {capabilities.provider}/{capabilities.model}",
+                provider=capabilities.provider,
+                retryable=False,
+            )
+        return await super().transcribe(call, key=key, timeout_s=timeout_s)
+
     def _require_generate_capabilities(
         self,
         call: ModelCall,
@@ -179,6 +198,9 @@ class ModelRuntime(_AdapterRuntime):
 
     def _require_embedding_capabilities(self, call: EmbeddingCall) -> ModelCapability:
         return self._require_capabilities(call.model, operation="embed")
+
+    def _require_transcription_capabilities(self, call: TranscriptionCall) -> ModelCapability:
+        return self._require_capabilities(call.model, operation="transcribe")
 
     def _require_capabilities(self, model: ModelRef, *, operation: str) -> ModelCapability:
         catalog_ref = self._catalog_ref(model)

@@ -19,15 +19,17 @@ from provider_runtime.types import (
     ModelResponse,
     ProviderApiKey,
     ProviderName,
+    TranscriptionCall,
+    TranscriptionResponse,
 )
 
-RuntimeOperation = Literal["generate", "stream", "embed", "probe_key"]
+RuntimeOperation = Literal["generate", "stream", "embed", "transcribe", "probe_key"]
 
 
 @dataclass(frozen=True)
 class CapturedRuntimeCall:
     operation: RuntimeOperation
-    call: ModelCall | EmbeddingCall | None
+    call: ModelCall | EmbeddingCall | TranscriptionCall | None
     key: ProviderApiKey
     timeout_s: float
     provider: ProviderName | None = None
@@ -73,6 +75,15 @@ class NoNetworkRuntime:
     ) -> EmbeddingResponse:
         raise AssertionError(_unexpected_network_message("embed", call.model))
 
+    async def transcribe(
+        self,
+        call: TranscriptionCall,
+        *,
+        key: ProviderApiKey,
+        timeout_s: float = 45,
+    ) -> TranscriptionResponse:
+        raise AssertionError(_unexpected_network_message("transcribe", call.model))
+
     async def probe_key(
         self,
         *,
@@ -93,6 +104,7 @@ class ScriptedRuntime(NoNetworkRuntime):
         generate_responses: Iterable[ModelResponse] = (),
         stream_chunks: Iterable[Iterable[ModelChunk]] = (),
         embed_responses: Iterable[EmbeddingResponse] = (),
+        transcribe_responses: Iterable[TranscriptionResponse] = (),
         probe_results: Iterable[KeyProbeResult] = (),
     ):
         super().__init__(catalog=catalog)
@@ -100,6 +112,7 @@ class ScriptedRuntime(NoNetworkRuntime):
         self._generate_responses = deque(generate_responses)
         self._stream_chunks = deque(tuple(chunks) for chunks in stream_chunks)
         self._embed_responses = deque(embed_responses)
+        self._transcribe_responses = deque(transcribe_responses)
         self._probe_results = deque(probe_results)
 
     async def generate(
@@ -132,6 +145,16 @@ class ScriptedRuntime(NoNetworkRuntime):
     ) -> EmbeddingResponse:
         self.calls.append(CapturedRuntimeCall("embed", call, key, timeout_s))
         return self._pop(self._embed_responses, "embed")
+
+    async def transcribe(
+        self,
+        call: TranscriptionCall,
+        *,
+        key: ProviderApiKey,
+        timeout_s: float = 45,
+    ) -> TranscriptionResponse:
+        self.calls.append(CapturedRuntimeCall("transcribe", call, key, timeout_s))
+        return self._pop(self._transcribe_responses, "transcribe")
 
     async def probe_key(
         self,
