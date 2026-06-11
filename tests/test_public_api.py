@@ -20,8 +20,10 @@ def test_target_surface_is_exported() -> None:
         "DEFAULT_CATALOG",
         "ModelCatalog",
         "ModelCapability",
+        "PriceValue",
         "PromptCacheCapability",
         "Pricing",
+        "PricingUnit",
         "ProviderApiKey",
         "ProviderApiKeySource",
         "ProviderBaseUrls",
@@ -36,6 +38,7 @@ def test_target_surface_is_exported() -> None:
         "CostPolicy",
         "CostStatus",
         "DEFAULT_PRICING_SOURCE",
+        "ReasoningBillingMode",
         "estimate_catalog_cost",
         "estimate_cost",
     ):

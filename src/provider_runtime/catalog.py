@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Literal
 
 from provider_runtime.types import ModelRef, PromptCacheTTL, ProviderName, ReasoningEffort
 
 PromptCacheMode = Literal["none", "turn_ttl", "keyed_ttl"]
+type PriceValue = Decimal | int | float | str
+PricingUnit = Literal["per_million_tokens", "provider_units"]
+ReasoningBillingMode = Literal["included_in_output", "separate", "not_billed", "unknown"]
 
 
 @dataclass(frozen=True)
@@ -24,10 +28,68 @@ class PromptCacheCapability:
 
 @dataclass(frozen=True)
 class Pricing:
-    input_per_million: float | None = None
-    output_per_million: float | None = None
-    cached_input_per_million: float | None = None
-    reasoning_per_million: float | None = None
+    input_per_million: PriceValue | None = None
+    output_per_million: PriceValue | None = None
+    cached_input_per_million: PriceValue | None = None
+    cache_write_per_million_by_ttl: dict[PromptCacheTTL, PriceValue] = field(default_factory=dict)
+    reasoning_per_million: PriceValue | None = None
+    reasoning_billing_mode: ReasoningBillingMode = "unknown"
+    source_url: str | None = None
+    verified_at: str | None = None
+    currency: str = "USD"
+    unit: PricingUnit = "per_million_tokens"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "input_per_million", _decimal_or_none(self.input_per_million))
+        object.__setattr__(self, "output_per_million", _decimal_or_none(self.output_per_million))
+        object.__setattr__(
+            self,
+            "cached_input_per_million",
+            _decimal_or_none(self.cached_input_per_million),
+        )
+        object.__setattr__(
+            self, "reasoning_per_million", _decimal_or_none(self.reasoning_per_million)
+        )
+        object.__setattr__(
+            self,
+            "cache_write_per_million_by_ttl",
+            {
+                ttl: price
+                for ttl, raw_price in self.cache_write_per_million_by_ttl.items()
+                if (price := _decimal_or_none(raw_price)) is not None
+            },
+        )
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "input_per_million": _decimal_string(self.input_per_million),
+            "output_per_million": _decimal_string(self.output_per_million),
+            "cached_input_per_million": _decimal_string(self.cached_input_per_million),
+            "cache_write_per_million_by_ttl": {
+                ttl: _decimal_string(price)
+                for ttl, price in self.cache_write_per_million_by_ttl.items()
+            },
+            "reasoning_per_million": _decimal_string(self.reasoning_per_million),
+            "reasoning_billing_mode": self.reasoning_billing_mode,
+            "source_url": self.source_url,
+            "verified_at": self.verified_at,
+            "currency": self.currency,
+            "unit": self.unit,
+        }
+
+
+def _decimal_or_none(value: PriceValue | None) -> Decimal | None:
+    if value is None:
+        return None
+    return Decimal(str(value))
+
+
+def _decimal_string(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    return format(Decimal(str(value)), "f")
 
 
 @dataclass(frozen=True)
