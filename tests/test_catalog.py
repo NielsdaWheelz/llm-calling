@@ -47,6 +47,18 @@ def test_catalog_covers_ariel_research_and_vision_models() -> None:
     assert vision.multimodal_input is True
 
 
+def test_catalog_keeps_generation_embeddings_and_transcription_disjoint() -> None:
+    for entry in DEFAULT_CATALOG.entries:
+        if entry.embeddings:
+            assert entry.max_output_tokens == 0
+            assert entry.reasoning_modes == ("none",)
+        if entry.transcription:
+            assert entry.max_output_tokens == 0
+            assert entry.max_context_tokens == 0
+            assert entry.reasoning_modes == ("none",)
+        assert not (entry.embeddings and entry.transcription)
+
+
 def test_catalog_rejects_unknown_models() -> None:
     with pytest.raises(KeyError):
         DEFAULT_CATALOG.require_capabilities(ModelRef(provider="openai", model="missing"))

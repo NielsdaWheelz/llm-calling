@@ -248,7 +248,6 @@ DEFAULT_CATALOG = ModelCatalog(
             max_context_tokens=400000,
             max_output_tokens=128000,
             prompt_cache=PromptCacheCapability("keyed_ttl", ("5m", "1h"), requires_key=True),
-            embeddings=True,
             raw_artifact_support=True,
             usage_reasoning_tokens=True,
             usage_cache_read_write_tokens=True,

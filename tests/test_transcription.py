@@ -68,6 +68,24 @@ async def test_runtime_retries_retryable_transcription_errors_before_success() -
     assert response.retry_count == 1
 
 
+@respx.mock
+async def test_terminal_parser_exceptions_do_not_retry_transcription_calls() -> None:
+    route = respx.post("https://api.openai.com/v1/audio/transcriptions").mock(
+        side_effect=TypeError("'NoneType' object is not subscriptable")
+    )
+
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(ModelCallError) as exc_info:
+            await ModelRuntime(http).transcribe(
+                call(retry=RetryPolicy(max_attempts=3, initial_delay_s=0)),
+                key=KEY,
+            )
+
+    assert route.call_count == 1
+    assert exc_info.value.retryable is False
+    assert [attempt.status for attempt in exc_info.value.attempts] == ["terminal_error"]
+
+
 async def test_runtime_rejects_unknown_transcription_model() -> None:
     async with httpx.AsyncClient() as http:
         with pytest.raises(ModelCallError) as exc_info:

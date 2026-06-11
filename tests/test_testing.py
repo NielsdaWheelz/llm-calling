@@ -13,6 +13,8 @@ from provider_runtime import (
     ProviderApiKey,
     ScriptedRuntime,
     TokenUsage,
+    TranscriptionCall,
+    TranscriptionResponse,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -93,3 +95,32 @@ async def test_scripted_runtime_returns_queued_embeddings_and_key_probe() -> Non
     assert embedding.provider_request_id == "req-emb"
     assert probe.ok is True
     assert [call.operation for call in runtime.calls] == ["embed", "probe_key"]
+
+
+async def test_scripted_runtime_returns_queued_transcription_response() -> None:
+    runtime = ScriptedRuntime(
+        transcribe_responses=(
+            TranscriptionResponse(
+                text="hello world",
+                usage=TokenUsage(input_tokens=2, output_tokens=3, total_tokens=5),
+                provider_request_id="req-transcribe",
+            ),
+        )
+    )
+
+    response = await runtime.transcribe(
+        TranscriptionCall(
+            model=ModelRef(provider="openai", model="gpt-4o-transcribe"),
+            audio=b"RIFF...",
+            filename="clip.wav",
+            media_type="audio/wav",
+        ),
+        key=KEY,
+        timeout_s=20,
+    )
+
+    assert response.text == "hello world"
+    assert response.provider_request_id == "req-transcribe"
+    assert len(runtime.calls) == 1
+    assert runtime.calls[0].operation == "transcribe"
+    assert runtime.calls[0].timeout_s == 20

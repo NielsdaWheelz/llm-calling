@@ -7,7 +7,9 @@ suite and run only when selected with ``-m live_provider`` plus
 
 from __future__ import annotations
 
+import io
 import os
+import wave
 from dataclasses import dataclass
 from typing import Literal, cast
 
@@ -15,6 +17,7 @@ import httpx
 import pytest
 
 from provider_runtime import (
+    EmbeddingCall,
     ModelCall,
     ModelMessage,
     ModelRef,
@@ -25,6 +28,7 @@ from provider_runtime import (
     StructuredOutputSpec,
     ToolResult,
     ToolSpec,
+    TranscriptionCall,
 )
 from provider_runtime.catalog import DEFAULT_CATALOG, ModelCapability
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode
@@ -109,6 +113,22 @@ def _provider_cases() -> tuple[ProviderCase, ...]:
     return tuple(
         ProviderCase(provider=provider, capability=_representative_capability(provider))
         for provider in _PROVIDER_ORDER
+    )
+
+
+def _embedding_cases() -> tuple[ProviderCase, ...]:
+    return tuple(
+        ProviderCase(provider=entry.provider, capability=entry)
+        for entry in DEFAULT_CATALOG.entries
+        if entry.embeddings
+    )
+
+
+def _transcription_cases() -> tuple[ProviderCase, ...]:
+    return tuple(
+        ProviderCase(provider=entry.provider, capability=entry)
+        for entry in DEFAULT_CATALOG.entries
+        if entry.transcription
     )
 
 
@@ -204,6 +224,16 @@ def _assert_text_response(case: ProviderCase, text: str) -> None:
 def _assert_usage_if_claimed(case: ProviderCase, usage: object | None) -> None:
     if case.capability.usage_input_output_tokens:
         assert usage is not None, f"{case.provider}/{case.model} did not return usage"
+
+
+def _silent_wav_bytes() -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16_000)
+        wav.writeframes(b"\x00\x00" * 4_000)
+    return buffer.getvalue()
 
 
 @pytest.mark.parametrize("case", _provider_cases(), ids=lambda case: case.provider)
@@ -400,6 +430,49 @@ async def test_live_structured_output_where_supported(
     )
     assert response.structured_output.get("ok") is True
     assert isinstance(response.structured_output.get("summary"), str)
+
+
+@pytest.mark.parametrize(
+    "case", _embedding_cases(), ids=lambda case: f"{case.provider}:{case.model}"
+)
+async def test_live_embeddings(live_env: LiveEnv, case: ProviderCase) -> None:
+    key = live_env.key_for(case.provider)
+    async with httpx.AsyncClient() as http:
+        response = await _runtime(http).embed(
+            EmbeddingCall(
+                model=ModelRef(provider=case.provider, model=case.model),
+                inputs=["nexus live embedding smoke"],
+                retry=RetryPolicy(max_attempts=1, initial_delay_s=0),
+            ),
+            key=key,
+            timeout_s=60,
+        )
+
+    assert len(response.embeddings) == 1
+    assert response.embeddings[0]
+    assert all(isinstance(value, float) for value in response.embeddings[0])
+    _assert_usage_if_claimed(case, response.usage)
+
+
+@pytest.mark.parametrize(
+    "case", _transcription_cases(), ids=lambda case: f"{case.provider}:{case.model}"
+)
+async def test_live_transcription(live_env: LiveEnv, case: ProviderCase) -> None:
+    key = live_env.key_for(case.provider)
+    async with httpx.AsyncClient() as http:
+        response = await _runtime(http).transcribe(
+            TranscriptionCall(
+                model=ModelRef(provider=case.provider, model=case.model),
+                audio=_silent_wav_bytes(),
+                filename="silence.wav",
+                media_type="audio/wav",
+                retry=RetryPolicy(max_attempts=1, initial_delay_s=0),
+            ),
+            key=key,
+            timeout_s=60,
+        )
+
+    assert isinstance(response.text, str)
 
 
 @pytest.mark.parametrize("case", _provider_cases(), ids=lambda case: case.provider)

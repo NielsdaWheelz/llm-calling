@@ -97,6 +97,24 @@ async def test_runtime_embeds_with_openai_base_url() -> None:
 
 
 @respx.mock
+async def test_terminal_parser_exceptions_do_not_retry_embedding_calls() -> None:
+    route = respx.post("https://api.openai.com/v1/embeddings").mock(
+        side_effect=TypeError("'NoneType' object is not subscriptable")
+    )
+
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(ModelCallError) as exc_info:
+            await ModelRuntime(http).embed(
+                call(retry=RetryPolicy(max_attempts=3, initial_delay_s=0)),
+                key=KEY,
+            )
+
+    assert route.call_count == 1
+    assert exc_info.value.retryable is False
+    assert [attempt.status for attempt in exc_info.value.attempts] == ["terminal_error"]
+
+
+@respx.mock
 async def test_runtime_retries_retryable_embedding_errors_before_success() -> None:
     route = respx.post("https://api.openai.com/v1/embeddings").mock(
         side_effect=[

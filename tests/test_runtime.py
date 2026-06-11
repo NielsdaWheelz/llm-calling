@@ -138,6 +138,32 @@ async def test_generate_wraps_transport_and_payload_exceptions(exc: Exception) -
     assert exc_info.value.error_code == ModelCallErrorCode.PROVIDER_DOWN
     assert type(exc).__name__ in exc_info.value.message
     assert str(exc) in exc_info.value.message
+    if isinstance(exc, (TypeError, AttributeError, httpx.DecodingError, httpx.StreamError)):
+        assert exc_info.value.retryable is False
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["generate", "stream"],
+)
+@respx.mock
+async def test_terminal_parser_exceptions_do_not_retry_model_calls(operation: str) -> None:
+    req = request("openai", retry=RetryPolicy(max_attempts=3, initial_delay_s=0))
+    route = respx.post(endpoint("openai", req.model.model)).mock(
+        side_effect=TypeError("'NoneType' object is not subscriptable")
+    )
+
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(ModelCallError) as exc_info:
+            if operation == "generate":
+                await runtime(http).generate(req, key=KEY)
+            else:
+                async for _ in runtime(http).stream(req, key=KEY):
+                    pass
+
+    assert route.call_count == 1
+    assert exc_info.value.retryable is False
+    assert [attempt.status for attempt in exc_info.value.attempts] == ["terminal_error"]
 
 
 @respx.mock
