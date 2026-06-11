@@ -18,7 +18,7 @@ packages = ["src/provider_runtime"]
 [dependency-groups]
 dev = [
     "pip-audit>=2.9.0",
-    "pyright>=1.1.390",
+    "pyright>=1.1.410",
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
     "respx>=0.21.0",
