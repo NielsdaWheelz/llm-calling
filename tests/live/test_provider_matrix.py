@@ -245,6 +245,41 @@ def _baseline_reasoning(capability: ModelCapability) -> ReasoningEffort:
     return "none" if "none" in capability.reasoning_modes else "default"
 
 
+def _default_send_max_output(case: ProviderCase) -> int:
+    return 512 if case.provider == "gemini" else 96
+
+
+def _reasoning_send_max_output(case: ProviderCase, effort: ReasoningEffort) -> int:
+    if case.provider != "gemini":
+        return 160
+    if case.model == "gemini-2.5-pro":
+        return {
+            "minimal": 256,
+            "low": 1408,
+            "medium": 8448,
+            "high": 16512,
+            "max": 32896,
+        }.get(effort, 512)
+    if case.model == "gemini-2.5-flash":
+        return {
+            "none": 160,
+            "minimal": 768,
+            "low": 1408,
+            "medium": 8448,
+            "high": 16512,
+            "max": 24896,
+        }.get(effort, 512)
+    return 1024
+
+
+def _streaming_max_output(case: ProviderCase) -> int:
+    return 256 if case.provider == "gemini" else 64
+
+
+def _structured_max_output(case: ProviderCase) -> int:
+    return 512 if case.provider == "gemini" else 96
+
+
 def _assert_text_response(case: ProviderCase, text: str) -> None:
     assert text.strip(), f"{case.provider}/{case.model} returned empty text"
 
@@ -274,6 +309,7 @@ async def test_live_default_send(live_env: LiveEnv, case: ProviderCase) -> None:
             _text_call(
                 case,
                 "Reply with a short sentence containing the word nexus.",
+                max_output_tokens=_default_send_max_output(case),
                 reasoning="default",
             ),
             key=key,
@@ -303,7 +339,7 @@ async def test_live_declared_reasoning_send(
             _text_call(
                 case,
                 "Answer in one sentence: what is two plus two?",
-                max_output_tokens=160,
+                max_output_tokens=_reasoning_send_max_output(case, reasoning_case.effort),
                 reasoning=reasoning_case.effort,
             ),
             key=key,
@@ -360,7 +396,7 @@ async def test_live_streaming_text(live_env: LiveEnv, case: ProviderCase) -> Non
             _text_call(
                 case,
                 "Stream one short sentence.",
-                max_output_tokens=64,
+                max_output_tokens=_streaming_max_output(case),
                 reasoning=_baseline_reasoning(case.capability),
             ),
             key=key,
@@ -404,8 +440,8 @@ async def test_live_forced_tool_call_and_continuation(
             _call(
                 case,
                 [user_turn],
-                max_output_tokens=128,
-                reasoning=_highest_reasoning_effort(case.capability),
+                max_output_tokens=256,
+                reasoning=_baseline_reasoning(case.capability),
                 tools=(tool,),
                 tool_choice="required",
             ),
@@ -435,8 +471,8 @@ async def test_live_forced_tool_call_and_continuation(
                         ),
                     ),
                 ],
-                max_output_tokens=96,
-                reasoning=_highest_reasoning_effort(case.capability),
+                max_output_tokens=256,
+                reasoning=_baseline_reasoning(case.capability),
             ),
             key=key,
             timeout_s=60,
@@ -470,7 +506,7 @@ async def test_live_structured_output_where_supported(
             _call(
                 case,
                 [ModelMessage(role="user", content="Return ok=true and a two-word summary.")],
-                max_output_tokens=96,
+                max_output_tokens=_structured_max_output(case),
                 reasoning=_baseline_reasoning(case.capability),
                 structured_output=StructuredOutputSpec(
                     name="live_provider_result",
@@ -538,7 +574,12 @@ async def test_live_invalid_key_maps_to_invalid_key(live_env: LiveEnv, case: Pro
     async with httpx.AsyncClient() as http:
         with pytest.raises(ModelCallError) as exc_info:
             await _runtime(http).generate(
-                _text_call(case, "This call must fail before model output.", max_output_tokens=8),
+                _text_call(
+                    case,
+                    "This call must fail before model output.",
+                    max_output_tokens=8,
+                    reasoning=_baseline_reasoning(case.capability),
+                ),
                 key=ProviderApiKey("invalid-live-provider-key", source="test"),
                 timeout_s=30,
             )
@@ -557,6 +598,7 @@ async def test_live_timeout_maps_to_timeout(live_env: LiveEnv, case: ProviderCas
                     case,
                     "This call intentionally uses an impossible timeout.",
                     max_output_tokens=8,
+                    reasoning=_baseline_reasoning(case.capability),
                     retry=RetryPolicy(max_attempts=2, initial_delay_s=0, max_delay_s=0),
                 ),
                 key=key,

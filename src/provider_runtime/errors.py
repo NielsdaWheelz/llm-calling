@@ -228,7 +228,7 @@ def _classify_anthropic_error(status_code: int, json_body: dict | None) -> Model
 def _classify_gemini_error(status_code: int, json_body: dict | None) -> ModelCallErrorCode:
     body_str = str(json_body).lower() if json_body else ""
 
-    if "api_key_invalid" in body_str:
+    if "api_key_invalid" in body_str or ("api key" in body_str and "invalid" in body_str):
         return ModelCallErrorCode.INVALID_KEY
 
     if status_code in (401, 403):

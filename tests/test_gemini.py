@@ -195,6 +195,43 @@ async def test_gemini_25_reasoning_uses_thinking_budget() -> None:
 
 
 @respx.mock
+async def test_gemini_default_reasoning_uses_cost_safe_visible_defaults() -> None:
+    pro_route = respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+    ).respond(200, json=load_json("success_nonstream.json"))
+    flash_route = respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent"
+    ).respond(200, json=load_json("success_nonstream.json"))
+
+    async with httpx.AsyncClient() as http:
+        await GeminiClient(http).generate(
+            ModelCall(
+                model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
+                messages=[ModelMessage(role="user", content="Hello.")],
+                max_output_tokens=100,
+                reasoning=ReasoningConfig(effort="default"),
+            ),
+            api_key="sk-test",
+            timeout_s=30,
+        )
+        await GeminiClient(http).generate(
+            ModelCall(
+                model=ModelRef(provider="gemini", model="gemini-3-flash-preview"),
+                messages=[ModelMessage(role="user", content="Hello.")],
+                max_output_tokens=100,
+                reasoning=ReasoningConfig(effort="default"),
+            ),
+            api_key="sk-test",
+            timeout_s=30,
+        )
+
+    pro_body = json.loads(pro_route.calls.last.request.content)
+    flash_body = json.loads(flash_route.calls.last.request.content)
+    assert pro_body["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 128}
+    assert flash_body["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "minimal"}
+
+
+@respx.mock
 async def test_gemini_25_explicit_budget_overrides_effort_mapping() -> None:
     route = respx.post(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
@@ -276,7 +313,16 @@ async def test_tool_call_nonstream_and_request_body() -> None:
             ToolSpec(
                 name="get_weather",
                 description="Get the weather.",
-                parameters={"type": "object", "properties": {"city": {"type": "string"}}},
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "city": {
+                            "type": "string",
+                            "additionalProperties": False,
+                        }
+                    },
+                    "additionalProperties": False,
+                },
             ),
         ),
         tool_choice="required",
@@ -609,6 +655,31 @@ async def test_stream_thought_parts_excluded_and_signature_captured() -> None:
         "thoughtSignature": "sig-abc",
     }
     assert chunks[-1].done is True
+
+
+@respx.mock
+async def test_stream_max_tokens_finish_reason_is_terminal_incomplete() -> None:
+    stream = (
+        'data: {"candidates":[{"content":{"parts":[{"text":"Partial"}],"role":"model"},'
+        '"index":0,"finishReason":"MAX_TOKENS"}],'
+        '"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3,"totalTokenCount":8}}\n\n'
+    )
+    respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+    ).respond(200, content=stream)
+
+    async with httpx.AsyncClient() as http:
+        chunks = [
+            chunk
+            async for chunk in GeminiClient(http).generate_stream(
+                request(), api_key="sk-test", timeout_s=30
+            )
+        ]
+
+    assert "".join(chunk.delta_text for chunk in chunks) == "Partial"
+    assert chunks[-1].done is True
+    assert chunks[-1].status == "incomplete"
+    assert chunks[-1].incomplete_details == {"finish_reason": "MAX_TOKENS"}
 
 
 @respx.mock

@@ -65,14 +65,20 @@ verification date are treated as absent.
 
 ## Reasoning
 
-`reasoning=ReasoningConfig(effort="default")` leaves OpenAI `reasoning` unset. Pass it explicitly when product
-policy should use the OpenAI API default. Explicit OpenAI reasoning values map directly for
-`"none"`, `"minimal"`, `"low"`, `"medium"`, and `"high"`; product `"max"` maps to OpenAI
-`"xhigh"`.
+`reasoning=ReasoningConfig(effort="default")` is the runtime-owned safe default for the
+selected catalog row. Direct OpenAI catalog rows omit `reasoning` for `default`; explicit direct
+OpenAI values currently include `"none"`, `"low"`, `"medium"`, and `"high"`, while product
+`"max"` maps to OpenAI `"xhigh"`.
 
 Gemini lowering is model-specific. Gemini 2.5 models use `thinkingBudget`; Gemini 3 models use
-`thinkingLevel`. Unsupported thinking-off modes, such as `none` on Gemini Pro models, are rejected
+`thinkingLevel`. The runtime maps Gemini `default` to a cost-safe visible-output setting for each
+model family instead of blindly using provider defaults that can consume small responses with
+thinking tokens. Unsupported thinking-off modes, such as `none` on Gemini Pro models, are rejected
 by catalog validation before a request reaches the provider adapter.
+
+OpenRouter receives explicit `reasoning` controls, including `exclude=true`, for every catalog
+reasoning mode. This keeps hidden reasoning out of the response while still letting callers choose
+supported reasoning effort levels.
 
 OpenAI responses preserve `status`, `incomplete_details`, `provider_request_id`, and
 `usage.output_tokens_details.reasoning_tokens`. A `response.incomplete` result is returned

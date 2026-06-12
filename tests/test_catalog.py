@@ -15,7 +15,10 @@ def test_catalog_returns_per_model_capabilities() -> None:
     assert openai.structured_output is True
     assert cloudflare.provider == "cloudflare"
     assert cloudflare.prompt_cache.supported is False
+    assert cloudflare.streaming is False
     assert cloudflare.structured_output is False
+    assert cloudflare.tool_calling is False
+    assert cloudflare.tool_choice_required is False
 
 
 def test_catalog_uses_route_as_lookup_provider() -> None:
@@ -54,10 +57,16 @@ def test_catalog_keeps_generation_embeddings_and_transcription_disjoint() -> Non
         assert entry.generation != entry.transcription or not entry.transcription
         if entry.embeddings:
             assert entry.generation is False
+            assert entry.streaming is False
+            assert entry.tool_calling is False
+            assert entry.tool_choice_required is False
             assert entry.max_output_tokens == 0
             assert entry.reasoning_modes == ("none",)
         if entry.transcription:
             assert entry.generation is False
+            assert entry.streaming is False
+            assert entry.tool_calling is False
+            assert entry.tool_choice_required is False
             assert entry.max_output_tokens == 0
             assert entry.max_context_tokens == 0
             assert entry.reasoning_modes == ("none",)
@@ -95,6 +104,16 @@ def test_gemini_catalog_does_not_claim_provider_request_ids() -> None:
 
     assert gemini_entries
     assert all(entry.provider_request_id is False for entry in gemini_entries)
+
+
+def test_live_catalog_does_not_overclaim_known_unavailable_capabilities() -> None:
+    openai = DEFAULT_CATALOG.require_capabilities(ModelRef(provider="openai", model="gpt-5.5"))
+    cloudflare_embedding = DEFAULT_CATALOG.require_capabilities(
+        ModelRef(provider="cloudflare", model="@cf/qwen/qwen3-embedding-0.6b")
+    )
+
+    assert "minimal" not in openai.reasoning_modes
+    assert cloudflare_embedding.usage_input_output_tokens is False
 
 
 def test_catalog_rejects_unknown_models() -> None:

@@ -260,9 +260,12 @@ class OpenAICompatibleChatClient:
             }
 
         if self._provider == "openrouter":
-            if req.reasoning.effort not in ("default", "none"):
-                effort = "high" if req.reasoning.effort == "max" else req.reasoning.effort
-                body["reasoning"] = {"effort": effort}
+            effort = req.reasoning.effort
+            if effort == "default":
+                effort = "none"
+            elif effort == "max":
+                effort = "xhigh"
+            body["reasoning"] = {"effort": effort, "exclude": True}
         elif req.reasoning.effort not in ("default", "none"):
             raise ModelCallError(
                 ModelCallErrorCode.BAD_REQUEST,

@@ -165,8 +165,28 @@ async def test_openrouter_reasoning_effort_is_forwarded() -> None:
         await chat_client(http).generate(req, api_key="sk-test", timeout_s=30)
 
     body = json.loads(route.calls.last.request.content)
-    assert body["reasoning"] == {"effort": "high"}
+    assert body["reasoning"] == {"effort": "high", "exclude": True}
     assert body["temperature"] == 0.7
+
+
+@respx.mock
+async def test_openrouter_default_reasoning_is_explicit_non_reasoning() -> None:
+    route = respx.post("https://openrouter.test/v1/chat/completions").respond(
+        200,
+        json=load_json("success_nonstream.json"),
+    )
+    req = ModelCall(
+        model=ModelRef(provider="openrouter", model="moonshotai/kimi-k2.6"),
+        messages=[ModelMessage(role="user", content="Hello!")],
+        max_output_tokens=100,
+        reasoning=ReasoningConfig(effort="default"),
+    )
+
+    async with httpx.AsyncClient() as http:
+        await chat_client(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["reasoning"] == {"effort": "none", "exclude": True}
 
 
 @respx.mock

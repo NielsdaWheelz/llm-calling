@@ -49,6 +49,18 @@ def test_anthropic_credit_balance_400_classifies_as_quota_exceeded() -> None:
     )
 
 
+def test_gemini_invalid_key_400_classifies_as_invalid_key() -> None:
+    body = {
+        "error": {
+            "code": 400,
+            "message": "API key not valid. Please pass a valid API key.",
+            "status": "INVALID_ARGUMENT",
+        }
+    }
+
+    assert classify_provider_error("gemini", 400, body, None) == ModelCallErrorCode.INVALID_KEY
+
+
 @pytest.mark.asyncio
 async def test_provider_error_body_snippet_is_explicit_and_redacts_secret_tokens() -> None:
     response = httpx.Response(

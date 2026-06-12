@@ -154,7 +154,7 @@ class GeminiClient:
         ) as response:
             await raise_for_provider_error(response, "gemini")
 
-            received_stop = False
+            received_terminal = False
             usage: TokenUsage | None = None
 
             async for line in response.aiter_lines():
@@ -208,8 +208,8 @@ class GeminiClient:
                             provider_usage=dict(usage_metadata),
                         )
 
-                    if finish_reason == "STOP":
-                        received_stop = True
+                    if finish_reason:
+                        received_terminal = True
                         # Yield any remaining text as non-terminal
                         if delta_text:
                             yield ModelChunk(delta_text=delta_text, done=False)
@@ -223,6 +223,12 @@ class GeminiClient:
                             done=True,
                             usage=usage,
                             provider_request_id=None,  # Gemini doesn't provide request ID
+                            status=("completed" if finish_reason == "STOP" else "incomplete"),
+                            incomplete_details=(
+                                None
+                                if finish_reason == "STOP"
+                                else {"finish_reason": finish_reason}
+                            ),
                         )
                         break
                     else:
@@ -233,10 +239,10 @@ class GeminiClient:
                         for tc in tool_calls:
                             yield ModelChunk(tool_call=tc, done=False)
 
-            if not received_stop:
+            if not received_terminal:
                 raise ModelCallError(
                     ModelCallErrorCode.PROVIDER_DOWN,
-                    "Gemini stream ended without STOP finish reason",
+                    "Gemini stream ended without terminal finish reason",
                     provider="gemini",
                     retryable=False,
                 )
@@ -306,7 +312,7 @@ class GeminiClient:
                         {
                             "name": tool.name,
                             "description": tool.description,
-                            "parameters": tool.parameters,
+                            "parameters": _gemini_tool_schema(tool.parameters),
                         }
                         for tool in req.tools
                     ]
@@ -318,27 +324,38 @@ class GeminiClient:
         if req.model.model == GEMINI_25_PRO:
             budget = req.reasoning.budget_tokens
             if budget is None:
-                if req.reasoning.effort == "default":
-                    return body
-                budget = _GEMINI_25_PRO_BUDGET_BY_EFFORT.get(req.reasoning.effort)
+                effort = "minimal" if req.reasoning.effort == "default" else req.reasoning.effort
+                budget = _GEMINI_25_PRO_BUDGET_BY_EFFORT.get(effort)
+            elif req.reasoning.effort == "default":
+                effort = "minimal"
+            else:
+                effort = req.reasoning.effort
             if budget is None:
-                raise ValueError(f"Unknown reasoning_effort: {req.reasoning.effort}")
+                raise ValueError(f"Unknown reasoning_effort: {effort}")
             body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": budget}
             return body
 
         if req.model.model == GEMINI_25_FLASH:
             budget = req.reasoning.budget_tokens
             if budget is None:
-                if req.reasoning.effort == "default":
-                    return body
-                budget = _GEMINI_25_FLASH_BUDGET_BY_EFFORT.get(req.reasoning.effort)
+                effort = "none" if req.reasoning.effort == "default" else req.reasoning.effort
+                budget = _GEMINI_25_FLASH_BUDGET_BY_EFFORT.get(effort)
+            elif req.reasoning.effort == "default":
+                effort = "none"
+            else:
+                effort = req.reasoning.effort
             if budget is None:
-                raise ValueError(f"Unknown reasoning_effort: {req.reasoning.effort}")
+                raise ValueError(f"Unknown reasoning_effort: {effort}")
             body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": budget}
             return body
 
         if req.reasoning.effort == "default":
-            return body
+            if req.model.model == GEMINI_31_PRO_PREVIEW:
+                body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}
+                return body
+            if req.model.model == GEMINI_3_FLASH_PREVIEW:
+                body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "minimal"}
+                return body
 
         if req.model.model == GEMINI_31_PRO_PREVIEW:
             if req.reasoning.effort in ("low", "medium"):
@@ -419,7 +436,8 @@ class GeminiClient:
                 retryable=False,
             )
 
-        content = candidates[0].get("content", {})
+        candidate = candidates[0]
+        content = candidate.get("content", {})
         parts = content.get("parts", [])
         text_parts = [
             part.get("text", "") for part in parts if "text" in part and not part.get("thought")
@@ -453,15 +471,42 @@ class GeminiClient:
                 provider_usage=dict(usage_metadata),
             )
 
+        finish_reason = candidate.get("finishReason")
+        status = None
+        incomplete_details = None
+        if finish_reason:
+            status = "completed" if finish_reason == "STOP" else "incomplete"
+            if finish_reason != "STOP":
+                incomplete_details = {"finish_reason": finish_reason}
+
         # Gemini doesn't return a request ID
         return ModelResponse(
             text=text,
             usage=usage,
             provider_request_id=None,
+            status=status,
+            incomplete_details=incomplete_details,
             structured_output=structured_output,
             tool_calls=tuple(tool_calls),
             provider_artifacts=tuple(provider_artifacts),
         )
+
+
+def _gemini_tool_schema(schema: dict[str, object]) -> dict[str, object]:
+    stripped = _strip_gemini_tool_schema_unsupported_fields(schema)
+    return stripped if isinstance(stripped, dict) else {}
+
+
+def _strip_gemini_tool_schema_unsupported_fields(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _strip_gemini_tool_schema_unsupported_fields(inner)
+            for key, inner in value.items()
+            if key != "additionalProperties"
+        }
+    if isinstance(value, list):
+        return [_strip_gemini_tool_schema_unsupported_fields(inner) for inner in value]
+    return value
 
 
 def _part_to_tool_call_and_artifact(

@@ -186,17 +186,26 @@ def _cap(
     reasoning_budget_range: tuple[int, int] | None = None,
     reasoning_allows_dynamic_budget: bool = False,
     prompt_cache: PromptCacheCapability | None = None,
+    streaming: bool = True,
+    tool_calling: bool = True,
+    tool_choice_required: bool = True,
     structured_output: bool = True,
+    structured_output_streaming: bool = False,
     embeddings: bool = False,
     transcription: bool = False,
     multimodal_input: bool = False,
     raw_artifact_support: bool = False,
     provider_request_id: bool = True,
+    usage_input_output_tokens: bool = True,
     usage_reasoning_tokens: bool = False,
     usage_cache_read_write_tokens: bool = False,
     reasoning_continuation: bool = False,
     pricing: Pricing | None = None,
 ) -> ModelCapability:
+    if not generation:
+        streaming = False
+        tool_calling = False
+        tool_choice_required = False
     return ModelCapability(
         provider=provider,
         model=model,
@@ -211,12 +220,17 @@ def _cap(
         max_context_tokens=max_context_tokens,
         max_output_tokens=max_output_tokens,
         prompt_cache=prompt_cache or PromptCacheCapability("none"),
+        streaming=streaming,
+        tool_calling=tool_calling,
+        tool_choice_required=tool_choice_required,
         structured_output=structured_output,
+        structured_output_streaming=structured_output_streaming,
         embeddings=embeddings,
         transcription=transcription,
         multimodal_input=multimodal_input,
         raw_artifact_support=raw_artifact_support,
         provider_request_id=provider_request_id,
+        usage_input_output_tokens=usage_input_output_tokens,
         usage_reasoning_tokens=usage_reasoning_tokens,
         usage_cache_read_write_tokens=usage_cache_read_write_tokens,
         reasoning_continuation=reasoning_continuation,
@@ -225,6 +239,14 @@ def _cap(
 
 
 _OPENAI_REASONING: tuple[ReasoningEffort, ...] = (
+    "default",
+    "none",
+    "low",
+    "medium",
+    "high",
+    "max",
+)
+_OPENROUTER_OPENAI_REASONING: tuple[ReasoningEffort, ...] = (
     "default",
     "none",
     "minimal",
@@ -549,7 +571,7 @@ DEFAULT_CATALOG = ModelCatalog(
         _cap(
             "openrouter",
             "openai/gpt-5.5",
-            reasoning_modes=_OPENAI_REASONING,
+            reasoning_modes=_OPENROUTER_OPENAI_REASONING,
             key_probe_model="openai/gpt-5.4-mini",
             max_context_tokens=1050000,
             max_output_tokens=32000,
@@ -565,7 +587,7 @@ DEFAULT_CATALOG = ModelCatalog(
         _cap(
             "openrouter",
             "openai/gpt-5.4-mini",
-            reasoning_modes=_OPENAI_REASONING,
+            reasoning_modes=_OPENROUTER_OPENAI_REASONING,
             key_probe_model="openai/gpt-5.4-mini",
             max_context_tokens=400000,
             max_output_tokens=32000,
@@ -585,6 +607,9 @@ DEFAULT_CATALOG = ModelCatalog(
             key_probe_model="@cf/openai/gpt-oss-20b",
             max_context_tokens=128000,
             max_output_tokens=4096,
+            streaming=False,
+            tool_calling=False,
+            tool_choice_required=False,
             structured_output=False,
             pricing=Pricing(
                 input_per_million="0.20",
@@ -604,6 +629,7 @@ DEFAULT_CATALOG = ModelCatalog(
             generation=False,
             structured_output=False,
             embeddings=True,
+            usage_input_output_tokens=False,
             pricing=Pricing(
                 input_per_million="0.012",
                 output_per_million="0",
