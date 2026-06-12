@@ -134,7 +134,8 @@ LLM_RUNTIME_LIVE=1 uv run pytest -v -m live_provider tests/live/test_provider_ma
 
 By default it covers every generation row in `DEFAULT_CATALOG`, every declared reasoning effort,
 OpenAI, Anthropic, Gemini, OpenRouter, Cloudflare, embeddings, and transcription.
-For focused diagnosis, set `LLM_RUNTIME_LIVE_PROVIDERS=openai,anthropic`.
+For focused diagnosis, set `LLM_RUNTIME_LIVE_PROVIDERS=openai,anthropic`; narrowed runs are
+debugging aids and do not count as acceptance proof.
 Required key env vars are `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
 `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and for Cloudflare both
 `CLOUDFLARE_AI_API_TOKEN` and `CLOUDFLARE_AI_ACCOUNT_ID`.
