@@ -369,7 +369,7 @@ class AnthropicClient:
             elif req.reasoning.effort == "high":
                 effort = "high"
             elif req.reasoning.effort == "max":
-                effort = "xhigh"
+                effort = "max"
             else:
                 raise ValueError(f"Unknown reasoning_effort: {req.reasoning.effort}")
 

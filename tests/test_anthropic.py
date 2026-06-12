@@ -334,6 +334,28 @@ async def test_structured_output_rejects_extended_thinking() -> None:
 
 
 @respx.mock
+async def test_adaptive_thinking_max_lowers_to_provider_max() -> None:
+    response_json = load_json("success_nonstream.json")
+    route = respx.post("https://api.anthropic.com/v1/messages").respond(
+        200,
+        json=response_json,
+    )
+    req = ModelCall(
+        model=ModelRef(provider="anthropic", model="claude-sonnet-4-6"),
+        messages=[ModelMessage(role="user", content="Think hard.")],
+        max_output_tokens=160,
+        reasoning=ReasoningConfig(effort="max"),
+    )
+
+    async with httpx.AsyncClient() as http:
+        await AnthropicClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["thinking"] == {"type": "adaptive"}
+    assert body["output_config"] == {"effort": "max"}
+
+
+@respx.mock
 async def test_tool_use_in_nonstream_response_populates_tool_calls() -> None:
     response_json = load_json("success_nonstream.json")
     response_json["content"] = [
