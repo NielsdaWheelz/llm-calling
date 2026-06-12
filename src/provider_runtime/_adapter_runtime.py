@@ -13,7 +13,12 @@ from provider_runtime.anthropic import AnthropicClient
 from provider_runtime.cloudflare import CloudflareClient, cloudflare_ai_base_url
 from provider_runtime.embeddings import EmbeddingsClient
 from provider_runtime.endpoints import ANTHROPIC_BASE_URL, GEMINI_BASE_URL, OPENAI_BASE_URL
-from provider_runtime.errors import ModelCallError, ModelCallErrorCode, classify_provider_error
+from provider_runtime.errors import (
+    ModelCallError,
+    ModelCallErrorCode,
+    classify_provider_error,
+    sanitize_provider_text,
+)
 from provider_runtime.gemini import GeminiClient
 from provider_runtime.openai import OpenAIClient
 from provider_runtime.openrouter import OPENROUTER_BASE_URL, OpenRouterClient
@@ -356,7 +361,7 @@ def _wrap_generate_error(provider: ProviderName, exc: Exception) -> ModelCallErr
     if isinstance(exc, httpx.TransportError):
         return ModelCallError(
             ModelCallErrorCode.PROVIDER_DOWN,
-            f"Transport error: {type(exc).__name__}: {exc}",
+            f"Transport error: {_exception_summary(exc)}",
             provider=provider,
         )
     if isinstance(exc, ModelCallError):
@@ -364,20 +369,20 @@ def _wrap_generate_error(provider: ProviderName, exc: Exception) -> ModelCallErr
     if _is_terminal_response_error(exc):
         return ModelCallError(
             ModelCallErrorCode.PROVIDER_DOWN,
-            f"Response parsing error: {type(exc).__name__}: {exc}",
+            f"Response parsing error: {_exception_summary(exc)}",
             provider=provider,
             retryable=False,
         )
     if isinstance(exc, (httpx.HTTPError, httpx.StreamError)):
         return ModelCallError(
             ModelCallErrorCode.PROVIDER_DOWN,
-            f"Transport error: {type(exc).__name__}: {exc}",
+            f"Transport error: {_exception_summary(exc)}",
             provider=provider,
             retryable=False,
         )
     return ModelCallError(
         ModelCallErrorCode.PROVIDER_DOWN,
-        f"Unexpected runtime error: {type(exc).__name__}: {exc}",
+        f"Unexpected runtime error: {_exception_summary(exc)}",
         provider=provider,
         retryable=False,
     )
@@ -397,7 +402,7 @@ def _wrap_stream_error(provider: ProviderName, exc: Exception) -> ModelCallError
     if isinstance(exc, httpx.TransportError):
         return ModelCallError(
             ModelCallErrorCode.PROVIDER_DOWN,
-            f"Stream transport error: {type(exc).__name__}: {exc}",
+            f"Stream transport error: {_exception_summary(exc)}",
             provider=provider,
         )
     if isinstance(exc, ModelCallError):
@@ -405,20 +410,20 @@ def _wrap_stream_error(provider: ProviderName, exc: Exception) -> ModelCallError
     if _is_terminal_response_error(exc):
         return ModelCallError(
             ModelCallErrorCode.PROVIDER_DOWN,
-            f"Stream parsing error: {type(exc).__name__}: {exc}",
+            f"Stream parsing error: {_exception_summary(exc)}",
             provider=provider,
             retryable=False,
         )
     if isinstance(exc, (httpx.HTTPError, httpx.StreamError)):
         return ModelCallError(
             ModelCallErrorCode.PROVIDER_DOWN,
-            f"Stream transport error: {type(exc).__name__}: {exc}",
+            f"Stream transport error: {_exception_summary(exc)}",
             provider=provider,
             retryable=False,
         )
     return ModelCallError(
         ModelCallErrorCode.PROVIDER_DOWN,
-        f"Unexpected stream error: {type(exc).__name__}: {exc}",
+        f"Unexpected stream error: {_exception_summary(exc)}",
         provider=provider,
         retryable=False,
     )
@@ -440,7 +445,7 @@ def _wrap_embedding_error(provider: ProviderName, exc: Exception) -> ModelCallEr
     if isinstance(exc, httpx.TransportError):
         return ModelCallError(
             ModelCallErrorCode.PROVIDER_DOWN,
-            f"Embedding transport error: {type(exc).__name__}: {exc}",
+            f"Embedding transport error: {_exception_summary(exc)}",
             provider=provider,
         )
     if isinstance(exc, ModelCallError):
@@ -448,20 +453,20 @@ def _wrap_embedding_error(provider: ProviderName, exc: Exception) -> ModelCallEr
     if _is_terminal_response_error(exc):
         return ModelCallError(
             ModelCallErrorCode.PROVIDER_DOWN,
-            f"Embedding response parsing error: {type(exc).__name__}: {exc}",
+            f"Embedding response parsing error: {_exception_summary(exc)}",
             provider=provider,
             retryable=False,
         )
     if isinstance(exc, (httpx.HTTPError, httpx.StreamError)):
         return ModelCallError(
             ModelCallErrorCode.PROVIDER_DOWN,
-            f"Embedding transport error: {type(exc).__name__}: {exc}",
+            f"Embedding transport error: {_exception_summary(exc)}",
             provider=provider,
             retryable=False,
         )
     return ModelCallError(
         ModelCallErrorCode.PROVIDER_DOWN,
-        f"Unexpected embedding error: {type(exc).__name__}: {exc}",
+        f"Unexpected embedding error: {_exception_summary(exc)}",
         provider=provider,
         retryable=False,
     )
@@ -485,7 +490,7 @@ def _wrap_transcription_error(provider: ProviderName, exc: Exception) -> ModelCa
     if isinstance(exc, httpx.TransportError):
         return ModelCallError(
             ModelCallErrorCode.PROVIDER_DOWN,
-            f"Transcription transport error: {type(exc).__name__}: {exc}",
+            f"Transcription transport error: {_exception_summary(exc)}",
             provider=provider,
         )
     if isinstance(exc, ModelCallError):
@@ -493,23 +498,27 @@ def _wrap_transcription_error(provider: ProviderName, exc: Exception) -> ModelCa
     if _is_terminal_response_error(exc):
         return ModelCallError(
             ModelCallErrorCode.PROVIDER_DOWN,
-            f"Transcription response parsing error: {type(exc).__name__}: {exc}",
+            f"Transcription response parsing error: {_exception_summary(exc)}",
             provider=provider,
             retryable=False,
         )
     if isinstance(exc, (httpx.HTTPError, httpx.StreamError)):
         return ModelCallError(
             ModelCallErrorCode.PROVIDER_DOWN,
-            f"Transcription transport error: {type(exc).__name__}: {exc}",
+            f"Transcription transport error: {_exception_summary(exc)}",
             provider=provider,
             retryable=False,
         )
     return ModelCallError(
         ModelCallErrorCode.PROVIDER_DOWN,
-        f"Unexpected transcription error: {type(exc).__name__}: {exc}",
+        f"Unexpected transcription error: {_exception_summary(exc)}",
         provider=provider,
         retryable=False,
     )
+
+
+def _exception_summary(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {sanitize_provider_text(str(exc), limit=300)}"
 
 
 def _is_terminal_response_error(exc: Exception) -> bool:

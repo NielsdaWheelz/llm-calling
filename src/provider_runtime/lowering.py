@@ -63,6 +63,16 @@ def _validate_generate_request(
         )
         if not supported:
             raise _bad_request(capabilities, "structured output is not supported")
+        allowed_reasoning_modes = capabilities.structured_output_reasoning_modes
+        if (
+            allowed_reasoning_modes is not None
+            and call.reasoning.effort not in allowed_reasoning_modes
+        ):
+            raise _bad_request(
+                capabilities,
+                "structured output is not supported with reasoning effort "
+                f"{call.reasoning.effort!r}",
+            )
     if call.tools and not capabilities.tool_calling:
         raise _bad_request(capabilities, "tool calling is not supported")
     if call.tool_choice == "required" and not capabilities.tool_choice_required:

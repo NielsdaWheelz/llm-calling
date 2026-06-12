@@ -14,7 +14,7 @@ Request body:
     }
   ],
   "max_output_tokens": 4096,
-  "reasoning": {"effort": "none" | "minimal" | "low" | "medium" | "high" | "xhigh"},
+  "reasoning": {"effort": "none" | "low" | "medium" | "high" | "xhigh"},
   "stream": false
 }
 
@@ -372,8 +372,6 @@ class OpenAIClient:
 
         if req.reasoning.effort == "none":
             body["reasoning"] = {"effort": "none"}
-        elif req.reasoning.effort == "minimal":
-            body["reasoning"] = {"effort": "minimal"}
         elif req.reasoning.effort == "low":
             body["reasoning"] = {"effort": "low"}
         elif req.reasoning.effort == "medium":

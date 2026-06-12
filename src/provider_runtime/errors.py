@@ -147,14 +147,49 @@ _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{10,}\b", re.IGNORECASE),
         "Bearer ...redacted",
     ),
+    (
+        re.compile(
+            r"(?i)([?&](?:api[_-]?key|key|token|secret|access[_-]?token|"
+            r"refresh[_-]?token|client[_-]?secret)=)[^&#\s]+"
+        ),
+        r"\1...redacted",
+    ),
+    (
+        re.compile(
+            r"(?i)(\"(?:api[_-]?key|x[_-]?api[_-]?key|key|token|secret|"
+            r"authorization|access[_-]?token|refresh[_-]?token|client[_-]?secret)\""
+            r"\s*:\s*\")[^\"]+(\")"
+        ),
+        r"\1...redacted\2",
+    ),
+    (
+        re.compile(
+            r"(?i)(\\\"(?:api[_-]?key|x[_-]?api[_-]?key|key|token|secret|"
+            r"authorization|access[_-]?token|refresh[_-]?token|client[_-]?secret)\\\""
+            r"\s*:\s*\\\")[^\\\"]+(\\\")"
+        ),
+        r"\1...redacted\2",
+    ),
+    (
+        re.compile(
+            r"(?i)\b(api[_-]?key|x[_-]?api[_-]?key|key|token|secret|"
+            r"authorization|access[_-]?token|refresh[_-]?token|client[_-]?secret)"
+            r"\s*[:=]\s*[A-Za-z0-9._~+/=-]{8,}"
+        ),
+        r"\1=...redacted",
+    ),
 )
 
 
-def _safe_body_snippet(body_text: str) -> str:
-    snippet = (body_text or "").strip()[:500]
+def sanitize_provider_text(text: str, *, limit: int = 500) -> str:
+    snippet = (text or "").strip()[:limit]
     for pattern, replacement in _SECRET_PATTERNS:
         snippet = pattern.sub(replacement, snippet)
     return snippet
+
+
+def _safe_body_snippet(body_text: str) -> str:
+    return sanitize_provider_text(body_text, limit=500)
 
 
 def _classify_openai_error(status_code: int, json_body: dict | None) -> ModelCallErrorCode:

@@ -114,6 +114,8 @@ class ModelCapability:
     reasoning_budget_tokens: tuple[int, ...] = ()
     reasoning_budget_range: tuple[int, int] | None = None
     reasoning_allows_dynamic_budget: bool = False
+    reasoning_reserve_tokens: dict[ReasoningEffort, int] = field(default_factory=dict)
+    structured_output_reasoning_modes: tuple[ReasoningEffort, ...] | None = None
     max_context_tokens: int | None = None
     max_output_tokens: int | None = None
     prompt_cache: PromptCacheCapability = field(
@@ -185,6 +187,8 @@ def _cap(
     reasoning_budget_tokens: tuple[int, ...] = (),
     reasoning_budget_range: tuple[int, int] | None = None,
     reasoning_allows_dynamic_budget: bool = False,
+    reasoning_reserve_tokens: dict[ReasoningEffort, int] | None = None,
+    structured_output_reasoning_modes: tuple[ReasoningEffort, ...] | None = None,
     prompt_cache: PromptCacheCapability | None = None,
     streaming: bool = True,
     tool_calling: bool = True,
@@ -217,6 +221,8 @@ def _cap(
         reasoning_budget_tokens=reasoning_budget_tokens,
         reasoning_budget_range=reasoning_budget_range,
         reasoning_allows_dynamic_budget=reasoning_allows_dynamic_budget,
+        reasoning_reserve_tokens=reasoning_reserve_tokens or {},
+        structured_output_reasoning_modes=structured_output_reasoning_modes,
         max_context_tokens=max_context_tokens,
         max_output_tokens=max_output_tokens,
         prompt_cache=prompt_cache or PromptCacheCapability("none"),
@@ -246,6 +252,14 @@ _OPENAI_REASONING: tuple[ReasoningEffort, ...] = (
     "high",
     "max",
 )
+_OPENAI_REASONING_RESERVES: dict[ReasoningEffort, int] = {
+    "default": 2048,
+    "none": 0,
+    "low": 1024,
+    "medium": 4096,
+    "high": 8192,
+    "max": 16384,
+}
 _OPENROUTER_OPENAI_REASONING: tuple[ReasoningEffort, ...] = (
     "default",
     "none",
@@ -317,6 +331,7 @@ DEFAULT_CATALOG = ModelCatalog(
             max_context_tokens=400000,
             max_output_tokens=128000,
             prompt_cache=PromptCacheCapability("keyed_ttl", ("5m", "1h"), requires_key=True),
+            reasoning_reserve_tokens=_OPENAI_REASONING_RESERVES,
             raw_artifact_support=True,
             usage_reasoning_tokens=True,
             usage_cache_read_write_tokens=True,
@@ -339,6 +354,7 @@ DEFAULT_CATALOG = ModelCatalog(
             max_context_tokens=400000,
             max_output_tokens=128000,
             prompt_cache=PromptCacheCapability("keyed_ttl", ("5m", "1h"), requires_key=True),
+            reasoning_reserve_tokens=_OPENAI_REASONING_RESERVES,
             raw_artifact_support=True,
             usage_reasoning_tokens=True,
             usage_cache_read_write_tokens=True,
@@ -397,6 +413,7 @@ DEFAULT_CATALOG = ModelCatalog(
             max_context_tokens=1000000,
             max_output_tokens=128000,
             prompt_cache=PromptCacheCapability("turn_ttl", ("5m", "1h")),
+            structured_output_reasoning_modes=("default", "none"),
             raw_artifact_support=True,
             usage_cache_read_write_tokens=True,
             reasoning_continuation=True,
@@ -418,6 +435,7 @@ DEFAULT_CATALOG = ModelCatalog(
             max_context_tokens=1000000,
             max_output_tokens=64000,
             prompt_cache=PromptCacheCapability("turn_ttl", ("5m", "1h")),
+            structured_output_reasoning_modes=("default", "none"),
             raw_artifact_support=True,
             usage_cache_read_write_tokens=True,
             reasoning_continuation=True,
@@ -439,6 +457,7 @@ DEFAULT_CATALOG = ModelCatalog(
             max_context_tokens=200000,
             max_output_tokens=64000,
             prompt_cache=PromptCacheCapability("turn_ttl", ("5m", "1h")),
+            structured_output_reasoning_modes=("default", "none"),
             raw_artifact_support=True,
             usage_cache_read_write_tokens=True,
             reasoning_continuation=True,

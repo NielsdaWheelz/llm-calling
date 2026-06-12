@@ -81,6 +81,34 @@ def test_structured_output_unsupported_model_fails_before_provider_io() -> None:
     assert "structured output" in exc_info.value.message
 
 
+def test_structured_output_reasoning_combination_fails_before_provider_io() -> None:
+    call = ModelCall(
+        model=ModelRef(provider="anthropic", model="claude-sonnet-4-6"),
+        messages=[ModelMessage(role="user", content="json")],
+        max_output_tokens=100,
+        reasoning=ReasoningConfig(effort="high"),
+        structured_output=StructuredOutputSpec(
+            name="result",
+            schema={
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+                "additionalProperties": False,
+            },
+        ),
+    )
+
+    with pytest.raises(ModelCallError) as exc_info:
+        lower_generate_request(
+            call,
+            _cap("anthropic", "claude-sonnet-4-6"),
+            streaming=False,
+        )
+
+    assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
+    assert "structured output is not supported with reasoning effort" in exc_info.value.message
+
+
 def test_reasoning_unsupported_model_fails_before_provider_io() -> None:
     call = ModelCall(
         model=ModelRef(provider="cloudflare", model="@cf/openai/gpt-oss-20b"),

@@ -113,7 +113,16 @@ def test_live_catalog_does_not_overclaim_known_unavailable_capabilities() -> Non
     )
 
     assert "minimal" not in openai.reasoning_modes
+    assert openai.reasoning_reserve_tokens["high"] == 8192
     assert cloudflare_embedding.usage_input_output_tokens is False
+
+
+def test_anthropic_catalog_models_structured_output_reasoning_constraint() -> None:
+    anthropic = DEFAULT_CATALOG.require_capabilities(
+        ModelRef(provider="anthropic", model="claude-sonnet-4-6")
+    )
+
+    assert anthropic.structured_output_reasoning_modes == ("default", "none")
 
 
 def test_catalog_rejects_unknown_models() -> None:

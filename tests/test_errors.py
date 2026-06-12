@@ -70,7 +70,9 @@ async def test_provider_error_body_snippet_is_explicit_and_redacts_secret_tokens
                 "message": (
                     "Bad keys sk-live-abcdefghijklmnopqrstuvwxyz1234567890, "
                     "AIzaSyabcdefghijklmnopqrstuvwxyz12345, and "
-                    "Bearer very-secret-provider-token"
+                    "Bearer very-secret-provider-token; "
+                    '"x-api-key": "cf-secret-token-12345"; '
+                    "https://example.invalid/?api_key=query-secret-12345"
                 )
             }
         },
@@ -87,4 +89,6 @@ async def test_provider_error_body_snippet_is_explicit_and_redacts_secret_tokens
     assert "sk-live-abcdefghijklmnopqrstuvwxyz1234567890" not in exc_info.value.safe_body_snippet
     assert "AIzaSyabcdefghijklmnopqrstuvwxyz12345" not in exc_info.value.safe_body_snippet
     assert "Bearer very-secret-provider-token" not in exc_info.value.safe_body_snippet
+    assert "cf-secret-token-12345" not in exc_info.value.safe_body_snippet
+    assert "query-secret-12345" not in exc_info.value.safe_body_snippet
     assert "...redacted" in exc_info.value.safe_body_snippet

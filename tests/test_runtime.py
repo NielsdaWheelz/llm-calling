@@ -151,6 +151,21 @@ async def test_generate_wraps_transport_and_payload_exceptions(exc: Exception) -
         assert exc_info.value.retryable is False
 
 
+@respx.mock
+async def test_generate_sanitizes_wrapped_exception_messages() -> None:
+    req = request("openai")
+    respx.post(endpoint("openai", req.model.model)).mock(
+        side_effect=httpx.RemoteProtocolError("failed with x-api-key=secret-provider-token-12345")
+    )
+
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(ModelCallError) as exc_info:
+            await runtime(http).generate(req, key=KEY)
+
+    assert "secret-provider-token-12345" not in exc_info.value.message
+    assert "x-api-key=...redacted" in exc_info.value.message
+
+
 @pytest.mark.parametrize(
     "operation",
     ["generate", "stream"],
