@@ -57,11 +57,13 @@ async with httpx.AsyncClient() as http:
 controls, prompt-cache shape, normalized usage claims, artifact support, and pricing provenance.
 The runtime rejects operation mismatches before provider I/O.
 
-Catalog pricing is advisory and fail-closed. A cost estimate is returned only when normalized usage
-and verified catalog rates are sufficient for the selected model and input size. Rates with provider
-thresholds use `Pricing.applies_up_to_input_tokens`; calls above that threshold return
-`missing_pricing` rather than a flattened under-estimate. Prices without a provider source URL and
-verification date are treated as absent.
+Catalog pricing is advisory and fail-closed. Runtime responses expose normalized usage; callers
+pass that usage and the selected catalog row to `estimate_catalog_cost(...)` when they need an
+advisory cost estimate. The estimator returns `estimated` only when verified catalog rates are
+sufficient for the selected model and input size. Rates with provider thresholds use
+`Pricing.applies_up_to_input_tokens`; calls above that threshold return `missing_pricing` rather
+than a flattened under-estimate. Prices without a provider source URL and verification date are
+treated as absent.
 
 ## Reasoning
 

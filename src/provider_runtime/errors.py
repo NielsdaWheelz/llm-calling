@@ -61,11 +61,7 @@ class ModelCallError(Exception):
 
 
 async def raise_for_provider_error(response: httpx.Response, provider: str) -> None:
-    """Raise ModelCallError with the provider's response body if status >= 400.
-
-    Stream contexts close their body after raise_for_status(), so error
-    detail is lost. Read explicitly here and surface it in the exception.
-    """
+    """Raise a typed provider error without retaining provider response bodies."""
     if response.status_code < 400:
         return
     try:
@@ -76,8 +72,6 @@ async def raise_for_provider_error(response: httpx.Response, provider: str) -> N
         json_body = response.json()
     except Exception:
         json_body = None
-    body_text = response.text if response.is_closed else ""
-    snippet = _safe_body_snippet(body_text)
     code = classify_provider_error(
         provider,
         response.status_code,
@@ -93,7 +87,6 @@ async def raise_for_provider_error(response: httpx.Response, provider: str) -> N
         retry_after_seconds=_retry_after_seconds(response.headers.get("retry-after")),
         provider_request_id=response.headers.get("x-request-id")
         or response.headers.get("request-id"),
-        safe_body_snippet=snippet or None,
     )
 
 

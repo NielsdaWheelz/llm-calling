@@ -96,6 +96,23 @@ async def test_stream_success() -> None:
 
 
 @respx.mock
+async def test_stream_malformed_json_event_fails_closed() -> None:
+    respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+    ).respond(200, content="data: {not-json}\n")
+
+    with pytest.raises(ModelCallError) as exc_info:
+        async with httpx.AsyncClient() as http:
+            async for _chunk in GeminiClient(http).generate_stream(
+                request(), api_key="sk-test", timeout_s=30
+            ):
+                pass
+
+    assert exc_info.value.error_code == ModelCallErrorCode.PROVIDER_DOWN
+    assert "not valid JSON" in exc_info.value.message
+
+
+@respx.mock
 async def test_assistant_role_maps_to_model() -> None:
     route = respx.post(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
@@ -173,6 +190,32 @@ async def test_structured_output_uses_response_json_schema_and_parses_response()
     assert body["generationConfig"]["responseMimeType"] == "application/json"
     assert body["generationConfig"]["responseJsonSchema"] == metadata_schema()
     assert response.structured_output == {"title": "The Book", "language": "en"}
+
+
+@respx.mock
+async def test_structured_output_missing_json_object_raises() -> None:
+    response_json = load_json("success_nonstream.json")
+    response_json["candidates"][0]["content"]["parts"][0]["text"] = "not json"
+    respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+    ).respond(200, json=response_json)
+    req = ModelCall(
+        model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
+        messages=[ModelMessage(role="user", content="Extract metadata.")],
+        max_output_tokens=100,
+        reasoning=ReasoningConfig(effort="default"),
+        structured_output=StructuredOutputSpec(
+            name="metadata_enrichment",
+            schema=metadata_schema(),
+        ),
+    )
+
+    with pytest.raises(ModelCallError) as exc_info:
+        async with httpx.AsyncClient() as http:
+            await GeminiClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
+    assert "structured output" in exc_info.value.message
 
 
 @respx.mock

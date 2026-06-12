@@ -85,10 +85,4 @@ async def test_provider_error_body_snippet_is_explicit_and_redacts_secret_tokens
     assert exc_info.value.provider_request_id == "req-secret"
     assert exc_info.value.message == "openai HTTP 401"
     assert str(exc_info.value) == "openai HTTP 401"
-    assert exc_info.value.safe_body_snippet is not None
-    assert "sk-live-abcdefghijklmnopqrstuvwxyz1234567890" not in exc_info.value.safe_body_snippet
-    assert "AIzaSyabcdefghijklmnopqrstuvwxyz12345" not in exc_info.value.safe_body_snippet
-    assert "Bearer very-secret-provider-token" not in exc_info.value.safe_body_snippet
-    assert "cf-secret-token-12345" not in exc_info.value.safe_body_snippet
-    assert "query-secret-12345" not in exc_info.value.safe_body_snippet
-    assert "...redacted" in exc_info.value.safe_body_snippet
+    assert exc_info.value.safe_body_snippet is None

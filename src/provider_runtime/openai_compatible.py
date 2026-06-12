@@ -8,6 +8,7 @@ import httpx
 
 from provider_runtime._artifact_validation import validated_provider_artifacts
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode, raise_for_provider_error
+from provider_runtime.structured_output import parse_required_structured_output
 from provider_runtime.tool_arguments import parse_tool_arguments_with_status
 from provider_runtime.types import (
     ModelCall,
@@ -82,6 +83,7 @@ class OpenAICompatibleChatClient:
             provider_request_id = response.headers.get("x-request-id")
             accumulated_usage: TokenUsage | None = None
             received_done = False
+            finish_reason: str | None = None
             tool_call_acc: dict[int, dict] = {}
 
             async for line in response.aiter_lines():
@@ -114,13 +116,20 @@ class OpenAICompatibleChatClient:
                         done=True,
                         usage=accumulated_usage,
                         provider_request_id=provider_request_id,
+                        status=_status_from_finish_reason(finish_reason),
+                        incomplete_details=_incomplete_details_from_finish_reason(finish_reason),
                     )
                     break
 
                 try:
                     data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
+                except json.JSONDecodeError as exc:
+                    raise ModelCallError(
+                        ModelCallErrorCode.PROVIDER_DOWN,
+                        f"{self._provider} stream event was not valid JSON",
+                        provider=self._provider,
+                        retryable=False,
+                    ) from exc
 
                 if "usage" in data:
                     accumulated_usage = self._parse_usage(data["usage"])
@@ -130,6 +139,8 @@ class OpenAICompatibleChatClient:
                     continue
 
                 choice = choices[0]
+                if choice.get("finish_reason"):
+                    finish_reason = str(choice["finish_reason"])
                 delta = choice.get("delta", {})
                 delta_text = delta.get("content", "")
 
@@ -297,14 +308,9 @@ class OpenAICompatibleChatClient:
         provider_artifacts = self._message_provider_artifacts(message, model=model)
         structured_output = None
         if structured:
-            req_structured_text = text.strip()
-            if req_structured_text.startswith("{"):
-                try:
-                    parsed = json.loads(req_structured_text)
-                except json.JSONDecodeError:
-                    parsed = None
-                if isinstance(parsed, dict):
-                    structured_output = parsed
+            structured_output = parse_required_structured_output(text, provider=self._provider)
+        finish_reason = choices[0].get("finish_reason")
+        finish_reason_str = str(finish_reason) if finish_reason else None
 
         tool_calls: list[ToolCall] = []
         for tc in message.get("tool_calls") or []:
@@ -336,6 +342,8 @@ class OpenAICompatibleChatClient:
             text=text,
             usage=usage,
             provider_request_id=provider_request_id,
+            status=_status_from_finish_reason(finish_reason_str),
+            incomplete_details=_incomplete_details_from_finish_reason(finish_reason_str),
             structured_output=structured_output,
             tool_calls=tuple(tool_calls),
             provider_artifacts=tuple(provider_artifacts),
@@ -431,3 +439,17 @@ class OpenAICompatibleChatClient:
 
 def _is_reasoning_detail(payload: dict[str, object]) -> bool:
     return isinstance(payload.get("type"), str) and str(payload["type"]).startswith("reasoning.")
+
+
+def _status_from_finish_reason(finish_reason: str | None) -> str | None:
+    if finish_reason is None:
+        return None
+    if finish_reason in {"stop", "tool_calls"}:
+        return "completed"
+    return "incomplete"
+
+
+def _incomplete_details_from_finish_reason(finish_reason: str | None) -> dict[str, object] | None:
+    if finish_reason is None or _status_from_finish_reason(finish_reason) == "completed":
+        return None
+    return {"finish_reason": finish_reason}

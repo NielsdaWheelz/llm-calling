@@ -92,8 +92,28 @@ async def test_stream_success() -> None:
 
     assert chunks[-1].done is True
     assert chunks[-1].provider_request_id == "msg_test123"
+    assert chunks[-1].status == "completed"
     assert all(chunk.usage is None for chunk in chunks[:-1])
     assert "Hello" in "".join(chunk.delta_text for chunk in chunks)
+
+
+@respx.mock
+async def test_stream_malformed_json_event_fails_closed() -> None:
+    respx.post("https://api.anthropic.com/v1/messages").respond(
+        200,
+        content="event: message_start\ndata: {not-json}\n",
+        headers={"content-type": "text/event-stream"},
+    )
+
+    with pytest.raises(ModelCallError) as exc_info:
+        async with httpx.AsyncClient() as http:
+            async for _chunk in AnthropicClient(http).generate_stream(
+                request(), api_key="sk-test", timeout_s=30
+            ):
+                pass
+
+    assert exc_info.value.error_code == ModelCallErrorCode.PROVIDER_DOWN
+    assert "not valid JSON" in exc_info.value.message
 
 
 @respx.mock
@@ -263,7 +283,35 @@ async def test_structured_output_uses_forced_tool_and_parses_tool_input() -> Non
     ]
     assert body["tool_choice"] == {"type": "tool", "name": "metadata_enrichment"}
     assert response.text == ""
+    assert response.status == "completed"
     assert response.structured_output == {"title": "The Book", "language": "en"}
+
+
+@respx.mock
+async def test_structured_output_missing_tool_input_raises() -> None:
+    response_json = load_json("success_nonstream.json")
+    response_json["content"] = [{"type": "text", "text": "not a tool"}]
+    response_json["stop_reason"] = "end_turn"
+    respx.post("https://api.anthropic.com/v1/messages").respond(
+        200,
+        json=response_json,
+    )
+    req = ModelCall(
+        model=ModelRef(provider="anthropic", model="claude-opus-4-8"),
+        messages=[ModelMessage(role="user", content="Extract metadata.")],
+        max_output_tokens=100,
+        structured_output=StructuredOutputSpec(
+            name="metadata_enrichment",
+            schema=metadata_schema(),
+        ),
+    )
+
+    with pytest.raises(ModelCallError) as exc_info:
+        async with httpx.AsyncClient() as http:
+            await AnthropicClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
+    assert "structured output" in exc_info.value.message
 
 
 async def test_structured_output_rejects_extended_thinking() -> None:

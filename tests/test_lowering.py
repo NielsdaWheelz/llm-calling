@@ -7,6 +7,7 @@ from provider_runtime import (
     ModelCallErrorCode,
     ModelMessage,
     ModelRef,
+    ProviderArtifact,
     ReasoningConfig,
     StructuredOutputSpec,
     TextPart,
@@ -199,3 +200,33 @@ def test_content_parts_unsupported_model_fails_before_provider_io() -> None:
 
     assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
     assert "content parts" in exc_info.value.message
+
+
+def test_provider_artifact_replay_unsupported_model_fails_before_provider_io() -> None:
+    call = ModelCall(
+        model=ModelRef(provider="cloudflare", model="@cf/openai/gpt-oss-20b"),
+        messages=[
+            ModelMessage(
+                role="assistant",
+                provider_artifacts=(
+                    ProviderArtifact(
+                        provider="cloudflare",
+                        model="@cf/openai/gpt-oss-20b",
+                        purpose="reasoning",
+                        payload={"reasoning": "opaque"},
+                    ),
+                ),
+            )
+        ],
+        max_output_tokens=100,
+    )
+
+    with pytest.raises(ModelCallError) as exc_info:
+        lower_generate_request(
+            call,
+            _cap("cloudflare", "@cf/openai/gpt-oss-20b"),
+            streaming=False,
+        )
+
+    assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
+    assert "provider artifact replay" in exc_info.value.message

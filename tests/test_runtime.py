@@ -228,7 +228,7 @@ async def test_generate_retries_retryable_errors_before_success() -> None:
     assert [attempt.status for attempt in response.attempts] == ["retryable_error", "success"]
     assert response.attempts[0].error_code == ModelCallErrorCode.PROVIDER_DOWN.value
     assert response.attempts[0].delay_s == 0
-    assert response.attempts[0].safe_body_snippet
+    assert response.attempts[0].safe_body_snippet is None
     assert response.attempts[1].provider_request_id == "req-after-retry"
     assert response.retry_count == 1
 

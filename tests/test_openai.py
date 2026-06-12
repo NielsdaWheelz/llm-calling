@@ -184,6 +184,29 @@ async def test_structured_output_uses_json_schema_text_format_and_parses_respons
 
 
 @respx.mock
+async def test_structured_output_missing_json_object_raises() -> None:
+    response_json = load_json("success_nonstream.json")
+    response_json["output"][0]["content"][0]["text"] = "not json"
+    respx.post("https://api.openai.com/v1/responses").respond(200, json=response_json)
+    req = ModelCall(
+        model=ModelRef(provider="openai", model="gpt-5.4-mini"),
+        messages=[ModelMessage(role="user", content="Extract metadata.")],
+        max_output_tokens=100,
+        structured_output=StructuredOutputSpec(
+            name="metadata_enrichment",
+            schema=metadata_schema(),
+        ),
+    )
+
+    with pytest.raises(ModelCallError) as exc_info:
+        async with httpx.AsyncClient() as http:
+            await OpenAIClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
+    assert "structured output" in exc_info.value.message
+
+
+@respx.mock
 async def test_gpt5_payload_omits_temperature_and_maps_max_reasoning() -> None:
     route = respx.post("https://api.openai.com/v1/responses").respond(
         200,
@@ -593,3 +616,22 @@ async def test_stream_incomplete_yields_terminal_chunk() -> None:
     assert chunks[-1].provider_request_id == "resp-incomplete"
     assert chunks[-1].usage is not None
     assert chunks[-1].usage.reasoning_tokens == 4
+
+
+@respx.mock
+async def test_stream_malformed_json_event_fails_closed() -> None:
+    respx.post("https://api.openai.com/v1/responses").respond(
+        200,
+        content="data: {not-json}\n\n",
+        headers={"content-type": "text/event-stream"},
+    )
+
+    with pytest.raises(ModelCallError) as exc_info:
+        async with httpx.AsyncClient() as http:
+            async for _chunk in OpenAIClient(http).generate_stream(
+                request(), api_key="sk-test", timeout_s=30
+            ):
+                pass
+
+    assert exc_info.value.error_code == ModelCallErrorCode.PROVIDER_DOWN
+    assert "not valid JSON" in exc_info.value.message

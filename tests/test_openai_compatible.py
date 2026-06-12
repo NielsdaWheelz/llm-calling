@@ -615,6 +615,38 @@ async def test_structured_output_uses_json_schema_response_format() -> None:
 
 
 @respx.mock
+async def test_structured_output_missing_json_object_raises() -> None:
+    respx.post("https://openrouter.test/v1/chat/completions").respond(
+        200,
+        json={
+            "id": "chatcmpl-bad-json",
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "not json"},
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+    )
+    req = ModelCall(
+        model=ModelRef(provider="openrouter", model="moonshotai/kimi-k2.6"),
+        messages=[ModelMessage(role="user", content="Extract metadata.")],
+        max_output_tokens=100,
+        structured_output=StructuredOutputSpec(
+            name="metadata",
+            schema={"type": "object"},
+        ),
+    )
+
+    with pytest.raises(ModelCallError) as exc_info:
+        async with httpx.AsyncClient() as http:
+            await chat_client(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
+    assert "structured output" in exc_info.value.message
+
+
+@respx.mock
 async def test_json_text_without_structured_request_is_plain_text() -> None:
     respx.post("https://openrouter.test/v1/chat/completions").respond(
         200,
@@ -637,3 +669,22 @@ async def test_json_text_without_structured_request_is_plain_text() -> None:
 
     assert response.text == '{"note":"plain JSON-looking text"}'
     assert response.structured_output is None
+
+
+@respx.mock
+async def test_stream_malformed_json_event_fails_closed() -> None:
+    respx.post("https://openrouter.test/v1/chat/completions").respond(
+        200,
+        content="data: {not-json}\n",
+        headers={"content-type": "text/event-stream"},
+    )
+
+    with pytest.raises(ModelCallError) as exc_info:
+        async with httpx.AsyncClient() as http:
+            async for _chunk in chat_client(http).generate_stream(
+                request(), api_key="sk-test", timeout_s=30
+            ):
+                pass
+
+    assert exc_info.value.error_code == ModelCallErrorCode.PROVIDER_DOWN
+    assert "not valid JSON" in exc_info.value.message

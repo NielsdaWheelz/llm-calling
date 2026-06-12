@@ -42,6 +42,10 @@ def _validate_generate_request(
         raise _bad_request(capabilities, "streaming is not supported")
     if call.max_output_tokens < 1:
         raise _bad_request(capabilities, "max_output_tokens must be >= 1")
+    if not call.messages:
+        raise _bad_request(capabilities, "messages must be non-empty")
+    if call.temperature is not None and not (0 <= call.temperature <= 2):
+        raise _bad_request(capabilities, "temperature must be between 0 and 2")
     if call.reasoning.effort not in capabilities.reasoning_modes:
         raise _bad_request(
             capabilities,
@@ -82,6 +86,11 @@ def _validate_generate_request(
         and not capabilities.multimodal_input
     ):
         raise _bad_request(capabilities, "content parts are not supported")
+    if (
+        any(message.provider_artifacts for message in call.messages)
+        and not capabilities.raw_artifact_support
+    ):
+        raise _bad_request(capabilities, "provider artifact replay is not supported")
 
 
 def _validate_reasoning_budget(call: ModelCall, capabilities: ModelCapability) -> None:

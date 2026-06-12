@@ -91,7 +91,11 @@ class AnthropicClient:
         await raise_for_provider_error(response, "anthropic")
 
         data = response.json()
-        return self._parse_response(data, model=req.model.model)
+        return self._parse_response(
+            data,
+            model=req.model.model,
+            structured=bool(req.structured_output),
+        )
 
     async def generate_stream(
         self,
@@ -122,6 +126,7 @@ class AnthropicClient:
             provider_request_id: str | None = None
             usage: TokenUsage | None = None
             received_stop = False
+            stop_reason: str | None = None
             usage_data: dict[str, object] = {}
             tool_blocks: dict[int, dict[str, object]] = {}
             thinking_blocks: dict[int, dict[str, object]] = {}
@@ -141,6 +146,8 @@ class AnthropicClient:
                             done=True,
                             usage=usage,
                             provider_request_id=provider_request_id,
+                            status=_status_from_stop_reason(stop_reason),
+                            incomplete_details=_incomplete_details_from_stop_reason(stop_reason),
                         )
                         break
                     continue
@@ -151,8 +158,13 @@ class AnthropicClient:
                 data_str = line[6:]
                 try:
                     data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
+                except json.JSONDecodeError as exc:
+                    raise ModelCallError(
+                        ModelCallErrorCode.PROVIDER_DOWN,
+                        "Anthropic stream event was not valid JSON",
+                        provider="anthropic",
+                        retryable=False,
+                    ) from exc
 
                 event_type = data.get("type", "")
 
@@ -242,6 +254,9 @@ class AnthropicClient:
 
                 # Handle message_delta - extract usage at end
                 if event_type == "message_delta":
+                    delta = data.get("delta")
+                    if isinstance(delta, dict) and delta.get("stop_reason"):
+                        stop_reason = str(delta["stop_reason"])
                     delta_usage = data.get("usage")
                     if isinstance(delta_usage, dict):
                         usage_data.update(delta_usage)
@@ -463,7 +478,7 @@ class AnthropicClient:
             "cache_control": {"type": "ephemeral", "ttl": cache_ttl},
         }
 
-    def _parse_response(self, data: dict, *, model: str) -> ModelResponse:
+    def _parse_response(self, data: dict, *, model: str, structured: bool) -> ModelResponse:
         """Parse non-streaming response."""
         # Extract text from content blocks
         content_blocks = data.get("content", [])
@@ -500,6 +515,13 @@ class AnthropicClient:
                         argument_status=arguments.status,
                     )
                 )
+        if structured and structured_output is None:
+            raise ModelCallError(
+                ModelCallErrorCode.BAD_REQUEST,
+                "Anthropic structured output did not include the required tool input",
+                provider="anthropic",
+                retryable=False,
+            )
         text = "".join(text_parts)
 
         # Extract usage - Anthropic uses input_tokens/output_tokens
@@ -510,11 +532,15 @@ class AnthropicClient:
 
         # Extract request ID from body
         provider_request_id = data.get("id")
+        stop_reason = data.get("stop_reason")
+        stop_reason_str = str(stop_reason) if stop_reason else None
 
         return ModelResponse(
             text=text,
             usage=usage,
             provider_request_id=provider_request_id,
+            status=_status_from_stop_reason(stop_reason_str),
+            incomplete_details=_incomplete_details_from_stop_reason(stop_reason_str),
             structured_output=structured_output,
             tool_calls=tuple(tool_calls),
             provider_artifacts=tuple(provider_artifacts),
@@ -544,3 +570,17 @@ class AnthropicClient:
 
 def _int_or_none(value: object) -> int | None:
     return value if isinstance(value, int) else None
+
+
+def _status_from_stop_reason(stop_reason: str | None) -> str | None:
+    if stop_reason is None:
+        return None
+    if stop_reason in {"end_turn", "tool_use", "stop_sequence"}:
+        return "completed"
+    return "incomplete"
+
+
+def _incomplete_details_from_stop_reason(stop_reason: str | None) -> dict[str, object] | None:
+    if stop_reason is None or _status_from_stop_reason(stop_reason) == "completed":
+        return None
+    return {"stop_reason": stop_reason}

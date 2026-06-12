@@ -61,6 +61,7 @@ import httpx
 from provider_runtime._artifact_validation import validated_provider_artifacts
 from provider_runtime.endpoints import GEMINI_BASE_URL
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode, raise_for_provider_error
+from provider_runtime.structured_output import parse_required_structured_output
 from provider_runtime.tool_arguments import parse_tool_arguments_with_status
 from provider_runtime.types import (
     BinaryPart,
@@ -168,8 +169,13 @@ class GeminiClient:
                 data_str = line[6:]
                 try:
                     data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
+                except json.JSONDecodeError as exc:
+                    raise ModelCallError(
+                        ModelCallErrorCode.PROVIDER_DOWN,
+                        "Gemini stream event was not valid JSON",
+                        provider="gemini",
+                        retryable=False,
+                    ) from exc
 
                 # Extract text from candidates[0].content.parts[].text
                 candidates = data.get("candidates", [])
@@ -452,13 +458,8 @@ class GeminiClient:
                 if artifact is not None:
                     provider_artifacts.append(artifact)
         structured_output = None
-        if structured and text.strip().startswith("{"):
-            try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError:
-                parsed = None
-            if isinstance(parsed, dict):
-                structured_output = parsed
+        if structured:
+            structured_output = parse_required_structured_output(text, provider="gemini")
 
         # Extract usage
         usage = None
