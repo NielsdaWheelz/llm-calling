@@ -11,6 +11,7 @@ from provider_runtime import (
     ReasoningConfig,
     StructuredOutputSpec,
     TextPart,
+    ToolSpec,
     lower_generate_request,
 )
 
@@ -80,6 +81,60 @@ def test_structured_output_unsupported_model_fails_before_provider_io() -> None:
 
     assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
     assert "structured output" in exc_info.value.message
+
+
+def test_kimi_structured_output_fails_before_provider_io() -> None:
+    call = ModelCall(
+        model=ModelRef(provider="openrouter", model="moonshotai/kimi-k2.6"),
+        messages=[ModelMessage(role="user", content="json")],
+        max_output_tokens=100,
+        structured_output=StructuredOutputSpec(
+            name="result",
+            schema={
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+                "additionalProperties": False,
+            },
+        ),
+    )
+
+    with pytest.raises(ModelCallError) as exc_info:
+        lower_generate_request(
+            call,
+            _cap("openrouter", "moonshotai/kimi-k2.6"),
+            streaming=False,
+        )
+
+    assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
+    assert "structured output" in exc_info.value.message
+
+
+def test_gemini_preview_required_tool_choice_fails_before_provider_io() -> None:
+    call = ModelCall(
+        model=ModelRef(provider="gemini", model="gemini-3.1-pro-preview"),
+        messages=[ModelMessage(role="user", content="Use the tool.")],
+        max_output_tokens=100,
+        reasoning=ReasoningConfig(effort="low"),
+        tools=(
+            ToolSpec(
+                name="lookup",
+                description="Lookup a value.",
+                parameters={"type": "object", "properties": {}},
+            ),
+        ),
+        tool_choice="required",
+    )
+
+    with pytest.raises(ModelCallError) as exc_info:
+        lower_generate_request(
+            call,
+            _cap("gemini", "gemini-3.1-pro-preview"),
+            streaming=False,
+        )
+
+    assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
+    assert "required tool choice" in exc_info.value.message
 
 
 def test_structured_output_reasoning_combination_fails_before_provider_io() -> None:

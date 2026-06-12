@@ -108,12 +108,21 @@ def test_gemini_catalog_does_not_claim_provider_request_ids() -> None:
 
 def test_live_catalog_does_not_overclaim_known_unavailable_capabilities() -> None:
     openai = DEFAULT_CATALOG.require_capabilities(ModelRef(provider="openai", model="gpt-5.5"))
+    gemini_preview = DEFAULT_CATALOG.require_capabilities(
+        ModelRef(provider="gemini", model="gemini-3.1-pro-preview")
+    )
+    kimi = DEFAULT_CATALOG.require_capabilities(
+        ModelRef(provider="openrouter", model="moonshotai/kimi-k2.6")
+    )
     cloudflare_embedding = DEFAULT_CATALOG.require_capabilities(
         ModelRef(provider="cloudflare", model="@cf/qwen/qwen3-embedding-0.6b")
     )
 
     assert "minimal" not in openai.reasoning_modes
     assert openai.reasoning_reserve_tokens["high"] == 8192
+    assert gemini_preview.tool_calling is True
+    assert gemini_preview.tool_choice_required is False
+    assert kimi.structured_output is False
     assert cloudflare_embedding.usage_input_output_tokens is False
 
 
