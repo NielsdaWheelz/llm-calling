@@ -39,6 +39,7 @@ def test_target_surface_is_exported() -> None:
         "CostStatus",
         "DEFAULT_PRICING_SOURCE",
         "ReasoningBillingMode",
+        "build_key_probe_call",
         "estimate_catalog_cost",
         "estimate_cost",
     ):

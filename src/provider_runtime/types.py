@@ -103,6 +103,7 @@ class RetryAttempt:
     retry_after_seconds: float | None = None
     delay_s: float | None = None
     provider_request_id: str | None = None
+    safe_body_snippet: str | None = None
     streamed_output_started: bool = False
 
     def __post_init__(self):
@@ -138,6 +139,8 @@ class RetryAttempt:
             payload["delay_s"] = self.delay_s
         if self.provider_request_id is not None:
             payload["provider_request_id"] = self.provider_request_id
+        if self.safe_body_snippet is not None:
+            payload["safe_body_snippet"] = self.safe_body_snippet
         return payload
 
 

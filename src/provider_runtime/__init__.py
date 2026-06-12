@@ -14,7 +14,7 @@ from provider_runtime.catalog import (
 )
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode
 from provider_runtime.lowering import GenerateRequestPlan, lower_generate_request
-from provider_runtime.runtime import ModelRuntime, ProviderBaseUrls
+from provider_runtime.runtime import ModelRuntime, ProviderBaseUrls, build_key_probe_call
 from provider_runtime.testing import CapturedRuntimeCall, NoNetworkRuntime, ScriptedRuntime
 from provider_runtime.types import (
     BinaryPart,
@@ -116,6 +116,7 @@ __all__ = [
     "ToolSpec",
     "TranscriptionCall",
     "TranscriptionResponse",
+    "build_key_probe_call",
     "estimate_cost",
     "estimate_catalog_cost",
     "lower_generate_request",

@@ -36,6 +36,22 @@ _PROVIDERS: frozenset[str] = frozenset(
 )
 
 
+def build_key_probe_call(
+    provider: ProviderName, *, catalog: ModelCatalog = DEFAULT_CATALOG
+) -> ModelCall | None:
+    """Return the canonical tiny generation request used to validate a provider key."""
+    model = catalog.key_probe_model(provider)
+    if model is None:
+        return None
+    return ModelCall(
+        model=ModelRef(provider=provider, model=model),
+        messages=[ModelMessage(role="user", content="Reply with ok.")],
+        max_output_tokens=8,
+        reasoning=ReasoningConfig(effort="none"),
+        retry=RetryPolicy(max_attempts=1),
+    )
+
+
 @dataclass(frozen=True)
 class ProviderBaseUrls:
     openai: str = OPENAI_BASE_URL
@@ -93,21 +109,15 @@ class ModelRuntime(_AdapterRuntime):
         key: ProviderApiKey,
         timeout_s: float = DEFAULT_TIMEOUT_S,
     ) -> KeyProbeResult:
-        model = self._catalog.key_probe_model(provider)
-        if model is None:
+        call = build_key_probe_call(provider, catalog=self._catalog)
+        if call is None:
             return KeyProbeResult(
                 provider=provider,
                 model="",
                 ok=False,
                 error_code=ModelCallErrorCode.MODEL_NOT_AVAILABLE.value,
             )
-        call = ModelCall(
-            model=ModelRef(provider=provider, model=model),
-            messages=[ModelMessage(role="user", content="Reply with ok.")],
-            max_output_tokens=8,
-            reasoning=ReasoningConfig(effort="none"),
-            retry=RetryPolicy(max_attempts=1),
-        )
+        model = call.model.model
         try:
             response = await self.generate(call, key=key, timeout_s=timeout_s)
         except ModelCallError as exc:

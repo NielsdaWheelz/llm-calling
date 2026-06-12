@@ -43,6 +43,27 @@ def estimate_catalog_cost(
     pricing_source: str = DEFAULT_PRICING_SOURCE,
 ) -> CostEstimate:
     """Return the shared advisory cost policy for a catalog-priced call."""
+    if (
+        usage is None
+        or pricing.unit != "per_million_tokens"
+        or not _pricing_has_provenance(pricing)
+    ):
+        breakdown = CostBreakdown(
+            input_cost_usd_micros=None,
+            output_cost_usd_micros=None,
+            cache_write_cost_usd_micros=None,
+            cache_read_cost_usd_micros=None,
+            reasoning_cost_usd_micros=None,
+            total_cost_usd_micros=None,
+        )
+        return CostEstimate(
+            policy="catalog_pricing",
+            status=_cost_status(usage, pricing, breakdown, cache_write_ttl=cache_write_ttl),
+            pricing_source=pricing_source,
+            pricing=pricing,
+            breakdown=breakdown,
+        )
+
     breakdown = estimate_cost(usage, pricing, cache_write_ttl=cache_write_ttl)
     status = _cost_status(usage, pricing, breakdown, cache_write_ttl=cache_write_ttl)
     return CostEstimate(
@@ -139,11 +160,17 @@ def _cost_status(
         return "not_token_priced"
     if usage is None or not _has_any_usage_tokens(usage):
         return "missing_usage"
+    if not _pricing_has_provenance(pricing):
+        return "missing_pricing"
     if not _pricing_applies_to_usage(usage, pricing):
         return "missing_pricing"
     if _has_missing_pricing(usage, pricing, cache_write_ttl=cache_write_ttl):
         return "missing_pricing"
     return "estimated" if breakdown.total_cost_usd_micros is not None else "missing_pricing"
+
+
+def _pricing_has_provenance(pricing: Pricing) -> bool:
+    return bool(pricing.source_url and pricing.verified_at)
 
 
 def _has_any_usage_tokens(usage: TokenUsage) -> bool:

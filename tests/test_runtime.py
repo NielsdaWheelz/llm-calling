@@ -5,7 +5,8 @@ import httpx
 import pytest
 import respx
 
-from provider_runtime import ModelRuntime, ProviderApiKey, ProviderBaseUrls
+import provider_runtime._adapter_runtime as adapter_runtime
+from provider_runtime import ModelRuntime, ProviderApiKey, ProviderBaseUrls, build_key_probe_call
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode
 from provider_runtime.types import ModelCall, ModelMessage, ModelRef, ReasoningConfig, RetryPolicy
 
@@ -205,8 +206,43 @@ async def test_generate_retries_retryable_errors_before_success() -> None:
     assert [attempt.status for attempt in response.attempts] == ["retryable_error", "success"]
     assert response.attempts[0].error_code == ModelCallErrorCode.PROVIDER_DOWN.value
     assert response.attempts[0].delay_s == 0
+    assert response.attempts[0].safe_body_snippet
     assert response.attempts[1].provider_request_id == "req-after-retry"
     assert response.retry_count == 1
+
+
+@respx.mock
+async def test_generate_honors_retry_after_delay_before_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slept: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        slept.append(delay)
+
+    monkeypatch.setattr(adapter_runtime, "_sleep_delay", fake_sleep)
+    req = request(
+        "openai",
+        retry=RetryPolicy(max_attempts=2, initial_delay_s=0, max_delay_s=2, deadline_s=60),
+    )
+    route = respx.post(endpoint("openai", req.model.model)).mock(
+        side_effect=[
+            httpx.Response(
+                429,
+                json={"error": {"code": "rate_limit_exceeded", "type": "rate_limit_error"}},
+                headers={"retry-after": "30", "x-request-id": "req-rate-limit"},
+            ),
+            httpx.Response(200, json=fixture("openai", "success_nonstream.json")),
+        ]
+    )
+
+    async with httpx.AsyncClient() as http:
+        response = await runtime(http).generate(req, key=KEY)
+
+    assert route.call_count == 2
+    assert slept == [30]
+    assert response.attempts[0].retry_after_seconds == 30
+    assert response.attempts[0].delay_s == 30
 
 
 @respx.mock
@@ -323,6 +359,17 @@ async def test_disabled_provider_is_model_not_available() -> None:
             await runtime.generate(request("openai"), key=KEY)
 
     assert exc_info.value.error_code == ModelCallErrorCode.MODEL_NOT_AVAILABLE
+
+
+async def test_build_key_probe_call_is_canonical_catalog_shape() -> None:
+    call = build_key_probe_call("openai")
+
+    assert call is not None
+    assert call.model == ModelRef(provider="openai", model="gpt-5.4-mini")
+    assert call.messages == [ModelMessage(role="user", content="Reply with ok.")]
+    assert call.max_output_tokens == 8
+    assert call.reasoning == ReasoningConfig(effort="none")
+    assert call.retry.max_attempts == 1
 
 
 @respx.mock

@@ -43,6 +43,8 @@ def test_inclusive_reasoning_billing_does_not_double_count_reasoning_tokens() ->
             input_per_million=1,
             output_per_million=2,
             reasoning_billing_mode="included_in_output",
+            source_url="https://example.invalid/pricing",
+            verified_at="2026-06-11",
         ),
     )
 
@@ -86,7 +88,12 @@ def test_estimate_catalog_cost_reports_not_token_priced_for_provider_unit_pricin
 def test_estimate_catalog_cost_reports_estimated_when_required_components_are_known() -> None:
     estimate = estimate_catalog_cost(
         TokenUsage(input_tokens=1000, output_tokens=1000, total_tokens=2000),
-        Pricing(input_per_million=1, output_per_million=2),
+        Pricing(
+            input_per_million=1,
+            output_per_million=2,
+            source_url="https://example.invalid/pricing",
+            verified_at="2026-06-11",
+        ),
         pricing_source="test-catalog",
     )
 
@@ -96,6 +103,20 @@ def test_estimate_catalog_cost_reports_estimated_when_required_components_are_kn
     assert estimate.breakdown.input_cost_usd_micros == 1000
     assert estimate.breakdown.output_cost_usd_micros == 2000
     assert estimate.breakdown.total_cost_usd_micros == 3000
+
+
+def test_estimate_catalog_cost_requires_pricing_provenance() -> None:
+    estimate = estimate_catalog_cost(
+        TokenUsage(input_tokens=1000, output_tokens=1000, total_tokens=2000),
+        Pricing(input_per_million=1, output_per_million=2),
+        pricing_source="test-catalog",
+    )
+
+    assert estimate.status == "missing_pricing"
+    assert estimate.pricing_source == "test-catalog"
+    assert estimate.breakdown.input_cost_usd_micros is None
+    assert estimate.breakdown.output_cost_usd_micros is None
+    assert estimate.breakdown.total_cost_usd_micros is None
 
 
 def test_pricing_snapshot_preserves_provenance_and_decimal_rates() -> None:

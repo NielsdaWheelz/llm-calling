@@ -574,6 +574,7 @@ def _attempt_from_error(
         retry_after_seconds=error.retry_after_seconds,
         delay_s=delay_s,
         provider_request_id=error.provider_request_id,
+        safe_body_snippet=error.safe_body_snippet,
         streamed_output_started=streamed_output_started,
     )
 
@@ -601,9 +602,10 @@ def _retry_delay_s(
     error: ModelCallError,
     retry: RetryPolicy,
 ) -> float:
-    delay = error.retry_after_seconds
-    if delay is None:
-        delay = retry.initial_delay_s * (2 ** max(0, attempt - 1))
+    if error.retry_after_seconds is not None:
+        return error.retry_after_seconds
+
+    delay = retry.initial_delay_s * (2 ** max(0, attempt - 1))
     if retry.jitter_s > 0:
         delay += random.uniform(0, retry.jitter_s)
     return min(delay, retry.max_delay_s)

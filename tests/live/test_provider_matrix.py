@@ -357,7 +357,12 @@ async def test_live_streaming_text(live_env: LiveEnv, case: ProviderCase) -> Non
 
     async with httpx.AsyncClient() as http:
         async for chunk in _runtime(http).stream(
-            _text_call(case, "Stream one short sentence.", max_output_tokens=64),
+            _text_call(
+                case,
+                "Stream one short sentence.",
+                max_output_tokens=64,
+                reasoning=_baseline_reasoning(case.capability),
+            ),
             key=key,
             timeout_s=60,
         ):
@@ -400,7 +405,7 @@ async def test_live_forced_tool_call_and_continuation(
                 case,
                 [user_turn],
                 max_output_tokens=128,
-                reasoning=_baseline_reasoning(case.capability),
+                reasoning=_highest_reasoning_effort(case.capability),
                 tools=(tool,),
                 tool_choice="required",
             ),
@@ -415,7 +420,12 @@ async def test_live_forced_tool_call_and_continuation(
                 case,
                 [
                     user_turn,
-                    ModelMessage(role="assistant", content=first.text, tool_calls=(tool_call,)),
+                    ModelMessage(
+                        role="assistant",
+                        content=first.text,
+                        tool_calls=(tool_call,),
+                        provider_artifacts=first.provider_artifacts,
+                    ),
                     ModelMessage(
                         role="tool",
                         tool_results=(
@@ -426,7 +436,7 @@ async def test_live_forced_tool_call_and_continuation(
                     ),
                 ],
                 max_output_tokens=96,
-                reasoning=_baseline_reasoning(case.capability),
+                reasoning=_highest_reasoning_effort(case.capability),
             ),
             key=key,
             timeout_s=60,
