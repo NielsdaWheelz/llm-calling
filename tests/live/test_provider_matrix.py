@@ -246,7 +246,11 @@ def _baseline_reasoning(capability: ModelCapability) -> ReasoningEffort:
 
 
 def _default_send_max_output(case: ProviderCase) -> int:
-    return 512 if case.provider == "gemini" else 96
+    if case.provider == "gemini":
+        return 512
+    if case.provider == "cloudflare":
+        return 160
+    return 96
 
 
 def _reasoning_send_max_output(case: ProviderCase, effort: ReasoningEffort) -> int:
