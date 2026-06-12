@@ -6,7 +6,14 @@ import pytest
 import respx
 
 import provider_runtime._adapter_runtime as adapter_runtime
-from provider_runtime import ModelRuntime, ProviderApiKey, ProviderBaseUrls, build_key_probe_call
+from provider_runtime import (
+    DEFAULT_CATALOG,
+    ModelRuntime,
+    ProviderApiKey,
+    ProviderBaseUrls,
+    build_key_probe_call,
+    lower_generate_request,
+)
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode
 from provider_runtime.types import ModelCall, ModelMessage, ModelRef, ReasoningConfig, RetryPolicy
 
@@ -240,9 +247,9 @@ async def test_generate_honors_retry_after_delay_before_success(
         response = await runtime(http).generate(req, key=KEY)
 
     assert route.call_count == 2
-    assert slept == [30]
+    assert slept == [2]
     assert response.attempts[0].retry_after_seconds == 30
-    assert response.attempts[0].delay_s == 30
+    assert response.attempts[0].delay_s == 2
 
 
 @respx.mock
@@ -370,6 +377,15 @@ async def test_build_key_probe_call_is_canonical_catalog_shape() -> None:
     assert call.max_output_tokens == 8
     assert call.reasoning == ReasoningConfig(effort="none")
     assert call.retry.max_attempts == 1
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "gemini", "openrouter", "cloudflare"])
+async def test_key_probe_calls_lower_for_every_provider(provider: str) -> None:
+    call = build_key_probe_call(provider)  # type: ignore[arg-type]
+
+    assert call is not None
+    capabilities = DEFAULT_CATALOG.require_capabilities(call.model)
+    lower_generate_request(call, capabilities, streaming=False)
 
 
 @respx.mock

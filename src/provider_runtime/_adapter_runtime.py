@@ -603,7 +603,7 @@ def _retry_delay_s(
     retry: RetryPolicy,
 ) -> float:
     if error.retry_after_seconds is not None:
-        return error.retry_after_seconds
+        return min(error.retry_after_seconds, retry.max_delay_s)
 
     delay = retry.initial_delay_s * (2 ** max(0, attempt - 1))
     if retry.jitter_s > 0:

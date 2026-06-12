@@ -480,6 +480,40 @@ async def test_reasoning_details_are_replayed_on_assistant_turn() -> None:
 
 
 @respx.mock
+async def test_rejects_mismatched_provider_artifact_before_request() -> None:
+    route = respx.post("https://openrouter.test/v1/chat/completions").respond(
+        200,
+        json=load_json("success_nonstream.json"),
+    )
+    req = ModelCall(
+        model=ModelRef(provider="openrouter", model="openai/gpt-oss-120b"),
+        messages=[
+            ModelMessage(role="user", content="Weather?"),
+            ModelMessage(
+                role="assistant",
+                provider_artifacts=(
+                    ProviderArtifact(
+                        provider="openai",
+                        model="openai/gpt-oss-120b",
+                        purpose="reasoning",
+                        payload={"type": "reasoning.encrypted", "data": "opaque"},
+                    ),
+                ),
+            ),
+        ],
+        max_output_tokens=100,
+        reasoning=ReasoningConfig(effort="high"),
+    )
+
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(ModelCallError) as info:
+            await chat_client(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    assert info.value.error_code == ModelCallErrorCode.BAD_REQUEST
+    assert route.call_count == 0
+
+
+@respx.mock
 async def test_stream_reasoning_details_emit_provider_artifact_not_delta_text() -> None:
     stream_body = (
         'data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text",'

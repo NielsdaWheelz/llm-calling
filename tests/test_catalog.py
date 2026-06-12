@@ -90,6 +90,13 @@ def test_gemini_reasoning_modes_do_not_overclaim_thinking_off() -> None:
     assert flash_25.reasoning_budget_range == (0, 24576)
 
 
+def test_gemini_catalog_does_not_claim_provider_request_ids() -> None:
+    gemini_entries = [entry for entry in DEFAULT_CATALOG.entries if entry.provider == "gemini"]
+
+    assert gemini_entries
+    assert all(entry.provider_request_id is False for entry in gemini_entries)
+
+
 def test_catalog_rejects_unknown_models() -> None:
     with pytest.raises(KeyError):
         DEFAULT_CATALOG.require_capabilities(ModelRef(provider="openai", model="missing"))

@@ -546,6 +546,40 @@ async def test_assistant_provider_artifacts_lead_replayed_content() -> None:
 
 
 @respx.mock
+async def test_rejects_mismatched_provider_artifact_before_request() -> None:
+    route = respx.post("https://api.anthropic.com/v1/messages").respond(
+        200,
+        json=load_json("success_nonstream.json"),
+    )
+    req = ModelCall(
+        model=ModelRef(provider="anthropic", model="claude-opus-4-8"),
+        messages=[
+            ModelMessage(role="user", content="Weather?"),
+            ModelMessage(
+                role="assistant",
+                provider_artifacts=(
+                    ProviderArtifact(
+                        provider="openai",
+                        model="claude-opus-4-8",
+                        purpose="thinking",
+                        payload={"type": "thinking", "thinking": "Plan.", "signature": "sig"},
+                    ),
+                ),
+            ),
+        ],
+        max_output_tokens=2000,
+        reasoning=ReasoningConfig(effort="high"),
+    )
+
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(ModelCallError) as info:
+            await AnthropicClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    assert info.value.error_code == ModelCallErrorCode.BAD_REQUEST
+    assert route.call_count == 0
+
+
+@respx.mock
 async def test_nonstream_thinking_blocks_exposed_as_provider_artifacts() -> None:
     response_json = load_json("success_nonstream.json")
     thinking = {"type": "thinking", "thinking": "Plan.", "signature": "sig-abc"}
@@ -578,7 +612,7 @@ async def test_usage_parses_cache_tokens() -> None:
             }
         )
 
-    assert usage.input_tokens == 10
+    assert usage.input_tokens == 160
     assert usage.output_tokens == 8
     assert usage.cache_creation_input_tokens == 100
     assert usage.cache_read_input_tokens == 50

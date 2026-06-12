@@ -48,6 +48,7 @@ from collections.abc import AsyncIterator
 
 import httpx
 
+from provider_runtime._artifact_validation import validated_provider_artifacts
 from provider_runtime.endpoints import ANTHROPIC_BASE_URL
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode, raise_for_provider_error
 from provider_runtime.tool_arguments import parse_tool_arguments_with_status
@@ -293,7 +294,7 @@ class AnthropicClient:
                 # Anthropic uses a separate system field
                 system_blocks.append(self._turn_to_text_block(turn))
             else:
-                messages.append(self._turn_to_message(turn))
+                messages.append(self._turn_to_message(turn, model=req.model.model))
 
         body: dict = {
             "model": req.model.model,
@@ -389,7 +390,7 @@ class AnthropicClient:
         block: dict[str, object] = {"type": "text", "text": turn.content}
         return self._with_cache_control(block, turn.cache_ttl)
 
-    def _turn_to_message(self, turn: ModelMessage) -> dict[str, object]:
+    def _turn_to_message(self, turn: ModelMessage, *, model: str) -> dict[str, object]:
         """Convert ModelMessage to Anthropic message format.
 
         Note: System turns are handled separately in _build_request_body.
@@ -410,7 +411,13 @@ class AnthropicClient:
         if turn.role == "assistant" and (turn.tool_calls or turn.provider_artifacts):
             # Thinking blocks must lead the assistant turn, unmodified, before tool_use.
             assistant_content: list[dict[str, object]] = [
-                item.to_provider_payload() for item in turn.provider_artifacts
+                item.to_provider_payload()
+                for item in validated_provider_artifacts(
+                    turn.provider_artifacts,
+                    provider="anthropic",
+                    model=model,
+                    purpose="thinking",
+                )
             ]
             if turn.content:
                 assistant_content.append({"type": "text", "text": turn.content})
@@ -514,15 +521,17 @@ class AnthropicClient:
         )
 
     def _parse_usage(self, usage_data: dict[str, object]) -> TokenUsage:
-        input_tokens = _int_or_none(usage_data.get("input_tokens"))
+        billed_input_tokens = _int_or_none(usage_data.get("input_tokens"))
         output_tokens = _int_or_none(usage_data.get("output_tokens"))
         cache_creation = _int_or_none(usage_data.get("cache_creation_input_tokens"))
         cache_read = _int_or_none(usage_data.get("cache_read_input_tokens"))
-        total = sum(
-            value
-            for value in (input_tokens, output_tokens, cache_creation, cache_read)
-            if value is not None
+        input_buckets = (billed_input_tokens, cache_creation, cache_read)
+        input_tokens = (
+            sum(value for value in input_buckets if value is not None)
+            if any(value is not None for value in input_buckets)
+            else None
         )
+        total = sum(value for value in (input_tokens, output_tokens) if value is not None)
         return TokenUsage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,

@@ -32,6 +32,7 @@ from collections.abc import AsyncIterator
 
 import httpx
 
+from provider_runtime._artifact_validation import validated_provider_artifacts
 from provider_runtime.endpoints import OPENAI_BASE_URL
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode, raise_for_provider_error
 from provider_runtime.tool_arguments import parse_tool_arguments_with_status
@@ -300,7 +301,12 @@ class OpenAIClient:
             if turn.role == "assistant":
                 # Replay captured reasoning items verbatim, in emission order: they must
                 # precede the message/function_call items they originally preceded.
-                for item in turn.provider_artifacts:
+                for item in validated_provider_artifacts(
+                    turn.provider_artifacts,
+                    provider="openai",
+                    model=req.model.model,
+                    purpose="reasoning",
+                ):
                     input_items.append(item.to_provider_payload())
             if turn.content or not turn.tool_calls:
                 content_type = "output_text" if turn.role == "assistant" else "input_text"

@@ -31,6 +31,32 @@ def test_estimate_cost_uses_integer_micros_and_excludes_cache_from_full_input() 
     assert cost.total_cost_usd_micros == 5025
 
 
+def test_estimate_cost_handles_anthropic_normalized_cache_usage() -> None:
+    cost = estimate_cost(
+        TokenUsage(
+            input_tokens=160,
+            output_tokens=8,
+            total_tokens=168,
+            cache_creation_input_tokens=100,
+            cache_read_input_tokens=50,
+        ),
+        Pricing(
+            input_per_million=1,
+            output_per_million=1,
+            cached_input_per_million="0.10",
+            cache_write_per_million_by_ttl={"5m": "1.25"},
+            reasoning_billing_mode="included_in_output",
+        ),
+        cache_write_ttl="5m",
+    )
+
+    assert cost.input_cost_usd_micros == 10
+    assert cost.output_cost_usd_micros == 8
+    assert cost.cache_write_cost_usd_micros == 125
+    assert cost.cache_read_cost_usd_micros == 5
+    assert cost.total_cost_usd_micros == 148
+
+
 def test_inclusive_reasoning_billing_does_not_double_count_reasoning_tokens() -> None:
     estimate = estimate_catalog_cost(
         TokenUsage(

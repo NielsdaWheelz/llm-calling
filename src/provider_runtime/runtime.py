@@ -26,6 +26,7 @@ from provider_runtime.types import (
     ProviderApiKey,
     ProviderName,
     ReasoningConfig,
+    ReasoningEffort,
     RetryPolicy,
     TranscriptionCall,
     TranscriptionResponse,
@@ -43,11 +44,19 @@ def build_key_probe_call(
     model = catalog.key_probe_model(provider)
     if model is None:
         return None
+    capabilities = catalog.require_capabilities(ModelRef(provider=provider, model=model))
+    probe_reasoning: ReasoningEffort = "none"
+    if probe_reasoning not in capabilities.reasoning_modes:
+        probe_reasoning = (
+            "default"
+            if "default" in capabilities.reasoning_modes
+            else capabilities.reasoning_modes[0]
+        )
     return ModelCall(
         model=ModelRef(provider=provider, model=model),
         messages=[ModelMessage(role="user", content="Reply with ok.")],
         max_output_tokens=8,
-        reasoning=ReasoningConfig(effort="none"),
+        reasoning=ReasoningConfig(effort=probe_reasoning),
         retry=RetryPolicy(max_attempts=1),
     )
 

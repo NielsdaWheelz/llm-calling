@@ -6,6 +6,7 @@ from typing import Literal, cast
 
 import httpx
 
+from provider_runtime._artifact_validation import validated_provider_artifacts
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode, raise_for_provider_error
 from provider_runtime.tool_arguments import parse_tool_arguments_with_status
 from provider_runtime.types import (
@@ -213,7 +214,12 @@ class OpenAICompatibleChatClient:
                         }
                         for tc in turn.tool_calls
                     ]
-                message.update(self._provider_artifact_message_fields(turn.provider_artifacts))
+                message.update(
+                    self._provider_artifact_message_fields(
+                        turn.provider_artifacts,
+                        model=req.model.model,
+                    )
+                )
                 messages.append(message)
                 continue
             messages.append({"role": turn.role, "content": turn.content})
@@ -383,13 +389,18 @@ class OpenAICompatibleChatClient:
     def _provider_artifact_message_fields(
         self,
         artifacts: tuple[ProviderArtifact, ...],
+        *,
+        model: str,
     ) -> dict[str, object]:
         reasoning_details: list[dict[str, object]] = []
         reasoning_parts: list[str] = []
         reasoning_content_parts: list[str] = []
-        for artifact in artifacts:
-            if artifact.provider != self._provider or artifact.purpose != "reasoning":
-                continue
+        for artifact in validated_provider_artifacts(
+            artifacts,
+            provider=cast(ProviderName, self._provider),
+            model=model,
+            purpose="reasoning",
+        ):
             payload = artifact.to_provider_payload()
             if _is_reasoning_detail(payload):
                 reasoning_details.append(payload)

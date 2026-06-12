@@ -452,6 +452,40 @@ async def test_reasoning_item_replayed_before_function_call() -> None:
 
 
 @respx.mock
+async def test_rejects_mismatched_provider_artifact_before_request() -> None:
+    route = respx.post("https://api.openai.com/v1/responses").respond(
+        200,
+        json=load_json("success_nonstream.json"),
+    )
+    req = ModelCall(
+        model=ModelRef(provider="openai", model="gpt-5.4-mini"),
+        messages=[
+            ModelMessage(role="user", content="Weather?"),
+            ModelMessage(
+                role="assistant",
+                provider_artifacts=(
+                    ProviderArtifact(
+                        provider="anthropic",
+                        model="gpt-5.4-mini",
+                        purpose="reasoning",
+                        payload={"type": "reasoning", "encrypted_content": "opaque"},
+                    ),
+                ),
+            ),
+        ],
+        max_output_tokens=100,
+        reasoning=ReasoningConfig(effort="high"),
+    )
+
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(ModelCallError) as info:
+            await OpenAIClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    assert info.value.error_code == ModelCallErrorCode.BAD_REQUEST
+    assert route.call_count == 0
+
+
+@respx.mock
 async def test_nonstream_reasoning_items_exposed_on_response() -> None:
     response_json = load_json("success_nonstream.json")
     reasoning_item = {
