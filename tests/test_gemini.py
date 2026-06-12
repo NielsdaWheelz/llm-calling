@@ -450,6 +450,109 @@ async def test_thought_signature_and_call_id_captured_then_echoed_on_replay() ->
     }
 
 
+@pytest.mark.parametrize(
+    "artifact",
+    [
+        ProviderArtifact(
+            provider="openai",
+            model="gemini-2.5-pro",
+            purpose="signature",
+            payload={"thoughtSignature": "sig-abc", "function_call_id": "fc-123"},
+        ),
+        ProviderArtifact(
+            provider="gemini",
+            model="gemini-2.5-flash",
+            purpose="signature",
+            payload={"thoughtSignature": "sig-abc", "function_call_id": "fc-123"},
+        ),
+        ProviderArtifact(
+            provider="gemini",
+            model="gemini-2.5-pro",
+            purpose="reasoning",
+            payload={"thoughtSignature": "sig-abc", "function_call_id": "fc-123"},
+        ),
+    ],
+)
+@respx.mock
+async def test_rejects_mismatched_provider_artifact_before_request(
+    artifact: ProviderArtifact,
+) -> None:
+    route = respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+    ).respond(200, json=load_json("success_nonstream.json"))
+    req = ModelCall(
+        model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
+        messages=[
+            ModelMessage(role="user", content="What's the weather?"),
+            ModelMessage(
+                role="assistant",
+                tool_calls=(
+                    ToolCall(
+                        id="fc-123",
+                        name="get_weather",
+                        arguments={"city": "Paris"},
+                    ),
+                ),
+                provider_artifacts=(artifact,),
+            ),
+        ],
+        max_output_tokens=100,
+        reasoning=ReasoningConfig(effort="default"),
+    )
+
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(ModelCallError) as info:
+            await GeminiClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    assert info.value.error_code == ModelCallErrorCode.BAD_REQUEST
+    assert route.call_count == 0
+
+
+@respx.mock
+async def test_rejects_unmatched_signature_artifact_before_request() -> None:
+    route = respx.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+    ).respond(200, json=load_json("success_nonstream.json"))
+    req = ModelCall(
+        model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
+        messages=[
+            ModelMessage(role="user", content="What's the weather?"),
+            ModelMessage(
+                role="assistant",
+                tool_calls=(
+                    ToolCall(
+                        id="fc-123",
+                        name="get_weather",
+                        arguments={"city": "Paris"},
+                    ),
+                ),
+                provider_artifacts=(
+                    ProviderArtifact(
+                        provider="gemini",
+                        model="gemini-2.5-pro",
+                        purpose="signature",
+                        payload={
+                            "type": "gemini.thought_signature",
+                            "function_call_id": "fc-other",
+                            "function_name": "other_tool",
+                            "thoughtSignature": "sig-abc",
+                        },
+                    ),
+                ),
+            ),
+        ],
+        max_output_tokens=100,
+        reasoning=ReasoningConfig(effort="default"),
+    )
+
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(ModelCallError) as info:
+            await GeminiClient(http).generate(req, api_key="sk-test", timeout_s=30)
+
+    assert info.value.error_code == ModelCallErrorCode.BAD_REQUEST
+    assert route.call_count == 0
+
+
 @respx.mock
 async def test_nonstream_thought_parts_excluded_from_text() -> None:
     response_json = load_json("success_nonstream.json")

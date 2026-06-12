@@ -58,6 +58,7 @@ from collections.abc import AsyncIterator
 
 import httpx
 
+from provider_runtime._artifact_validation import validated_provider_artifacts
 from provider_runtime.endpoints import GEMINI_BASE_URL
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode, raise_for_provider_error
 from provider_runtime.tool_arguments import parse_tool_arguments_with_status
@@ -280,7 +281,7 @@ class GeminiClient:
             if turn.role == "system":
                 system_prompt = turn.content
             else:
-                contents.append(self._turn_to_content(turn, call_id_to_name))
+                contents.append(self._turn_to_content(turn, call_id_to_name, model=req.model.model))
 
         body: dict = {
             "contents": contents,
@@ -361,7 +362,13 @@ class GeminiClient:
 
         raise ValueError(f"Unknown reasoning_effort: {req.reasoning.effort}")
 
-    def _turn_to_content(self, turn: ModelMessage, call_id_to_name: dict[str, str]) -> dict:
+    def _turn_to_content(
+        self,
+        turn: ModelMessage,
+        call_id_to_name: dict[str, str],
+        *,
+        model: str,
+    ) -> dict:
         """Convert ModelMessage to Gemini content format.
 
         Note: Gemini uses "model" instead of "assistant" for the role, and
@@ -380,9 +387,9 @@ class GeminiClient:
                     for result in turn.tool_results
                 ],
             }
-        if turn.role == "assistant" and turn.tool_calls:
+        if turn.role == "assistant" and (turn.tool_calls or turn.provider_artifacts):
             parts: list[dict] = []
-            signature_by_call = _gemini_signature_by_call(turn)
+            signature_by_call = _gemini_signature_by_call(turn, model=model)
             if turn.content:
                 parts.append({"text": turn.content})
             for call in turn.tool_calls:
@@ -511,16 +518,40 @@ def _turn_parts(turn: ModelMessage) -> list[dict[str, object]]:
     return parts or [{"text": ""}]
 
 
-def _gemini_signature_by_call(turn: ModelMessage) -> dict[str, str]:
+def _gemini_signature_by_call(turn: ModelMessage, *, model: str) -> dict[str, str]:
     signatures: dict[str, str] = {}
-    for artifact in turn.provider_artifacts:
-        if artifact.provider != "gemini" or artifact.purpose != "signature":
-            continue
+    call_ids = {call.id for call in turn.tool_calls}
+    call_names = {call.name for call in turn.tool_calls}
+    for artifact in validated_provider_artifacts(
+        turn.provider_artifacts,
+        provider="gemini",
+        model=model,
+        purpose="signature",
+    ):
         payload = artifact.to_provider_payload()
         signature = payload.get("thoughtSignature")
-        if not isinstance(signature, str):
-            continue
-        for key in (payload.get("function_call_id"), payload.get("function_name")):
+        if not isinstance(signature, str) or not signature:
+            raise ModelCallError(
+                ModelCallErrorCode.BAD_REQUEST,
+                "Gemini signature artifact replay requires thoughtSignature",
+                provider="gemini",
+                retryable=False,
+            )
+        matched = False
+        for key, valid_keys in (
+            (payload.get("function_call_id"), call_ids),
+            (payload.get("function_name"), call_names),
+        ):
             if isinstance(key, str) and key:
-                signatures[key] = signature
+                if key in valid_keys:
+                    signatures[key] = signature
+                    matched = True
+                continue
+        if not matched:
+            raise ModelCallError(
+                ModelCallErrorCode.BAD_REQUEST,
+                "Gemini signature artifact replay requires a matching assistant tool call",
+                provider="gemini",
+                retryable=False,
+            )
     return signatures
