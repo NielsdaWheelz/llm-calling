@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import cast
@@ -19,10 +20,10 @@ from provider_runtime.types import (
     EmbeddingResponse,
     KeyProbeResult,
     ModelCall,
-    ModelChunk,
     ModelMessage,
     ModelRef,
     ModelResponse,
+    ModelStreamEvent,
     ProviderApiKey,
     ProviderName,
     ReasoningConfig,
@@ -165,11 +166,17 @@ class ModelRuntime(_AdapterRuntime):
         *,
         key: ProviderApiKey,
         timeout_s: float = DEFAULT_TIMEOUT_S,
-    ) -> AsyncIterator[ModelChunk]:
+        cancel: asyncio.Event | None = None,
+    ) -> AsyncIterator[ModelStreamEvent]:
         capabilities = self._require_generate_capabilities(call, streaming=True)
         plan = lower_generate_request(call, capabilities, streaming=True)
-        async for chunk in super().stream(plan.call, key=key, timeout_s=timeout_s):
-            yield chunk
+        async for event in super().stream(
+            plan.call,
+            key=key,
+            timeout_s=timeout_s,
+            cancel=cancel,
+        ):
+            yield event
 
     async def embed(
         self,

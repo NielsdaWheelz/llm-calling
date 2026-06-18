@@ -54,9 +54,9 @@ from provider_runtime.errors import ModelCallError, ModelCallErrorCode, raise_fo
 from provider_runtime.tool_arguments import parse_tool_arguments_with_status
 from provider_runtime.types import (
     ModelCall,
-    ModelChunk,
     ModelMessage,
     ModelResponse,
+    ModelStreamEvent,
     ProviderArtifact,
     TokenUsage,
     ToolCall,
@@ -103,7 +103,7 @@ class AnthropicClient:
         *,
         api_key: str,
         timeout_s: float,
-    ) -> AsyncIterator[ModelChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         """Streaming message generation using Server-Sent Events."""
         if req.structured_output is not None:
             raise ModelCallError(
@@ -141,13 +141,20 @@ class AnthropicClient:
 
                     if event_type == "message_stop":
                         received_stop = True
-                        yield ModelChunk(
-                            delta_text="",
-                            done=True,
+                        status = _status_from_stop_reason(stop_reason)
+                        yield ModelStreamEvent(
+                            type=("incomplete" if status == "incomplete" else "completed"),
+                            provider="anthropic",
+                            model=req.model.model,
+                            route=req.model.route,
                             usage=usage,
                             provider_request_id=provider_request_id,
-                            status=_status_from_stop_reason(stop_reason),
-                            incomplete_details=_incomplete_details_from_stop_reason(stop_reason),
+                            status=status,
+                            incomplete_details=(
+                                _incomplete_details_from_stop_reason(stop_reason)
+                                if status == "incomplete"
+                                else None
+                            ),
                         )
                         break
                     continue
@@ -176,6 +183,14 @@ class AnthropicClient:
                     if isinstance(start_usage, dict):
                         usage_data.update(start_usage)
                         usage = self._parse_usage(usage_data)
+                    yield ModelStreamEvent(
+                        type="stream_start",
+                        provider="anthropic",
+                        model=req.model.model,
+                        route=req.model.route,
+                        provider_event_type=event_type,
+                        provider_request_id=provider_request_id,
+                    )
                     continue
 
                 # Handle content_block_start - track tool_use and thinking blocks
@@ -189,6 +204,18 @@ class AnthropicClient:
                                 "name": block.get("name", ""),
                                 "json": "",
                             }
+                            if block.get("id") and block.get("name"):
+                                yield ModelStreamEvent(
+                                    type="tool_call_start",
+                                    provider="anthropic",
+                                    model=req.model.model,
+                                    route=req.model.route,
+                                    provider_event_type=event_type,
+                                    item_index=index,
+                                    tool_call_id=str(block["id"]),
+                                    tool_call_index=index,
+                                    tool_name=str(block["name"]),
+                                )
                     elif block.get("type") in ("thinking", "redacted_thinking"):
                         index = data.get("index")
                         if isinstance(index, int):
@@ -202,11 +229,34 @@ class AnthropicClient:
                     if delta.get("type") == "text_delta":
                         delta_text = delta.get("text", "")
                         if delta_text:
-                            yield ModelChunk(delta_text=delta_text, done=False)
+                            yield ModelStreamEvent(
+                                type="text_delta",
+                                provider="anthropic",
+                                model=req.model.model,
+                                route=req.model.route,
+                                provider_event_type=event_type,
+                                item_index=data.get("index"),
+                                text=delta_text,
+                            )
                     elif delta.get("type") == "input_json_delta":
                         index = data.get("index")
                         if isinstance(index, int) and index in tool_blocks:
-                            tool_blocks[index]["json"] += delta.get("partial_json", "")
+                            partial_json = delta.get("partial_json", "")
+                            tool_blocks[index]["json"] += partial_json
+                            if partial_json:
+                                block_state = tool_blocks[index]
+                                yield ModelStreamEvent(
+                                    type="tool_call_delta",
+                                    provider="anthropic",
+                                    model=req.model.model,
+                                    route=req.model.route,
+                                    provider_event_type=event_type,
+                                    item_index=index,
+                                    tool_call_id=str(block_state["id"]),
+                                    tool_call_index=index,
+                                    tool_name=str(block_state["name"]),
+                                    tool_arguments_delta=partial_json,
+                                )
                     elif delta.get("type") in ("thinking_delta", "signature_delta"):
                         key = "thinking" if delta.get("type") == "thinking_delta" else "signature"
                         index = data.get("index")
@@ -229,26 +279,38 @@ class AnthropicClient:
                             tool_name=str(block_state["name"]),
                             call_id=str(block_state["id"]),
                         )
-                        yield ModelChunk(
+                        yield ModelStreamEvent(
+                            type="tool_call_done",
+                            provider="anthropic",
+                            model=req.model.model,
+                            route=req.model.route,
+                            provider_event_type=event_type,
+                            item_index=index,
+                            tool_call_id=str(block_state["id"]),
+                            tool_call_index=index,
                             tool_call=ToolCall(
                                 id=str(block_state["id"]),
                                 name=str(block_state["name"]),
                                 arguments=arguments.arguments,
                                 argument_status=arguments.status,
                             ),
-                            done=False,
                         )
                     elif isinstance(index, int) and index in thinking_blocks:
                         # One complete thinking/redacted_thinking block, verbatim.
                         block = thinking_blocks.pop(index)
-                        yield ModelChunk(
+                        yield ModelStreamEvent(
+                            type="provider_artifact",
+                            provider="anthropic",
+                            model=req.model.model,
+                            route=req.model.route,
+                            provider_event_type=event_type,
+                            item_index=index,
                             provider_artifact=ProviderArtifact(
                                 provider="anthropic",
                                 model=req.model.model,
                                 purpose="thinking",
                                 payload=block,
                             ),
-                            done=False,
                         )
                     continue
 

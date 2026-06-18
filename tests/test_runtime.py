@@ -178,16 +178,20 @@ async def test_terminal_parser_exceptions_do_not_retry_model_calls(operation: st
     )
 
     async with httpx.AsyncClient() as http:
-        with pytest.raises(ModelCallError) as exc_info:
-            if operation == "generate":
+        if operation == "generate":
+            with pytest.raises(ModelCallError) as exc_info:
                 await runtime(http).generate(req, key=KEY)
-            else:
-                async for _ in runtime(http).stream(req, key=KEY):
-                    pass
+
+            assert exc_info.value.retryable is False
+            assert [attempt.status for attempt in exc_info.value.attempts] == ["terminal_error"]
+        else:
+            events = [event async for event in runtime(http).stream(req, key=KEY)]
+
+            assert events[-1].type == "failed"
+            assert events[-1].error_code == ModelCallErrorCode.PROVIDER_DOWN.value
+            assert [attempt.status for attempt in events[-1].attempts] == ["terminal_error"]
 
     assert route.call_count == 1
-    assert exc_info.value.retryable is False
-    assert [attempt.status for attempt in exc_info.value.attempts] == ["terminal_error"]
 
 
 @respx.mock
@@ -198,12 +202,11 @@ async def test_stream_wraps_protocol_error() -> None:
     )
 
     async with httpx.AsyncClient() as http:
-        with pytest.raises(ModelCallError) as exc_info:
-            async for _ in runtime(http).stream(req, key=KEY):
-                pass
+        events = [event async for event in runtime(http).stream(req, key=KEY)]
 
-    assert exc_info.value.error_code == ModelCallErrorCode.PROVIDER_DOWN
-    assert "peer closed connection" in exc_info.value.message
+    assert events[-1].type == "failed"
+    assert events[-1].error_code == ModelCallErrorCode.PROVIDER_DOWN.value
+    assert "peer closed connection" in (events[-1].error_detail or "")
 
 
 @respx.mock
@@ -305,13 +308,15 @@ async def test_stream_retries_only_before_first_chunk() -> None:
     )
 
     async with httpx.AsyncClient() as http:
-        chunks = [chunk async for chunk in runtime(http).stream(req, key=KEY)]
+        events = [event async for event in runtime(http).stream(req, key=KEY)]
 
     assert route.call_count == 2
-    assert "".join(chunk.delta_text for chunk in chunks) == "Hello! How can I help?"
-    assert chunks[-1].done is True
-    assert [attempt.status for attempt in chunks[-1].attempts] == ["retryable_error", "success"]
-    assert chunks[-1].retry_count == 1
+    assert "".join(event.text for event in events if event.type == "text_delta") == (
+        "Hello! How can I help?"
+    )
+    assert events[-1].terminal is True
+    assert [attempt.status for attempt in events[-1].attempts] == ["retryable_error", "success"]
+    assert events[-1].retry_count == 1
 
 
 @respx.mock

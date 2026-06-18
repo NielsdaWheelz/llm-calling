@@ -26,8 +26,8 @@ from provider_runtime.types import (
     EmbeddingCall,
     EmbeddingResponse,
     ModelCall,
-    ModelChunk,
     ModelResponse,
+    ModelStreamEvent,
     ProviderApiKey,
     ProviderName,
     RetryAttempt,
@@ -117,73 +117,130 @@ class _AdapterRuntime:
         *,
         key: ProviderApiKey,
         timeout_s: float = DEFAULT_TIMEOUT_S,
-    ) -> AsyncIterator[ModelChunk]:
+        cancel: asyncio.Event | None = None,
+    ) -> AsyncIterator[ModelStreamEvent]:
         provider = self._resolve_provider(call.model.route or call.model.provider)
         client = self._resolve_client(provider)
         attempts = max(1, call.retry.max_attempts)
         started = time.monotonic()
         attempt_trace: list[RetryAttempt] = []
+        sequence = 0
         for attempt in range(1, attempts + 1):
-            emitted_chunk = False
+            emitted_output = False
+            if cancel is not None and cancel.is_set():
+                sequence += 1
+                yield ModelStreamEvent(
+                    type="cancelled",
+                    provider=provider,
+                    model=call.model.model,
+                    route=call.model.route,
+                    sequence=sequence,
+                    retry_attempt=attempt,
+                )
+                return
             try:
-                async for chunk in client.generate_stream(
+                async for event in client.generate_stream(
                     call, api_key=key.reveal(), timeout_s=timeout_s
                 ):
-                    emitted_chunk = True
-                    if chunk.done:
+                    sequence += 1
+                    event = replace(event, sequence=sequence, retry_attempt=attempt)
+                    if event.type in {
+                        "text_delta",
+                        "tool_call_start",
+                        "tool_call_delta",
+                        "tool_call_done",
+                        "provider_artifact",
+                    }:
+                        emitted_output = True
+                    if event.terminal:
                         success_attempt = RetryAttempt(
                             attempt_number=attempt,
                             max_attempts=attempts,
-                            status="success",
-                            provider_request_id=chunk.provider_request_id,
-                            streamed_output_started=emitted_chunk,
+                            status="success" if event.type != "failed" else "terminal_error",
+                            provider_request_id=event.provider_request_id,
+                            streamed_output_started=emitted_output,
                         )
                         yield replace(
-                            chunk,
+                            event,
                             attempts=tuple((*attempt_trace, success_attempt)),
                         )
                     else:
-                        yield chunk
+                        yield event
+                    if cancel is not None and cancel.is_set():
+                        sequence += 1
+                        yield ModelStreamEvent(
+                            type="cancelled",
+                            provider=provider,
+                            model=call.model.model,
+                            route=call.model.route,
+                            sequence=sequence,
+                            retry_attempt=attempt,
+                        )
+                        return
                 return
             except Exception as raw_exc:
                 exc = _wrap_stream_error(provider, raw_exc)
-                if emitted_chunk or attempt >= attempts or not _can_retry(exc, call.retry):
-                    exc.with_attempts(
-                        tuple(
-                            (
-                                *attempt_trace,
-                                _attempt_from_error(
-                                    exc,
-                                    attempt=attempt,
-                                    max_attempts=attempts,
-                                    status="terminal_error",
-                                    streamed_output_started=emitted_chunk,
-                                ),
-                            )
+                if emitted_output or attempt >= attempts or not _can_retry(exc, call.retry):
+                    attempts_payload = tuple(
+                        (
+                            *attempt_trace,
+                            _attempt_from_error(
+                                exc,
+                                attempt=attempt,
+                                max_attempts=attempts,
+                                status="terminal_error",
+                                streamed_output_started=emitted_output,
+                            ),
                         )
                     )
-                    raise exc from raw_exc
+                    exc.with_attempts(attempts_payload)
+                    sequence += 1
+                    yield ModelStreamEvent(
+                        type="failed",
+                        provider=provider,
+                        model=call.model.model,
+                        route=call.model.route,
+                        sequence=sequence,
+                        retry_attempt=attempt,
+                        provider_request_id=exc.provider_request_id,
+                        error_code=exc.error_code.value,
+                        error_detail=exc.message,
+                        attempts=attempts_payload,
+                    )
+                    return
                 delay_s = _retry_delay_s(
                     attempt=attempt,
                     error=exc,
                     retry=call.retry,
                 )
                 if _deadline_exhausted(started=started, retry=call.retry, delay_s=delay_s):
-                    exc.with_attempts(
-                        tuple(
-                            (
-                                *attempt_trace,
-                                _attempt_from_error(
-                                    exc,
-                                    attempt=attempt,
-                                    max_attempts=attempts,
-                                    status="terminal_error",
-                                    streamed_output_started=emitted_chunk,
-                                ),
-                            )
+                    attempts_payload = tuple(
+                        (
+                            *attempt_trace,
+                            _attempt_from_error(
+                                exc,
+                                attempt=attempt,
+                                max_attempts=attempts,
+                                status="terminal_error",
+                                streamed_output_started=emitted_output,
+                            ),
                         )
                     )
-                    raise exc from raw_exc
+                    exc.with_attempts(attempts_payload)
+                    sequence += 1
+                    yield ModelStreamEvent(
+                        type="failed",
+                        provider=provider,
+                        model=call.model.model,
+                        route=call.model.route,
+                        sequence=sequence,
+                        retry_attempt=attempt,
+                        provider_request_id=exc.provider_request_id,
+                        error_code=exc.error_code.value,
+                        error_detail=exc.message,
+                        attempts=attempts_payload,
+                    )
+                    return
                 attempt_trace.append(
                     _attempt_from_error(
                         exc,

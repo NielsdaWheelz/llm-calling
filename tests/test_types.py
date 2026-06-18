@@ -2,9 +2,9 @@ import pytest
 
 from provider_runtime.types import (
     BinaryPart,
-    ModelChunk,
     ModelMessage,
     ModelResponse,
+    ModelStreamEvent,
     ProviderArtifact,
     TextPart,
     TokenUsage,
@@ -13,39 +13,54 @@ from provider_runtime.types import (
 )
 
 
-def test_non_terminal_chunk_cannot_include_usage() -> None:
+def test_text_delta_event_cannot_include_usage() -> None:
     with pytest.raises(ValueError):
-        ModelChunk(
-            delta_text="x",
-            done=False,
+        ModelStreamEvent(
+            type="text_delta",
+            provider="openai",
+            model="gpt-5.4-mini",
+            text="x",
             usage=TokenUsage(input_tokens=1, output_tokens=1, total_tokens=2),
         )
 
 
-def test_non_terminal_chunk_cannot_include_terminal_status() -> None:
+def test_text_delta_event_cannot_include_terminal_status() -> None:
     with pytest.raises(ValueError):
-        ModelChunk(delta_text="x", done=False, status="incomplete")
+        ModelStreamEvent(
+            type="text_delta",
+            provider="openai",
+            model="gpt-5.4-mini",
+            text="x",
+            status="incomplete",
+        )
 
 
-def test_non_terminal_chunk_cannot_include_incomplete_details() -> None:
+def test_text_delta_event_cannot_include_incomplete_details() -> None:
     with pytest.raises(ValueError):
-        ModelChunk(
-            delta_text="x",
-            done=False,
+        ModelStreamEvent(
+            type="text_delta",
+            provider="openai",
+            model="gpt-5.4-mini",
+            text="x",
             incomplete_details={"reason": "max_output_tokens"},
         )
 
 
-def test_non_terminal_chunk_may_carry_provider_artifact() -> None:
+def test_provider_artifact_event_carries_opaque_artifact() -> None:
     artifact = ProviderArtifact(
         provider="openai",
         model="gpt-5.4-mini",
         purpose="reasoning",
         payload={"type": "reasoning", "id": "rs_1"},
     )
-    chunk = ModelChunk(provider_artifact=artifact, done=False)
+    event = ModelStreamEvent(
+        type="provider_artifact",
+        provider="openai",
+        model="gpt-5.4-mini",
+        provider_artifact=artifact,
+    )
 
-    assert chunk.provider_artifact == artifact
+    assert event.provider_artifact == artifact
     assert artifact.to_provider_payload() == {"type": "reasoning", "id": "rs_1"}
 
 
@@ -69,7 +84,12 @@ def test_provider_artifacts_are_excluded_from_dataclass_repr() -> None:
         provider_request_id="req_123",
         provider_artifacts=(artifact,),
     )
-    chunk = ModelChunk(provider_artifact=artifact)
+    event = ModelStreamEvent(
+        type="provider_artifact",
+        provider="openai",
+        model="gpt-5.4-mini",
+        provider_artifact=artifact,
+    )
     tool_call = ToolCall(
         id="call_1",
         name="lookup",
@@ -77,7 +97,7 @@ def test_provider_artifacts_are_excluded_from_dataclass_repr() -> None:
         provider_metadata={"thoughtSignature": "tool-secret"},
     )
 
-    combined = "\n".join(map(repr, (message, response, chunk, tool_call)))
+    combined = "\n".join(map(repr, (message, response, event, tool_call)))
     assert "opaque-provider-secret" not in combined
     assert "sig-secret" not in combined
     assert "private thought" not in combined

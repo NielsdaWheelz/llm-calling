@@ -14,9 +14,9 @@ from provider_runtime.types import (
     EmbeddingResponse,
     KeyProbeResult,
     ModelCall,
-    ModelChunk,
     ModelRef,
     ModelResponse,
+    ModelStreamEvent,
     ProviderApiKey,
     ProviderName,
     TranscriptionCall,
@@ -62,9 +62,14 @@ class NoNetworkRuntime:
         *,
         key: ProviderApiKey,
         timeout_s: float = 45,
-    ) -> AsyncIterator[ModelChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         raise AssertionError(_unexpected_network_message("stream", call.model))
-        yield ModelChunk(done=True)
+        yield ModelStreamEvent(
+            type="completed",
+            provider=call.model.provider,
+            model=call.model.model,
+            route=call.model.route,
+        )
 
     async def embed(
         self,
@@ -102,7 +107,7 @@ class ScriptedRuntime(NoNetworkRuntime):
         *,
         catalog: ModelCatalog = DEFAULT_CATALOG,
         generate_responses: Iterable[ModelResponse] = (),
-        stream_chunks: Iterable[Iterable[ModelChunk]] = (),
+        stream_events: Iterable[Iterable[ModelStreamEvent]] = (),
         embed_responses: Iterable[EmbeddingResponse] = (),
         transcribe_responses: Iterable[TranscriptionResponse] = (),
         probe_results: Iterable[KeyProbeResult] = (),
@@ -110,7 +115,7 @@ class ScriptedRuntime(NoNetworkRuntime):
         super().__init__(catalog=catalog)
         self.calls: list[CapturedRuntimeCall] = []
         self._generate_responses = deque(generate_responses)
-        self._stream_chunks = deque(tuple(chunks) for chunks in stream_chunks)
+        self._stream_events = deque(tuple(events) for events in stream_events)
         self._embed_responses = deque(embed_responses)
         self._transcribe_responses = deque(transcribe_responses)
         self._probe_results = deque(probe_results)
@@ -131,10 +136,10 @@ class ScriptedRuntime(NoNetworkRuntime):
         *,
         key: ProviderApiKey,
         timeout_s: float = 45,
-    ) -> AsyncIterator[ModelChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         self.calls.append(CapturedRuntimeCall("stream", call, key, timeout_s))
-        for chunk in self._pop(self._stream_chunks, "stream"):
-            yield chunk
+        for event in self._pop(self._stream_events, "stream"):
+            yield event
 
     async def embed(
         self,

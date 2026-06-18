@@ -32,6 +32,30 @@ def load_text(name: str) -> str:
     return (FIXTURES / name).read_text()
 
 
+def stream_text(events) -> str:
+    return "".join(event.text for event in events if event.type == "text_delta")
+
+
+def terminal(events):
+    return next(event for event in events if event.terminal)
+
+
+def tool_calls(events) -> list[ToolCall]:
+    return [
+        event.tool_call
+        for event in events
+        if event.type == "tool_call_done" and event.tool_call is not None
+    ]
+
+
+def provider_artifacts(events) -> list[ProviderArtifact]:
+    return [
+        event.provider_artifact
+        for event in events
+        if event.type == "provider_artifact" and event.provider_artifact is not None
+    ]
+
+
 def chat_client(http: httpx.AsyncClient) -> OpenAICompatibleChatClient:
     return OpenAICompatibleChatClient(
         http, provider="openrouter", base_url="https://openrouter.test/v1"
@@ -103,17 +127,16 @@ async def test_stream_success() -> None:
     )
 
     async with httpx.AsyncClient() as http:
-        chunks = [
-            chunk
-            async for chunk in chat_client(http).generate_stream(
+        events = [
+            event
+            async for event in chat_client(http).generate_stream(
                 request(), api_key="sk-test", timeout_s=30
             )
         ]
 
-    assert chunks[-1].done is True
-    assert chunks[-1].provider_request_id == "req-openrouter-123"
-    assert all(chunk.usage is None for chunk in chunks[:-1])
-    assert "Hello from OpenAI-compatible." in "".join(chunk.delta_text for chunk in chunks)
+    assert terminal(events).provider_request_id == "req-openrouter-123"
+    assert all(event.usage is None for event in events if not event.terminal)
+    assert "Hello from OpenAI-compatible." in stream_text(events)
 
 
 @respx.mock
@@ -133,18 +156,19 @@ async def test_stream_usage_normalizes_reasoning_and_cache_token_details() -> No
     )
 
     async with httpx.AsyncClient() as http:
-        chunks = [
-            chunk
-            async for chunk in chat_client(http).generate_stream(
+        events = [
+            event
+            async for event in chat_client(http).generate_stream(
                 request(), api_key="sk-test", timeout_s=30
             )
         ]
 
-    assert chunks[-1].usage is not None
-    assert chunks[-1].usage.cached_tokens == 12
-    assert chunks[-1].usage.cache_read_input_tokens == 12
-    assert chunks[-1].usage.cache_creation_input_tokens == 6
-    assert chunks[-1].usage.reasoning_tokens == 4
+    usage = terminal(events).usage
+    assert usage is not None
+    assert usage.cached_tokens == 12
+    assert usage.cache_read_input_tokens == 12
+    assert usage.cache_creation_input_tokens == 6
+    assert usage.reasoning_tokens == 4
 
 
 @respx.mock
@@ -392,19 +416,17 @@ async def test_stream_tool_calls() -> None:
     )
 
     async with httpx.AsyncClient() as http:
-        chunks = [
-            chunk
-            async for chunk in chat_client(http).generate_stream(
+        events = [
+            event
+            async for event in chat_client(http).generate_stream(
                 req, api_key="sk-test", timeout_s=30
             )
         ]
 
-    tool_chunks = [c for c in chunks if c.tool_call is not None]
-    assert len(tool_chunks) == 1
-    assert tool_chunks[0].tool_call == ToolCall(
-        id="call_xyz", name="get_weather", arguments={"city": "Paris"}
-    )
-    assert chunks[-1].done is True
+    tools = tool_calls(events)
+    assert len(tools) == 1
+    assert tools[0] == ToolCall(id="call_xyz", name="get_weather", arguments={"city": "Paris"})
+    assert terminal(events).terminal is True
 
 
 @respx.mock
@@ -549,16 +571,15 @@ async def test_stream_reasoning_details_emit_provider_artifact_not_delta_text() 
     )
 
     async with httpx.AsyncClient() as http:
-        chunks = [
-            chunk
-            async for chunk in chat_client(http).generate_stream(
+        events = [
+            event
+            async for event in chat_client(http).generate_stream(
                 request(), api_key="sk-test", timeout_s=30
             )
         ]
 
-    assert "".join(chunk.delta_text for chunk in chunks) == "Visible."
-    artifact_chunks = [chunk.provider_artifact for chunk in chunks if chunk.provider_artifact]
-    assert [artifact.to_provider_payload() for artifact in artifact_chunks] == [
+    assert stream_text(events) == "Visible."
+    assert [artifact.to_provider_payload() for artifact in provider_artifacts(events)] == [
         {
             "type": "reasoning.text",
             "text": "secret thought",
@@ -568,7 +589,7 @@ async def test_stream_reasoning_details_emit_provider_artifact_not_delta_text() 
             "index": 0,
         }
     ]
-    assert chunks[-1].done is True
+    assert terminal(events).terminal is True
 
 
 @respx.mock

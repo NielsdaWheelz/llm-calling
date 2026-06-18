@@ -12,8 +12,8 @@ from provider_runtime.structured_output import parse_required_structured_output
 from provider_runtime.tool_arguments import parse_tool_arguments_with_status
 from provider_runtime.types import (
     ModelCall,
-    ModelChunk,
     ModelResponse,
+    ModelStreamEvent,
     ProviderArtifact,
     ProviderName,
     TokenUsage,
@@ -67,7 +67,7 @@ class OpenAICompatibleChatClient:
         *,
         api_key: str,
         timeout_s: float,
-    ) -> AsyncIterator[ModelChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         headers = self._build_headers(api_key)
         body = self._build_request_body(req, stream=True)
 
@@ -85,6 +85,13 @@ class OpenAICompatibleChatClient:
             received_done = False
             finish_reason: str | None = None
             tool_call_acc: dict[int, dict] = {}
+            yield ModelStreamEvent(
+                type="stream_start",
+                provider=self._provider,
+                model=req.model.model,
+                route=req.model.route,
+                provider_request_id=provider_request_id,
+            )
 
             async for line in response.aiter_lines():
                 if not line or not line.startswith("data: "):
@@ -101,23 +108,35 @@ class OpenAICompatibleChatClient:
                             tool_name=acc["name"],
                             call_id=acc["id"],
                         )
-                        yield ModelChunk(
+                        yield ModelStreamEvent(
+                            type="tool_call_done",
+                            provider=self._provider,
+                            model=req.model.model,
+                            route=req.model.route,
+                            tool_call_id=acc["id"],
+                            tool_call_index=idx,
                             tool_call=ToolCall(
                                 id=acc["id"],
                                 name=acc["name"],
                                 arguments=parsed_args.arguments,
                                 argument_status=parsed_args.status,
                             ),
-                            done=False,
                         )
                     tool_call_acc.clear()
-                    yield ModelChunk(
-                        delta_text="",
-                        done=True,
+                    status = _status_from_finish_reason(finish_reason)
+                    yield ModelStreamEvent(
+                        type=("incomplete" if status == "incomplete" else "completed"),
+                        provider=self._provider,
+                        model=req.model.model,
+                        route=req.model.route,
                         usage=accumulated_usage,
                         provider_request_id=provider_request_id,
-                        status=_status_from_finish_reason(finish_reason),
-                        incomplete_details=_incomplete_details_from_finish_reason(finish_reason),
+                        status=status,
+                        incomplete_details=(
+                            _incomplete_details_from_finish_reason(finish_reason)
+                            if status == "incomplete"
+                            else None
+                        ),
                     )
                     break
 
@@ -145,18 +164,48 @@ class OpenAICompatibleChatClient:
                 delta_text = delta.get("content", "")
 
                 for artifact in self._message_provider_artifacts(delta, model=req.model.model):
-                    yield ModelChunk(provider_artifact=artifact, done=False)
+                    yield ModelStreamEvent(
+                        type="provider_artifact",
+                        provider=self._provider,
+                        model=req.model.model,
+                        route=req.model.route,
+                        provider_artifact=artifact,
+                    )
 
                 for tc_delta in delta.get("tool_calls") or []:
                     idx = tc_delta.get("index", 0)
-                    acc = tool_call_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                    acc = tool_call_acc.setdefault(
+                        idx, {"id": "", "name": "", "arguments": "", "started": False}
+                    )
                     if tc_delta.get("id"):
                         acc["id"] = tc_delta["id"]
                     fn = tc_delta.get("function") or {}
                     if fn.get("name"):
                         acc["name"] = fn["name"]
+                    if acc["id"] and acc["name"] and not acc["started"]:
+                        acc["started"] = True
+                        yield ModelStreamEvent(
+                            type="tool_call_start",
+                            provider=self._provider,
+                            model=req.model.model,
+                            route=req.model.route,
+                            tool_call_id=acc["id"],
+                            tool_call_index=idx,
+                            tool_name=acc["name"],
+                        )
                     if "arguments" in fn and fn["arguments"]:
                         acc["arguments"] += fn["arguments"]
+                        if acc["id"] and acc["name"]:
+                            yield ModelStreamEvent(
+                                type="tool_call_delta",
+                                provider=self._provider,
+                                model=req.model.model,
+                                route=req.model.route,
+                                tool_call_id=acc["id"],
+                                tool_call_index=idx,
+                                tool_name=acc["name"],
+                                tool_arguments_delta=fn["arguments"],
+                            )
 
                 if choice.get("finish_reason") == "tool_calls" and tool_call_acc:
                     for idx in sorted(tool_call_acc):
@@ -167,19 +216,30 @@ class OpenAICompatibleChatClient:
                             tool_name=acc["name"],
                             call_id=acc["id"],
                         )
-                        yield ModelChunk(
+                        yield ModelStreamEvent(
+                            type="tool_call_done",
+                            provider=self._provider,
+                            model=req.model.model,
+                            route=req.model.route,
+                            tool_call_id=acc["id"],
+                            tool_call_index=idx,
                             tool_call=ToolCall(
                                 id=acc["id"],
                                 name=acc["name"],
                                 arguments=parsed_args.arguments,
                                 argument_status=parsed_args.status,
                             ),
-                            done=False,
                         )
                     tool_call_acc.clear()
 
                 if delta_text:
-                    yield ModelChunk(delta_text=delta_text, done=False)
+                    yield ModelStreamEvent(
+                        type="text_delta",
+                        provider=self._provider,
+                        model=req.model.model,
+                        route=req.model.route,
+                        text=delta_text,
+                    )
 
             if not received_done:
                 raise ModelCallError(

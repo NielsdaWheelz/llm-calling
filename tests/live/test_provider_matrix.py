@@ -392,11 +392,11 @@ async def test_live_streaming_text(live_env: LiveEnv, case: ProviderCase) -> Non
     if not case.capability.streaming:
         pytest.skip(f"{case.provider}/{case.model} does not support streaming")
     key = live_env.key_for(case.provider)
-    chunks = []
+    text_parts = []
     terminal_seen = False
 
     async with httpx.AsyncClient() as http:
-        async for chunk in _runtime(http).stream(
+        async for event in _runtime(http).stream(
             _text_call(
                 case,
                 "Stream one short sentence.",
@@ -406,14 +406,14 @@ async def test_live_streaming_text(live_env: LiveEnv, case: ProviderCase) -> Non
             key=key,
             timeout_s=60,
         ):
-            if chunk.delta_text:
-                chunks.append(chunk.delta_text)
-            if chunk.done:
+            if event.type == "text_delta":
+                text_parts.append(event.text)
+            if event.terminal:
                 terminal_seen = True
-                _assert_usage_if_claimed(case, chunk.usage)
+                _assert_usage_if_claimed(case, event.usage)
 
-    assert terminal_seen, f"{case.provider}/{case.model} stream did not emit terminal chunk"
-    _assert_text_response(case, "".join(chunks))
+    assert terminal_seen, f"{case.provider}/{case.model} stream did not emit terminal event"
+    _assert_text_response(case, "".join(text_parts))
 
 
 @pytest.mark.parametrize(

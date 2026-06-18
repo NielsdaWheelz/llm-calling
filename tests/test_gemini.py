@@ -34,6 +34,30 @@ def load_text(name: str) -> str:
     return (FIXTURES / name).read_text()
 
 
+def stream_text(events) -> str:
+    return "".join(event.text for event in events if event.type == "text_delta")
+
+
+def terminal(events):
+    return next(event for event in events if event.terminal)
+
+
+def tool_calls(events) -> list[ToolCall]:
+    return [
+        event.tool_call
+        for event in events
+        if event.type == "tool_call_done" and event.tool_call is not None
+    ]
+
+
+def provider_artifacts(events) -> list[ProviderArtifact]:
+    return [
+        event.provider_artifact
+        for event in events
+        if event.type == "provider_artifact" and event.provider_artifact is not None
+    ]
+
+
 def request() -> ModelCall:
     return ModelCall(
         model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
@@ -83,16 +107,16 @@ async def test_stream_success() -> None:
     ).respond(200, content=load_text("success_stream_chunks.txt"))
 
     async with httpx.AsyncClient() as http:
-        chunks = [
-            chunk
-            async for chunk in GeminiClient(http).generate_stream(
+        events = [
+            event
+            async for event in GeminiClient(http).generate_stream(
                 request(), api_key="sk-test", timeout_s=30
             )
         ]
 
-    assert chunks[-1].done is True
-    assert all(chunk.usage is None for chunk in chunks[:-1])
-    assert "Hello" in "".join(chunk.delta_text for chunk in chunks)
+    assert terminal(events).terminal is True
+    assert all(event.usage is None for event in events if not event.terminal)
+    assert "Hello" in stream_text(events)
 
 
 @respx.mock
@@ -674,30 +698,28 @@ async def test_stream_thought_parts_excluded_and_signature_captured() -> None:
     ).respond(200, content=stream)
 
     async with httpx.AsyncClient() as http:
-        chunks = [
-            chunk
-            async for chunk in GeminiClient(http).generate_stream(
+        events = [
+            event
+            async for event in GeminiClient(http).generate_stream(
                 request(), api_key="sk-test", timeout_s=30
             )
         ]
 
-    assert "".join(chunk.delta_text for chunk in chunks) == "Visible answer."
-    tool_chunks = [chunk for chunk in chunks if chunk.tool_call is not None]
-    assert tool_chunks[0].tool_call == ToolCall(
+    assert stream_text(events) == "Visible answer."
+    assert tool_calls(events)[0] == ToolCall(
         id="fc-123",
         name="get_weather",
         arguments={"city": "Paris"},
     )
-    artifact_chunks = [chunk for chunk in chunks if chunk.provider_artifact is not None]
-    assert len(artifact_chunks) == 1
-    assert artifact_chunks[0].provider_artifact is not None
-    assert artifact_chunks[0].provider_artifact.to_provider_payload() == {
+    artifacts = provider_artifacts(events)
+    assert len(artifacts) == 1
+    assert artifacts[0].to_provider_payload() == {
         "type": "gemini.thought_signature",
         "function_call_id": "fc-123",
         "function_name": "get_weather",
         "thoughtSignature": "sig-abc",
     }
-    assert chunks[-1].done is True
+    assert terminal(events).terminal is True
 
 
 @respx.mock
@@ -712,17 +734,16 @@ async def test_stream_max_tokens_finish_reason_is_terminal_incomplete() -> None:
     ).respond(200, content=stream)
 
     async with httpx.AsyncClient() as http:
-        chunks = [
-            chunk
-            async for chunk in GeminiClient(http).generate_stream(
+        events = [
+            event
+            async for event in GeminiClient(http).generate_stream(
                 request(), api_key="sk-test", timeout_s=30
             )
         ]
 
-    assert "".join(chunk.delta_text for chunk in chunks) == "Partial"
-    assert chunks[-1].done is True
-    assert chunks[-1].status == "incomplete"
-    assert chunks[-1].incomplete_details == {"finish_reason": "MAX_TOKENS"}
+    assert stream_text(events) == "Partial"
+    assert terminal(events).status == "incomplete"
+    assert terminal(events).incomplete_details == {"finish_reason": "MAX_TOKENS"}
 
 
 @respx.mock
@@ -738,16 +759,14 @@ async def test_stream_yields_tool_call_chunk() -> None:
     ).respond(200, content=stream)
 
     async with httpx.AsyncClient() as http:
-        chunks = [
-            chunk
-            async for chunk in GeminiClient(http).generate_stream(
+        events = [
+            event
+            async for event in GeminiClient(http).generate_stream(
                 request(), api_key="sk-test", timeout_s=30
             )
         ]
 
-    tool_chunks = [c for c in chunks if c.tool_call is not None]
-    assert len(tool_chunks) == 1
-    assert tool_chunks[0].tool_call == ToolCall(
-        id="get_weather", name="get_weather", arguments={"city": "Paris"}
-    )
-    assert chunks[-1].done is True
+    tools = tool_calls(events)
+    assert len(tools) == 1
+    assert tools[0] == ToolCall(id="get_weather", name="get_weather", arguments={"city": "Paris"})
+    assert terminal(events).terminal is True

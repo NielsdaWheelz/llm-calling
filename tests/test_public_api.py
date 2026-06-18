@@ -27,6 +27,8 @@ def test_target_surface_is_exported() -> None:
         "ProviderApiKey",
         "ProviderApiKeySource",
         "ProviderBaseUrls",
+        "ModelStreamEvent",
+        "ModelStreamEventType",
         "RetryAttempt",
         "RetryAttemptStatus",
         "GenerateRequestPlan",
@@ -44,3 +46,4 @@ def test_target_surface_is_exported() -> None:
         "estimate_cost",
     ):
         assert hasattr(provider_runtime, name)
+    assert not hasattr(provider_runtime, "ModelChunk")

@@ -66,9 +66,9 @@ from provider_runtime.tool_arguments import parse_tool_arguments_with_status
 from provider_runtime.types import (
     BinaryPart,
     ModelCall,
-    ModelChunk,
     ModelMessage,
     ModelResponse,
+    ModelStreamEvent,
     ProviderArtifact,
     TextPart,
     TokenUsage,
@@ -134,7 +134,7 @@ class GeminiClient:
         *,
         api_key: str,
         timeout_s: float,
-    ) -> AsyncIterator[ModelChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         """Streaming content generation using Server-Sent Events."""
         if req.structured_output is not None:
             raise ModelCallError(
@@ -157,6 +157,12 @@ class GeminiClient:
 
             received_terminal = False
             usage: TokenUsage | None = None
+            yield ModelStreamEvent(
+                type="stream_start",
+                provider="gemini",
+                model=req.model.model,
+                route=req.model.route,
+            )
 
             async for line in response.aiter_lines():
                 if not line:
@@ -218,32 +224,87 @@ class GeminiClient:
                         received_terminal = True
                         # Yield any remaining text as non-terminal
                         if delta_text:
-                            yield ModelChunk(delta_text=delta_text, done=False)
+                            yield ModelStreamEvent(
+                                type="text_delta",
+                                provider="gemini",
+                                model=req.model.model,
+                                route=req.model.route,
+                                text=delta_text,
+                            )
                         for artifact in provider_artifacts:
-                            yield ModelChunk(provider_artifact=artifact, done=False)
+                            yield ModelStreamEvent(
+                                type="provider_artifact",
+                                provider="gemini",
+                                model=req.model.model,
+                                route=req.model.route,
+                                provider_artifact=artifact,
+                            )
                         for tc in tool_calls:
-                            yield ModelChunk(tool_call=tc, done=False)
+                            yield ModelStreamEvent(
+                                type="tool_call_start",
+                                provider="gemini",
+                                model=req.model.model,
+                                route=req.model.route,
+                                tool_call_id=tc.id,
+                                tool_name=tc.name,
+                            )
+                            yield ModelStreamEvent(
+                                type="tool_call_done",
+                                provider="gemini",
+                                model=req.model.model,
+                                route=req.model.route,
+                                tool_call_id=tc.id,
+                                tool_call=tc,
+                            )
                         # Then yield terminal chunk
-                        yield ModelChunk(
-                            delta_text="",
-                            done=True,
+                        completed = finish_reason == "STOP"
+                        yield ModelStreamEvent(
+                            type="completed" if completed else "incomplete",
+                            provider="gemini",
+                            model=req.model.model,
+                            route=req.model.route,
                             usage=usage,
                             provider_request_id=None,  # Gemini doesn't provide request ID
-                            status=("completed" if finish_reason == "STOP" else "incomplete"),
-                            incomplete_details=(
-                                None
-                                if finish_reason == "STOP"
-                                else {"finish_reason": finish_reason}
-                            ),
+                            status="completed" if completed else "incomplete",
+                            incomplete_details=None
+                            if completed
+                            else {"finish_reason": finish_reason},
                         )
                         break
                     else:
                         if delta_text:
-                            yield ModelChunk(delta_text=delta_text, done=False)
+                            yield ModelStreamEvent(
+                                type="text_delta",
+                                provider="gemini",
+                                model=req.model.model,
+                                route=req.model.route,
+                                text=delta_text,
+                            )
                         for artifact in provider_artifacts:
-                            yield ModelChunk(provider_artifact=artifact, done=False)
+                            yield ModelStreamEvent(
+                                type="provider_artifact",
+                                provider="gemini",
+                                model=req.model.model,
+                                route=req.model.route,
+                                provider_artifact=artifact,
+                            )
                         for tc in tool_calls:
-                            yield ModelChunk(tool_call=tc, done=False)
+                            yield ModelStreamEvent(
+                                type="tool_call_start",
+                                provider="gemini",
+                                model=req.model.model,
+                                route=req.model.route,
+                                tool_call_id=tc.id,
+                                tool_name=tc.name,
+                            )
+                            yield ModelStreamEvent(
+                                type="tool_call_done",
+                                provider="gemini",
+                                model=req.model.model,
+                                route=req.model.route,
+                                tool_call_id=tc.id,
+                                tool_call=tc,
+                            )
 
             if not received_terminal:
                 raise ModelCallError(

@@ -34,6 +34,30 @@ def load_text(name: str) -> str:
     return (FIXTURES / name).read_text()
 
 
+def stream_text(events) -> str:
+    return "".join(event.text for event in events if event.type == "text_delta")
+
+
+def terminal(events):
+    return next(event for event in events if event.terminal)
+
+
+def tool_calls(events) -> list[ToolCall]:
+    return [
+        event.tool_call
+        for event in events
+        if event.type == "tool_call_done" and event.tool_call is not None
+    ]
+
+
+def provider_artifacts(events) -> list[ProviderArtifact]:
+    return [
+        event.provider_artifact
+        for event in events
+        if event.type == "provider_artifact" and event.provider_artifact is not None
+    ]
+
+
 def request(reasoning_effort: ReasoningEffort = "none") -> ModelCall:
     return ModelCall(
         model=ModelRef(provider="openai", model="gpt-5.4-mini"),
@@ -93,18 +117,18 @@ async def test_stream_success() -> None:
     )
 
     async with httpx.AsyncClient() as http:
-        chunks = [
-            chunk
-            async for chunk in OpenAIClient(http).generate_stream(
+        events = [
+            event
+            async for event in OpenAIClient(http).generate_stream(
                 request(), api_key="sk-test", timeout_s=30
             )
         ]
 
-    assert chunks[-1].done is True
-    assert chunks[-1].provider_request_id == "req-test-123"
-    assert chunks[-1].status == "completed"
-    assert all(chunk.usage is None for chunk in chunks[:-1])
-    assert "Hello" in "".join(chunk.delta_text for chunk in chunks)
+    done = terminal(events)
+    assert done.provider_request_id == "req-test-123"
+    assert done.status == "completed"
+    assert all(event.usage is None for event in events if not event.terminal)
+    assert "Hello" in stream_text(events)
 
 
 @respx.mock
@@ -382,20 +406,17 @@ async def test_stream_tool_call_yields_tool_call_chunk() -> None:
     )
 
     async with httpx.AsyncClient() as http:
-        chunks = [
-            chunk
-            async for chunk in OpenAIClient(http).generate_stream(
+        events = [
+            event
+            async for event in OpenAIClient(http).generate_stream(
                 request(), api_key="sk-test", timeout_s=30
             )
         ]
 
-    tool_chunks = [chunk for chunk in chunks if chunk.tool_call is not None]
-    assert len(tool_chunks) == 1
-    assert tool_chunks[0].tool_call == ToolCall(
-        id="call_xyz", name="get_weather", arguments={"city": "Berlin"}
-    )
-    assert chunks[-1].done is True
-    assert chunks[-1].status == "completed"
+    tools = tool_calls(events)
+    assert len(tools) == 1
+    assert tools[0] == ToolCall(id="call_xyz", name="get_weather", arguments={"city": "Berlin"})
+    assert terminal(events).status == "completed"
 
 
 @respx.mock
@@ -566,24 +587,20 @@ async def test_stream_reasoning_item_yields_provider_artifact_chunk() -> None:
     )
 
     async with httpx.AsyncClient() as http:
-        chunks = [
-            chunk
-            async for chunk in OpenAIClient(http).generate_stream(
+        events = [
+            event
+            async for event in OpenAIClient(http).generate_stream(
                 request("high"), api_key="sk-test", timeout_s=30
             )
         ]
 
-    provider_artifacts = [
-        chunk.provider_artifact for chunk in chunks if chunk.provider_artifact is not None
-    ]
-    assert [artifact.to_provider_payload() for artifact in provider_artifacts] == [
+    assert [artifact.to_provider_payload() for artifact in provider_artifacts(events)] == [
         {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "gAAAA-opaque"}
     ]
-    tool_chunks = [chunk for chunk in chunks if chunk.tool_call is not None]
-    assert tool_chunks[0].tool_call == ToolCall(
+    assert tool_calls(events)[0] == ToolCall(
         id="call_xyz", name="get_weather", arguments={}, provider_metadata={"id": "fc_1"}
     )
-    assert chunks[-1].done is True
+    assert terminal(events).terminal is True
 
 
 @respx.mock
@@ -603,19 +620,20 @@ async def test_stream_incomplete_yields_terminal_chunk() -> None:
         headers={"content-type": "text/event-stream"},
     )
 
-    chunks = []
+    events = []
     async with httpx.AsyncClient() as http:
-        async for chunk in OpenAIClient(http).generate_stream(
+        async for event in OpenAIClient(http).generate_stream(
             request(), api_key="sk-test", timeout_s=30
         ):
-            chunks.append(chunk)
+            events.append(event)
 
-    assert [chunk.done for chunk in chunks] == [False, True]
-    assert chunks[-1].status == "incomplete"
-    assert chunks[-1].incomplete_details == {"reason": "max_output_tokens"}
-    assert chunks[-1].provider_request_id == "resp-incomplete"
-    assert chunks[-1].usage is not None
-    assert chunks[-1].usage.reasoning_tokens == 4
+    assert stream_text(events) == "partial"
+    assert events[-1].terminal is True
+    assert events[-1].status == "incomplete"
+    assert events[-1].incomplete_details == {"reason": "max_output_tokens"}
+    assert events[-1].provider_request_id == "resp-incomplete"
+    assert events[-1].usage is not None
+    assert events[-1].usage.reasoning_tokens == 4
 
 
 @respx.mock
