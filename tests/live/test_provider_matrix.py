@@ -423,7 +423,11 @@ async def test_live_forced_tool_call_and_continuation(
     live_env: LiveEnv,
     case: ProviderCase,
 ) -> None:
-    if not case.capability.tool_calling or not case.capability.tool_choice_required:
+    if (
+        not case.capability.streaming
+        or not case.capability.tool_calling
+        or not case.capability.tool_choice_required
+    ):
         pytest.skip(f"{case.provider}/{case.model} does not support required tool calls")
     key = live_env.key_for(case.provider)
     tool = ToolSpec(
@@ -437,10 +441,20 @@ async def test_live_forced_tool_call_and_continuation(
         },
     )
     user_turn = ModelMessage(role="user", content="Use the tool for weather in Paris.")
+    first_text_parts: list[str] = []
+    first_artifacts = []
+    first_tool_start = False
+    first_tool_delta = False
+    first_tool_calls = []
+    first_terminal_count = 0
+    first_terminal_usage = None
+    final_text_parts: list[str] = []
+    final_terminal_count = 0
+    final_terminal_usage = None
 
     async with httpx.AsyncClient() as http:
         runtime = _runtime(http)
-        first = await runtime.generate(
+        async for event in runtime.stream(
             _call(
                 case,
                 [user_turn],
@@ -451,20 +465,45 @@ async def test_live_forced_tool_call_and_continuation(
             ),
             key=key,
             timeout_s=60,
-        )
-        assert first.tool_calls, f"{case.provider}/{case.model} did not return a tool call"
-        tool_call = first.tool_calls[0]
+        ):
+            if event.type == "text_delta":
+                first_text_parts.append(event.text)
+            elif event.type == "provider_artifact" and event.provider_artifact is not None:
+                first_artifacts.append(event.provider_artifact)
+            elif event.type == "tool_call_start":
+                first_tool_start = True
+            elif event.type == "tool_call_delta":
+                first_tool_delta = True
+            elif event.type == "tool_call_done":
+                first_tool_calls.append(event.tool_call)
+            if event.terminal:
+                first_terminal_count += 1
+                first_terminal_usage = event.usage
 
-        final = await runtime.generate(
+        assert first_terminal_count == 1, (
+            f"{case.provider}/{case.model} stream emitted {first_terminal_count} terminals"
+        )
+        _assert_usage_if_claimed(case, first_terminal_usage)
+        assert first_tool_calls and first_tool_calls[0] is not None, (
+            f"{case.provider}/{case.model} did not stream a completed tool call"
+        )
+        if case.capability.stream.tool_call_start:
+            assert first_tool_start, f"{case.provider}/{case.model} did not stream tool start"
+        if case.capability.stream.tool_call_delta:
+            assert first_tool_delta, f"{case.provider}/{case.model} did not stream tool deltas"
+        tool_call = first_tool_calls[0]
+        assert tool_call is not None
+
+        async for event in runtime.stream(
             _call(
                 case,
                 [
                     user_turn,
                     ModelMessage(
                         role="assistant",
-                        content=first.text,
+                        content="".join(first_text_parts),
                         tool_calls=(tool_call,),
-                        provider_artifacts=first.provider_artifacts,
+                        provider_artifacts=tuple(first_artifacts),
                     ),
                     ModelMessage(
                         role="tool",
@@ -480,9 +519,18 @@ async def test_live_forced_tool_call_and_continuation(
             ),
             key=key,
             timeout_s=60,
-        )
+        ):
+            if event.type == "text_delta":
+                final_text_parts.append(event.text)
+            if event.terminal:
+                final_terminal_count += 1
+                final_terminal_usage = event.usage
 
-    _assert_text_response(case, final.text)
+    assert final_terminal_count == 1, (
+        f"{case.provider}/{case.model} continuation emitted {final_terminal_count} terminals"
+    )
+    _assert_usage_if_claimed(case, final_terminal_usage)
+    _assert_text_response(case, "".join(final_text_parts))
 
 
 @pytest.mark.parametrize(
