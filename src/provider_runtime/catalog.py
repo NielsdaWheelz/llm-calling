@@ -12,6 +12,7 @@ PromptCacheMode = Literal["none", "turn_ttl", "keyed_ttl"]
 type PriceValue = Decimal | int | float | str
 PricingUnit = Literal["per_million_tokens", "provider_units"]
 ReasoningBillingMode = Literal["included_in_output", "separate", "not_billed", "unknown"]
+CancellationCapability = Literal["http_close", "best_effort", "none"]
 
 
 @dataclass(frozen=True)
@@ -103,6 +104,27 @@ class RouteCapability:
 
 
 @dataclass(frozen=True)
+class StreamCapabilities:
+    supported: bool
+    text_deltas: bool
+    activity_events: bool
+    tool_call_start: bool
+    tool_call_delta: bool
+    tool_call_done: bool
+    provider_artifacts: bool
+    usage_delta: bool
+    terminal_usage: bool
+    native_event_ids: bool
+    provider_request_id: bool
+    structured_output_streaming: bool
+    cancellation: CancellationCapability
+    default_connect_timeout_s: float
+    default_read_idle_timeout_s: float
+    default_total_timeout_s: float
+    max_total_timeout_s: float
+
+
+@dataclass(frozen=True)
 class ModelCapability:
     provider: ProviderName
     model: str
@@ -139,6 +161,32 @@ class ModelCapability:
     default_timeout_s: int = 45
     max_timeout_s: int = 180
     pricing: Pricing = field(default_factory=Pricing)
+    stream: StreamCapabilities = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "stream",
+            StreamCapabilities(
+                supported=self.streaming,
+                text_deltas=self.streaming,
+                activity_events=False,
+                tool_call_start=self.streaming and self.tool_calling,
+                tool_call_delta=self.streaming and self.tool_calling,
+                tool_call_done=self.streaming and self.tool_calling,
+                provider_artifacts=self.streaming and self.raw_artifact_support,
+                usage_delta=False,
+                terminal_usage=self.streaming and self.usage_input_output_tokens,
+                native_event_ids=self.streaming,
+                provider_request_id=self.streaming and self.provider_request_id,
+                structured_output_streaming=self.structured_output_streaming,
+                cancellation="http_close" if self.streaming else "none",
+                default_connect_timeout_s=10.0,
+                default_read_idle_timeout_s=float(self.default_timeout_s),
+                default_total_timeout_s=float(self.default_timeout_s),
+                max_total_timeout_s=float(self.max_timeout_s),
+            ),
+        )
 
 
 class ModelCatalog:

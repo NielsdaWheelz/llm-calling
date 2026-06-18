@@ -39,8 +39,8 @@ from provider_runtime.structured_output import parse_required_structured_output
 from provider_runtime.tool_arguments import parse_tool_arguments_with_status
 from provider_runtime.types import (
     ModelCall,
-    ModelChunk,
     ModelResponse,
+    ModelStreamEvent,
     ProviderArtifact,
     TokenUsage,
     ToolCall,
@@ -90,7 +90,7 @@ class OpenAIClient:
         *,
         api_key: str,
         timeout_s: float,
-    ) -> AsyncIterator[ModelChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         if req.structured_output is not None:
             raise ModelCallError(
                 ModelCallErrorCode.BAD_REQUEST,
@@ -113,6 +113,13 @@ class OpenAIClient:
             accumulated_usage: TokenUsage | None = None
             emitted_terminal = False
             tool_call_items: dict[str, dict] = {}
+            yield ModelStreamEvent(
+                type="stream_start",
+                provider="openai",
+                model=req.model.model,
+                route=req.model.route,
+                provider_request_id=provider_request_id,
+            )
 
             async for line in response.aiter_lines():
                 if not line or not line.startswith("data: "):
@@ -121,9 +128,11 @@ class OpenAIClient:
                 data_str = line[6:]
                 if data_str == "[DONE]":
                     if not emitted_terminal:
-                        yield ModelChunk(
-                            delta_text="",
-                            done=True,
+                        yield ModelStreamEvent(
+                            type="completed",
+                            provider="openai",
+                            model=req.model.model,
+                            route=req.model.route,
                             usage=accumulated_usage,
                             provider_request_id=provider_request_id,
                             status="completed",
@@ -146,38 +155,78 @@ class OpenAIClient:
                 if event_type == "response.output_text.delta":
                     delta_text = data.get("delta", "")
                     if delta_text:
-                        yield ModelChunk(delta_text=delta_text, done=False)
+                        yield ModelStreamEvent(
+                            type="text_delta",
+                            provider="openai",
+                            model=req.model.model,
+                            route=req.model.route,
+                            provider_event_type=event_type,
+                            item_id=data.get("item_id"),
+                            content_index=data.get("content_index"),
+                            text=delta_text,
+                        )
                     continue
 
                 if event_type == "response.output_item.added":
                     item = data.get("item") or {}
                     if item.get("type") == "function_call":
                         item_id = data.get("item_id") or item.get("id") or ""
+                        call_id = item.get("call_id") or item_id
+                        name = item.get("name") or ""
                         tool_call_items[item_id] = {
-                            "call_id": item.get("call_id") or "",
-                            "name": item.get("name") or "",
+                            "call_id": call_id,
+                            "name": name,
                             "arguments": "",
                         }
+                        if call_id and name:
+                            yield ModelStreamEvent(
+                                type="tool_call_start",
+                                provider="openai",
+                                model=req.model.model,
+                                route=req.model.route,
+                                provider_event_type=event_type,
+                                item_id=item_id,
+                                tool_call_id=call_id,
+                                tool_name=name,
+                            )
                     continue
 
                 if event_type == "response.function_call_arguments.delta":
                     item_id = data.get("item_id") or ""
                     if item_id in tool_call_items:
-                        tool_call_items[item_id]["arguments"] += data.get("delta", "")
+                        delta = data.get("delta", "")
+                        tool_call_items[item_id]["arguments"] += delta
+                        if delta:
+                            yield ModelStreamEvent(
+                                type="tool_call_delta",
+                                provider="openai",
+                                model=req.model.model,
+                                route=req.model.route,
+                                provider_event_type=event_type,
+                                item_id=item_id,
+                                tool_call_id=tool_call_items[item_id]["call_id"],
+                                tool_name=tool_call_items[item_id]["name"],
+                                tool_arguments_delta=delta,
+                            )
                     continue
 
                 if event_type == "response.output_item.done":
                     item = data.get("item") or {}
                     if item.get("type") == "reasoning":
                         # Full reasoning item (incl. id and encrypted_content), verbatim.
-                        yield ModelChunk(
+                        yield ModelStreamEvent(
+                            type="provider_artifact",
+                            provider="openai",
+                            model=req.model.model,
+                            route=req.model.route,
+                            provider_event_type=event_type,
+                            item_id=data.get("item_id") or item.get("id"),
                             provider_artifact=ProviderArtifact(
                                 provider="openai",
                                 model=req.model.model,
                                 purpose="reasoning",
                                 payload=dict(item),
                             ),
-                            done=False,
                         )
                     elif item.get("type") == "function_call":
                         item_id = data.get("item_id") or item.get("id") or ""
@@ -193,7 +242,14 @@ class OpenAIClient:
                             tool_name=name,
                             call_id=call_id,
                         )
-                        yield ModelChunk(
+                        yield ModelStreamEvent(
+                            type="tool_call_done",
+                            provider="openai",
+                            model=req.model.model,
+                            route=req.model.route,
+                            provider_event_type=event_type,
+                            item_id=item_id,
+                            tool_call_id=call_id,
                             tool_call=ToolCall(
                                 id=call_id,
                                 name=name,
@@ -201,7 +257,6 @@ class OpenAIClient:
                                 argument_status=parsed_args.status,
                                 provider_metadata={"id": item["id"]} if item.get("id") else None,
                             ),
-                            done=False,
                         )
                     continue
 
@@ -226,13 +281,18 @@ class OpenAIClient:
 
                     if not emitted_terminal:
                         emitted_terminal = True
-                        yield ModelChunk(
-                            delta_text="",
-                            done=True,
+                        yield ModelStreamEvent(
+                            type=("incomplete" if status == "incomplete" else "completed"),
+                            provider="openai",
+                            model=req.model.model,
+                            route=req.model.route,
+                            provider_event_type=event_type,
                             usage=accumulated_usage,
                             provider_request_id=provider_request_id,
                             status=status,
-                            incomplete_details=incomplete_details,
+                            incomplete_details=(
+                                incomplete_details if status == "incomplete" else None
+                            ),
                         )
                     break
 

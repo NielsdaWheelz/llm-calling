@@ -102,7 +102,7 @@ from provider_runtime import (
 
 async with httpx.AsyncClient() as http:
     runtime = ModelRuntime(http, enable_openai=True)
-    async for chunk in runtime.stream(
+    async for event in runtime.stream(
         ModelCall(
             model=ModelRef(provider="openai", model="gpt-5.4-mini"),
             messages=[ModelMessage(role="user", content="Stream one sentence.")],
@@ -111,8 +111,8 @@ async with httpx.AsyncClient() as http:
         ),
         key=ProviderApiKey("sk-...", source="platform"),
     ):
-        if not chunk.done:
-            print(chunk.delta_text, end="")
+        if event.type == "text_delta":
+            print(event.text, end="")
 ```
 
 Retries are bounded and limited to normalized retryable provider failures: timeouts, connection

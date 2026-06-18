@@ -15,14 +15,15 @@ from provider_runtime.errors import ModelCallError, ModelCallErrorCode
 from provider_runtime.lowering import lower_generate_request
 from provider_runtime.openrouter import OPENROUTER_BASE_URL
 from provider_runtime.types import (
+    CancelSignal,
     EmbeddingCall,
     EmbeddingResponse,
     KeyProbeResult,
     ModelCall,
-    ModelChunk,
     ModelMessage,
     ModelRef,
     ModelResponse,
+    ModelStreamEvent,
     ProviderApiKey,
     ProviderName,
     ReasoningConfig,
@@ -165,11 +166,17 @@ class ModelRuntime(_AdapterRuntime):
         *,
         key: ProviderApiKey,
         timeout_s: float = DEFAULT_TIMEOUT_S,
-    ) -> AsyncIterator[ModelChunk]:
+        cancel: CancelSignal | None = None,
+    ) -> AsyncIterator[ModelStreamEvent]:
         capabilities = self._require_generate_capabilities(call, streaming=True)
         plan = lower_generate_request(call, capabilities, streaming=True)
-        async for chunk in super().stream(plan.call, key=key, timeout_s=timeout_s):
-            yield chunk
+        async for event in super().stream(
+            plan.call,
+            key=key,
+            timeout_s=timeout_s,
+            cancel=cancel,
+        ):
+            yield event
 
     async def embed(
         self,

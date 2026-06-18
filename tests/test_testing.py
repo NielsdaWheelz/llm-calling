@@ -5,10 +5,10 @@ from provider_runtime import (
     EmbeddingResponse,
     KeyProbeResult,
     ModelCall,
-    ModelChunk,
     ModelMessage,
     ModelRef,
     ModelResponse,
+    ModelStreamEvent,
     NoNetworkRuntime,
     ProviderApiKey,
     ScriptedRuntime,
@@ -55,14 +55,57 @@ async def test_scripted_runtime_returns_queued_generate_response_and_records_cal
     assert runtime.calls[0].timeout_s == 12
 
 
-async def test_scripted_runtime_returns_queued_stream_chunks() -> None:
-    runtime = ScriptedRuntime(stream_chunks=((ModelChunk(delta_text="a"), ModelChunk(done=True)),))
+async def test_scripted_runtime_returns_queued_stream_events() -> None:
+    runtime = ScriptedRuntime(
+        stream_events=(
+            (
+                ModelStreamEvent(
+                    type="text_delta", provider="openai", model="gpt-5.4-mini", text="a"
+                ),
+                ModelStreamEvent(type="completed", provider="openai", model="gpt-5.4-mini"),
+            ),
+        )
+    )
 
-    chunks = [chunk async for chunk in runtime.stream(_call(), key=KEY)]
+    events = [event async for event in runtime.stream(_call(), key=KEY)]
 
-    assert [chunk.delta_text for chunk in chunks] == ["a", ""]
-    assert chunks[-1].done is True
+    assert [(event.type, event.text) for event in events] == [
+        ("text_delta", "a"),
+        ("completed", ""),
+    ]
+    assert events[-1].terminal is True
     assert runtime.calls[0].operation == "stream"
+
+
+async def test_scripted_runtime_rejects_stream_without_terminal() -> None:
+    runtime = ScriptedRuntime(
+        stream_events=(
+            (
+                ModelStreamEvent(
+                    type="text_delta", provider="openai", model="gpt-5.4-mini", text="a"
+                ),
+            ),
+        )
+    )
+
+    with pytest.raises(AssertionError, match="missing terminal"):
+        [event async for event in runtime.stream(_call(), key=KEY)]
+
+
+async def test_scripted_runtime_rejects_stream_events_after_terminal() -> None:
+    runtime = ScriptedRuntime(
+        stream_events=(
+            (
+                ModelStreamEvent(type="completed", provider="openai", model="gpt-5.4-mini"),
+                ModelStreamEvent(
+                    type="text_delta", provider="openai", model="gpt-5.4-mini", text="late"
+                ),
+            ),
+        )
+    )
+
+    with pytest.raises(AssertionError, match="after terminal"):
+        [event async for event in runtime.stream(_call(), key=KEY)]
 
 
 async def test_scripted_runtime_returns_queued_embeddings_and_key_probe() -> None:
