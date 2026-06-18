@@ -11,6 +11,7 @@ from provider_runtime.catalog import (
     PromptCacheMode,
     ReasoningBillingMode,
     RouteCapability,
+    StreamCapabilities,
 )
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode
 from provider_runtime.lowering import GenerateRequestPlan, lower_generate_request
@@ -18,6 +19,7 @@ from provider_runtime.runtime import ModelRuntime, ProviderBaseUrls, build_key_p
 from provider_runtime.testing import CapturedRuntimeCall, NoNetworkRuntime, ScriptedRuntime
 from provider_runtime.types import (
     BinaryPart,
+    CancelSignal,
     ContentPart,
     EmbeddingCall,
     EmbeddingResponse,
@@ -88,6 +90,7 @@ __all__ = [
     "ModelStreamActivity",
     "ModelStreamEvent",
     "ModelStreamEventType",
+    "CancelSignal",
     "NoNetworkRuntime",
     "PriceValue",
     "Pricing",
@@ -111,6 +114,7 @@ __all__ = [
     "RetryPolicy",
     "RouteCapability",
     "ScriptedRuntime",
+    "StreamCapabilities",
     "StructuredOutputSpec",
     "TextPart",
     "TokenUsage",

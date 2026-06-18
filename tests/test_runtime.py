@@ -1,4 +1,6 @@
+import asyncio
 import json
+from collections import deque
 from pathlib import Path
 
 import httpx
@@ -15,7 +17,14 @@ from provider_runtime import (
     lower_generate_request,
 )
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode
-from provider_runtime.types import ModelCall, ModelMessage, ModelRef, ReasoningConfig, RetryPolicy
+from provider_runtime.types import (
+    ModelCall,
+    ModelMessage,
+    ModelRef,
+    ModelStreamEvent,
+    ReasoningConfig,
+    RetryPolicy,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -68,6 +77,36 @@ def runtime(http: httpx.AsyncClient) -> ModelRuntime:
 
 def success_fixture(provider: str) -> dict:
     return fixture(provider, "success_nonstream.json")
+
+
+class _FakeStream:
+    def __init__(self, events: list[ModelStreamEvent] | None = None, *, block: bool = False):
+        self.events = deque(events or [])
+        self.block = block
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> ModelStreamEvent:
+        if self.block:
+            await asyncio.Event().wait()
+        try:
+            return self.events.popleft()
+        except IndexError as exc:
+            raise StopAsyncIteration from exc
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _FakeStreamClient:
+    def __init__(self, stream: _FakeStream):
+        self.stream = stream
+
+    def generate_stream(self, _call, *, api_key: str, timeout_s: float):
+        del api_key, timeout_s
+        return self.stream
 
 
 async def test_capabilities_returns_catalog_entry() -> None:
@@ -317,6 +356,102 @@ async def test_stream_retries_only_before_first_chunk() -> None:
     assert events[-1].terminal is True
     assert [attempt.status for attempt in events[-1].attempts] == ["retryable_error", "success"]
     assert events[-1].retry_count == 1
+
+
+async def test_stream_does_not_retry_after_visible_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    req = request("openai", retry=RetryPolicy(max_attempts=2, initial_delay_s=0))
+    streams = deque(
+        (
+            _FakeStream(
+                [
+                    ModelStreamEvent(
+                        type="text_delta",
+                        provider="openai",
+                        model=req.model.model,
+                        text="partial",
+                    )
+                ]
+            ),
+            _FakeStream(
+                [
+                    ModelStreamEvent(
+                        type="completed",
+                        provider="openai",
+                        model=req.model.model,
+                    )
+                ]
+            ),
+        )
+    )
+
+    async with httpx.AsyncClient() as http:
+        model_runtime = runtime(http)
+        monkeypatch.setattr(
+            model_runtime,
+            "_resolve_client",
+            lambda _provider: _FakeStreamClient(streams.popleft()),
+        )
+        events = [event async for event in model_runtime.stream(req, key=KEY)]
+
+    assert [event.type for event in events] == ["text_delta", "failed"]
+    assert events[-1].error_code == ModelCallErrorCode.PROVIDER_DOWN.value
+    assert events[-1].attempts[-1].streamed_output_started is True
+    assert len(streams) == 1
+
+
+async def test_stream_cancel_closes_quiet_provider_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    req = request("openai")
+    cancel = asyncio.Event()
+    provider_stream = _FakeStream(block=True)
+
+    async with httpx.AsyncClient() as http:
+        model_runtime = runtime(http)
+        monkeypatch.setattr(
+            model_runtime,
+            "_resolve_client",
+            lambda _provider: _FakeStreamClient(provider_stream),
+        )
+        stream = model_runtime.stream(req, key=KEY, cancel=cancel)
+        first = asyncio.ensure_future(anext(stream))
+        await asyncio.sleep(0)
+        cancel.set()
+        event = await asyncio.wait_for(first, timeout=1)
+
+    assert event.type == "cancelled"
+    assert event.terminal is True
+    assert provider_stream.closed is True
+    assert event.attempts[-1].status == "abandoned"
+
+
+async def test_stream_stops_after_terminal_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    req = request("openai")
+
+    async with httpx.AsyncClient() as http:
+        model_runtime = runtime(http)
+        monkeypatch.setattr(
+            model_runtime,
+            "_resolve_client",
+            lambda _provider: _FakeStreamClient(
+                _FakeStream(
+                    [
+                        ModelStreamEvent(
+                            type="completed",
+                            provider="openai",
+                            model=req.model.model,
+                        ),
+                        ModelStreamEvent(
+                            type="text_delta",
+                            provider="openai",
+                            model=req.model.model,
+                            text="late",
+                        ),
+                    ]
+                )
+            ),
+        )
+        events = [event async for event in model_runtime.stream(req, key=KEY)]
+
+    assert [event.type for event in events] == ["completed"]
 
 
 @respx.mock

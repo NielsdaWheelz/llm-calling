@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import cast
@@ -16,6 +15,7 @@ from provider_runtime.errors import ModelCallError, ModelCallErrorCode
 from provider_runtime.lowering import lower_generate_request
 from provider_runtime.openrouter import OPENROUTER_BASE_URL
 from provider_runtime.types import (
+    CancelSignal,
     EmbeddingCall,
     EmbeddingResponse,
     KeyProbeResult,
@@ -166,7 +166,7 @@ class ModelRuntime(_AdapterRuntime):
         *,
         key: ProviderApiKey,
         timeout_s: float = DEFAULT_TIMEOUT_S,
-        cancel: asyncio.Event | None = None,
+        cancel: CancelSignal | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         capabilities = self._require_generate_capabilities(call, streaming=True)
         plan = lower_generate_request(call, capabilities, streaming=True)

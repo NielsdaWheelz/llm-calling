@@ -46,6 +46,27 @@ def test_text_delta_event_cannot_include_incomplete_details() -> None:
         )
 
 
+def test_completed_event_cannot_include_error_code() -> None:
+    with pytest.raises(ValueError):
+        ModelStreamEvent(
+            type="completed",
+            provider="openai",
+            model="gpt-5.4-mini",
+            error_code="timeout",
+        )
+
+
+def test_text_delta_event_cannot_include_tool_argument_partial() -> None:
+    with pytest.raises(ValueError):
+        ModelStreamEvent(
+            type="text_delta",
+            provider="openai",
+            model="gpt-5.4-mini",
+            text="x",
+            tool_arguments_partial={"q": "hello"},
+        )
+
+
 def test_provider_artifact_event_carries_opaque_artifact() -> None:
     artifact = ProviderArtifact(
         provider="openai",

@@ -19,6 +19,15 @@ def test_catalog_returns_per_model_capabilities() -> None:
     assert cloudflare.structured_output is False
     assert cloudflare.tool_calling is False
     assert cloudflare.tool_choice_required is False
+    assert openai.stream.supported is True
+    assert openai.stream.tool_call_start is True
+    assert openai.stream.tool_call_delta is True
+    assert openai.stream.tool_call_done is True
+    assert openai.stream.cancellation == "http_close"
+    assert openai.stream.default_total_timeout_s == openai.default_timeout_s
+    assert openai.stream.max_total_timeout_s == openai.max_timeout_s
+    assert cloudflare.stream.supported is False
+    assert cloudflare.stream.cancellation == "none"
 
 
 def test_catalog_uses_route_as_lookup_provider() -> None:

@@ -62,7 +62,9 @@ class NoNetworkRuntime:
         *,
         key: ProviderApiKey,
         timeout_s: float = 45,
+        cancel: object | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
+        del cancel
         raise AssertionError(_unexpected_network_message("stream", call.model))
         yield ModelStreamEvent(
             type="completed",
@@ -136,10 +138,18 @@ class ScriptedRuntime(NoNetworkRuntime):
         *,
         key: ProviderApiKey,
         timeout_s: float = 45,
+        cancel: object | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
+        del cancel
         self.calls.append(CapturedRuntimeCall("stream", call, key, timeout_s))
+        terminal_seen = False
         for event in self._pop(self._stream_events, "stream"):
+            if terminal_seen:
+                raise AssertionError("Scripted provider-runtime stream yielded after terminal")
+            terminal_seen = event.terminal
             yield event
+        if not terminal_seen:
+            raise AssertionError("Scripted provider-runtime stream is missing terminal event")
 
     async def embed(
         self,

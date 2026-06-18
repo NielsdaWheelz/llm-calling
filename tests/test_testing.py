@@ -77,6 +77,37 @@ async def test_scripted_runtime_returns_queued_stream_events() -> None:
     assert runtime.calls[0].operation == "stream"
 
 
+async def test_scripted_runtime_rejects_stream_without_terminal() -> None:
+    runtime = ScriptedRuntime(
+        stream_events=(
+            (
+                ModelStreamEvent(
+                    type="text_delta", provider="openai", model="gpt-5.4-mini", text="a"
+                ),
+            ),
+        )
+    )
+
+    with pytest.raises(AssertionError, match="missing terminal"):
+        [event async for event in runtime.stream(_call(), key=KEY)]
+
+
+async def test_scripted_runtime_rejects_stream_events_after_terminal() -> None:
+    runtime = ScriptedRuntime(
+        stream_events=(
+            (
+                ModelStreamEvent(type="completed", provider="openai", model="gpt-5.4-mini"),
+                ModelStreamEvent(
+                    type="text_delta", provider="openai", model="gpt-5.4-mini", text="late"
+                ),
+            ),
+        )
+    )
+
+    with pytest.raises(AssertionError, match="after terminal"):
+        [event async for event in runtime.stream(_call(), key=KEY)]
+
+
 async def test_scripted_runtime_returns_queued_embeddings_and_key_probe() -> None:
     runtime = ScriptedRuntime(
         embed_responses=(

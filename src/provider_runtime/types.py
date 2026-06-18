@@ -3,7 +3,7 @@
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Protocol
 
 ReasoningEffort = Literal["default", "none", "minimal", "low", "medium", "high", "max"]
 ProviderName = Literal["openai", "anthropic", "gemini", "openrouter", "cloudflare"]
@@ -37,6 +37,12 @@ ModelStreamActivity = Literal[
     "waiting",
     "retrying",
 ]
+
+
+class CancelSignal(Protocol):
+    async def wait(self) -> bool: ...
+
+    def is_set(self) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -330,6 +336,8 @@ class ModelStreamEvent:
                 raise ValueError("tool_call_delta events require call id and argument delta")
         elif self.tool_arguments_delta:
             raise ValueError("Only tool_call_delta events may carry tool_arguments_delta")
+        if self.tool_arguments_partial is not None and self.type != "tool_call_delta":
+            raise ValueError("Only tool_call_delta events may carry tool_arguments_partial")
         if self.type == "tool_call_done" and self.tool_call is None:
             raise ValueError("tool_call_done events require tool_call")
         if self.type != "tool_call_done" and self.tool_call is not None:
@@ -352,6 +360,8 @@ class ModelStreamEvent:
             raise ValueError("incomplete_details is only allowed on incomplete events")
         if self.type == "failed" and not self.error_code:
             raise ValueError("failed events require error_code")
+        if self.type != "failed" and self.error_code is not None:
+            raise ValueError("Only failed events may carry error_code")
         if self.type != "failed" and self.error_detail is not None:
             raise ValueError("Only failed events may carry error_detail")
         if self.attempts and self.type not in {"completed", "incomplete", "failed", "cancelled"}:
