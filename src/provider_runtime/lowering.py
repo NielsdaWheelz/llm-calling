@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 
 from provider_runtime.catalog import ModelCapability
 from provider_runtime.errors import ModelCallError, ModelCallErrorCode
+from provider_runtime.tool_schema import StrictSchemaError, normalize_model_call_schemas
 from provider_runtime.types import ModelCall, ModelMessage
 
 
@@ -27,6 +28,16 @@ def lower_generate_request(
     """Validate a call against model capabilities and lower optional intent."""
     _validate_generate_request(call, capabilities, streaming=streaming)
     lowered = _lower_prompt_cache(call, capabilities)
+    try:
+        lowered = replace(
+            lowered,
+            call=normalize_model_call_schemas(lowered.call, capabilities),
+        )
+    except StrictSchemaError as exc:
+        raise _bad_request(
+            capabilities,
+            f"strict schema is not supported by {capabilities.provider}: {exc}",
+        ) from exc
     return lowered
 
 

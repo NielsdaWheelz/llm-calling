@@ -19,6 +19,7 @@ from provider_runtime.errors import (
     ModelCallError,
     ModelCallErrorCode,
     classify_provider_error,
+    safe_provider_error_body_snippet,
     sanitize_provider_text,
 )
 from provider_runtime.gemini import GeminiClient
@@ -644,10 +645,11 @@ def _is_terminal_response_error(exc: Exception) -> bool:
 
 def _http_status_model_error(provider: ProviderName, exc: httpx.HTTPStatusError) -> ModelCallError:
     response = exc.response
+    json_body = _parse_json_or_none(response)
     code = classify_provider_error(
         provider,
         response.status_code,
-        _parse_json_or_none(response),
+        json_body,
         None,
     )
     return ModelCallError(
@@ -665,6 +667,7 @@ def _http_status_model_error(provider: ProviderName, exc: httpx.HTTPStatusError)
             ModelCallErrorCode.TIMEOUT,
             ModelCallErrorCode.PROVIDER_DOWN,
         },
+        safe_body_snippet=safe_provider_error_body_snippet(json_body, _response_text_or_none(response)),
     )
 
 
@@ -756,6 +759,13 @@ def _parse_json_or_none(response: httpx.Response) -> dict | None:
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _response_text_or_none(response: httpx.Response) -> str | None:
+    try:
+        return response.text
+    except Exception:
+        return None
 
 
 def _retry_after_seconds(raw: str | None) -> float | None:

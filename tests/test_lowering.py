@@ -38,6 +38,114 @@ def test_openai_cache_intent_derives_prompt_cache_key() -> None:
     assert plan.call.messages[0].cache_ttl == "5m"
 
 
+def test_openai_strict_tool_schema_is_normalized_before_provider_io() -> None:
+    parameters = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "freshness_days": {"type": "integer", "nullable": True},
+            "filters": {
+                "type": "object",
+                "properties": {
+                    "kinds": {"type": "array", "items": {"type": "string"}},
+                    "include_archived": {"type": "boolean"},
+                },
+                "required": ["kinds"],
+            },
+        },
+        "required": ["query"],
+    }
+    call = ModelCall(
+        model=ModelRef(provider="openai", model="gpt-5.4-mini"),
+        messages=[ModelMessage(role="user", content="search")],
+        max_output_tokens=100,
+        tools=(ToolSpec(name="search", description="Search.", parameters=parameters),),
+    )
+
+    plan = lower_generate_request(call, _cap("openai", "gpt-5.4-mini"), streaming=False)
+
+    assert "additionalProperties" not in parameters
+    normalized = plan.call.tools[0].parameters
+    assert normalized["additionalProperties"] is False
+    assert normalized["required"] == ["query", "freshness_days", "filters"]
+    assert normalized["properties"]["freshness_days"]["type"] == ["integer", "null"]
+    assert "nullable" not in normalized["properties"]["freshness_days"]
+    filters = normalized["properties"]["filters"]
+    assert filters["additionalProperties"] is False
+    assert filters["required"] == ["kinds", "include_archived"]
+    assert filters["properties"]["include_archived"]["type"] == ["boolean", "null"]
+
+
+def test_openai_structured_output_schema_is_normalized_before_provider_io() -> None:
+    call = ModelCall(
+        model=ModelRef(provider="openai", model="gpt-5.4-mini"),
+        messages=[ModelMessage(role="user", content="json")],
+        max_output_tokens=100,
+        structured_output=StructuredOutputSpec(
+            name="result",
+            schema={
+                "type": "object",
+                "properties": {
+                    "answer": {"type": "string"},
+                    "confidence": {"type": "number"},
+                },
+                "required": ["answer"],
+            },
+        ),
+    )
+
+    plan = lower_generate_request(call, _cap("openai", "gpt-5.4-mini"), streaming=False)
+
+    assert plan.call.structured_output is not None
+    schema = plan.call.structured_output.schema
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == ["answer", "confidence"]
+    assert schema["properties"]["confidence"]["type"] == ["number", "null"]
+
+
+def test_anthropic_tool_schema_is_not_openai_strictified() -> None:
+    parameters = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
+        "required": ["query"],
+    }
+    call = ModelCall(
+        model=ModelRef(provider="anthropic", model="claude-sonnet-4-6"),
+        messages=[ModelMessage(role="user", content="search")],
+        max_output_tokens=100,
+        tools=(ToolSpec(name="search", description="Search.", parameters=parameters),),
+    )
+
+    plan = lower_generate_request(call, _cap("anthropic", "claude-sonnet-4-6"), streaming=False)
+
+    assert plan.call.tools[0].parameters == parameters
+    assert "additionalProperties" not in plan.call.tools[0].parameters
+
+
+def test_openai_unstrictifiable_tool_schema_fails_before_provider_io() -> None:
+    call = ModelCall(
+        model=ModelRef(provider="openai", model="gpt-5.4-mini"),
+        messages=[ModelMessage(role="user", content="map")],
+        max_output_tokens=100,
+        tools=(
+            ToolSpec(
+                name="map_tool",
+                description="Dynamic map.",
+                parameters={
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                },
+            ),
+        ),
+    )
+
+    with pytest.raises(ModelCallError) as exc_info:
+        lower_generate_request(call, _cap("openai", "gpt-5.4-mini"), streaming=False)
+
+    assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
+    assert "map-like additionalProperties" in exc_info.value.message
+
+
 def test_unsupported_cache_intent_is_stripped_before_provider_io() -> None:
     call = ModelCall(
         model=ModelRef(provider="openrouter", model="moonshotai/kimi-k2.6"),

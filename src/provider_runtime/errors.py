@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from enum import StrEnum
 
@@ -61,7 +62,7 @@ class ModelCallError(Exception):
 
 
 async def raise_for_provider_error(response: httpx.Response, provider: str) -> None:
-    """Raise a typed provider error without retaining provider response bodies."""
+    """Raise a typed provider error with bounded operator-only diagnostics."""
     if response.status_code < 400:
         return
     try:
@@ -69,13 +70,18 @@ async def raise_for_provider_error(response: httpx.Response, provider: str) -> N
     except Exception:
         pass
     try:
+        body_text = response.text
+    except Exception:
+        body_text = None
+    try:
         json_body = response.json()
     except Exception:
         json_body = None
+    json_dict = json_body if isinstance(json_body, dict) else None
     code = classify_provider_error(
         provider,
         response.status_code,
-        json_body if isinstance(json_body, dict) else None,
+        json_dict,
         None,
     )
     message = f"{provider} HTTP {response.status_code}"
@@ -87,6 +93,7 @@ async def raise_for_provider_error(response: httpx.Response, provider: str) -> N
         retry_after_seconds=_retry_after_seconds(response.headers.get("retry-after")),
         provider_request_id=response.headers.get("x-request-id")
         or response.headers.get("request-id"),
+        safe_body_snippet=safe_provider_error_body_snippet(json_dict, body_text),
     )
 
 
@@ -183,6 +190,43 @@ def sanitize_provider_text(text: str, *, limit: int = 500) -> str:
 
 def _safe_body_snippet(body_text: str) -> str:
     return sanitize_provider_text(body_text, limit=500)
+
+
+def safe_provider_error_body_snippet(
+    json_body: dict | None,
+    body_text: str | None,
+) -> str | None:
+    summary = _provider_error_summary(json_body)
+    if summary:
+        return sanitize_provider_text(
+            json.dumps(summary, sort_keys=True, separators=(",", ":")),
+            limit=500,
+        )
+    if body_text:
+        sanitized = _safe_body_snippet(body_text)
+        return sanitized or None
+    return None
+
+
+def _provider_error_summary(json_body: dict | None) -> dict[str, object]:
+    if not json_body:
+        return {}
+    summary: dict[str, object] = {}
+    error = json_body.get("error")
+    if isinstance(error, dict):
+        for key in ("message", "type", "code", "param", "status"):
+            value = error.get(key)
+            if isinstance(value, str | int | float | bool) or value is None:
+                if value is not None:
+                    summary[key] = value
+        return summary
+    if isinstance(error, str):
+        summary["message"] = error
+    for key in ("message", "error_description", "code", "status"):
+        value = json_body.get(key)
+        if isinstance(value, str | int | float | bool):
+            summary[key] = value
+    return summary
 
 
 def _classify_openai_error(status_code: int, json_body: dict | None) -> ModelCallErrorCode:
