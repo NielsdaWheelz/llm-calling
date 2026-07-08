@@ -144,6 +144,20 @@ def _collect_unstrictifiable_issues(
                 "map-like additionalProperties schemas cannot be strictified",
             )
         )
+    elif additional is True:
+        issues.append(
+            SchemaIssue(
+                f"{path}.additionalProperties",
+                "additionalProperties=true cannot be strictified",
+            )
+        )
+    elif additional not in (None, False):
+        issues.append(
+            SchemaIssue(
+                f"{path}.additionalProperties",
+                "additionalProperties must be false or omitted",
+            )
+        )
 
     required = node.get("required")
     if required is not None and (

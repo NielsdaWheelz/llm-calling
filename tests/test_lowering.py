@@ -146,6 +146,31 @@ def test_openai_unstrictifiable_tool_schema_fails_before_provider_io() -> None:
     assert "map-like additionalProperties" in exc_info.value.message
 
 
+def test_openai_additional_properties_true_fails_before_provider_io() -> None:
+    call = ModelCall(
+        model=ModelRef(provider="openai", model="gpt-5.4-mini"),
+        messages=[ModelMessage(role="user", content="open object")],
+        max_output_tokens=100,
+        tools=(
+            ToolSpec(
+                name="open_object",
+                description="Open object.",
+                parameters={
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "additionalProperties": True,
+                },
+            ),
+        ),
+    )
+
+    with pytest.raises(ModelCallError) as exc_info:
+        lower_generate_request(call, _cap("openai", "gpt-5.4-mini"), streaming=False)
+
+    assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
+    assert "additionalProperties=true" in exc_info.value.message
+
+
 def test_unsupported_cache_intent_is_stripped_before_provider_io() -> None:
     call = ModelCall(
         model=ModelRef(provider="openrouter", model="moonshotai/kimi-k2.6"),

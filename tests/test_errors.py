@@ -93,3 +93,18 @@ async def test_provider_error_body_snippet_is_explicit_and_redacts_secret_tokens
     assert "very-secret-provider-token" not in exc_info.value.safe_body_snippet
     assert "cf-secret-token-12345" not in exc_info.value.safe_body_snippet
     assert "query-secret-12345" not in exc_info.value.safe_body_snippet
+
+
+@pytest.mark.asyncio
+async def test_provider_error_plain_text_body_is_not_persisted_as_safe_snippet() -> None:
+    response = httpx.Response(
+        400,
+        text="Rejected prompt fragment: user private content",
+        headers={"x-request-id": "req-plain"},
+    )
+
+    with pytest.raises(ModelCallError) as exc_info:
+        await raise_for_provider_error(response, "openai")
+
+    assert exc_info.value.provider_request_id == "req-plain"
+    assert exc_info.value.safe_body_snippet is None

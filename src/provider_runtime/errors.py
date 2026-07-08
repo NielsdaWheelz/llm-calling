@@ -188,10 +188,6 @@ def sanitize_provider_text(text: str, *, limit: int = 500) -> str:
     return snippet
 
 
-def _safe_body_snippet(body_text: str) -> str:
-    return sanitize_provider_text(body_text, limit=500)
-
-
 def safe_provider_error_body_snippet(
     json_body: dict | None,
     body_text: str | None,
@@ -202,9 +198,6 @@ def safe_provider_error_body_snippet(
             json.dumps(summary, sort_keys=True, separators=(",", ":")),
             limit=500,
         )
-    if body_text:
-        sanitized = _safe_body_snippet(body_text)
-        return sanitized or None
     return None
 
 
