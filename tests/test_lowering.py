@@ -22,6 +22,11 @@ def _cap(provider: str, model: str):
     )
 
 
+def _obj(value: object) -> dict[str, object]:
+    assert isinstance(value, dict)
+    return value
+
+
 def test_openai_cache_intent_derives_prompt_cache_key() -> None:
     call = ModelCall(
         model=ModelRef(provider="openai", model="gpt-5.4-mini"),
@@ -68,12 +73,15 @@ def test_openai_strict_tool_schema_is_normalized_before_provider_io() -> None:
     normalized = plan.call.tools[0].parameters
     assert normalized["additionalProperties"] is False
     assert normalized["required"] == ["query", "freshness_days", "filters"]
-    assert normalized["properties"]["freshness_days"]["type"] == ["integer", "null"]
-    assert "nullable" not in normalized["properties"]["freshness_days"]
-    filters = normalized["properties"]["filters"]
+    properties = _obj(normalized["properties"])
+    freshness_days = _obj(properties["freshness_days"])
+    assert freshness_days["type"] == ["integer", "null"]
+    assert "nullable" not in freshness_days
+    filters = _obj(properties["filters"])
     assert filters["additionalProperties"] is False
     assert filters["required"] == ["kinds", "include_archived"]
-    assert filters["properties"]["include_archived"]["type"] == ["boolean", "null"]
+    include_archived = _obj(_obj(filters["properties"])["include_archived"])
+    assert include_archived["type"] == ["boolean", "null"]
 
 
 def test_openai_structured_output_schema_is_normalized_before_provider_io() -> None:
@@ -100,7 +108,8 @@ def test_openai_structured_output_schema_is_normalized_before_provider_io() -> N
     schema = plan.call.structured_output.schema
     assert schema["additionalProperties"] is False
     assert schema["required"] == ["answer", "confidence"]
-    assert schema["properties"]["confidence"]["type"] == ["number", "null"]
+    confidence = _obj(_obj(schema["properties"])["confidence"])
+    assert confidence["type"] == ["number", "null"]
 
 
 def test_anthropic_tool_schema_is_not_openai_strictified() -> None:
