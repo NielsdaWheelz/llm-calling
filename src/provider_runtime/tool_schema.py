@@ -134,7 +134,9 @@ def _collect_unstrictifiable_issues(
         if key in node:
             issues.append(SchemaIssue(f"{path}.{key}", f"{key} is not supported in strict schemas"))
     if "patternProperties" in node:
-        issues.append(SchemaIssue(f"{path}.patternProperties", "patternProperties is not supported"))
+        issues.append(
+            SchemaIssue(f"{path}.patternProperties", "patternProperties is not supported")
+        )
 
     additional = node.get("additionalProperties")
     if isinstance(additional, dict):
@@ -206,7 +208,9 @@ def _required_set(node: dict[str, Any], path: str) -> set[str]:
     if required is None:
         return set()
     if not isinstance(required, list) or any(not isinstance(item, str) for item in required):
-        raise StrictSchemaError([SchemaIssue(f"{path}.required", "required must be an array of strings")])
+        raise StrictSchemaError(
+            [SchemaIssue(f"{path}.required", "required must be an array of strings")]
+        )
     return set(required)
 
 

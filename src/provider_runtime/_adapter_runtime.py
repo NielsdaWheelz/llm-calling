@@ -667,7 +667,9 @@ def _http_status_model_error(provider: ProviderName, exc: httpx.HTTPStatusError)
             ModelCallErrorCode.TIMEOUT,
             ModelCallErrorCode.PROVIDER_DOWN,
         },
-        safe_body_snippet=safe_provider_error_body_snippet(json_body, _response_text_or_none(response)),
+        safe_body_snippet=safe_provider_error_body_snippet(
+            json_body, _response_text_or_none(response)
+        ),
     )
 
 
