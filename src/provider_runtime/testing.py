@@ -1,202 +1,191 @@
-"""No-network runtime helpers for application tests."""
+"""No-network runtime doubles for application tests.
+
+`NoNetworkRuntime` fails loudly on any provider I/O; `ScriptedRuntime` replays
+queued outcomes/scripts while recording every call. Both keep the structural
+interface of `ProviderRuntime`'s public methods (`generate`, `stream`,
+`embed`, `transcribe`) so application code accepts either.
+
+Captured calls never store the credential key — only the provider name.
+"""
 
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from provider_runtime.catalog import DEFAULT_CATALOG, ModelCapability, ModelCatalog
-from provider_runtime.errors import ModelCallError, ModelCallErrorCode
 from provider_runtime.types import (
+    CallOutcome,
+    CancelSignal,
+    CodecStreamEvent,
     EmbeddingCall,
     EmbeddingResponse,
-    KeyProbeResult,
-    ModelCall,
-    ModelRef,
-    ModelResponse,
-    ModelStreamEvent,
-    ProviderApiKey,
+    FinalizedProviderCall,
+    ProviderCredential,
     ProviderName,
+    RuntimeStreamEvent,
+    StreamStart,
+    TerminalEvent,
     TranscriptionCall,
     TranscriptionResponse,
 )
 
-RuntimeOperation = Literal["generate", "stream", "embed", "transcribe", "probe_key"]
+type RuntimeOperation = Literal["generate", "stream", "embed", "transcribe"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CapturedRuntimeCall:
     operation: RuntimeOperation
-    call: ModelCall | EmbeddingCall | TranscriptionCall | None
-    key: ProviderApiKey
-    timeout_s: float
-    provider: ProviderName | None = None
+    call: FinalizedProviderCall | EmbeddingCall | TranscriptionCall
+    # The key is deliberately NOT captured.
+    credential_provider: ProviderName
+    streamed: bool
+
+
+def _unexpected(operation: RuntimeOperation, provider: str, model: str) -> str:
+    return f"Unexpected provider-runtime {operation} in test: {provider}/{model}"
 
 
 class NoNetworkRuntime:
-    """Runtime implementation that defects on provider I/O in tests."""
-
-    def __init__(self, *, catalog: ModelCatalog = DEFAULT_CATALOG):
-        self._catalog = catalog
-
-    def is_provider_available(self, provider: str) -> bool:
-        return self._catalog.key_probe_model(provider) is not None  # type: ignore[arg-type]
-
-    def capabilities(self, model: ModelRef) -> ModelCapability | None:
-        return self._catalog.capabilities(model)
+    """Runtime double that fails on any provider I/O in tests."""
 
     async def generate(
-        self,
-        call: ModelCall,
-        *,
-        key: ProviderApiKey,
-        timeout_s: float = 45,
-    ) -> ModelResponse:
-        raise AssertionError(_unexpected_network_message("generate", call.model))
+        self, call: FinalizedProviderCall, *, credential: ProviderCredential
+    ) -> CallOutcome:
+        raise AssertionError(
+            _unexpected("generate", call.request.target.provider, call.request.target.model)
+        )
 
     async def stream(
         self,
-        call: ModelCall,
+        call: FinalizedProviderCall,
         *,
-        key: ProviderApiKey,
-        timeout_s: float = 45,
-        cancel: object | None = None,
-    ) -> AsyncIterator[ModelStreamEvent]:
+        credential: ProviderCredential,
+        cancel: CancelSignal | None = None,
+    ) -> AsyncIterator[RuntimeStreamEvent]:
         del cancel
-        raise AssertionError(_unexpected_network_message("stream", call.model))
-        yield ModelStreamEvent(
-            type="completed",
-            provider=call.model.provider,
-            model=call.model.model,
-            route=call.model.route,
+        raise AssertionError(
+            _unexpected("stream", call.request.target.provider, call.request.target.model)
         )
+        # Unreachable yield: keeps this an async generator like the real runtime.
+        yield RuntimeStreamEvent(seq=1, event=StreamStart())
 
     async def embed(
-        self,
-        call: EmbeddingCall,
-        *,
-        key: ProviderApiKey,
-        timeout_s: float = 45,
+        self, call: EmbeddingCall, *, credential: ProviderCredential
     ) -> EmbeddingResponse:
-        raise AssertionError(_unexpected_network_message("embed", call.model))
+        raise AssertionError(_unexpected("embed", "openai", call.model))
 
     async def transcribe(
-        self,
-        call: TranscriptionCall,
-        *,
-        key: ProviderApiKey,
-        timeout_s: float = 45,
+        self, call: TranscriptionCall, *, credential: ProviderCredential
     ) -> TranscriptionResponse:
-        raise AssertionError(_unexpected_network_message("transcribe", call.model))
+        raise AssertionError(_unexpected("transcribe", "openai", call.model))
 
-    async def probe_key(
-        self,
-        *,
-        provider: ProviderName,
-        key: ProviderApiKey,
-        timeout_s: float = 45,
-    ) -> KeyProbeResult:
-        raise AssertionError(f"Unexpected provider key probe in test: {provider}")
+
+@dataclass(slots=True)
+class _Scripts:
+    generate: deque[CallOutcome]
+    stream: deque[tuple[CodecStreamEvent, ...]]
+    embed: deque[EmbeddingResponse]
+    transcribe: deque[TranscriptionResponse]
+
+
+def _validated_script(script: Sequence[CodecStreamEvent]) -> tuple[CodecStreamEvent, ...]:
+    events = tuple(script)
+    if not events or not isinstance(events[-1], TerminalEvent):
+        raise AssertionError("Scripted provider-runtime stream must end with a TerminalEvent")
+    for event in events[:-1]:
+        if isinstance(event, TerminalEvent):
+            raise AssertionError(
+                "Scripted provider-runtime stream has events after its TerminalEvent"
+            )
+    return events
 
 
 class ScriptedRuntime(NoNetworkRuntime):
-    """No-network runtime with queued responses for deterministic tests."""
+    """No-network runtime with queued responses for deterministic tests.
+
+    Stream scripts are codec-event sequences; the double wraps them in
+    `RuntimeStreamEvent` envelopes (seq starting at 1 per stream) exactly like
+    the real runtime, and enforces the one-terminal grammar: each script must
+    end with exactly one `TerminalEvent` and contain none before it.
+    """
 
     def __init__(
         self,
         *,
-        catalog: ModelCatalog = DEFAULT_CATALOG,
-        generate_responses: Iterable[ModelResponse] = (),
-        stream_events: Iterable[Iterable[ModelStreamEvent]] = (),
+        generate_outcomes: Iterable[CallOutcome] = (),
+        stream_scripts: Iterable[Sequence[CodecStreamEvent]] = (),
         embed_responses: Iterable[EmbeddingResponse] = (),
         transcribe_responses: Iterable[TranscriptionResponse] = (),
-        probe_results: Iterable[KeyProbeResult] = (),
-    ):
-        super().__init__(catalog=catalog)
-        self.calls: list[CapturedRuntimeCall] = []
-        self._generate_responses = deque(generate_responses)
-        self._stream_events = deque(tuple(events) for events in stream_events)
-        self._embed_responses = deque(embed_responses)
-        self._transcribe_responses = deque(transcribe_responses)
-        self._probe_results = deque(probe_results)
+    ) -> None:
+        self.calls = []
+        self._scripts = _Scripts(
+            generate=deque(generate_outcomes),
+            stream=deque(_validated_script(script) for script in stream_scripts),
+            embed=deque(embed_responses),
+            transcribe=deque(transcribe_responses),
+        )
 
     async def generate(
-        self,
-        call: ModelCall,
-        *,
-        key: ProviderApiKey,
-        timeout_s: float = 45,
-    ) -> ModelResponse:
-        self.calls.append(CapturedRuntimeCall("generate", call, key, timeout_s))
-        return self._pop(self._generate_responses, "generate")
+        self, call: FinalizedProviderCall, *, credential: ProviderCredential
+    ) -> CallOutcome:
+        self._capture("generate", call, credential, streamed=False)
+        return _pop(self._scripts.generate, "generate")
 
     async def stream(
         self,
-        call: ModelCall,
+        call: FinalizedProviderCall,
         *,
-        key: ProviderApiKey,
-        timeout_s: float = 45,
-        cancel: object | None = None,
-    ) -> AsyncIterator[ModelStreamEvent]:
+        credential: ProviderCredential,
+        cancel: CancelSignal | None = None,
+    ) -> AsyncIterator[RuntimeStreamEvent]:
         del cancel
-        self.calls.append(CapturedRuntimeCall("stream", call, key, timeout_s))
-        terminal_seen = False
-        for event in self._pop(self._stream_events, "stream"):
-            if terminal_seen:
-                raise AssertionError("Scripted provider-runtime stream yielded after terminal")
-            terminal_seen = event.terminal
-            yield event
-        if not terminal_seen:
-            raise AssertionError("Scripted provider-runtime stream is missing terminal event")
+        self._capture("stream", call, credential, streamed=True)
+        script = _pop(self._scripts.stream, "stream")
+        for seq, event in enumerate(script, start=1):
+            yield RuntimeStreamEvent(seq=seq, event=event)
 
     async def embed(
-        self,
-        call: EmbeddingCall,
-        *,
-        key: ProviderApiKey,
-        timeout_s: float = 45,
+        self, call: EmbeddingCall, *, credential: ProviderCredential
     ) -> EmbeddingResponse:
-        self.calls.append(CapturedRuntimeCall("embed", call, key, timeout_s))
-        return self._pop(self._embed_responses, "embed")
+        self._capture("embed", call, credential, streamed=False)
+        return _pop(self._scripts.embed, "embed")
 
     async def transcribe(
-        self,
-        call: TranscriptionCall,
-        *,
-        key: ProviderApiKey,
-        timeout_s: float = 45,
+        self, call: TranscriptionCall, *, credential: ProviderCredential
     ) -> TranscriptionResponse:
-        self.calls.append(CapturedRuntimeCall("transcribe", call, key, timeout_s))
-        return self._pop(self._transcribe_responses, "transcribe")
+        self._capture("transcribe", call, credential, streamed=False)
+        return _pop(self._scripts.transcribe, "transcribe")
 
-    async def probe_key(
+    def _capture(
         self,
+        operation: RuntimeOperation,
+        call: FinalizedProviderCall | EmbeddingCall | TranscriptionCall,
+        credential: ProviderCredential,
         *,
-        provider: ProviderName,
-        key: ProviderApiKey,
-        timeout_s: float = 45,
-    ) -> KeyProbeResult:
-        self.calls.append(CapturedRuntimeCall("probe_key", None, key, timeout_s, provider))
-        return self._pop(self._probe_results, "probe_key")
-
-    @staticmethod
-    def _pop[T](queue: deque[T], operation: RuntimeOperation) -> T:
-        try:
-            return queue.popleft()
-        except IndexError as exc:
-            raise AssertionError(f"No scripted provider-runtime {operation} result queued") from exc
+        streamed: bool,
+    ) -> None:
+        self.calls.append(
+            CapturedRuntimeCall(
+                operation=operation,
+                call=call,
+                credential_provider=credential.provider,
+                streamed=streamed,
+            )
+        )
 
 
-def model_not_available(provider: ProviderName, model: str) -> ModelCallError:
-    return ModelCallError(
-        ModelCallErrorCode.MODEL_NOT_AVAILABLE,
-        f"No scripted model result queued for {provider}/{model}",
-        provider=provider,
-        retryable=False,
-    )
+def _pop[T](queue: deque[T], operation: RuntimeOperation) -> T:
+    try:
+        return queue.popleft()
+    except IndexError:
+        raise AssertionError(f"No scripted provider-runtime {operation} result queued") from None
 
 
-def _unexpected_network_message(operation: RuntimeOperation, model: ModelRef) -> str:
-    return f"Unexpected provider-runtime {operation} in test: {model.provider}/{model.model}"
+__all__ = [
+    "CapturedRuntimeCall",
+    "NoNetworkRuntime",
+    "RuntimeOperation",
+    "ScriptedRuntime",
+]

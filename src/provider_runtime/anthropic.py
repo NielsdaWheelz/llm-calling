@@ -1,648 +1,1096 @@
-"""Anthropic Messages API client.
+"""Anthropic Messages codec (protocol/codec id ``anthropic_messages``).
 
-Per PR-04 spec section 4.2:
-- Endpoint: POST https://api.anthropic.com/v1/messages
-- Headers: x-api-key: <key>, anthropic-version: 2023-06-01, Content-Type: application/json
+Full replacement of the pre-cutover ``AnthropicClient``. The old forced-tool
+structured-output path and the thinking-budget machinery are DELETED: strict
+JSON output rides the native, GA ``output_config.format`` (dialect
+``anthropic_output_config_json_schema``, no beta header, thinking-compatible),
+and no ``thinking`` field is ever sent — Fable's thinking is always on and
+Sonnet 5 runs adaptive by default, so the codec emits only
+``output_config.effort``.
 
-ModelMessage conversion:
-- System turn extracted to separate "system" field (Anthropic doesn't use system in messages array)
-- Remaining turns mapped to messages with role preserved
-
-Request body:
-{
-  "model": "<model_name>",
-  "max_tokens": 1024,
-  "temperature": 0.7,
-  "system": "<system_prompt>",
-  "messages": [
-    {"role": "user", "content": "..."},
-    {"role": "assistant", "content": "..."}
-  ]
-}
-
-Response (non-stream):
-{
-  "id": "msg_...",
-  "content": [{"type": "text", "text": "<output_text>"}],
-  "usage": {
-    "input_tokens": 100,
-    "output_tokens": 50
-  }
-}
-
-- text = concatenate all content[].text where type="text"
-- usage.prompt_tokens = input_tokens
-- usage.completion_tokens = output_tokens
-- usage.total_tokens = sum
-- provider_request_id = id
-
-Streaming:
-- Set "stream": true
-- Events: event: content_block_delta with data: {"delta": {"text": "..."}}
-- Terminal: event: message_stop
-- Usage in event: message_delta at end
+Wire decisions
+--------------
+- Sampling: NEVER sent (Claude 400s on ``temperature``/``top_p``/``top_k``).
+- Caching (spec §7 "explicit breakpoint ... optionally plus top-level
+  automatic"): BOTH mechanisms are emitted on every request. The explicit
+  breakpoint ``cache_control {"type": "ephemeral", "ttl": "5m"}`` is placed on
+  the LAST block of the leading stable-prefix run — a system block, or, when
+  stable content extends into leading user messages, the last stable content
+  block. Additionally the constant top-level request field
+  ``cache_control: {"type": "ephemeral"}`` opts into Anthropic's automatic
+  mode (auto-breakpoint on the last cacheable block), which serves append-only
+  chat tails beyond the stable prefix. This is the simplest spec-compliant
+  form: the explicit breakpoint is deterministic (it feeds ``prefix_bytes``
+  and the cache plan) and the automatic field is a byte-constant, so it never
+  perturbs affinity.
+- Reasoning: top-level ``output_config: {"effort": <native>}`` — identity
+  mapping for low/medium/high/xhigh/max. No ``thinking`` field of any kind.
+- Strict output: MERGED into the SAME ``output_config`` object:
+  ``{"effort": X, "format": {"type": "json_schema", "schema": ...}}`` with the
+  schema serialized via ``to_json_schema(inline_defs=True,
+  include_annotations=True)``.
+- Continuation: the artifact ``opaque_payload`` is ``{"blocks": [...]}`` — the
+  prior turn's thinking/redacted_thinking content blocks verbatim. On encode
+  they lead the assistant turn unchanged; typed fields supply the text and
+  tool_use blocks (runtime-api assistant-turn rule).
+- Streaming: ``stream_request`` derives the streaming variant of a finalized
+  request by injecting ``"stream": true`` into the body (identical
+  deterministic serialization); ``generate`` uses the finalized request as-is.
+- Refusal billability: Anthropic confirms pre-output refusals are unbilled, so
+  a refusal whose reported ``usage.output_tokens == 0`` is
+  ``ConfirmedNonBillable``; any refusal with billed output tokens (mid-stream
+  refusal) or without reported usage is ``PossiblyBillable``.
+- Streamed refusal: the stream terminal grammar has no ``Refused`` — an
+  HTTP-200 ``stop_reason: "refusal"`` on a stream terminates as
+  ``Incomplete(reason="content_filter_partial", status="refused")`` with a
+  Present safe detail, and the partial output (including any thinking blocks)
+  is invalidated: no ``ContinuationDelta`` is emitted for a refused stream.
+- Structured-output decode arm (cross-codec rule): decode returns
+  ``TextContent`` ONLY. The seam's ``decode_response(status, headers, body)``
+  and ``decode_stream(headers, events)`` signatures carry no plan context, and
+  the output arm is determined by the PLAN, never re-inferred — so under
+  ``StrictJsonOutput`` the schema-conformant JSON arrives as the
+  ``TextContent`` text, and ``StructuredContent`` construction (strict parse,
+  with Refused/Incomplete taking precedence) belongs to the plan-owning
+  runtime.
 """
 
+from __future__ import annotations
+
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping, Sequence
+from typing import Final
 
-import httpx
-
-from provider_runtime._artifact_validation import validated_provider_artifacts
-from provider_runtime.endpoints import ANTHROPIC_BASE_URL
-from provider_runtime.errors import ModelCallError, ModelCallErrorCode, raise_for_provider_error
-from provider_runtime.tool_arguments import parse_tool_arguments_with_status
+from provider_runtime._signals import (
+    ClassifiedError,
+    ExpectedFailureSignal,
+    TransientStreamError,
+)
+from provider_runtime.catalog import ChatModelContract
+from provider_runtime.errors import (
+    CredentialRejected,
+    PlanningDefect,
+    ProtocolDefect,
+    RuntimeDefect,
+    safe_provider_error_body_snippet,
+    sanitize_provider_text,
+)
+from provider_runtime.schema import to_json_schema
+from provider_runtime.transport import SseEvent
 from provider_runtime.types import (
-    ModelCall,
-    ModelMessage,
-    ModelResponse,
-    ModelStreamEvent,
-    ProviderArtifact,
+    Absent,
+    AssistantMessage,
+    CallMeta,
+    CallOutcome,
+    CanonicalTool,
+    CodecStreamEvent,
+    ConfirmedNonBillable,
+    ContinuationArtifact,
+    ContinuationDelta,
+    DraftRequest,
+    Dynamic,
+    FinalizedProviderRequest,
+    GenerateIntent,
+    Incomplete,
+    InvalidToolArguments,
+    PossiblyBillable,
+    Presence,
+    Present,
+    PromptBlock,
+    ProviderContextTooLarge,
+    ProviderHttpUnavailable,
+    ProviderProtocol,
+    ProviderRateLimit,
+    ProviderStreamInterrupted,
+    ProviderTarget,
+    Refused,
+    ResponsePayload,
+    Stable,
+    StreamStart,
+    StrictJsonOutput,
+    Succeeded,
+    SystemMessage,
+    TerminalEvent,
+    TextContent,
+    TextDelta,
+    TextOutput,
     TokenUsage,
     ToolCall,
+    ToolCallDelta,
+    ToolCallDone,
+    ToolCallStart,
+    ToolResultMessage,
+    UsageEvent,
+    UserMessage,
 )
 
-ANTHROPIC_API_VERSION = "2023-06-01"
-ANTHROPIC_ADAPTIVE_THINKING_MODELS = {"claude-opus-4-8", "claude-sonnet-4-6"}
+CODEC_ID: Final[str] = "anthropic_messages"
+PROTOCOL: Final[ProviderProtocol] = "anthropic_messages"
+
+_URL: Final[str] = "https://api.anthropic.com/v1/messages"
+_API_VERSION: Final[str] = "2023-06-01"
+
+_EXPLICIT_BREAKPOINT: Final[Mapping[str, str]] = {"type": "ephemeral", "ttl": "5m"}
+_AUTOMATIC_CACHE_CONTROL: Final[Mapping[str, str]] = {"type": "ephemeral"}
+
+_SUCCESS_STOP_REASONS: Final[frozenset[str]] = frozenset({"end_turn", "tool_use", "stop_sequence"})
+_THINKING_BLOCK_TYPES: Final[frozenset[str]] = frozenset({"thinking", "redacted_thinking"})
+# 5xx-shaped in-band/streamed provider error types (overloaded_error ≙ 529).
+_TRANSIENT_ERROR_TYPES: Final[frozenset[str]] = frozenset({"overloaded_error", "api_error"})
 
 
-class AnthropicClient:
-    def __init__(self, client: httpx.AsyncClient, *, base_url: str = ANTHROPIC_BASE_URL):
-        self._client = client
-        self._url = f"{base_url.rstrip('/')}/messages"
+def _dumps(obj: object) -> str:
+    # The one body serialization rule (codec seam): deterministic literal
+    # construction order, compact separators, no ASCII escaping.
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
-    async def generate(
-        self,
-        req: ModelCall,
-        *,
-        api_key: str,
-        timeout_s: float,
-    ) -> ModelResponse:
-        """Non-streaming message generation."""
-        headers = self._build_headers(api_key)
-        body = self._build_request_body(req, stream=False)
 
-        response = await self._client.post(
-            self._url,
-            headers=headers,
-            json=body,
-            timeout=httpx.Timeout(timeout_s, connect=10.0),
+def _dump_bytes(obj: object) -> bytes:
+    return _dumps(obj).encode("utf-8")
+
+
+def _frame(component: bytes) -> bytes:
+    return len(component).to_bytes(8, "big") + component
+
+
+# ---------------------------------------------------------------------------
+# encode / finalize / stream_request
+
+
+def _tool_wire(tool: CanonicalTool) -> dict[str, object]:
+    return {
+        "name": tool.name,
+        "description": tool.description,
+        "input_schema": to_json_schema(tool.parameters, inline_defs=True, include_annotations=True),
+    }
+
+
+def _continuation_blocks(artifact: ContinuationArtifact) -> list[dict[str, object]]:
+    raw = artifact.opaque_payload.get("blocks")
+    if not isinstance(raw, Sequence) or isinstance(raw, str | bytes):
+        raise PlanningDefect(
+            code="invalid_continuation_payload",
+            message=(
+                "anthropic continuation artifact payload must carry a 'blocks' sequence of"
+                " content blocks"
+            ),
         )
-        await raise_for_provider_error(response, "anthropic")
-
-        data = response.json()
-        return self._parse_response(
-            data,
-            model=req.model.model,
-            structured=bool(req.structured_output),
-        )
-
-    async def generate_stream(
-        self,
-        req: ModelCall,
-        *,
-        api_key: str,
-        timeout_s: float,
-    ) -> AsyncIterator[ModelStreamEvent]:
-        """Streaming message generation using Server-Sent Events."""
-        if req.structured_output is not None:
-            raise ModelCallError(
-                ModelCallErrorCode.BAD_REQUEST,
-                "Anthropic structured output streaming is not implemented",
-                provider="anthropic",
+    blocks: list[dict[str, object]] = []
+    for index, block in enumerate(raw):
+        if not isinstance(block, Mapping):
+            raise PlanningDefect(
+                code="invalid_continuation_payload",
+                message=(f"anthropic continuation artifact payload block {index} is not a mapping"),
             )
-        headers = self._build_headers(api_key)
-        body = self._build_request_body(req, stream=True)
+        blocks.append({str(key): value for key, value in block.items()})
+    return blocks
 
-        async with self._client.stream(
-            "POST",
-            self._url,
-            headers=headers,
-            json=body,
-            timeout=httpx.Timeout(timeout_s, connect=10.0),
-        ) as response:
-            await raise_for_provider_error(response, "anthropic")
 
-            provider_request_id: str | None = None
-            usage: TokenUsage | None = None
-            received_stop = False
-            stop_reason: str | None = None
-            usage_data: dict[str, object] = {}
-            tool_blocks: dict[int, dict[str, object]] = {}
-            thinking_blocks: dict[int, dict[str, object]] = {}
-
-            async for line in response.aiter_lines():
-                if not line:
-                    continue
-
-                # Anthropic SSE format: "event: <type>\ndata: {...}"
-                if line.startswith("event: "):
-                    event_type = line[7:]
-
-                    if event_type == "message_stop":
-                        received_stop = True
-                        status = _status_from_stop_reason(stop_reason)
-                        yield ModelStreamEvent(
-                            type=("incomplete" if status == "incomplete" else "completed"),
-                            provider="anthropic",
-                            model=req.model.model,
-                            route=req.model.route,
-                            usage=usage,
-                            provider_request_id=provider_request_id,
-                            status=status,
-                            incomplete_details=(
-                                _incomplete_details_from_stop_reason(stop_reason)
-                                if status == "incomplete"
-                                else None
-                            ),
-                        )
-                        break
-                    continue
-
-                if not line.startswith("data: "):
-                    continue
-
-                data_str = line[6:]
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError as exc:
-                    raise ModelCallError(
-                        ModelCallErrorCode.PROVIDER_DOWN,
-                        "Anthropic stream event was not valid JSON",
-                        provider="anthropic",
-                        retryable=False,
-                    ) from exc
-
-                event_type = data.get("type", "")
-
-                # Handle message_start - extract request ID
-                if event_type == "message_start":
-                    message = data.get("message", {})
-                    provider_request_id = message.get("id")
-                    start_usage = message.get("usage")
-                    if isinstance(start_usage, dict):
-                        usage_data.update(start_usage)
-                        usage = self._parse_usage(usage_data)
-                    yield ModelStreamEvent(
-                        type="stream_start",
-                        provider="anthropic",
-                        model=req.model.model,
-                        route=req.model.route,
-                        provider_event_type=event_type,
-                        provider_request_id=provider_request_id,
-                    )
-                    continue
-
-                # Handle content_block_start - track tool_use and thinking blocks
-                if event_type == "content_block_start":
-                    block = data.get("content_block", {})
-                    if block.get("type") == "tool_use":
-                        index = data.get("index")
-                        if isinstance(index, int):
-                            tool_blocks[index] = {
-                                "id": block.get("id", ""),
-                                "name": block.get("name", ""),
-                                "json": "",
-                            }
-                            if block.get("id") and block.get("name"):
-                                yield ModelStreamEvent(
-                                    type="tool_call_start",
-                                    provider="anthropic",
-                                    model=req.model.model,
-                                    route=req.model.route,
-                                    provider_event_type=event_type,
-                                    item_index=index,
-                                    tool_call_id=str(block["id"]),
-                                    tool_call_index=index,
-                                    tool_name=str(block["name"]),
-                                )
-                    elif block.get("type") in ("thinking", "redacted_thinking"):
-                        index = data.get("index")
-                        if isinstance(index, int):
-                            thinking_blocks[index] = dict(block)
-                    continue
-
-                # Handle content_block_delta - extract text, tool_use input json,
-                # or thinking/signature deltas
-                if event_type == "content_block_delta":
-                    delta = data.get("delta", {})
-                    if delta.get("type") == "text_delta":
-                        delta_text = delta.get("text", "")
-                        if delta_text:
-                            yield ModelStreamEvent(
-                                type="text_delta",
-                                provider="anthropic",
-                                model=req.model.model,
-                                route=req.model.route,
-                                provider_event_type=event_type,
-                                item_index=data.get("index"),
-                                text=delta_text,
-                            )
-                    elif delta.get("type") == "input_json_delta":
-                        index = data.get("index")
-                        if isinstance(index, int) and index in tool_blocks:
-                            partial_json = delta.get("partial_json", "")
-                            tool_blocks[index]["json"] += partial_json
-                            if partial_json:
-                                block_state = tool_blocks[index]
-                                yield ModelStreamEvent(
-                                    type="tool_call_delta",
-                                    provider="anthropic",
-                                    model=req.model.model,
-                                    route=req.model.route,
-                                    provider_event_type=event_type,
-                                    item_index=index,
-                                    tool_call_id=str(block_state["id"]),
-                                    tool_call_index=index,
-                                    tool_name=str(block_state["name"]),
-                                    tool_arguments_delta=partial_json,
-                                )
-                    elif delta.get("type") in ("thinking_delta", "signature_delta"):
-                        key = "thinking" if delta.get("type") == "thinking_delta" else "signature"
-                        index = data.get("index")
-                        if isinstance(index, int) and index in thinking_blocks:
-                            block_state = thinking_blocks[index]
-                            block_state[key] = str(block_state.get(key) or "") + str(
-                                delta.get(key) or ""
-                            )
-                    continue
-
-                # Handle content_block_stop - finalize tool_use and thinking blocks
-                if event_type == "content_block_stop":
-                    index = data.get("index")
-                    if isinstance(index, int) and index in tool_blocks:
-                        block_state = tool_blocks.pop(index)
-                        raw_json = str(block_state["json"] or "{}")
-                        arguments = parse_tool_arguments_with_status(
-                            raw_json,
-                            provider="anthropic",
-                            tool_name=str(block_state["name"]),
-                            call_id=str(block_state["id"]),
-                        )
-                        yield ModelStreamEvent(
-                            type="tool_call_done",
-                            provider="anthropic",
-                            model=req.model.model,
-                            route=req.model.route,
-                            provider_event_type=event_type,
-                            item_index=index,
-                            tool_call_id=str(block_state["id"]),
-                            tool_call_index=index,
-                            tool_call=ToolCall(
-                                id=str(block_state["id"]),
-                                name=str(block_state["name"]),
-                                arguments=arguments.arguments,
-                                argument_status=arguments.status,
-                            ),
-                        )
-                    elif isinstance(index, int) and index in thinking_blocks:
-                        # One complete thinking/redacted_thinking block, verbatim.
-                        block = thinking_blocks.pop(index)
-                        yield ModelStreamEvent(
-                            type="provider_artifact",
-                            provider="anthropic",
-                            model=req.model.model,
-                            route=req.model.route,
-                            provider_event_type=event_type,
-                            item_index=index,
-                            provider_artifact=ProviderArtifact(
-                                provider="anthropic",
-                                model=req.model.model,
-                                purpose="thinking",
-                                payload=block,
-                            ),
-                        )
-                    continue
-
-                # Handle message_delta - extract usage at end
-                if event_type == "message_delta":
-                    delta = data.get("delta")
-                    if isinstance(delta, dict) and delta.get("stop_reason"):
-                        stop_reason = str(delta["stop_reason"])
-                    delta_usage = data.get("usage")
-                    if isinstance(delta_usage, dict):
-                        usage_data.update(delta_usage)
-                        usage = self._parse_usage(usage_data)
-                    continue
-
-            if not received_stop:
-                raise ModelCallError(
-                    ModelCallErrorCode.PROVIDER_DOWN,
-                    "Anthropic stream ended without message_stop event",
-                    provider="anthropic",
-                    retryable=False,
+def _assistant_wire(message: AssistantMessage, intent: GenerateIntent) -> dict[str, object]:
+    content: list[dict[str, object]] = []
+    match message.continuation:
+        case Present(value=artifact):
+            if artifact.target != intent.target or artifact.codec_id != CODEC_ID:
+                raise PlanningDefect(
+                    code="continuation_mismatch",
+                    message=(
+                        "continuation artifact does not match the intent target/codec: "
+                        f"artifact codec {artifact.codec_id!r} for "
+                        f"{artifact.target.provider}/{artifact.target.model}, intent "
+                        f"{CODEC_ID!r} for {intent.target.provider}/{intent.target.model}"
+                    ),
                 )
-
-    def _build_headers(self, api_key: str) -> dict[str, str]:
-        """Build request headers."""
-        return {
-            "x-api-key": api_key,
-            "anthropic-version": ANTHROPIC_API_VERSION,
-            "Content-Type": "application/json",
-        }
-
-    def _build_request_body(self, req: ModelCall, stream: bool) -> dict:
-        """Build request body from ModelCall.
-
-        Extracts system turn to separate field.
-        """
-        if req.prompt_cache_key is not None:
-            raise ModelCallError(
-                ModelCallErrorCode.BAD_REQUEST,
-                "Anthropic does not support prompt_cache_key",
-                provider="anthropic",
-            )
-        if req.structured_output is not None and req.reasoning.effort not in (
-            "default",
-            "none",
-        ):
-            raise ModelCallError(
-                ModelCallErrorCode.BAD_REQUEST,
-                "Anthropic forced structured output is incompatible with extended thinking",
-                provider="anthropic",
-            )
-
-        # Extract system prompt and non-system messages
-        system_blocks = []
-        messages = []
-
-        for turn in req.messages:
-            if turn.role == "system":
-                # Anthropic uses a separate system field
-                system_blocks.append(self._turn_to_text_block(turn))
-            else:
-                messages.append(self._turn_to_message(turn, model=req.model.model))
-
-        body: dict = {
-            "model": req.model.model,
-            "max_tokens": req.max_output_tokens,
-            "messages": messages,
-            "stream": stream,
-        }
-
-        if system_blocks:
-            body["system"] = system_blocks
-        tools_payload: list[dict[str, object]] = []
-        if req.structured_output is not None:
-            tools_payload.append(
-                {
-                    "name": req.structured_output.name,
-                    "description": f"Return {req.structured_output.name}.",
-                    "input_schema": req.structured_output.schema,
-                }
-            )
-            body["tool_choice"] = {"type": "tool", "name": req.structured_output.name}
-        for tool in req.tools:
-            tools_payload.append(
-                {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "input_schema": tool.parameters,
-                }
-            )
-        if tools_payload:
-            body["tools"] = tools_payload
-        if req.tools and req.structured_output is None:
-            if req.tool_choice == "auto":
-                body["tool_choice"] = {"type": "auto"}
-            elif req.tool_choice == "none":
-                body["tool_choice"] = {"type": "none"}
-            elif req.tool_choice == "required":
-                body["tool_choice"] = {"type": "any"}
-
-        uses_adaptive_thinking = req.model.model in ANTHROPIC_ADAPTIVE_THINKING_MODELS and (
-            req.reasoning.effort not in ("default", "none")
-        )
-        if req.temperature is not None and not uses_adaptive_thinking:
-            body["temperature"] = req.temperature
-
-        if req.reasoning.effort == "default":
-            return body
-
-        if req.reasoning.effort == "none":
-            body["thinking"] = {"type": "disabled"}
-            return body
-
-        if req.model.model in ANTHROPIC_ADAPTIVE_THINKING_MODELS:
-            if req.reasoning.effort in ("minimal", "low"):
-                effort = "low"
-            elif req.reasoning.effort == "medium":
-                effort = "medium"
-            elif req.reasoning.effort == "high":
-                effort = "high"
-            elif req.reasoning.effort == "max":
-                effort = "max"
-            else:
-                raise ValueError(f"Unknown reasoning_effort: {req.reasoning.effort}")
-
-            body["thinking"] = {"type": "adaptive"}
-            body["output_config"] = {"effort": effort}
-            return body
-
-        if req.reasoning.effort == "minimal":
-            budget_tokens = 1024
-        elif req.reasoning.effort == "low":
-            budget_tokens = 1536
-        elif req.reasoning.effort == "medium":
-            budget_tokens = 2048
-        elif req.reasoning.effort == "high":
-            budget_tokens = 3072
-        elif req.reasoning.effort == "max":
-            budget_tokens = 4000
-        else:
-            raise ValueError(f"Unknown reasoning_effort: {req.reasoning.effort}")
-
-        max_allowed_budget = req.max_output_tokens - 1
-        if max_allowed_budget < 1024:
-            body["thinking"] = {"type": "disabled"}
-        else:
-            body["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": min(budget_tokens, max_allowed_budget),
+            # Thinking/redacted_thinking blocks lead the assistant turn VERBATIM.
+            content.extend(_continuation_blocks(artifact))
+        case Absent():
+            pass
+    if message.text:
+        content.append({"type": "text", "text": message.text})
+    for call in message.tool_calls:
+        content.append(
+            {
+                "type": "tool_use",
+                "id": call.id,
+                "name": call.name,
+                "input": dict(call.arguments),
             }
+        )
+    if not content:
+        # Anthropic rejects empty content arrays; there is no wire-legal way
+        # to represent a turn with no continuation blocks, text, or tool
+        # calls — omitting the message would silently misrepresent the
+        # conversation, so this is a defect, not a silent drop.
+        raise PlanningDefect(
+            code="empty_assistant_turn",
+            message=(
+                "anthropic assistant turn has no continuation blocks, text, or tool calls to encode"
+            ),
+        )
+    return {"role": "assistant", "content": content}
 
-        return body
 
-    def _turn_to_text_block(self, turn: ModelMessage) -> dict[str, object]:
-        block: dict[str, object] = {"type": "text", "text": turn.content}
-        return self._with_cache_control(block, turn.cache_ttl)
+def _tool_result_wire(message: ToolResultMessage) -> dict[str, object]:
+    return {
+        "type": "tool_result",
+        "tool_use_id": message.call_id,
+        "content": message.output,
+        "is_error": message.is_error,
+    }
 
-    def _turn_to_message(self, turn: ModelMessage, *, model: str) -> dict[str, object]:
-        """Convert ModelMessage to Anthropic message format.
 
-        Note: System turns are handled separately in _build_request_body.
-        """
-        if turn.role == "tool":
-            tool_content: list[dict[str, object]] = [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": result.call_id,
-                    "content": result.output,
-                    "is_error": result.is_error,
-                }
-                for result in turn.tool_results
-            ]
-            if tool_content:
-                tool_content[-1] = self._with_cache_control(tool_content[-1], turn.cache_ttl)
-            return {"role": "user", "content": tool_content}
-        if turn.role == "assistant" and (turn.tool_calls or turn.provider_artifacts):
-            # Thinking blocks must lead the assistant turn, unmodified, before tool_use.
-            assistant_content: list[dict[str, object]] = [
-                item.to_provider_payload()
-                for item in validated_provider_artifacts(
-                    turn.provider_artifacts,
-                    provider="anthropic",
-                    model=model,
-                    purpose="thinking",
-                )
-            ]
-            if turn.content:
-                assistant_content.append({"type": "text", "text": turn.content})
-            for call in turn.tool_calls:
-                assistant_content.append(
-                    {
-                        "type": "tool_use",
-                        "id": call.id,
-                        "name": call.name,
-                        "input": call.arguments,
-                    }
-                )
-            if assistant_content:
-                assistant_content[-1] = self._with_cache_control(
-                    assistant_content[-1], turn.cache_ttl
-                )
-            return {"role": "assistant", "content": assistant_content}
-        message_content: str | list[dict[str, object]]
-        if turn.cache_ttl == "none":
-            message_content = turn.content
-        else:
-            message_content = [self._turn_to_text_block(turn)]
-        return {
-            "role": turn.role,
-            "content": message_content,
-        }
+def _text_block_wire(block: PromptBlock) -> dict[str, object]:
+    return {"type": "text", "text": block.text}
 
-    def _with_cache_control(
-        self,
-        block: dict[str, object],
-        cache_ttl: str,
-    ) -> dict[str, object]:
-        if cache_ttl == "none":
-            return block
-        if cache_ttl not in ("5m", "1h"):
-            raise ModelCallError(
-                ModelCallErrorCode.BAD_REQUEST,
-                f"Unknown prompt cache ttl: {cache_ttl}",
-                provider="anthropic",
-            )
-        return {
-            **block,
-            "cache_control": {"type": "ephemeral", "ttl": cache_ttl},
-        }
 
-    def _parse_response(self, data: dict, *, model: str, structured: bool) -> ModelResponse:
-        """Parse non-streaming response."""
-        # Extract text from content blocks
-        content_blocks = data.get("content", [])
-        text_parts = []
-        structured_output = None
-        tool_calls: list[ToolCall] = []
-        provider_artifacts: list[ProviderArtifact] = []
-        for block in content_blocks:
-            if block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
-            elif block.get("type") in ("thinking", "redacted_thinking"):
-                provider_artifacts.append(
-                    ProviderArtifact(
-                        provider="anthropic",
-                        model=model,
-                        purpose="thinking",
-                        payload=dict(block),
-                    )
-                )
-            elif block.get("type") == "tool_use":
-                arguments = parse_tool_arguments_with_status(
-                    block.get("input"),
-                    provider="anthropic",
-                    tool_name=str(block.get("name", "")),
-                    call_id=str(block.get("id", "")),
-                )
-                if structured_output is None:
-                    structured_output = arguments.arguments
-                tool_calls.append(
-                    ToolCall(
-                        id=str(block.get("id", "")),
-                        name=str(block.get("name", "")),
-                        arguments=arguments.arguments,
-                        argument_status=arguments.status,
-                    )
-                )
-        if structured and structured_output is None:
-            raise ModelCallError(
-                ModelCallErrorCode.BAD_REQUEST,
-                "Anthropic structured output did not include the required tool input",
-                provider="anthropic",
-                retryable=False,
-            )
-        text = "".join(text_parts)
-
-        # Extract usage - Anthropic uses input_tokens/output_tokens
-        usage = None
-        usage_data = data.get("usage")
-        if usage_data:
-            usage = self._parse_usage(usage_data)
-
-        # Extract request ID from body
-        provider_request_id = data.get("id")
-        stop_reason = data.get("stop_reason")
-        stop_reason_str = str(stop_reason) if stop_reason else None
-
-        return ModelResponse(
-            text=text,
-            usage=usage,
-            provider_request_id=provider_request_id,
-            status=_status_from_stop_reason(stop_reason_str),
-            incomplete_details=_incomplete_details_from_stop_reason(stop_reason_str),
-            structured_output=structured_output,
-            tool_calls=tuple(tool_calls),
-            provider_artifacts=tuple(provider_artifacts),
+def encode(intent: GenerateIntent, contract: ChatModelContract) -> DraftRequest:
+    if contract.protocol != PROTOCOL:
+        raise PlanningDefect(
+            code="protocol_mismatch",
+            message=(
+                f"anthropic codec received contract protocol {contract.protocol!r}; "
+                f"expected {PROTOCOL!r}"
+            ),
+        )
+    native_reasoning = contract.reasoning.native_mapping.get(intent.reasoning)
+    if native_reasoning is None:
+        raise PlanningDefect(
+            code="unsupported_reasoning_level",
+            message=(
+                f"reasoning level {intent.reasoning!r} has no native mapping for "
+                f"{intent.target.provider}/{intent.target.model}"
+            ),
         )
 
-    def _parse_usage(self, usage_data: dict[str, object]) -> TokenUsage:
-        billed_input_tokens = _int_or_none(usage_data.get("input_tokens"))
-        output_tokens = _int_or_none(usage_data.get("output_tokens"))
-        cache_creation = _int_or_none(usage_data.get("cache_creation_input_tokens"))
-        cache_read = _int_or_none(usage_data.get("cache_read_input_tokens"))
-        input_buckets = (billed_input_tokens, cache_creation, cache_read)
-        input_tokens = (
-            sum(value for value in input_buckets if value is not None)
-            if any(value is not None for value in input_buckets)
-            else None
+    system_blocks: list[dict[str, object]] = []
+    messages: list[dict[str, object]] = []
+    # Wire-ordered (block dict, stability) pairs plus run-breakers (None) for
+    # assistant/tool turns; the stable prefix is the leading Stable run.
+    flattened: list[tuple[dict[str, object], Stable] | None] = []
+    # Placement-scoped stable-prefix projection for cache-affinity framing:
+    # the leading system-field blocks (if any) as ONE {"system": [...]} entry,
+    # then each leading user message's stable content as its own
+    # {"role": "user", "content": [...]} entry — so a role move (system vs.
+    # leading user) or a message regrouping changes prefix_bytes. Shares the
+    # same wire dict objects as `system_blocks`/`messages`, so the breakpoint
+    # stamp below is visible here too.
+    stable_prefix_projection: list[dict[str, object]] = []
+    system_stable_blocks: list[dict[str, object]] = []
+    prefix_open = True
+
+    pending_tool_results: list[dict[str, object]] = []
+
+    def flush_tool_results() -> None:
+        if pending_tool_results:
+            messages.append({"role": "user", "content": list(pending_tool_results)})
+            pending_tool_results.clear()
+
+    system_phase = True
+    for message in intent.messages:
+        match message:
+            case SystemMessage(blocks=blocks):
+                if not system_phase:
+                    raise PlanningDefect(
+                        code="misplaced_system_message",
+                        message=(
+                            "anthropic system messages must precede all conversation turns"
+                            " (the Messages API has a single top-level system field)"
+                        ),
+                    )
+                for block in blocks:
+                    if not block.text:
+                        # Anthropic rejects empty text blocks; drop it from
+                        # the wire entirely rather than sending "". An empty
+                        # dynamic block still ends the leading stable run —
+                        # it carries no wire artifact, but its position in
+                        # the message sequence still marks where the planner
+                        # guaranteed stable prefix stops.
+                        if isinstance(block.stability, Dynamic):
+                            flattened.append(None)
+                            prefix_open = False
+                        continue
+                    wire = _text_block_wire(block)
+                    system_blocks.append(wire)
+                    match block.stability:
+                        case Stable() as stable:
+                            flattened.append((wire, stable))
+                            if prefix_open:
+                                system_stable_blocks.append(wire)
+                        case Dynamic():
+                            flattened.append(None)
+                            prefix_open = False
+            case UserMessage(blocks=blocks):
+                system_phase = False
+                flush_tool_results()
+                if system_stable_blocks:
+                    stable_prefix_projection.append({"system": system_stable_blocks})
+                    system_stable_blocks = []
+                content: list[dict[str, object]] = []
+                stable_content: list[dict[str, object]] = []
+                for block in blocks:
+                    if not block.text:
+                        # Same empty-text drop as the system-phase loop above.
+                        if isinstance(block.stability, Dynamic):
+                            flattened.append(None)
+                            prefix_open = False
+                        continue
+                    wire = _text_block_wire(block)
+                    content.append(wire)
+                    match block.stability:
+                        case Stable() as stable:
+                            flattened.append((wire, stable))
+                            if prefix_open:
+                                stable_content.append(wire)
+                        case Dynamic():
+                            flattened.append(None)
+                            prefix_open = False
+                if not content:
+                    raise PlanningDefect(
+                        code="empty_message_content",
+                        message=(
+                            "anthropic user turn has no non-empty content blocks to"
+                            " encode (Anthropic rejects an empty content array)"
+                        ),
+                    )
+                messages.append({"role": "user", "content": content})
+                if stable_content:
+                    stable_prefix_projection.append({"role": "user", "content": stable_content})
+            case AssistantMessage():
+                system_phase = False
+                flush_tool_results()
+                flattened.append(None)
+                prefix_open = False
+                messages.append(_assistant_wire(message, intent))
+            case ToolResultMessage():
+                system_phase = False
+                flattened.append(None)
+                prefix_open = False
+                pending_tool_results.append(_tool_result_wire(message))
+    flush_tool_results()
+    if system_stable_blocks:
+        stable_prefix_projection.append({"system": system_stable_blocks})
+
+    # Explicit 5m breakpoint on the LAST block of the leading stable run. The
+    # planner guarantees a non-empty contiguous stable prefix; the codec places
+    # the breakpoint wherever that run ends (system block or leading stable
+    # content block).
+    stable_prefix: list[dict[str, object]] = []
+    for entry in flattened:
+        if entry is None:
+            break
+        stable_prefix.append(entry[0])
+    if stable_prefix:
+        stable_prefix[-1]["cache_control"] = dict(_EXPLICIT_BREAKPOINT)
+
+    tools_wire = [_tool_wire(tool) for tool in intent.tools]
+
+    output_config: dict[str, object] = {"effort": native_reasoning}
+    format_wire: dict[str, object] | None = None
+    match intent.output:
+        case StrictJsonOutput(schema=schema):
+            format_wire = {
+                "type": "json_schema",
+                "schema": to_json_schema(schema, inline_defs=True, include_annotations=True),
+            }
+            output_config["format"] = format_wire
+        case TextOutput():
+            pass
+
+    body: dict[str, object] = {
+        "model": intent.target.model,
+        "max_tokens": intent.max_output_tokens,
+    }
+    if system_blocks:
+        body["system"] = system_blocks
+    body["messages"] = messages
+    if tools_wire:
+        body["tools"] = tools_wire
+        body["tool_choice"] = {"type": intent.tool_choice}
+    body["output_config"] = output_config
+    # Top-level automatic caching (append-only chat) — a byte-constant field.
+    body["cache_control"] = dict(_AUTOMATIC_CACHE_CONTROL)
+
+    # Fixed section tags separate the four component classes (stable/tools/
+    # tool_choice/format) so a stable text byte-equal to a tool-definition
+    # dump can never collide across classes; the stable class is framed at
+    # message/placement granularity (system field vs. messages[] role), not
+    # bare block text, so a role move or message regrouping changes the bytes.
+    prefix_components: list[bytes] = [_frame(b"stable")]
+    prefix_components.extend(_frame(_dump_bytes(item)) for item in stable_prefix_projection)
+    prefix_components.append(_frame(b"tools"))
+    prefix_components.extend(_frame(_dump_bytes(tool)) for tool in tools_wire)
+    prefix_components.append(_frame(b"tool_choice"))
+    if tools_wire:
+        prefix_components.append(_frame(_dump_bytes({"type": intent.tool_choice})))
+    prefix_components.append(_frame(b"format"))
+    if format_wire is not None:
+        prefix_components.append(_frame(_dump_bytes(format_wire)))
+
+    return DraftRequest(
+        target=intent.target,
+        protocol=PROTOCOL,
+        url=_URL,
+        safe_headers={"anthropic-version": _API_VERSION, "accept": "application/json"},
+        native_reasoning=native_reasoning,
+        provider_framing_overhead_tokens=contract.provider_framing_overhead_tokens,
+        prefix_bytes=b"".join(prefix_components),
+        body=_dump_bytes(body),
+    )
+
+
+def finalize(draft: DraftRequest, affinity: str) -> FinalizedProviderRequest:
+    """Anthropic carries no injected affinity field: passthrough (body unchanged)."""
+    del affinity
+    return FinalizedProviderRequest(
+        target=draft.target,
+        protocol=draft.protocol,
+        url=draft.url,
+        method="POST",
+        safe_headers=draft.safe_headers,
+        body=draft.body,
+    )
+
+
+def stream_request(request: FinalizedProviderRequest) -> FinalizedProviderRequest:
+    """The streaming variant of a finalized call: inject ``"stream": true``.
+
+    Returns a NEW value with the identical deterministic serialization;
+    ``generate`` uses the finalized request as-is.
+    """
+    body = _parse_json_object(request.body, context="finalized anthropic request body")
+    streamed = dict(body)
+    streamed["stream"] = True
+    return FinalizedProviderRequest(
+        target=request.target,
+        protocol=request.protocol,
+        url=request.url,
+        method=request.method,
+        safe_headers=request.safe_headers,
+        body=_dump_bytes(streamed),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shared decode helpers
+
+
+def _parse_json_object(body: bytes, *, context: str) -> dict[str, object]:
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ProtocolDefect(
+            code="malformed_provider_body",
+            message=f"{context} is not valid JSON: {exc}",
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise ProtocolDefect(
+            code="malformed_provider_body",
+            message=f"{context} must be a JSON object; got {type(parsed).__name__}",
         )
-        total = sum(value for value in (input_tokens, output_tokens) if value is not None)
-        return TokenUsage(
+    return parsed
+
+
+def _int_field(raw: object) -> int | None:
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) else None
+
+
+def _usage_presence(raw: object) -> Presence[TokenUsage]:
+    """Fold one Anthropic usage mapping into the normalized TokenUsage.
+
+    Anthropic's wire ``input_tokens`` EXCLUDES cache read/write components,
+    but ``TokenUsage.input_tokens`` is, by the codec-invariant convention
+    documented on ``TokenUsage.from_components``, always the cache-INCLUSIVE
+    total prompt token count. Normalize at ingress: the stored
+    ``input_tokens`` is the raw wire value plus cache_read_input_tokens plus
+    cache_creation_input_tokens, matching what OpenAI/Gemini/Moonshot/
+    OpenRouter report natively. Anthropic also reports no total, so the
+    derived-total branch of ``from_components`` applies: total = input
+    (already inclusive) + output.
+    """
+    if not isinstance(raw, Mapping):
+        return Absent()
+    raw_input_tokens = _int_field(raw.get("input_tokens"))
+    output_tokens = _int_field(raw.get("output_tokens"))
+    if raw_input_tokens is None or output_tokens is None:
+        return Absent()
+    cache_read = _int_field(raw.get("cache_read_input_tokens"))
+    cache_write = _int_field(raw.get("cache_creation_input_tokens"))
+    input_tokens = raw_input_tokens + (cache_read or 0) + (cache_write or 0)
+    return Present(
+        TokenUsage.from_components(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            total_tokens=total,
-            cache_creation_input_tokens=cache_creation,
-            cache_read_input_tokens=cache_read,
-            provider_usage=dict(usage_data),
+            total_tokens=Absent(),
+            reasoning_tokens=Absent(),
+            cache_read_input_tokens=Absent() if cache_read is None else Present(cache_read),
+            cache_write_input_tokens=Absent() if cache_write is None else Present(cache_write),
+        )
+    )
+
+
+def _request_id(headers: Mapping[str, str], in_band: object) -> Presence[str]:
+    header = headers.get("request-id")
+    if isinstance(header, str) and header:
+        return Present(header)
+    if isinstance(in_band, str) and in_band:
+        return Present(in_band)
+    return Absent()
+
+
+def _meta(
+    *,
+    model: str,
+    provider_request_id: Presence[str],
+    usage: Presence[TokenUsage],
+    billability: ConfirmedNonBillable | PossiblyBillable,
+) -> CallMeta:
+    return CallMeta(
+        provider="anthropic",
+        model=model,
+        provider_request_id=provider_request_id,
+        upstream_provider=Absent(),
+        usage=usage,
+        attempt_trace=(),
+        billability=billability,
+    )
+
+
+def _refusal_billability(usage: Presence[TokenUsage]) -> ConfirmedNonBillable | PossiblyBillable:
+    """Anthropic contract: a pre-output refusal is unbilled. The observable
+    signal is reported usage with zero output tokens; anything else (billed
+    partial output, or no reported usage) stays PossiblyBillable."""
+    match usage:
+        case Present(value=value) if value.output_tokens == 0:
+            return ConfirmedNonBillable()
+        case _:
+            return PossiblyBillable()
+
+
+def _refusal_detail(stop_details: object) -> str:
+    if isinstance(stop_details, Mapping):
+        explanation = stop_details.get("explanation")
+        if isinstance(explanation, str) and explanation:
+            return sanitize_provider_text(explanation)
+        category = stop_details.get("category")
+        if isinstance(category, str) and category:
+            return sanitize_provider_text(f"refusal category: {category}")
+    return "provider refusal"
+
+
+def _tool_call_from_wire(block: Mapping[str, object]) -> ToolCall:
+    call_id = block.get("id")
+    name = block.get("name")
+    if not isinstance(call_id, str) or not isinstance(name, str):
+        raise ProtocolDefect(
+            code="malformed_content_block",
+            message="anthropic tool_use block is missing string 'id'/'name' fields",
+        )
+    arguments = block.get("input")
+    if not isinstance(arguments, Mapping):
+        raise ExpectedFailureSignal(
+            InvalidToolArguments(
+                safe_detail=(
+                    f"anthropic tool_use input for tool {name!r} (call {call_id}) is not a"
+                    " JSON object"
+                )
+            )
+        )
+    return ToolCall(id=call_id, name=name, arguments=dict(arguments))
+
+
+def _continuation_presence(
+    thinking_blocks: Sequence[Mapping[str, object]], model: str
+) -> Presence[ContinuationArtifact]:
+    if not thinking_blocks:
+        return Absent()
+    return Present(
+        ContinuationArtifact(
+            target=ProviderTarget(provider="anthropic", model=model),
+            codec_id=CODEC_ID,
+            opaque_payload={"blocks": [dict(block) for block in thinking_blocks]},
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# decode_response (non-stream, 2xx only)
+
+
+def decode_response(status: int, headers: Mapping[str, str], body: bytes) -> CallOutcome:
+    del status  # 2xx only by contract; non-2xx goes through classify_error.
+    data = _parse_json_object(body, context="anthropic response body")
+    model = data.get("model")
+    if not isinstance(model, str) or not model:
+        raise ProtocolDefect(
+            code="malformed_provider_body",
+            message="anthropic response body is missing the string 'model' field",
+        )
+    provider_request_id = _request_id(headers, data.get("id"))
+    usage = _usage_presence(data.get("usage"))
+    stop_reason = data.get("stop_reason")
+
+    if stop_reason == "refusal":
+        return Refused(
+            meta=_meta(
+                model=model,
+                provider_request_id=provider_request_id,
+                usage=usage,
+                billability=_refusal_billability(usage),
+            ),
+            safe_detail=_refusal_detail(data.get("stop_details")),
         )
 
+    if stop_reason == "max_tokens":
+        return Incomplete(
+            meta=_meta(
+                model=model,
+                provider_request_id=provider_request_id,
+                usage=usage,
+                billability=PossiblyBillable(),
+            ),
+            reason="max_output_tokens",
+            status="provider_incomplete",
+            safe_detail=Absent(),
+        )
 
-def _int_or_none(value: object) -> int | None:
-    return value if isinstance(value, int) else None
+    if not isinstance(stop_reason, str) or stop_reason not in _SUCCESS_STOP_REASONS:
+        raise ProtocolDefect(
+            code="unknown_stop_reason",
+            message=f"anthropic response carried unknown stop_reason {stop_reason!r}",
+        )
+
+    content = data.get("content")
+    if not isinstance(content, list):
+        raise ProtocolDefect(
+            code="malformed_provider_body",
+            message="anthropic response 'content' must be an array of blocks",
+        )
+    text_blocks: list[str] = []
+    tool_calls: list[ToolCall] = []
+    thinking_blocks: list[Mapping[str, object]] = []
+    for block in content:
+        if not isinstance(block, Mapping):
+            raise ProtocolDefect(
+                code="malformed_content_block",
+                message="anthropic content block is not a JSON object",
+            )
+        block_type = block.get("type")
+        if block_type == "text":
+            text = block.get("text")
+            if not isinstance(text, str):
+                raise ProtocolDefect(
+                    code="malformed_content_block",
+                    message="anthropic text block is missing the string 'text' field",
+                )
+            text_blocks.append(text)
+        elif block_type == "tool_use":
+            tool_calls.append(_tool_call_from_wire(block))
+        elif isinstance(block_type, str) and block_type in _THINKING_BLOCK_TYPES:
+            thinking_blocks.append(block)
+        else:
+            raise ProtocolDefect(
+                code="unknown_content_block",
+                message=f"anthropic response carried unknown content block type {block_type!r}",
+            )
+
+    return Succeeded(
+        meta=_meta(
+            model=model,
+            provider_request_id=provider_request_id,
+            usage=usage,
+            billability=PossiblyBillable(),
+        ),
+        response=ResponsePayload(
+            # TextContent only (cross-codec rule): under strict output the
+            # schema-conformant JSON is this text; the runtime owns the parse.
+            content=TextContent(text="".join(text_blocks), tool_calls=tuple(tool_calls)),
+            continuation=_continuation_presence(thinking_blocks, model),
+        ),
+    )
 
 
-def _status_from_stop_reason(stop_reason: str | None) -> str | None:
-    if stop_reason is None:
-        return None
-    if stop_reason in {"end_turn", "tool_use", "stop_sequence"}:
-        return "completed"
-    return "incomplete"
+# ---------------------------------------------------------------------------
+# decode_stream
 
 
-def _incomplete_details_from_stop_reason(stop_reason: str | None) -> dict[str, object] | None:
-    if stop_reason is None or _status_from_stop_reason(stop_reason) == "completed":
-        return None
-    return {"stop_reason": stop_reason}
+def _stream_event_payload(event: SseEvent) -> dict[str, object]:
+    payload = _parse_json_object(event.data.encode("utf-8"), context="anthropic stream event data")
+    return payload
+
+
+def _raise_stream_error(payload: dict[str, object]) -> None:
+    error = payload.get("error")
+    error_type = error.get("type") if isinstance(error, Mapping) else None
+    if isinstance(error_type, str) and error_type in _TRANSIENT_ERROR_TYPES:
+        raise TransientStreamError(ProviderHttpUnavailable())
+    snippet = safe_provider_error_body_snippet(payload, None)
+    raise ProtocolDefect(
+        code="stream_error_event",
+        message=f"anthropic stream carried a non-transient error event: {snippet or error_type!r}",
+    )
+
+
+class _StreamState:
+    """Mutable per-stream accumulation (codec-private; the yielded events and
+    the terminal outcome are the only externally visible values)."""
+
+    __slots__ = (
+        "model",
+        "in_band_id",
+        "usage_data",
+        "stop_reason",
+        "stop_details",
+        "texts_by_index",
+        "text_order",
+        "tool_by_index",
+        "tool_calls",
+        "thinking_by_index",
+        "thinking_blocks",
+        "saw_message_stop",
+    )
+
+    def __init__(self) -> None:
+        self.model: str | None = None
+        self.in_band_id: object = None
+        self.usage_data: dict[str, object] = {}
+        self.stop_reason: str | None = None
+        self.stop_details: object = None
+        self.texts_by_index: dict[int, list[str]] = {}
+        self.text_order: list[int] = []
+        self.tool_by_index: dict[int, dict[str, str]] = {}
+        self.tool_calls: list[ToolCall] = []
+        self.thinking_by_index: dict[int, dict[str, object]] = {}
+        self.thinking_blocks: list[Mapping[str, object]] = []
+        self.saw_message_stop = False
+
+
+def _require_index(payload: Mapping[str, object]) -> int:
+    index = payload.get("index")
+    if not isinstance(index, int) or isinstance(index, bool):
+        raise ProtocolDefect(
+            code="malformed_stream_event",
+            message="anthropic content_block event is missing the integer 'index' field",
+        )
+    return index
+
+
+async def decode_stream(
+    headers: Mapping[str, str],
+    events: AsyncIterator[SseEvent],
+) -> AsyncIterator[CodecStreamEvent]:
+    state = _StreamState()
+
+    async for event in events:
+        if event.event == "ping":
+            continue
+        payload = _stream_event_payload(event)
+        raw_type = payload.get("type")
+        event_type = raw_type if isinstance(raw_type, str) else event.event
+
+        if event_type == "ping":
+            continue
+        if event_type == "error":
+            _raise_stream_error(payload)
+        elif event_type == "message_start":
+            message = payload.get("message")
+            if not isinstance(message, Mapping):
+                raise ProtocolDefect(
+                    code="malformed_stream_event",
+                    message="anthropic message_start event is missing the 'message' object",
+                )
+            model = message.get("model")
+            if isinstance(model, str) and model:
+                state.model = model
+            state.in_band_id = message.get("id")
+            start_usage = message.get("usage")
+            if isinstance(start_usage, Mapping):
+                state.usage_data.update(start_usage)
+            yield StreamStart()
+        elif event_type == "content_block_start":
+            index = _require_index(payload)
+            block = payload.get("content_block")
+            if not isinstance(block, Mapping):
+                raise ProtocolDefect(
+                    code="malformed_stream_event",
+                    message="anthropic content_block_start is missing the 'content_block' object",
+                )
+            block_type = block.get("type")
+            if block_type == "text":
+                state.texts_by_index[index] = []
+                state.text_order.append(index)
+            elif block_type == "tool_use":
+                call_id = block.get("id")
+                name = block.get("name")
+                if not isinstance(call_id, str) or not isinstance(name, str):
+                    raise ProtocolDefect(
+                        code="malformed_stream_event",
+                        message=(
+                            "anthropic tool_use content_block_start is missing string"
+                            " 'id'/'name' fields"
+                        ),
+                    )
+                state.tool_by_index[index] = {"id": call_id, "name": name, "json": ""}
+                yield ToolCallStart(call_id=call_id, name=name)
+            elif isinstance(block_type, str) and block_type in _THINKING_BLOCK_TYPES:
+                state.thinking_by_index[index] = {str(key): value for key, value in block.items()}
+            else:
+                raise ProtocolDefect(
+                    code="unknown_content_block",
+                    message=(f"anthropic stream carried unknown content block type {block_type!r}"),
+                )
+        elif event_type == "content_block_delta":
+            index = _require_index(payload)
+            delta = payload.get("delta")
+            if not isinstance(delta, Mapping):
+                raise ProtocolDefect(
+                    code="malformed_stream_event",
+                    message="anthropic content_block_delta is missing the 'delta' object",
+                )
+            delta_type = delta.get("type")
+            if delta_type == "text_delta":
+                text = delta.get("text")
+                if not isinstance(text, str):
+                    raise ProtocolDefect(
+                        code="malformed_stream_event",
+                        message="anthropic text_delta is missing the string 'text' field",
+                    )
+                state.texts_by_index.setdefault(index, [])
+                if index not in state.text_order:
+                    state.text_order.append(index)
+                state.texts_by_index[index].append(text)
+                if text:
+                    yield TextDelta(text=text)
+            elif delta_type == "input_json_delta":
+                tool = state.tool_by_index.get(index)
+                if tool is None:
+                    raise ProtocolDefect(
+                        code="malformed_stream_event",
+                        message="anthropic input_json_delta arrived for an unknown tool block",
+                    )
+                partial = delta.get("partial_json")
+                if not isinstance(partial, str):
+                    raise ProtocolDefect(
+                        code="malformed_stream_event",
+                        message=(
+                            "anthropic input_json_delta is missing the string 'partial_json' field"
+                        ),
+                    )
+                tool["json"] += partial
+                if partial:
+                    yield ToolCallDelta(call_id=tool["id"], arguments_delta=partial)
+            elif delta_type == "thinking_delta" or delta_type == "signature_delta":
+                block_state = state.thinking_by_index.get(index)
+                if block_state is None:
+                    raise ProtocolDefect(
+                        code="malformed_stream_event",
+                        message=(f"anthropic {delta_type} arrived for an unknown thinking block"),
+                    )
+                key = "thinking" if delta_type == "thinking_delta" else "signature"
+                fragment = delta.get(key)
+                if not isinstance(fragment, str):
+                    raise ProtocolDefect(
+                        code="malformed_stream_event",
+                        message=f"anthropic {delta_type} is missing the string {key!r} field",
+                    )
+                existing = block_state.get(key)
+                block_state[key] = (existing if isinstance(existing, str) else "") + fragment
+            else:
+                raise ProtocolDefect(
+                    code="malformed_stream_event",
+                    message=f"anthropic stream carried unknown delta type {delta_type!r}",
+                )
+        elif event_type == "content_block_stop":
+            index = _require_index(payload)
+            tool = state.tool_by_index.pop(index, None)
+            if tool is not None:
+                raw_arguments = tool["json"] or "{}"
+                try:
+                    arguments = json.loads(raw_arguments)
+                except json.JSONDecodeError:
+                    arguments = None
+                if not isinstance(arguments, dict):
+                    raise ExpectedFailureSignal(
+                        InvalidToolArguments(
+                            safe_detail=(
+                                f"anthropic tool_use arguments for tool {tool['name']!r} "
+                                f"(call {tool['id']}) did not parse as a JSON object"
+                            )
+                        )
+                    )
+                tool_call = ToolCall(id=tool["id"], name=tool["name"], arguments=arguments)
+                state.tool_calls.append(tool_call)
+                yield ToolCallDone(tool_call=tool_call)
+                continue
+            thinking = state.thinking_by_index.pop(index, None)
+            if thinking is not None:
+                state.thinking_blocks.append(thinking)
+        elif event_type == "message_delta":
+            delta = payload.get("delta")
+            if isinstance(delta, Mapping):
+                stop_reason = delta.get("stop_reason")
+                if isinstance(stop_reason, str):
+                    state.stop_reason = stop_reason
+                if "stop_details" in delta:
+                    state.stop_details = delta.get("stop_details")
+            delta_usage = payload.get("usage")
+            if isinstance(delta_usage, Mapping):
+                state.usage_data.update(delta_usage)
+                folded = _usage_presence(state.usage_data)
+                if isinstance(folded, Present):
+                    yield UsageEvent(usage=folded.value)
+        elif event_type == "message_stop":
+            state.saw_message_stop = True
+            break
+        # Unknown event types are ignored (forward-compatible per Anthropic's
+        # streaming contract; malformed payloads of KNOWN types defect above).
+
+    if not state.saw_message_stop:
+        # No terminal frame: transient interruption; the runtime rebuilds the
+        # leaf with the true partial_output flag it tracks.
+        raise TransientStreamError(ProviderStreamInterrupted(partial_output=False))
+
+    if state.model is None:
+        raise ProtocolDefect(
+            code="malformed_stream_event",
+            message="anthropic stream reached message_stop without a message_start model",
+        )
+
+    usage = _usage_presence(state.usage_data)
+    provider_request_id = _request_id(headers, state.in_band_id)
+
+    if state.stop_reason == "refusal":
+        # Streamed refusal: the four-kind stream terminal grammar has no
+        # Refused — terminate as incomplete+refused and invalidate the partial
+        # output (no ContinuationDelta for a refused stream).
+        yield TerminalEvent(
+            outcome=Incomplete(
+                meta=_meta(
+                    model=state.model,
+                    provider_request_id=provider_request_id,
+                    usage=usage,
+                    billability=_refusal_billability(usage),
+                ),
+                reason="content_filter_partial",
+                status="refused",
+                safe_detail=Present(_refusal_detail(state.stop_details)),
+            )
+        )
+        return
+
+    if state.stop_reason == "max_tokens":
+        yield TerminalEvent(
+            outcome=Incomplete(
+                meta=_meta(
+                    model=state.model,
+                    provider_request_id=provider_request_id,
+                    usage=usage,
+                    billability=PossiblyBillable(),
+                ),
+                reason="max_output_tokens",
+                status="provider_incomplete",
+                safe_detail=Absent(),
+            )
+        )
+        return
+
+    if state.stop_reason is None or state.stop_reason not in _SUCCESS_STOP_REASONS:
+        raise ProtocolDefect(
+            code="unknown_stop_reason",
+            message=f"anthropic stream carried unknown stop_reason {state.stop_reason!r}",
+        )
+
+    continuation = _continuation_presence(state.thinking_blocks, state.model)
+    match continuation:
+        case Present(value=artifact):
+            # Exactly ONE ContinuationDelta, after all contributing native
+            # items are final and before the terminal.
+            yield ContinuationDelta(artifact=artifact)
+        case Absent():
+            pass
+
+    text_blocks = ["".join(state.texts_by_index[index]) for index in state.text_order]
+    yield TerminalEvent(
+        outcome=Succeeded(
+            meta=_meta(
+                model=state.model,
+                provider_request_id=provider_request_id,
+                usage=usage,
+                billability=PossiblyBillable(),
+            ),
+            response=ResponsePayload(
+                # TextContent only (cross-codec rule); see decode_response.
+                content=TextContent(text="".join(text_blocks), tool_calls=tuple(state.tool_calls)),
+                continuation=continuation,
+            ),
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# classify_error (non-2xx only)
+
+
+def _error_body(body: bytes) -> tuple[dict[str, object] | None, str | None, str]:
+    """Best-effort parse: (json body, error.type, lower-cased error.message)."""
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, None, ""
+    if not isinstance(parsed, dict):
+        return None, None, ""
+    error = parsed.get("error")
+    if not isinstance(error, Mapping):
+        return parsed, None, ""
+    error_type = error.get("type")
+    message = error.get("message")
+    return (
+        parsed,
+        error_type if isinstance(error_type, str) else None,
+        message.lower() if isinstance(message, str) else "",
+    )
+
+
+def _retry_after_seconds(headers: Mapping[str, str]) -> Presence[float]:
+    raw = headers.get("retry-after")
+    if raw is None:
+        return Absent()
+    try:
+        return Present(float(raw))
+    except ValueError:
+        return Absent()
+
+
+def classify_error(status: int, headers: Mapping[str, str], body: bytes) -> ClassifiedError:
+    json_body, error_type, error_message = _error_body(body)
+    snippet = safe_provider_error_body_snippet(json_body, None) or sanitize_provider_text(
+        body.decode("utf-8", errors="replace")
+    )
+
+    if status == 429:
+        return ProviderRateLimit(retry_after=_retry_after_seconds(headers))
+    if status in (500, 502, 503, 504, 529) or error_type == "overloaded_error":
+        return ProviderHttpUnavailable()
+    if status == 413 or error_type == "request_too_large":
+        return ProviderContextTooLarge()
+    if error_type == "invalid_request_error" and "too long" in error_message:
+        # e.g. "prompt is too long: N tokens > limit" — the documented
+        # context-overflow shape on this provider (400, not 413).
+        return ProviderContextTooLarge()
+    if status in (401, 403):
+        raise CredentialRejected(
+            message=f"anthropic rejected the platform credential (HTTP {status}): {snippet}"
+        )
+    if (
+        status == 402
+        or "credit balance is too low" in error_message
+        or error_type == "billing_error"
+    ):
+        raise RuntimeDefect(
+            origin="provider_http",
+            code="quota_exhausted",
+            message=f"anthropic reported exhausted quota/credit (HTTP {status}): {snippet}",
+        )
+    raise RuntimeDefect(
+        origin="provider_http",
+        code="unclassified_provider_error",
+        message=f"anthropic returned an unclassified error (HTTP {status}): {snippet}",
+    )

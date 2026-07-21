@@ -1,277 +1,91 @@
-"""Usage normalization and deterministic catalog cost estimates."""
+"""Terminal costing from frozen plan accounting.
+
+`cost_from_accounting` computes the advisory cost breakdown for a terminal
+call from the plan's frozen `Accounting` rates and the codec-normalized
+`TokenUsage`. It deliberately imports nothing from the catalog (negative
+gate): the planner froze the rates at plan time so terminal costing never
+re-reads `PricingContract`.
+
+Conventions:
+- All amounts are integer USD micros; rates are USD micros per million tokens.
+- A component the provider did not report is 0-cost — plain zeros, not owned
+  absence: an unreported component is honestly "nothing billed on this line".
+- Billable input subtracts cache read/write tokens (each only when Present)
+  from `input_tokens`, floored at 0 — cache traffic is billed on its own lines
+  at the cache rates.
+- The reasoning line exists only when the plan froze
+  `reasoning_billed_outside_output=True` and the provider reported reasoning
+  tokens; it is billed at the OUTPUT rate (providers billing reasoning outside
+  the output limit price it as output; no separate reasoning rate exists in
+  `Accounting`). Providers billing reasoning inside output already include it
+  in `output_tokens`, so the line stays 0 to avoid double counting.
+- Each line is rounded to micros with `Decimal` `ROUND_HALF_UP`; the total is
+  the sum of the rounded lines.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Literal
+from typing import assert_never
 
-from provider_runtime.catalog import Pricing, ReasoningBillingMode
-from provider_runtime.types import PromptCacheTTL, TokenUsage
+from provider_runtime.types import Absent, Accounting, Presence, Present, TokenUsage
 
-CostPolicy = Literal["catalog_pricing"]
-CostStatus = Literal["estimated", "missing_pricing", "missing_usage", "not_token_priced"]
+_MILLION = Decimal(1_000_000)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CostBreakdown:
-    input_cost_usd_micros: int | None
-    output_cost_usd_micros: int | None
-    cache_write_cost_usd_micros: int | None
-    cache_read_cost_usd_micros: int | None
-    reasoning_cost_usd_micros: int | None
-    total_cost_usd_micros: int | None
+    input_cost_usd_micros: int
+    output_cost_usd_micros: int
+    cache_write_cost_usd_micros: int
+    cache_read_cost_usd_micros: int
+    reasoning_cost_usd_micros: int
+    total_cost_usd_micros: int
 
 
-@dataclass(frozen=True)
-class CostEstimate:
-    policy: CostPolicy
-    status: CostStatus
-    pricing_source: str
-    pricing: Pricing
-    breakdown: CostBreakdown
+def _tokens(maybe: Presence[int]) -> int:
+    match maybe:
+        case Present(value=value):
+            return value
+        case Absent():
+            return 0
+        case _:
+            assert_never(maybe)
 
 
-DEFAULT_PRICING_SOURCE = "provider_runtime.catalog.DEFAULT_CATALOG"
+def _line_usd_micros(tokens: int, rate_usd_micros_per_million: int) -> int:
+    if tokens == 0:
+        return 0
+    exact = Decimal(tokens) * Decimal(rate_usd_micros_per_million) / _MILLION
+    return int(exact.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
-def estimate_catalog_cost(
-    usage: TokenUsage | None,
-    pricing: Pricing,
-    *,
-    cache_write_ttl: PromptCacheTTL | None = None,
-    pricing_source: str = DEFAULT_PRICING_SOURCE,
-) -> CostEstimate:
-    """Return the shared advisory cost policy for a catalog-priced call."""
-    if (
-        usage is None
-        or pricing.unit != "per_million_tokens"
-        or not _pricing_has_provenance(pricing)
-    ):
-        breakdown = CostBreakdown(
-            input_cost_usd_micros=None,
-            output_cost_usd_micros=None,
-            cache_write_cost_usd_micros=None,
-            cache_read_cost_usd_micros=None,
-            reasoning_cost_usd_micros=None,
-            total_cost_usd_micros=None,
-        )
-        return CostEstimate(
-            policy="catalog_pricing",
-            status=_cost_status(usage, pricing, breakdown, cache_write_ttl=cache_write_ttl),
-            pricing_source=pricing_source,
-            pricing=pricing,
-            breakdown=breakdown,
-        )
+def cost_from_accounting(accounting: Accounting, usage: TokenUsage) -> CostBreakdown:
+    cache_read_tokens = _tokens(usage.cache_read_input_tokens)
+    cache_write_tokens = _tokens(usage.cache_write_input_tokens)
+    billable_input_tokens = max(0, usage.input_tokens - cache_read_tokens - cache_write_tokens)
 
-    breakdown = estimate_cost(usage, pricing, cache_write_ttl=cache_write_ttl)
-    status = _cost_status(usage, pricing, breakdown, cache_write_ttl=cache_write_ttl)
-    return CostEstimate(
-        policy="catalog_pricing",
-        status=status,
-        pricing_source=pricing_source,
-        pricing=pricing,
-        breakdown=breakdown,
+    input_cost = _line_usd_micros(billable_input_tokens, accounting.input_rate)
+    output_cost = _line_usd_micros(usage.output_tokens, accounting.output_rate)
+    cache_write_cost = _line_usd_micros(cache_write_tokens, accounting.cache_write_rate)
+    cache_read_cost = _line_usd_micros(cache_read_tokens, accounting.cache_read_rate)
+    reasoning_cost = (
+        _line_usd_micros(_tokens(usage.reasoning_tokens), accounting.output_rate)
+        if accounting.reasoning_billed_outside_output
+        else 0
     )
 
-
-def estimate_cost(
-    usage: TokenUsage | None,
-    pricing: Pricing,
-    *,
-    cache_write_ttl: PromptCacheTTL | None = None,
-) -> CostBreakdown:
-    """Return advisory cost from normalized usage and catalog pricing.
-
-    Missing token counts or missing prices yield ``None`` for that component
-    and for the total. Returned values are integer USD micros.
-    """
-    if (
-        usage is None
-        or pricing.unit != "per_million_tokens"
-        or not _pricing_applies_to_usage(usage, pricing)
-    ):
-        return CostBreakdown(
-            input_cost_usd_micros=None,
-            output_cost_usd_micros=None,
-            cache_write_cost_usd_micros=None,
-            cache_read_cost_usd_micros=None,
-            reasoning_cost_usd_micros=None,
-            total_cost_usd_micros=None,
-        )
-
-    cache_read_tokens = _first_present(usage.cached_tokens, usage.cache_read_input_tokens)
-    cache_write_tokens = usage.cache_creation_input_tokens
-    billable_input_tokens = usage.input_tokens
-    if billable_input_tokens is not None:
-        billable_input_tokens = max(
-            0, billable_input_tokens - (cache_read_tokens or 0) - (cache_write_tokens or 0)
-        )
-
-    input_cost = _component_cost_usd_micros(billable_input_tokens, pricing.input_per_million)
-    output_cost = _component_cost_usd_micros(usage.output_tokens, pricing.output_per_million)
-    cache_write_cost = _component_cost_usd_micros(
-        cache_write_tokens,
-        _cache_write_price(pricing, cache_write_ttl),
-    )
-    cache_read_cost = _component_cost_usd_micros(
-        cache_read_tokens, pricing.cached_input_per_million
-    )
-    reasoning_cost = _reasoning_cost_usd_micros(
-        usage.reasoning_tokens,
-        pricing.reasoning_per_million,
-        pricing.reasoning_billing_mode,
-    )
-
-    components = [
-        component
-        for component in (
-            input_cost,
-            output_cost,
-            cache_write_cost,
-            cache_read_cost,
-            reasoning_cost,
-        )
-        if component is not None
-    ]
-    total_cost = (
-        sum(components)
-        if components and not _has_missing_pricing(usage, pricing, cache_write_ttl=cache_write_ttl)
-        else None
-    )
     return CostBreakdown(
         input_cost_usd_micros=input_cost,
         output_cost_usd_micros=output_cost,
         cache_write_cost_usd_micros=cache_write_cost,
         cache_read_cost_usd_micros=cache_read_cost,
         reasoning_cost_usd_micros=reasoning_cost,
-        total_cost_usd_micros=total_cost,
+        total_cost_usd_micros=(
+            input_cost + output_cost + cache_write_cost + cache_read_cost + reasoning_cost
+        ),
     )
 
 
-def _cost_status(
-    usage: TokenUsage | None,
-    pricing: Pricing,
-    breakdown: CostBreakdown,
-    *,
-    cache_write_ttl: PromptCacheTTL | None,
-) -> CostStatus:
-    if pricing.unit != "per_million_tokens":
-        return "not_token_priced"
-    if usage is None or not _has_any_usage_tokens(usage):
-        return "missing_usage"
-    if not _pricing_has_provenance(pricing):
-        return "missing_pricing"
-    if not _pricing_applies_to_usage(usage, pricing):
-        return "missing_pricing"
-    if _has_missing_pricing(usage, pricing, cache_write_ttl=cache_write_ttl):
-        return "missing_pricing"
-    return "estimated" if breakdown.total_cost_usd_micros is not None else "missing_pricing"
-
-
-def _pricing_has_provenance(pricing: Pricing) -> bool:
-    return bool(pricing.source_url and pricing.verified_at)
-
-
-def _has_any_usage_tokens(usage: TokenUsage) -> bool:
-    return any(
-        value is not None
-        for value in (
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.reasoning_tokens,
-            usage.cache_creation_input_tokens,
-            usage.cache_read_input_tokens,
-            usage.cached_tokens,
-        )
-    )
-
-
-def _pricing_applies_to_usage(usage: TokenUsage, pricing: Pricing) -> bool:
-    if pricing.applies_up_to_input_tokens is None or usage.input_tokens is None:
-        return True
-    return usage.input_tokens <= pricing.applies_up_to_input_tokens
-
-
-def _has_missing_pricing(
-    usage: TokenUsage,
-    pricing: Pricing,
-    *,
-    cache_write_ttl: PromptCacheTTL | None,
-) -> bool:
-    cache_read_tokens = _first_present(usage.cached_tokens, usage.cache_read_input_tokens)
-    cache_write_tokens = usage.cache_creation_input_tokens
-    billable_input_tokens = usage.input_tokens
-    if billable_input_tokens is not None:
-        billable_input_tokens = max(
-            0, billable_input_tokens - (cache_read_tokens or 0) - (cache_write_tokens or 0)
-        )
-    return any(
-        (
-            _needs_price(billable_input_tokens, pricing.input_per_million),
-            _needs_price(usage.output_tokens, pricing.output_per_million),
-            _needs_price(cache_read_tokens, pricing.cached_input_per_million),
-            _needs_price(cache_write_tokens, _cache_write_price(pricing, cache_write_ttl)),
-            _reasoning_needs_price(
-                usage.reasoning_tokens,
-                pricing.reasoning_per_million,
-                pricing.reasoning_billing_mode,
-            ),
-        )
-    )
-
-
-def _needs_price(tokens: int | None, price_per_million: object | None) -> bool:
-    return tokens is not None and tokens > 0 and price_per_million is None
-
-
-def _reasoning_needs_price(
-    tokens: int | None,
-    price_per_million: object | None,
-    billing_mode: ReasoningBillingMode,
-) -> bool:
-    if tokens is None or tokens <= 0:
-        return False
-    if billing_mode == "separate":
-        return price_per_million is None
-    return billing_mode == "unknown"
-
-
-def _component_cost_usd_micros(tokens: int | None, price_per_million: object | None) -> int | None:
-    if tokens is None:
-        return None
-    if tokens == 0:
-        return 0
-    if price_per_million is None:
-        return None
-    return int(
-        (Decimal(tokens) * Decimal(str(price_per_million))).quantize(
-            Decimal("1"), rounding=ROUND_HALF_UP
-        )
-    )
-
-
-def _reasoning_cost_usd_micros(
-    tokens: int | None,
-    price_per_million: object | None,
-    billing_mode: ReasoningBillingMode,
-) -> int | None:
-    if billing_mode != "separate":
-        return None
-    return _component_cost_usd_micros(tokens, price_per_million)
-
-
-def _cache_write_price(
-    pricing: Pricing,
-    cache_write_ttl: PromptCacheTTL | None,
-) -> object | None:
-    if cache_write_ttl is None:
-        return None
-    return pricing.cache_write_per_million_by_ttl.get(cache_write_ttl)
-
-
-def _first_present(*values: int | None) -> int | None:
-    for value in values:
-        if value is not None:
-            return value
-    return None
+__all__ = ["CostBreakdown", "cost_from_accounting"]

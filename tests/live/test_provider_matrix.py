@@ -1,101 +1,175 @@
-"""Live provider-runtime acceptance matrix.
+"""Live provider certification matrix (spec §14 paid tier; §8 operator evidence).
 
-These tests intentionally fail closed. They are excluded from the default test
-suite and run only when selected with ``-m live_provider`` plus
-``LLM_RUNTIME_LIVE=1``.
+Fail-closed paid acceptance tests over the real providers. Excluded from the
+default suite (``addopts`` deselects ``live_provider``); run with:
+
+    LLM_RUNTIME_LIVE=1 uv run pytest -m live_provider tests/live/test_provider_matrix.py
+
+Environment contract (preserved from the pre-cutover matrix):
+
+- ``LLM_RUNTIME_LIVE=1`` is required — anything else fails, never skips;
+- ``LLM_RUNTIME_LIVE_PROVIDERS`` optionally narrows to a comma-separated subset
+  of ``openai,anthropic,gemini,moonshot,openrouter`` (release certification runs
+  unfiltered);
+- required keys per provider: ``OPENAI_API_KEY``, ``ANTHROPIC_API_KEY``,
+  ``GEMINI_API_KEY``, ``MOONSHOT_API_KEY``, ``OPENROUTER_API_KEY``.
+
+Per direct chat target the matrix proves: every declared reasoning level, an
+above-minimum-prefix cache warm/read pair with a reported cache read, strict
+JSON with a required-nullable field, a streamed tool call + same-target
+continuation replay, invalid-key classification, request-id/usage presence per
+contract facts, and the §9 input-bound obligation
+(``planned_input_token_upper_bound`` >= provider-billed input) on every call.
+
+The OpenRouter operator route is OperatorUncertified in CATALOG, so the planner
+refuses it by design. ``test_openrouter_certification`` is THE CERTIFIER: it
+plans through a hand-built OperatorCertified copy of the catalog row (pinned to
+``moonshotai/int4``), proves routed Kimi ``low|high|max`` (spec §4 recheck, both
+arms: direct levels are covered by the matrix above), the pinned upstream, and a
+NON-ZERO billed cache read, then writes the §8 evidence artifact
+(endpoint-metadata snapshot, probe generation ids, observed cache usage) to
+``tests/live/evidence/openrouter-<date>.json`` and prints the
+``evidence_revision`` to pin in the catalog row.
 """
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
+import hashlib
 import io
+import json
 import os
+import uuid
 import wave
-from dataclasses import dataclass
-from typing import Literal, cast
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
 
 from provider_runtime import (
+    CATALOG,
+    CATALOG_REVISION,
+    Absent,
+    AssistantMessage,
+    CallOutcome,
+    CanonicalTool,
+    ChatModelContract,
+    ContinuationArtifact,
+    ContinuationDelta,
+    CredentialRejected,
+    Dynamic,
     EmbeddingCall,
-    ModelCall,
-    ModelMessage,
-    ModelRef,
-    ModelRuntime,
-    ProviderApiKey,
-    ReasoningConfig,
-    RetryPolicy,
-    StructuredOutputSpec,
-    ToolResult,
-    ToolSpec,
+    FinalizedProviderCall,
+    GenerateIntent,
+    GlobalScope,
+    Incomplete,
+    OpenRouterCertifiedPrefix,
+    OperatorCertified,
+    Present,
+    PromptBlock,
+    ProviderCredential,
+    ProviderName,
+    ProviderRuntime,
+    ReasoningLevel,
+    Stable,
+    StrictJsonOutput,
+    StructuredContent,
+    Succeeded,
+    SystemMessage,
+    TerminalEvent,
+    TextContent,
+    TextDelta,
+    TextOutput,
+    TokenUsage,
+    ToolCall,
+    ToolCallDone,
+    ToolResultMessage,
     TranscriptionCall,
+    UserMessage,
+    parse_canonical_schema,
+    plan_generate,
 )
-from provider_runtime.catalog import DEFAULT_CATALOG, ModelCapability
-from provider_runtime.errors import ModelCallError, ModelCallErrorCode
-from provider_runtime.types import ProviderName, ReasoningEffort
+from provider_runtime.catalog import (
+    AnthropicPrefixContract,
+    AutomaticPrefixContract,
+    Catalog,
+    OpenAIExplicitPrefixContract,
+    OpenRouterPrefixContract,
+)
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.live_provider]
+pytestmark = pytest.mark.live_provider
 
 _PROVIDER_ORDER: tuple[ProviderName, ...] = (
     "openai",
     "anthropic",
     "gemini",
+    "moonshot",
     "openrouter",
-    "cloudflare",
 )
-_PROVIDER_ENV: dict[ProviderName, tuple[str, ...]] = {
-    "openai": ("OPENAI_API_KEY",),
-    "anthropic": ("ANTHROPIC_API_KEY",),
-    "gemini": ("GEMINI_API_KEY",),
-    "openrouter": ("OPENROUTER_API_KEY",),
-    "cloudflare": ("CLOUDFLARE_AI_API_TOKEN", "CLOUDFLARE_AI_ACCOUNT_ID"),
+_PROVIDER_ENV: dict[ProviderName, str] = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "moonshot": "MOONSHOT_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
 }
-_REASONING_ORDER: tuple[ReasoningEffort, ...] = (
-    "max",
-    "high",
-    "medium",
-    "low",
-    "minimal",
-    "none",
-    "default",
+
+_OPENROUTER_ROW: ChatModelContract = next(
+    row for row in CATALOG.chat if row.protocol == "openrouter_chat"
 )
-_ANTHROPIC_ADAPTIVE_THINKING_MODELS = frozenset(("claude-opus-4-8", "claude-sonnet-4-6"))
-_ToolChoice = Literal["auto", "none", "required"]
+_DIRECT_ROWS: tuple[ChatModelContract, ...] = tuple(
+    row for row in CATALOG.chat if row.protocol != "openrouter_chat"
+)
+
+# The certifier plans through an OperatorCertified copy of the catalog row; the
+# artifact this run writes mints the real evidence_revision for the catalog. The
+# certified pin facts must match the row's cache contract or catalog construction
+# rejects the copy.
+assert isinstance(_OPENROUTER_ROW.cache, OpenRouterPrefixContract)
+_CERTIFYING_OPENROUTER_ROW: ChatModelContract = dataclasses.replace(
+    _OPENROUTER_ROW,
+    certification=OperatorCertified(
+        certified_pinned_upstream=_OPENROUTER_ROW.cache.pinned_upstream,
+        certified_canonical_revision=_OPENROUTER_ROW.cache.canonical_revision,
+        evidence_revision="certification-in-progress",
+    ),
+)
+
+_EVIDENCE_DIR = Path(__file__).parent / "evidence"
+_OPENROUTER_ENDPOINTS_URL = (
+    f"https://openrouter.ai/api/v1/models/{_OPENROUTER_ROW.target.model}/endpoints"
+)
 
 
-@dataclass(frozen=True)
+def _row_id(row: ChatModelContract) -> str:
+    return f"{row.target.provider}:{row.target.model}"
+
+
+# ---------------------------------------------------------------------------
+# Environment gate (fail closed, never skip-success)
+
+
+@dataclasses.dataclass(frozen=True)
 class LiveEnv:
     selected_providers: frozenset[ProviderName]
 
-    def key_for(self, provider: ProviderName) -> ProviderApiKey:
+    def credential_for(self, provider: ProviderName) -> ProviderCredential:
         if provider not in self.selected_providers:
             pytest.skip(f"{provider} not selected by LLM_RUNTIME_LIVE_PROVIDERS")
-        missing = [name for name in _PROVIDER_ENV[provider] if not os.environ.get(name)]
-        if missing:
-            pytest.fail(f"{provider} live-provider matrix requires env vars: {', '.join(missing)}")
-        return ProviderApiKey(os.environ[_PROVIDER_ENV[provider][0]], source="platform")
-
-
-@dataclass(frozen=True)
-class ProviderCase:
-    provider: ProviderName
-    capability: ModelCapability
-
-    @property
-    def model(self) -> str:
-        return self.capability.model
-
-
-@dataclass(frozen=True)
-class ReasoningCase:
-    provider_case: ProviderCase
-    effort: ReasoningEffort
+        env_name = _PROVIDER_ENV[provider]
+        key = os.environ.get(env_name)
+        if not key:
+            pytest.fail(f"{provider} live matrix requires env var {env_name}")
+        return ProviderCredential(provider=provider, key=key)
 
 
 @pytest.fixture(scope="session")
 def live_env() -> LiveEnv:
     if os.environ.get("LLM_RUNTIME_LIVE") != "1":
-        pytest.fail("Set LLM_RUNTIME_LIVE=1 to run the live provider-runtime matrix")
+        pytest.fail("Set LLM_RUNTIME_LIVE=1 to run the live provider matrix")
     return LiveEnv(selected_providers=_selected_providers())
 
 
@@ -103,10 +177,8 @@ def _selected_providers() -> frozenset[ProviderName]:
     raw = os.environ.get("LLM_RUNTIME_LIVE_PROVIDERS")
     if not raw:
         return frozenset(_PROVIDER_ORDER)
-
     requested = {name.strip().lower() for name in raw.split(",") if name.strip()}
-    known = set(_PROVIDER_ORDER)
-    unknown = requested - known
+    unknown = requested - set(_PROVIDER_ORDER)
     if unknown:
         pytest.fail(
             "Unknown LLM_RUNTIME_LIVE_PROVIDERS value(s): "
@@ -115,182 +187,581 @@ def _selected_providers() -> frozenset[ProviderName]:
     return frozenset(cast(ProviderName, name) for name in requested)
 
 
-def _provider_cases() -> tuple[ProviderCase, ...]:
-    return tuple(
-        ProviderCase(provider=provider, capability=_representative_capability(provider))
-        for provider in _PROVIDER_ORDER
-    )
+# ---------------------------------------------------------------------------
+# Intent/plan/call helpers
 
 
-def _generation_cases() -> tuple[ProviderCase, ...]:
-    return tuple(
-        ProviderCase(provider=entry.provider, capability=entry)
-        for entry in DEFAULT_CATALOG.entries
-        if entry.generation
-    )
+def _catalog_for(row: ChatModelContract) -> Catalog:
+    if row.protocol == "openrouter_chat":
+        return Catalog(chat=(row,), embeddings=(), transcriptions=())
+    return CATALOG
 
 
-def _reasoning_cases() -> tuple[ReasoningCase, ...]:
-    return tuple(
-        ReasoningCase(ProviderCase(provider=entry.provider, capability=entry), effort)
-        for entry in DEFAULT_CATALOG.entries
-        if entry.generation
-        for effort in entry.reasoning_modes
-        if effort != "default"
-    )
+def _plan(row: ChatModelContract, intent: GenerateIntent) -> FinalizedProviderCall:
+    plan = plan_generate(intent, _catalog_for(row))
+    assert isinstance(plan, FinalizedProviderCall), f"{_row_id(row)}: planner rejected {plan}"
+    return plan
 
 
-def _embedding_cases() -> tuple[ProviderCase, ...]:
-    return tuple(
-        ProviderCase(provider=entry.provider, capability=entry)
-        for entry in DEFAULT_CATALOG.entries
-        if entry.embeddings
-    )
+_TEXT_OUTPUT = TextOutput()
 
 
-def _transcription_cases() -> tuple[ProviderCase, ...]:
-    return tuple(
-        ProviderCase(provider=entry.provider, capability=entry)
-        for entry in DEFAULT_CATALOG.entries
-        if entry.transcription
-    )
-
-
-def _representative_capability(provider: ProviderName) -> ModelCapability:
-    key_probe_model = DEFAULT_CATALOG.key_probe_model(provider)
-    entries = [
-        entry
-        for entry in DEFAULT_CATALOG.entries
-        if entry.provider == provider and entry.generation
-    ]
-    if key_probe_model:
-        for entry in entries:
-            if entry.model == key_probe_model:
-                return entry
-    if entries:
-        return entries[0]
-    raise AssertionError(f"No generation model configured for live provider {provider}")
-
-
-def _reasoning_capability(provider: ProviderName) -> ModelCapability:
-    entries = [
-        entry
-        for entry in DEFAULT_CATALOG.entries
-        if entry.provider == provider and entry.generation
-    ]
-    if provider == "anthropic":
-        for entry in entries:
-            if entry.model in _ANTHROPIC_ADAPTIVE_THINKING_MODELS:
-                return entry
-    return _representative_capability(provider)
-
-
-def _runtime(http: httpx.AsyncClient) -> ModelRuntime:
-    return ModelRuntime(
-        http,
-        cloudflare_account_id=os.environ.get("CLOUDFLARE_AI_ACCOUNT_ID"),
-    )
-
-
-def _call(
-    case: ProviderCase,
-    messages: list[ModelMessage],
+def _intent(
+    row: ChatModelContract,
     *,
-    max_output_tokens: int = 96,
-    reasoning: ReasoningEffort = "none",
-    retry: RetryPolicy | None = None,
-    structured_output: StructuredOutputSpec | None = None,
-    tools: tuple[ToolSpec, ...] = (),
-    tool_choice: _ToolChoice = "auto",
-) -> ModelCall:
-    return ModelCall(
-        model=ModelRef(provider=case.provider, model=case.model),
-        messages=messages,
-        max_output_tokens=max_output_tokens,
-        reasoning=ReasoningConfig(effort=reasoning),
-        retry=retry or RetryPolicy(max_attempts=1, initial_delay_s=0),
-        structured_output=structured_output,
-        tools=tools,
-        tool_choice=tool_choice,
-    )
-
-
-def _text_call(
-    case: ProviderCase,
     prompt: str,
-    *,
-    max_output_tokens: int = 96,
-    reasoning: ReasoningEffort = "none",
-    retry: RetryPolicy | None = None,
-) -> ModelCall:
-    return _call(
-        case,
-        [ModelMessage(role="user", content=prompt)],
+    stable_prefix: str,
+    max_output_tokens: int,
+    reasoning: ReasoningLevel,
+    tools: tuple[CanonicalTool, ...] = (),
+    output: TextOutput | StrictJsonOutput = _TEXT_OUTPUT,
+    history: tuple[AssistantMessage | ToolResultMessage, ...] = (),
+) -> GenerateIntent:
+    return GenerateIntent(
+        target=row.target,
+        messages=(
+            SystemMessage(
+                blocks=(PromptBlock(text=stable_prefix, stability=Stable(GlobalScope())),)
+            ),
+            UserMessage(blocks=(PromptBlock(text=prompt, stability=Dynamic()),)),
+            *history,
+        ),
         max_output_tokens=max_output_tokens,
         reasoning=reasoning,
-        retry=retry,
+        tools=tools,
+        tool_choice="auto" if tools else "none",
+        output=output,
     )
 
 
-def _highest_reasoning_effort(capability: ModelCapability) -> ReasoningEffort:
-    for effort in _REASONING_ORDER:
-        if effort in capability.reasoning_modes:
-            return effort
-    raise AssertionError(
-        f"No reasoning mode configured for {capability.provider}/{capability.model}"
+async def _generate(
+    row: ChatModelContract, intent: GenerateIntent, credential: ProviderCredential
+) -> tuple[FinalizedProviderCall, CallOutcome]:
+    call = _plan(row, intent)
+    async with httpx.AsyncClient() as http:
+        outcome = await ProviderRuntime(http).generate(call, credential=credential)
+    return call, outcome
+
+
+_SHORT_STABLE_PREFIX = (
+    "You are the Nexus live-certification assistant. Answer briefly and factually."
+)
+
+
+def _cheapest_level(row: ChatModelContract) -> ReasoningLevel:
+    return row.reasoning.levels[0]
+
+
+def _reasoning_budget(row: ChatModelContract, level: ReasoningLevel) -> int:
+    # Reasoning/thinking tokens bill inside the output budget on every current
+    # provider, so budgets scale with effort; Incomplete(max_output_tokens) is
+    # still an accepted terminal for level probes.
+    if row.target.provider == "gemini":
+        return {"minimal": 1024, "low": 2048, "medium": 8448, "high": 16512}[level]
+    return {
+        "none": 256,
+        "minimal": 512,
+        "low": 1024,
+        "medium": 2048,
+        "high": 4096,
+        "xhigh": 8192,
+        "max": 8192,
+    }[level]
+
+
+# ---------------------------------------------------------------------------
+# Assertions shared across the matrix
+
+
+def _accepted(row: ChatModelContract, outcome: CallOutcome) -> Succeeded | Incomplete:
+    assert isinstance(outcome, Succeeded | Incomplete), f"{_row_id(row)}: {outcome}"
+    if isinstance(outcome, Incomplete):
+        assert outcome.status == "provider_incomplete", f"{_row_id(row)}: {outcome}"
+        assert outcome.reason == "max_output_tokens", f"{_row_id(row)}: {outcome}"
+    return outcome
+
+
+def _usage_of(row: ChatModelContract, outcome: CallOutcome) -> TokenUsage:
+    usage = outcome.meta.usage
+    assert isinstance(usage, Present), f"{_row_id(row)}: no usage reported"
+    return usage.value
+
+
+def _count(maybe: Present[int] | Absent) -> int:
+    return maybe.value if isinstance(maybe, Present) else 0
+
+
+def _assert_input_bound(
+    row: ChatModelContract, call: FinalizedProviderCall, usage: TokenUsage
+) -> None:
+    # §9 certification obligation: the bytes-as-tokens planner bound dominates
+    # billed input. Anthropic input_tokens excludes cache components; the other
+    # providers report cache reads as a subset of input_tokens.
+    billed_input = usage.input_tokens
+    if row.target.provider == "anthropic":
+        billed_input += _count(usage.cache_read_input_tokens) + _count(
+            usage.cache_write_input_tokens
+        )
+    assert call.planned_input_token_upper_bound >= billed_input, (
+        f"{_row_id(row)}: planned bound {call.planned_input_token_upper_bound} "
+        f"< billed input {billed_input}"
     )
 
 
-def _baseline_reasoning(capability: ModelCapability) -> ReasoningEffort:
-    return "none" if "none" in capability.reasoning_modes else "default"
+def _assert_correlation_facts(row: ChatModelContract, outcome: CallOutcome) -> None:
+    meta = outcome.meta
+    assert meta.provider == row.target.provider
+    if row.provider_request_id_available:
+        assert isinstance(meta.provider_request_id, Present), (
+            f"{_row_id(row)}: contract declares a provider request id; got Absent"
+        )
+    else:
+        # Gemini: no request correlation — the catalog records that fact.
+        assert isinstance(meta.provider_request_id, Absent), (
+            f"{_row_id(row)}: contract declares NO provider request id; got Present"
+        )
 
 
-def _default_send_max_output(case: ProviderCase) -> int:
-    if case.provider == "gemini":
-        return 512
-    if case.provider == "cloudflare":
-        return 160
-    return 96
+def _assert_call_facts(
+    row: ChatModelContract, call: FinalizedProviderCall, outcome: CallOutcome
+) -> TokenUsage:
+    usage = _usage_of(row, outcome)
+    _assert_input_bound(row, call, usage)
+    _assert_correlation_facts(row, outcome)
+    return usage
 
 
-def _reasoning_send_max_output(case: ProviderCase, effort: ReasoningEffort) -> int:
-    if case.provider != "gemini":
-        return 160
-    if case.model == "gemini-2.5-pro":
-        return {
-            "minimal": 256,
-            "low": 1408,
-            "medium": 8448,
-            "high": 16512,
-            "max": 32896,
-        }.get(effort, 512)
-    if case.model == "gemini-2.5-flash":
-        return {
-            "none": 160,
-            "minimal": 768,
-            "low": 1408,
-            "medium": 8448,
-            "high": 16512,
-            "max": 24896,
-        }.get(effort, 512)
-    return 1024
+# ---------------------------------------------------------------------------
+# 1. Per-target minimal generate per declared reasoning level
 
 
-def _streaming_max_output(case: ProviderCase) -> int:
-    return 256 if case.provider == "gemini" else 64
+@pytest.mark.parametrize(
+    ("row", "level"),
+    [
+        pytest.param(row, level, id=f"{_row_id(row)}:{level}")
+        for row in _DIRECT_ROWS
+        for level in row.reasoning.levels
+    ],
+)
+async def test_live_declared_reasoning_level(
+    live_env: LiveEnv, row: ChatModelContract, level: ReasoningLevel
+) -> None:
+    credential = live_env.credential_for(row.target.provider)
+    call, outcome = await _generate(
+        row,
+        _intent(
+            row,
+            prompt="Answer in one short sentence: what is two plus two?",
+            stable_prefix=_SHORT_STABLE_PREFIX,
+            max_output_tokens=_reasoning_budget(row, level),
+            reasoning=level,
+        ),
+        credential,
+    )
+    terminal = _accepted(row, outcome)
+    _assert_call_facts(row, call, terminal)
+    assert call.native_reasoning == row.reasoning.native_mapping[level]
+    if isinstance(terminal, Succeeded):
+        content = terminal.response.content
+        assert isinstance(content, TextContent) and content.text.strip()
 
 
-def _structured_max_output(case: ProviderCase) -> int:
-    return 512 if case.provider == "gemini" else 96
+# ---------------------------------------------------------------------------
+# 2. Above-minimum-prefix cache warm/read pair
 
 
-def _assert_text_response(case: ProviderCase, text: str) -> None:
-    assert text.strip(), f"{case.provider}/{case.model} returned empty text"
+def _minimum_prefix_tokens(row: ChatModelContract) -> int:
+    match row.cache:
+        case OpenAIExplicitPrefixContract(minimum_prefix_tokens=minimum):
+            return minimum
+        case AnthropicPrefixContract(minimum_prefix_tokens=minimum):
+            return minimum
+        case AutomaticPrefixContract(minimum_prefix_tokens=Present(value=minimum)):
+            return minimum
+        case AutomaticPrefixContract() | OpenRouterPrefixContract():
+            # Moonshot direct/routed: no documented minimum — probe well above
+            # every known threshold.
+            return 4096
+    raise AssertionError(f"unhandled cache contract for {_row_id(row)}")
 
 
-def _assert_usage_if_claimed(case: ProviderCase, usage: object | None) -> None:
-    if case.capability.usage_input_output_tokens:
-        assert usage is not None, f"{case.provider}/{case.model} did not return usage"
+def _cache_probe_prefix(row: ChatModelContract) -> str:
+    # Fresh nonce per run: call one writes the cache, call two must read it.
+    # ~12 tokens per sentence; target 2x the contract minimum for headroom.
+    nonce = uuid.uuid4().hex
+    sentences = max(1, (_minimum_prefix_tokens(row) * 2) // 12)
+    body = " ".join(
+        f"Cache certification segment {index} of nonce {nonce}: the archive catalogs "
+        "resonance across ingested sources and preserves provenance for every claim."
+        for index in range(sentences)
+    )
+    return f"{_SHORT_STABLE_PREFIX}\n{body}"
+
+
+async def _cache_warm_read_pair(
+    row: ChatModelContract, credential: ProviderCredential
+) -> tuple[
+    tuple[FinalizedProviderCall, CallOutcome],
+    tuple[FinalizedProviderCall, CallOutcome],
+    TokenUsage,
+]:
+    prefix = _cache_probe_prefix(row)
+    level = _cheapest_level(row)
+
+    def probe_intent(prompt: str) -> GenerateIntent:
+        return _intent(
+            row,
+            prompt=prompt,
+            stable_prefix=prefix,
+            max_output_tokens=_reasoning_budget(row, level),
+            reasoning=level,
+        )
+
+    warm = await _generate(row, probe_intent("Reply with the single word: warm."), credential)
+    _accepted(row, warm[1])
+    warm_usage = _assert_call_facts(row, warm[0], warm[1])
+    assert warm[0].request_fingerprint != ""
+    await asyncio.sleep(3)
+    read = await _generate(row, probe_intent("Reply with the single word: read."), credential)
+    _accepted(row, read[1])
+    read_usage = _assert_call_facts(row, read[0], read[1])
+    assert _count(read_usage.cache_read_input_tokens) > 0, (
+        f"{_row_id(row)}: no cache read reported on the second above-minimum-prefix call "
+        f"(warm usage: {warm_usage}, read usage: {read_usage})"
+    )
+    return warm, read, read_usage
+
+
+@pytest.mark.parametrize("row", _DIRECT_ROWS, ids=_row_id)
+async def test_live_cache_warm_read_pair(live_env: LiveEnv, row: ChatModelContract) -> None:
+    credential = live_env.credential_for(row.target.provider)
+    await _cache_warm_read_pair(row, credential)
+
+
+# ---------------------------------------------------------------------------
+# 3. Strict JSON (canonical subset incl. a required-nullable field)
+
+
+_STRICT_SCHEMA = parse_canonical_schema(
+    {
+        "type": "object",
+        "properties": {
+            "ok": {"type": "boolean"},
+            "summary": {"type": "string", "description": "Two-word answer summary."},
+            "note": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "description": "Optional remark; null when there is nothing to add.",
+            },
+        },
+        "required": ["ok", "summary", "note"],
+        "additionalProperties": False,
+    }
+)
+
+
+@pytest.mark.parametrize("row", _DIRECT_ROWS, ids=_row_id)
+async def test_live_strict_json_output(live_env: LiveEnv, row: ChatModelContract) -> None:
+    credential = live_env.credential_for(row.target.provider)
+    level = _cheapest_level(row)
+    call, outcome = await _generate(
+        row,
+        _intent(
+            row,
+            prompt="Return ok=true, a two-word summary, and note=null.",
+            stable_prefix=_SHORT_STABLE_PREFIX,
+            max_output_tokens=max(_reasoning_budget(row, level), 2048),
+            reasoning=level,
+            output=StrictJsonOutput(name="live_matrix_result", schema=_STRICT_SCHEMA),
+        ),
+        credential,
+    )
+    assert isinstance(outcome, Succeeded), f"{_row_id(row)}: {outcome}"
+    _assert_call_facts(row, call, outcome)
+    content = outcome.response.content
+    assert isinstance(content, StructuredContent), f"{_row_id(row)}: {content}"
+    assert content.payload.get("ok") is True
+    assert isinstance(content.payload.get("summary"), str)
+    assert "note" in content.payload  # required-nullable: present, possibly null
+
+
+# ---------------------------------------------------------------------------
+# 4. Streamed tool call + same-target continuation replay
+
+
+_SEARCH_TOOL = CanonicalTool(
+    name="search_library",
+    description="Look up a compact snippet from the library index for a query.",
+    parameters=parse_canonical_schema(
+        {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "Search query text."}},
+            "required": ["query"],
+            "additionalProperties": False,
+        }
+    ),
+)
+
+
+def _tool_level(row: ChatModelContract) -> ReasoningLevel:
+    # Reasoning ON so the continuation artifact carries real native replay
+    # material (encrypted reasoning / thinking blocks / thought signatures /
+    # preserved reasoning) on every codec.
+    return "low" if "low" in row.reasoning.levels else _cheapest_level(row)
+
+
+async def _stream_tool_turn(
+    row: ChatModelContract,
+    intent: GenerateIntent,
+    credential: ProviderCredential,
+) -> tuple[FinalizedProviderCall, str, ToolCall, ContinuationArtifact]:
+    call = _plan(row, intent)
+    text_parts: list[str] = []
+    tool_calls: list[ToolCall] = []
+    artifacts: list[ContinuationArtifact] = []
+    terminals: list[TerminalEvent] = []
+    sequence: list[int] = []
+    async with httpx.AsyncClient() as http:
+        async for event in ProviderRuntime(http).stream(call, credential=credential):
+            sequence.append(event.seq)
+            match event.event:
+                case TextDelta(text=text):
+                    text_parts.append(text)
+                case ToolCallDone(tool_call=tool_call):
+                    tool_calls.append(tool_call)
+                case ContinuationDelta(artifact=artifact):
+                    artifacts.append(artifact)
+                case TerminalEvent() as terminal:
+                    terminals.append(terminal)
+                case _:
+                    pass
+            if isinstance(event.event, TerminalEvent):
+                break
+    assert sequence == list(range(1, len(sequence) + 1)), f"{_row_id(row)}: seq gap {sequence}"
+    assert len(terminals) == 1, f"{_row_id(row)}: {len(terminals)} terminal events"
+    outcome = terminals[0].outcome
+    terminal = _accepted(row, outcome)
+    _assert_call_facts(row, call, terminal)
+    assert tool_calls, f"{_row_id(row)}: model streamed no completed tool call"
+    assert len(artifacts) <= 1, f"{_row_id(row)}: more than one ContinuationDelta"
+    assert artifacts, f"{_row_id(row)}: no continuation artifact for the tool turn"
+    return call, "".join(text_parts), tool_calls[0], artifacts[0]
+
+
+@pytest.mark.parametrize("row", _DIRECT_ROWS, ids=_row_id)
+async def test_live_tool_call_and_continuation(live_env: LiveEnv, row: ChatModelContract) -> None:
+    credential = live_env.credential_for(row.target.provider)
+    level = _tool_level(row)
+    prompt = (
+        "You MUST call the search_library tool exactly once, with query='resonance engine', "
+        "before answering. Then summarize the tool result in one sentence."
+    )
+    first_intent = _intent(
+        row,
+        prompt=prompt,
+        stable_prefix=_SHORT_STABLE_PREFIX,
+        max_output_tokens=max(_reasoning_budget(row, level), 2048),
+        reasoning=level,
+        tools=(_SEARCH_TOOL,),
+    )
+    _, assistant_text, tool_call, artifact = await _stream_tool_turn(row, first_intent, credential)
+    assert tool_call.name == _SEARCH_TOOL.name
+    assert "query" in dict(tool_call.arguments)
+
+    replay_intent = _intent(
+        row,
+        prompt=prompt,
+        stable_prefix=_SHORT_STABLE_PREFIX,
+        max_output_tokens=max(_reasoning_budget(row, level), 2048),
+        reasoning=level,
+        tools=(_SEARCH_TOOL,),
+        history=(
+            AssistantMessage(
+                text=assistant_text,
+                tool_calls=(tool_call,),
+                continuation=Present(artifact),
+            ),
+            ToolResultMessage(
+                call_id=tool_call.id,
+                output="search_library result: the resonance engine links related sources.",
+                is_error=False,
+            ),
+        ),
+    )
+    call, outcome = await _generate(row, replay_intent, credential)
+    assert isinstance(outcome, Succeeded), f"{_row_id(row)}: continuation replay: {outcome}"
+    _assert_call_facts(row, call, outcome)
+    content = outcome.response.content
+    assert isinstance(content, TextContent) and content.text.strip(), (
+        f"{_row_id(row)}: continuation replay produced no text"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 5. Invalid-key probe per provider
+
+
+def _invalid_key_row(provider: ProviderName) -> ChatModelContract:
+    if provider == "openrouter":
+        return _CERTIFYING_OPENROUTER_ROW
+    return next(row for row in _DIRECT_ROWS if row.target.provider == provider)
+
+
+@pytest.mark.parametrize("provider", _PROVIDER_ORDER)
+async def test_live_invalid_key_is_credential_rejected(
+    live_env: LiveEnv, provider: ProviderName
+) -> None:
+    live_env.credential_for(provider)  # provider selection + real-key presence gate
+    row = _invalid_key_row(provider)
+    intent = _intent(
+        row,
+        prompt="This call must fail before model output.",
+        stable_prefix=_SHORT_STABLE_PREFIX,
+        max_output_tokens=16,
+        reasoning=_cheapest_level(row),
+    )
+    call = _plan(row, intent)
+    async with httpx.AsyncClient() as http:
+        with pytest.raises(CredentialRejected):
+            await ProviderRuntime(http).generate(
+                call,
+                credential=ProviderCredential(provider=provider, key="invalid-live-matrix-key"),
+            )
+
+
+# ---------------------------------------------------------------------------
+# 6. OpenRouter operator certification (THE certifier; §8 evidence artifact)
+
+
+_ROUTED_KIMI_LEVELS: tuple[ReasoningLevel, ...] = ("low", "high", "max")
+
+
+def _observed_upstream(row: ChatModelContract, outcome: CallOutcome) -> str:
+    upstream = outcome.meta.upstream_provider
+    assert isinstance(upstream, Present), f"{_row_id(row)}: no upstream provider observed"
+    return upstream.value
+
+
+def _generation_id(outcome: CallOutcome) -> str | None:
+    request_id = outcome.meta.provider_request_id
+    return request_id.value if isinstance(request_id, Present) else None
+
+
+async def _fetch_endpoint_metadata(credential: ProviderCredential) -> object:
+    async with httpx.AsyncClient() as http:
+        response = await http.get(
+            _OPENROUTER_ENDPOINTS_URL,
+            headers={"Authorization": f"Bearer {credential.key}"},
+            timeout=30,
+        )
+    assert response.status_code == 200, (
+        f"endpoint metadata fetch failed: HTTP {response.status_code}"
+    )
+    return response.json()
+
+
+async def test_openrouter_certification(live_env: LiveEnv) -> None:
+    row = _CERTIFYING_OPENROUTER_ROW
+    credential = live_env.credential_for("openrouter")
+    cache_contract = row.cache
+    assert isinstance(cache_contract, OpenRouterPrefixContract)
+    pinned_upstream = cache_contract.pinned_upstream
+
+    # Reasoning probes: routed Kimi low|high|max (spec §4 recheck, routed arm).
+    reasoning_probes: list[dict[str, object]] = []
+    for level in _ROUTED_KIMI_LEVELS:
+        call, outcome = await _generate(
+            row,
+            _intent(
+                row,
+                prompt="Answer in one short sentence: what is two plus two?",
+                stable_prefix=_SHORT_STABLE_PREFIX,
+                max_output_tokens=_reasoning_budget(row, level),
+                reasoning=level,
+            ),
+            credential,
+        )
+        terminal = _accepted(row, outcome)
+        _assert_call_facts(row, call, terminal)
+        cache_plan = call.cache_plan
+        assert isinstance(cache_plan, OpenRouterCertifiedPrefix)
+        assert cache_plan.pinned_upstream == pinned_upstream
+        observed = _observed_upstream(row, terminal)
+        assert observed == pinned_upstream, (
+            f"routed to {observed!r}, not the pinned upstream {pinned_upstream!r}"
+        )
+        reasoning_probes.append(
+            {
+                "level": level,
+                "generation_id": _generation_id(terminal),
+                "observed_upstream": observed,
+            }
+        )
+
+    # Billed cache read on the warm/read pair (the §8 hard gate: endpoint
+    # metadata claims supports_implicit_caching=false; only this paid probe
+    # settles it — zero read keeps the route uncertified).
+    warm, read, read_usage = await _cache_warm_read_pair(row, credential)
+    assert _observed_upstream(row, warm[1]) == pinned_upstream
+    assert _observed_upstream(row, read[1]) == pinned_upstream
+    cache_read_tokens = _count(read_usage.cache_read_input_tokens)
+    assert cache_read_tokens > 0
+
+    # Evidence artifact (§8): endpoint-metadata snapshot + probe generation ids
+    # + observed cache usage. The revision id is content-addressed.
+    endpoint_metadata = await _fetch_endpoint_metadata(credential)
+    captured_on = datetime.now(UTC).date().isoformat()
+    artifact_body: dict[str, object] = {
+        "captured_at": datetime.now(UTC).isoformat(),
+        "catalog_revision": CATALOG_REVISION,
+        "target": f"{row.target.provider}/{row.target.model}",
+        "pinned_upstream": pinned_upstream,
+        "canonical_revision": cache_contract.canonical_revision,
+        "endpoint_metadata": endpoint_metadata,
+        "reasoning_probes": reasoning_probes,
+        "cache_probe": {
+            "warm_generation_id": _generation_id(warm[1]),
+            "read_generation_id": _generation_id(read[1]),
+            "observed_cache_read_tokens": cache_read_tokens,
+            "billed_cache_read": True,
+        },
+    }
+    digest = hashlib.sha256(
+        json.dumps(artifact_body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:12]
+    evidence_revision = f"openrouter-{captured_on}-{digest}"
+    artifact = {"evidence_revision": evidence_revision, **artifact_body}
+
+    _EVIDENCE_DIR.mkdir(exist_ok=True)
+    evidence_path = _EVIDENCE_DIR / f"openrouter-{captured_on}.json"
+    evidence_path.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n")
+    print(
+        f"\nOpenRouter certification evidence written to {evidence_path}\n"
+        "Pin in the catalog row: OperatorCertified("
+        f"certified_pinned_upstream={pinned_upstream!r}, "
+        f"certified_canonical_revision={cache_contract.canonical_revision!r}, "
+        f"evidence_revision={evidence_revision!r})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. Non-generation ports (openai-only)
+
+
+async def test_live_embeddings(live_env: LiveEnv) -> None:
+    credential = live_env.credential_for("openai")
+    embedding_row = CATALOG.embeddings[0]
+    async with httpx.AsyncClient() as http:
+        response = await ProviderRuntime(http).embed(
+            EmbeddingCall(
+                model=embedding_row.target.model,
+                inputs=("nexus live embedding smoke",),
+                dimensions=Absent(),
+            ),
+            credential=credential,
+        )
+    assert len(response.embeddings) == 1
+    assert response.embeddings[0]
+    assert all(isinstance(value, float) for value in response.embeddings[0])
 
 
 def _silent_wav_bytes() -> bytes:
@@ -303,359 +774,17 @@ def _silent_wav_bytes() -> bytes:
     return buffer.getvalue()
 
 
-@pytest.mark.parametrize(
-    "case", _generation_cases(), ids=lambda case: f"{case.provider}:{case.model}"
-)
-async def test_live_default_send(live_env: LiveEnv, case: ProviderCase) -> None:
-    key = live_env.key_for(case.provider)
+async def test_live_transcription(live_env: LiveEnv) -> None:
+    credential = live_env.credential_for("openai")
+    transcription_row = CATALOG.transcriptions[0]
     async with httpx.AsyncClient() as http:
-        response = await _runtime(http).generate(
-            _text_call(
-                case,
-                "Reply with a short sentence containing the word nexus.",
-                max_output_tokens=_default_send_max_output(case),
-                reasoning="default",
-            ),
-            key=key,
-            timeout_s=60,
-        )
-
-    _assert_text_response(case, response.text)
-    _assert_usage_if_claimed(case, response.usage)
-    assert response.status not in {"failed", "incomplete", "error"}
-
-
-@pytest.mark.parametrize(
-    "reasoning_case",
-    _reasoning_cases(),
-    ids=lambda reasoning_case: (
-        f"{reasoning_case.provider_case.provider}:"
-        f"{reasoning_case.provider_case.model}:{reasoning_case.effort}"
-    ),
-)
-async def test_live_declared_reasoning_send(
-    live_env: LiveEnv, reasoning_case: ReasoningCase
-) -> None:
-    case = reasoning_case.provider_case
-    key = live_env.key_for(case.provider)
-    async with httpx.AsyncClient() as http:
-        response = await _runtime(http).generate(
-            _text_call(
-                case,
-                "Answer in one sentence: what is two plus two?",
-                max_output_tokens=_reasoning_send_max_output(case, reasoning_case.effort),
-                reasoning=reasoning_case.effort,
-            ),
-            key=key,
-            timeout_s=90,
-        )
-
-    _assert_text_response(case, response.text)
-
-
-@pytest.mark.parametrize(
-    "case", _generation_cases(), ids=lambda case: f"{case.provider}:{case.model}"
-)
-async def test_live_cacheable_prompt(live_env: LiveEnv, case: ProviderCase) -> None:
-    if not case.capability.prompt_cache.supported:
-        pytest.skip(f"{case.provider}/{case.model} does not support prompt caching")
-    key = live_env.key_for(case.provider)
-
-    messages = [
-        ModelMessage(
-            role="system",
-            content="Stable live-provider cache prefix. Reply concisely.",
-            cache_ttl=case.capability.prompt_cache.ttl_options[0],
-        ),
-        ModelMessage(role="user", content="Reply with the word cached once."),
-    ]
-    async with httpx.AsyncClient() as http:
-        response = await _runtime(http).generate(
-            _call(
-                case,
-                messages,
-                max_output_tokens=48,
-                reasoning=_baseline_reasoning(case.capability),
-            ),
-            key=key,
-            timeout_s=60,
-        )
-
-    _assert_text_response(case, response.text)
-    _assert_usage_if_claimed(case, response.usage)
-
-
-@pytest.mark.parametrize(
-    "case", _generation_cases(), ids=lambda case: f"{case.provider}:{case.model}"
-)
-async def test_live_streaming_text(live_env: LiveEnv, case: ProviderCase) -> None:
-    if not case.capability.streaming:
-        pytest.skip(f"{case.provider}/{case.model} does not support streaming")
-    key = live_env.key_for(case.provider)
-    text_parts = []
-    terminal_seen = False
-
-    async with httpx.AsyncClient() as http:
-        async for event in _runtime(http).stream(
-            _text_call(
-                case,
-                "Stream one short sentence.",
-                max_output_tokens=_streaming_max_output(case),
-                reasoning=_baseline_reasoning(case.capability),
-            ),
-            key=key,
-            timeout_s=60,
-        ):
-            if event.type == "text_delta":
-                text_parts.append(event.text)
-            if event.terminal:
-                terminal_seen = True
-                _assert_usage_if_claimed(case, event.usage)
-
-    assert terminal_seen, f"{case.provider}/{case.model} stream did not emit terminal event"
-    _assert_text_response(case, "".join(text_parts))
-
-
-@pytest.mark.parametrize(
-    "case", _generation_cases(), ids=lambda case: f"{case.provider}:{case.model}"
-)
-async def test_live_forced_tool_call_and_continuation(
-    live_env: LiveEnv,
-    case: ProviderCase,
-) -> None:
-    if (
-        not case.capability.streaming
-        or not case.capability.tool_calling
-        or not case.capability.tool_choice_required
-    ):
-        pytest.skip(f"{case.provider}/{case.model} does not support required tool calls")
-    key = live_env.key_for(case.provider)
-    tool = ToolSpec(
-        name="lookup_weather",
-        description="Look up a compact weather summary.",
-        parameters={
-            "type": "object",
-            "properties": {"city": {"type": "string"}},
-            "required": ["city"],
-            "additionalProperties": False,
-        },
-    )
-    user_turn = ModelMessage(role="user", content="Use the tool for weather in Paris.")
-    first_text_parts: list[str] = []
-    first_artifacts = []
-    first_tool_start = False
-    first_tool_delta = False
-    first_tool_calls = []
-    first_terminal_count = 0
-    first_terminal_usage = None
-    final_text_parts: list[str] = []
-    final_terminal_count = 0
-    final_terminal_usage = None
-
-    async with httpx.AsyncClient() as http:
-        runtime = _runtime(http)
-        async for event in runtime.stream(
-            _call(
-                case,
-                [user_turn],
-                max_output_tokens=256,
-                reasoning=_baseline_reasoning(case.capability),
-                tools=(tool,),
-                tool_choice="required",
-            ),
-            key=key,
-            timeout_s=60,
-        ):
-            if event.type == "text_delta":
-                first_text_parts.append(event.text)
-            elif event.type == "provider_artifact" and event.provider_artifact is not None:
-                first_artifacts.append(event.provider_artifact)
-            elif event.type == "tool_call_start":
-                first_tool_start = True
-            elif event.type == "tool_call_delta":
-                first_tool_delta = True
-            elif event.type == "tool_call_done":
-                first_tool_calls.append(event.tool_call)
-            if event.terminal:
-                first_terminal_count += 1
-                first_terminal_usage = event.usage
-
-        assert first_terminal_count == 1, (
-            f"{case.provider}/{case.model} stream emitted {first_terminal_count} terminals"
-        )
-        _assert_usage_if_claimed(case, first_terminal_usage)
-        assert first_tool_calls and first_tool_calls[0] is not None, (
-            f"{case.provider}/{case.model} did not stream a completed tool call"
-        )
-        if case.capability.stream.tool_call_start:
-            assert first_tool_start, f"{case.provider}/{case.model} did not stream tool start"
-        if case.capability.stream.tool_call_delta:
-            assert first_tool_delta, f"{case.provider}/{case.model} did not stream tool deltas"
-        tool_call = first_tool_calls[0]
-        assert tool_call is not None
-
-        async for event in runtime.stream(
-            _call(
-                case,
-                [
-                    user_turn,
-                    ModelMessage(
-                        role="assistant",
-                        content="".join(first_text_parts),
-                        tool_calls=(tool_call,),
-                        provider_artifacts=tuple(first_artifacts),
-                    ),
-                    ModelMessage(
-                        role="tool",
-                        tool_results=(
-                            ToolResult(
-                                call_id=tool_call.id, output="Paris weather: mild and clear."
-                            ),
-                        ),
-                    ),
-                ],
-                max_output_tokens=256,
-                reasoning=_baseline_reasoning(case.capability),
-            ),
-            key=key,
-            timeout_s=60,
-        ):
-            if event.type == "text_delta":
-                final_text_parts.append(event.text)
-            if event.terminal:
-                final_terminal_count += 1
-                final_terminal_usage = event.usage
-
-    assert final_terminal_count == 1, (
-        f"{case.provider}/{case.model} continuation emitted {final_terminal_count} terminals"
-    )
-    _assert_usage_if_claimed(case, final_terminal_usage)
-    _assert_text_response(case, "".join(final_text_parts))
-
-
-@pytest.mark.parametrize(
-    "case", _generation_cases(), ids=lambda case: f"{case.provider}:{case.model}"
-)
-async def test_live_structured_output_where_supported(
-    live_env: LiveEnv,
-    case: ProviderCase,
-) -> None:
-    if not case.capability.structured_output:
-        pytest.skip(f"{case.provider}/{case.model} does not support structured output")
-    key = live_env.key_for(case.provider)
-    schema = {
-        "type": "object",
-        "properties": {
-            "ok": {"type": "boolean"},
-            "summary": {"type": "string"},
-        },
-        "required": ["ok", "summary"],
-        "additionalProperties": False,
-    }
-
-    async with httpx.AsyncClient() as http:
-        response = await _runtime(http).generate(
-            _call(
-                case,
-                [ModelMessage(role="user", content="Return ok=true and a two-word summary.")],
-                max_output_tokens=_structured_max_output(case),
-                reasoning=_baseline_reasoning(case.capability),
-                structured_output=StructuredOutputSpec(
-                    name="live_provider_result",
-                    schema=schema,
-                    strict=True,
-                ),
-            ),
-            key=key,
-            timeout_s=60,
-        )
-
-    assert isinstance(response.structured_output, dict), (
-        f"{case.provider}/{case.model} did not return parsed structured output"
-    )
-    assert response.structured_output.get("ok") is True
-    assert isinstance(response.structured_output.get("summary"), str)
-
-
-@pytest.mark.parametrize(
-    "case", _embedding_cases(), ids=lambda case: f"{case.provider}:{case.model}"
-)
-async def test_live_embeddings(live_env: LiveEnv, case: ProviderCase) -> None:
-    key = live_env.key_for(case.provider)
-    async with httpx.AsyncClient() as http:
-        response = await _runtime(http).embed(
-            EmbeddingCall(
-                model=ModelRef(provider=case.provider, model=case.model),
-                inputs=["nexus live embedding smoke"],
-                retry=RetryPolicy(max_attempts=1, initial_delay_s=0),
-            ),
-            key=key,
-            timeout_s=60,
-        )
-
-    assert len(response.embeddings) == 1
-    assert response.embeddings[0]
-    assert all(isinstance(value, float) for value in response.embeddings[0])
-    _assert_usage_if_claimed(case, response.usage)
-
-
-@pytest.mark.parametrize(
-    "case", _transcription_cases(), ids=lambda case: f"{case.provider}:{case.model}"
-)
-async def test_live_transcription(live_env: LiveEnv, case: ProviderCase) -> None:
-    key = live_env.key_for(case.provider)
-    async with httpx.AsyncClient() as http:
-        response = await _runtime(http).transcribe(
+        response = await ProviderRuntime(http).transcribe(
             TranscriptionCall(
-                model=ModelRef(provider=case.provider, model=case.model),
-                audio=_silent_wav_bytes(),
+                model=transcription_row.target.model,
                 filename="silence.wav",
+                content=_silent_wav_bytes(),
                 media_type="audio/wav",
-                retry=RetryPolicy(max_attempts=1, initial_delay_s=0),
             ),
-            key=key,
-            timeout_s=60,
+            credential=credential,
         )
-
     assert isinstance(response.text, str)
-
-
-@pytest.mark.parametrize("case", _provider_cases(), ids=lambda case: case.provider)
-async def test_live_invalid_key_maps_to_invalid_key(live_env: LiveEnv, case: ProviderCase) -> None:
-    live_env.key_for(case.provider)
-    async with httpx.AsyncClient() as http:
-        with pytest.raises(ModelCallError) as exc_info:
-            await _runtime(http).generate(
-                _text_call(
-                    case,
-                    "This call must fail before model output.",
-                    max_output_tokens=8,
-                    reasoning=_baseline_reasoning(case.capability),
-                ),
-                key=ProviderApiKey("invalid-live-provider-key", source="test"),
-                timeout_s=30,
-            )
-
-    assert exc_info.value.error_code == ModelCallErrorCode.INVALID_KEY
-    assert exc_info.value.retryable is False
-
-
-@pytest.mark.parametrize("case", _provider_cases(), ids=lambda case: case.provider)
-async def test_live_timeout_maps_to_timeout(live_env: LiveEnv, case: ProviderCase) -> None:
-    key = live_env.key_for(case.provider)
-    async with httpx.AsyncClient() as http:
-        with pytest.raises(ModelCallError) as exc_info:
-            await _runtime(http).generate(
-                _text_call(
-                    case,
-                    "This call intentionally uses an impossible timeout.",
-                    max_output_tokens=8,
-                    reasoning=_baseline_reasoning(case.capability),
-                    retry=RetryPolicy(max_attempts=2, initial_delay_s=0, max_delay_s=0),
-                ),
-                key=key,
-                timeout_s=0,
-            )
-
-    assert exc_info.value.error_code == ModelCallErrorCode.TIMEOUT
-    assert exc_info.value.retryable is True

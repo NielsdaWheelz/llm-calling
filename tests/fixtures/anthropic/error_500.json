@@ -1,7 +1,0 @@
-{
-  "type": "error",
-  "error": {
-    "type": "api_error",
-    "message": "An internal server error occurred."
-  }
-}

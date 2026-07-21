@@ -1,772 +1,889 @@
+"""Tests for the rewritten Gemini generateContent codec (spec §7 Gemini row).
+
+Coverage per the codec-seam test list plus Gemini specifics: no-cache-fields
+golden, thinkingLevel per level, unstripped native JSON schema
+(additionalProperties present on the wire), thoughtSignature replay round-trip,
+synthesized call ids mapped back to coalesced functionResponse parts, stream
+chunk accumulation, SAFETY mapping, and always-Absent request ids.
+"""
+
 import json
+from collections.abc import AsyncIterator, Iterable
 from pathlib import Path
 
-import httpx
 import pytest
-import respx
 
-from provider_runtime.errors import ModelCallError, ModelCallErrorCode
-from provider_runtime.gemini import GeminiClient
+from provider_runtime import gemini
+from provider_runtime._signals import ExpectedFailureSignal, TransientStreamError
+from provider_runtime.catalog import CATALOG
+from provider_runtime.errors import (
+    CredentialRejected,
+    PlanningDefect,
+    ProtocolDefect,
+    RuntimeDefect,
+)
+from provider_runtime.schema import parse_canonical_schema
+from provider_runtime.transport import SseEvent
 from provider_runtime.types import (
-    BinaryPart,
-    ModelCall,
-    ModelMessage,
-    ModelRef,
-    ProviderArtifact,
-    ReasoningConfig,
-    StructuredOutputSpec,
-    TextPart,
+    Absent,
+    AssistantMessage,
+    CanonicalTool,
+    ContinuationArtifact,
+    ContinuationDelta,
+    Dynamic,
+    GenerateIntent,
+    GlobalScope,
+    Incomplete,
+    InvalidToolArguments,
+    OutputSpec,
+    PossiblyBillable,
+    Present,
+    PromptBlock,
+    PromptMessage,
+    ProviderContextTooLarge,
+    ProviderHttpUnavailable,
+    ProviderRateLimit,
+    ProviderStreamInterrupted,
+    ProviderTarget,
+    ReasoningLevel,
+    Stable,
+    StreamStart,
+    StrictJsonOutput,
+    Succeeded,
+    SystemMessage,
+    TerminalEvent,
+    TextContent,
+    TextDelta,
+    TextOutput,
     ToolCall,
-    ToolResult,
-    ToolSpec,
+    ToolCallDone,
+    ToolCallStart,
+    ToolChoice,
+    ToolResultMessage,
+    UserMessage,
 )
 
-pytestmark = pytest.mark.asyncio
-
 FIXTURES = Path(__file__).parent / "fixtures" / "gemini"
+TARGET = ProviderTarget(provider="gemini", model="gemini-3.5-flash")
+CONTRACT = CATALOG.chat_contract(TARGET)
+
+SYSTEM = SystemMessage(
+    blocks=(PromptBlock(text="You are a librarian.", stability=Stable(scope=GlobalScope())),)
+)
+USER = UserMessage(blocks=(PromptBlock(text="Hello", stability=Dynamic()),))
+
+TOOL_SCHEMA_JSON = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string", "description": "Search query"},
+        "library_id": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+    },
+    "required": ["query", "library_id"],
+    "additionalProperties": False,
+}
+SEARCH_TOOL = CanonicalTool(
+    name="app_search",
+    description="Search the library",
+    parameters=parse_canonical_schema(TOOL_SCHEMA_JSON),
+)
+_TEXT_OUTPUT = TextOutput()
 
 
-def load_json(name: str) -> dict:
-    return json.loads((FIXTURES / name).read_text())
-
-
-def load_text(name: str) -> str:
-    return (FIXTURES / name).read_text()
-
-
-def stream_text(events) -> str:
-    return "".join(event.text for event in events if event.type == "text_delta")
-
-
-def terminal(events):
-    return next(event for event in events if event.terminal)
-
-
-def tool_calls(events) -> list[ToolCall]:
-    return [
-        event.tool_call
-        for event in events
-        if event.type == "tool_call_done" and event.tool_call is not None
-    ]
-
-
-def provider_artifacts(events) -> list[ProviderArtifact]:
-    return [
-        event.provider_artifact
-        for event in events
-        if event.type == "provider_artifact" and event.provider_artifact is not None
-    ]
-
-
-def request() -> ModelCall:
-    return ModelCall(
-        model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
-        messages=[
-            ModelMessage(role="system", content="You are helpful."),
-            ModelMessage(role="user", content="Hello!"),
-            ModelMessage(role="assistant", content="Hi."),
-        ],
-        max_output_tokens=100,
-        temperature=0.7,
-        reasoning=ReasoningConfig(effort="default"),
+def _intent(
+    messages: Iterable[PromptMessage] = (SYSTEM, USER),
+    *,
+    reasoning: ReasoningLevel = "medium",
+    tools: Iterable[CanonicalTool] = (),
+    tool_choice: ToolChoice = "auto",
+    output: OutputSpec = _TEXT_OUTPUT,
+    max_output_tokens: int = 1024,
+) -> GenerateIntent:
+    return GenerateIntent(
+        target=TARGET,
+        messages=tuple(messages),
+        max_output_tokens=max_output_tokens,
+        reasoning=reasoning,
+        tools=tuple(tools),
+        tool_choice=tool_choice,
+        output=output,
     )
 
 
-def metadata_schema() -> dict[str, object]:
-    return {
-        "type": "object",
-        "properties": {
-            "title": {"type": "string"},
-            "language": {"type": "string"},
-        },
-        "required": ["title", "language"],
-    }
+def _body(intent: GenerateIntent) -> dict:
+    return json.loads(gemini.encode(intent, CONTRACT).body)
 
 
-@respx.mock
-async def test_nonstream_success() -> None:
-    respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
-    ).respond(200, json=load_json("success_nonstream.json"))
-
-    async with httpx.AsyncClient() as http:
-        response = await GeminiClient(http).generate(request(), api_key="sk-test", timeout_s=30)
-
-    assert response.text == "Hello! How can I help you today?"
-    assert response.usage is not None
-    assert response.usage.input_tokens == 10
-    assert response.usage.output_tokens == 8
-    assert response.usage.total_tokens == 18
-    assert response.provider_request_id is None
+def _fixture_bytes(name: str) -> bytes:
+    return (FIXTURES / name).read_bytes()
 
 
-@respx.mock
-async def test_stream_success() -> None:
-    respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
-    ).respond(200, content=load_text("success_stream_chunks.txt"))
-
-    async with httpx.AsyncClient() as http:
-        events = [
-            event
-            async for event in GeminiClient(http).generate_stream(
-                request(), api_key="sk-test", timeout_s=30
-            )
-        ]
-
-    assert terminal(events).terminal is True
-    assert all(event.usage is None for event in events if not event.terminal)
-    assert "Hello" in stream_text(events)
+def _decode_fixture(name: str):
+    return gemini.decode_response(200, {}, _fixture_bytes(name))
 
 
-@respx.mock
-async def test_stream_malformed_json_event_fails_closed() -> None:
-    respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
-    ).respond(200, content="data: {not-json}\n")
-
-    with pytest.raises(ModelCallError) as exc_info:
-        async with httpx.AsyncClient() as http:
-            async for _chunk in GeminiClient(http).generate_stream(
-                request(), api_key="sk-test", timeout_s=30
-            ):
-                pass
-
-    assert exc_info.value.error_code == ModelCallErrorCode.PROVIDER_DOWN
-    assert "not valid JSON" in exc_info.value.message
+def _sse(data: str) -> SseEvent:
+    return SseEvent(event=None, data=data)
 
 
-@respx.mock
-async def test_assistant_role_maps_to_model() -> None:
-    route = respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
-    ).respond(200, json=load_json("success_nonstream.json"))
-
-    async with httpx.AsyncClient() as http:
-        await GeminiClient(http).generate(request(), api_key="sk-test", timeout_s=30)
-
-    body = json.loads(route.calls.last.request.content)
-    assert body["systemInstruction"] == {"parts": [{"text": "You are helpful."}]}
-    assert body["contents"] == [
-        {"role": "user", "parts": [{"text": "Hello!"}]},
-        {"role": "model", "parts": [{"text": "Hi."}]},
-    ]
+def _fixture_stream_events() -> list[SseEvent]:
+    lines = (FIXTURES / "success_stream_chunks.txt").read_text().splitlines()
+    return [_sse(line.removeprefix("data: ")) for line in lines if line.startswith("data: ")]
 
 
-@respx.mock
-async def test_multimodal_content_parts_lower_to_inline_data() -> None:
-    route = respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-    ).respond(200, json=load_json("success_nonstream.json"))
-    req = ModelCall(
-        model=ModelRef(provider="gemini", model="gemini-2.5-flash"),
-        messages=[
-            ModelMessage(
-                role="user",
-                content_parts=(
-                    TextPart("Extract text."),
-                    BinaryPart(data=b"image-bytes", media_type="image/png"),
-                ),
-            )
-        ],
-        max_output_tokens=100,
+async def _aiter(events: Iterable[SseEvent]) -> AsyncIterator[SseEvent]:
+    for event in events:
+        yield event
+
+
+async def _collect(events: Iterable[SseEvent]):
+    return [event async for event in gemini.decode_stream({}, _aiter(events))]
+
+
+# ---------------------------------------------------------------------------
+# encode goldens
+
+
+def test_encode_plain_text_golden_and_no_cache_fields():
+    draft = gemini.encode(_intent(), CONTRACT)
+    assert draft.url == (
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"
     )
-
-    async with httpx.AsyncClient() as http:
-        await GeminiClient(http).generate(req, api_key="sk-test", timeout_s=30)
-
-    body = json.loads(route.calls.last.request.content)
-    assert body["contents"] == [
-        {
-            "role": "user",
-            "parts": [
-                {"text": "Extract text."},
-                {"inlineData": {"mimeType": "image/png", "data": "aW1hZ2UtYnl0ZXM="}},
-            ],
-        }
-    ]
-
-
-@respx.mock
-async def test_structured_output_uses_response_json_schema_and_parses_response() -> None:
-    response_json = load_json("success_nonstream.json")
-    response_json["candidates"][0]["content"]["parts"][0]["text"] = (
-        '{"title":"The Book","language":"en"}'
-    )
-    route = respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
-    ).respond(200, json=response_json)
-    req = ModelCall(
-        model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
-        messages=[ModelMessage(role="user", content="Extract metadata.")],
-        max_output_tokens=100,
-        reasoning=ReasoningConfig(effort="default"),
-        structured_output=StructuredOutputSpec(
-            name="metadata_enrichment",
-            schema=metadata_schema(),
-        ),
-    )
-
-    async with httpx.AsyncClient() as http:
-        response = await GeminiClient(http).generate(req, api_key="sk-test", timeout_s=30)
-
-    body = json.loads(route.calls.last.request.content)
-    assert body["generationConfig"]["responseMimeType"] == "application/json"
-    assert body["generationConfig"]["responseJsonSchema"] == metadata_schema()
-    assert response.structured_output == {"title": "The Book", "language": "en"}
-
-
-@respx.mock
-async def test_structured_output_missing_json_object_raises() -> None:
-    response_json = load_json("success_nonstream.json")
-    response_json["candidates"][0]["content"]["parts"][0]["text"] = "not json"
-    respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
-    ).respond(200, json=response_json)
-    req = ModelCall(
-        model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
-        messages=[ModelMessage(role="user", content="Extract metadata.")],
-        max_output_tokens=100,
-        reasoning=ReasoningConfig(effort="default"),
-        structured_output=StructuredOutputSpec(
-            name="metadata_enrichment",
-            schema=metadata_schema(),
-        ),
-    )
-
-    with pytest.raises(ModelCallError) as exc_info:
-        async with httpx.AsyncClient() as http:
-            await GeminiClient(http).generate(req, api_key="sk-test", timeout_s=30)
-
-    assert exc_info.value.error_code == ModelCallErrorCode.BAD_REQUEST
-    assert "structured output" in exc_info.value.message
-
-
-@respx.mock
-async def test_gemini_25_reasoning_uses_thinking_budget() -> None:
-    route = respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-    ).respond(200, json=load_json("success_nonstream.json"))
-    req = ModelCall(
-        model=ModelRef(provider="gemini", model="gemini-2.5-flash"),
-        messages=[ModelMessage(role="user", content="Think briefly.")],
-        max_output_tokens=100,
-        reasoning=ReasoningConfig(effort="low"),
-    )
-
-    async with httpx.AsyncClient() as http:
-        await GeminiClient(http).generate(req, api_key="sk-test", timeout_s=30)
-
-    body = json.loads(route.calls.last.request.content)
-    assert body["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 1024}
-
-
-@respx.mock
-async def test_gemini_default_reasoning_uses_cost_safe_visible_defaults() -> None:
-    pro_route = respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
-    ).respond(200, json=load_json("success_nonstream.json"))
-    flash_route = respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent"
-    ).respond(200, json=load_json("success_nonstream.json"))
-
-    async with httpx.AsyncClient() as http:
-        await GeminiClient(http).generate(
-            ModelCall(
-                model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
-                messages=[ModelMessage(role="user", content="Hello.")],
-                max_output_tokens=100,
-                reasoning=ReasoningConfig(effort="default"),
-            ),
-            api_key="sk-test",
-            timeout_s=30,
-        )
-        await GeminiClient(http).generate(
-            ModelCall(
-                model=ModelRef(provider="gemini", model="gemini-3-flash-preview"),
-                messages=[ModelMessage(role="user", content="Hello.")],
-                max_output_tokens=100,
-                reasoning=ReasoningConfig(effort="default"),
-            ),
-            api_key="sk-test",
-            timeout_s=30,
-        )
-
-    pro_body = json.loads(pro_route.calls.last.request.content)
-    flash_body = json.loads(flash_route.calls.last.request.content)
-    assert pro_body["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 128}
-    assert flash_body["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "minimal"}
-
-
-@respx.mock
-async def test_gemini_25_explicit_budget_overrides_effort_mapping() -> None:
-    route = respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
-    ).respond(200, json=load_json("success_nonstream.json"))
-    req = ModelCall(
-        model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
-        messages=[ModelMessage(role="user", content="Think exactly this much.")],
-        max_output_tokens=100,
-        reasoning=ReasoningConfig(effort="default", budget_tokens=2048),
-    )
-
-    async with httpx.AsyncClient() as http:
-        await GeminiClient(http).generate(req, api_key="sk-test", timeout_s=30)
-
-    body = json.loads(route.calls.last.request.content)
-    assert body["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 2048}
-
-
-@respx.mock
-async def test_gemini_31_pro_reasoning_uses_thinking_level_without_off_mapping() -> None:
-    route = respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent"
-    ).respond(200, json=load_json("success_nonstream.json"))
-    req = ModelCall(
-        model=ModelRef(provider="gemini", model="gemini-3.1-pro-preview"),
-        messages=[ModelMessage(role="user", content="Think carefully.")],
-        max_output_tokens=100,
-        reasoning=ReasoningConfig(effort="max"),
-    )
-
-    async with httpx.AsyncClient() as http:
-        await GeminiClient(http).generate(req, api_key="sk-test", timeout_s=30)
-
-    body = json.loads(route.calls.last.request.content)
-    assert body["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "high"}
-
-
-@respx.mock
-async def test_tool_call_nonstream_and_request_body() -> None:
-    response_json = {
-        "candidates": [
-            {
-                "content": {
-                    "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "Paris"}}}],
-                    "role": "model",
-                },
-                "finishReason": "STOP",
-                "index": 0,
-            }
-        ],
-        "usageMetadata": {
-            "promptTokenCount": 5,
-            "candidatesTokenCount": 3,
-            "totalTokenCount": 8,
+    assert dict(draft.safe_headers) == {}
+    assert draft.native_reasoning == "medium"
+    assert json.loads(draft.body) == {
+        "contents": [{"role": "user", "parts": [{"text": "Hello"}]}],
+        "systemInstruction": {"parts": [{"text": "You are a librarian."}]},
+        "generationConfig": {
+            "maxOutputTokens": 1024,
+            "thinkingConfig": {"thinkingLevel": "medium"},
         },
     }
-    route = respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
-    ).respond(200, json=response_json)
-    req = ModelCall(
-        model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
-        messages=[
-            ModelMessage(role="user", content="What's the weather?"),
-            ModelMessage(
-                role="assistant",
-                content="",
-                tool_calls=(
-                    ToolCall(id="call_1", name="get_weather", arguments={"city": "Paris"}),
-                ),
-            ),
-            ModelMessage(
-                role="tool",
-                tool_results=(ToolResult(call_id="call_1", output="sunny"),),
-            ),
-        ],
-        max_output_tokens=100,
-        reasoning=ReasoningConfig(effort="default"),
-        tools=(
-            ToolSpec(
-                name="get_weather",
-                description="Get the weather.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "city": {
-                            "type": "string",
-                            "additionalProperties": False,
-                        }
-                    },
-                    "additionalProperties": False,
-                },
-            ),
-        ),
-        tool_choice="required",
-    )
+    # Implicit caching only: NO cache control of any kind reaches the wire.
+    assert "cache" not in draft.body.decode().lower()
 
-    async with httpx.AsyncClient() as http:
-        response = await GeminiClient(http).generate(req, api_key="sk-test", timeout_s=30)
 
-    body = json.loads(route.calls.last.request.content)
+@pytest.mark.parametrize("level", ["minimal", "low", "medium", "high"])
+def test_encode_thinking_level_per_level(level: ReasoningLevel):
+    draft = gemini.encode(_intent(reasoning=level), CONTRACT)
+    body = json.loads(draft.body)
+    assert body["generationConfig"]["thinkingConfig"] == {"thinkingLevel": level}
+    assert draft.native_reasoning == level
+
+
+def test_encode_unsupported_reasoning_level_is_planning_defect():
+    with pytest.raises(PlanningDefect):
+        gemini.encode(_intent(reasoning="max"), CONTRACT)
+
+
+def test_encode_tools_native_json_schema_unstripped():
+    body = _body(_intent(tools=(SEARCH_TOOL,)))
     assert body["tools"] == [
         {
             "functionDeclarations": [
                 {
-                    "name": "get_weather",
-                    "description": "Get the weather.",
-                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+                    "name": "app_search",
+                    "description": "Search the library",
+                    # JSON-Schema-native and UNSTRIPPED: additionalProperties,
+                    # required, the nullable anyOf union, and annotations all
+                    # survive (the old keyword stripping is dead).
+                    "parametersJsonSchema": TOOL_SCHEMA_JSON,
                 }
             ]
         }
     ]
-    assert body["toolConfig"] == {"functionCallingConfig": {"mode": "ANY"}}
-    assert body["contents"] == [
-        {"role": "user", "parts": [{"text": "What's the weather?"}]},
+    assert body["toolConfig"] == {"functionCallingConfig": {"mode": "AUTO"}}
+
+
+def test_encode_tool_choice_none():
+    body = _body(_intent(tools=(SEARCH_TOOL,), tool_choice="none"))
+    assert body["toolConfig"] == {"functionCallingConfig": {"mode": "NONE"}}
+
+
+def test_encode_without_tools_sends_no_tool_fields():
+    body = _body(_intent())
+    assert "tools" not in body
+    assert "toolConfig" not in body
+
+
+def test_encode_strict_output_response_json_schema():
+    schema = parse_canonical_schema(
         {
-            "role": "model",
-            "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "Paris"}}}],
-        },
-        {
-            "role": "user",
-            "parts": [
-                {"functionResponse": {"name": "get_weather", "response": {"output": "sunny"}}}
-            ],
-        },
-    ]
-    assert response.tool_calls == (
-        ToolCall(id="get_weather", name="get_weather", arguments={"city": "Paris"}),
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "topic": {"$ref": "#/$defs/topic"},
+            },
+            "required": ["summary", "topic"],
+            "additionalProperties": False,
+            "$defs": {"topic": {"type": "string", "enum": ["tides", "moons"]}},
+        }
     )
-
-
-@respx.mock
-async def test_tool_call_nonstream_non_object_arguments_raise_typed_error() -> None:
-    response_json = {
-        "candidates": [
-            {
-                "content": {
-                    "parts": [
-                        {"functionCall": {"name": "get_weather", "args": ["not", "an", "object"]}}
-                    ],
-                    "role": "model",
-                },
-                "finishReason": "STOP",
-                "index": 0,
-            }
-        ],
-    }
-    respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
-    ).respond(200, json=response_json)
-
-    async with httpx.AsyncClient() as http:
-        with pytest.raises(ModelCallError) as exc_info:
-            await GeminiClient(http).generate(request(), api_key="sk-test", timeout_s=30)
-
-    assert exc_info.value.error_code == ModelCallErrorCode.TOOL_ARGUMENTS_INVALID
-    assert exc_info.value.retryable is False
-
-
-@respx.mock
-async def test_thought_signature_and_call_id_captured_then_echoed_on_replay() -> None:
-    response_json = {
-        "candidates": [
-            {
-                "content": {
-                    "parts": [
-                        {
-                            "functionCall": {
-                                "id": "fc-123",
-                                "name": "get_weather",
-                                "args": {"city": "Paris"},
-                            },
-                            "thoughtSignature": "sig-abc",
-                        }
-                    ],
-                    "role": "model",
-                },
-                "finishReason": "STOP",
-                "index": 0,
-            }
-        ],
-        "usageMetadata": {
-            "promptTokenCount": 5,
-            "candidatesTokenCount": 3,
-            "totalTokenCount": 8,
+    body = _body(_intent(output=StrictJsonOutput(name="summary", schema=schema)))
+    config = body["generationConfig"]
+    assert config["responseMimeType"] == "application/json"
+    # Defs are inlined; nothing is stripped or rewritten.
+    assert config["responseJsonSchema"] == {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "topic": {"type": "string", "enum": ["tides", "moons"]},
         },
+        "required": ["summary", "topic"],
+        "additionalProperties": False,
     }
-    route = respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
-    ).respond(200, json=response_json)
-    req = ModelCall(
-        model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
-        messages=[
-            ModelMessage(role="user", content="What's the weather?"),
-            ModelMessage(
-                role="assistant",
-                tool_calls=(
-                    ToolCall(
-                        id="fc-123",
-                        name="get_weather",
-                        arguments={"city": "Paris"},
-                    ),
-                ),
-                provider_artifacts=(
-                    ProviderArtifact(
-                        provider="gemini",
-                        model="gemini-2.5-pro",
-                        purpose="signature",
-                        payload={
-                            "type": "gemini.thought_signature",
-                            "function_call_id": "fc-123",
-                            "function_name": "get_weather",
-                            "thoughtSignature": "sig-abc",
-                        },
-                    ),
-                ),
-            ),
-            ModelMessage(role="tool", tool_results=(ToolResult(call_id="fc-123", output="sunny"),)),
-        ],
-        max_output_tokens=100,
-        reasoning=ReasoningConfig(effort="default"),
-        tools=(
-            ToolSpec(
-                name="get_weather",
-                description="Get the weather.",
-                parameters={"type": "object", "properties": {"city": {"type": "string"}}},
-            ),
+
+
+def test_encode_tools_with_strict_output_is_planning_defect():
+    strict = StrictJsonOutput(name="x", schema=SEARCH_TOOL.parameters)
+    with pytest.raises(PlanningDefect):
+        gemini.encode(_intent(tools=(SEARCH_TOOL,), output=strict), CONTRACT)
+
+
+# ---------------------------------------------------------------------------
+# continuation replay + functionResponse coalescing
+
+
+def _tooled_conversation() -> tuple[GenerateIntent, list[dict]]:
+    outcome = _decode_fixture("success_nonstream_tools.json")
+    assert isinstance(outcome, Succeeded)
+    assert isinstance(outcome.response.content, TextContent)
+    assistant = AssistantMessage(
+        text=outcome.response.content.text,
+        tool_calls=outcome.response.content.tool_calls,
+        continuation=outcome.response.continuation,
+    )
+    intent = _intent(
+        (
+            SYSTEM,
+            USER,
+            assistant,
+            ToolResultMessage(call_id="call_0", output="42 results", is_error=False),
+            ToolResultMessage(call_id="call_1", output="boom", is_error=True),
         ),
+        tools=(SEARCH_TOOL,),
     )
+    fixture_parts = json.loads(_fixture_bytes("success_nonstream_tools.json"))["candidates"][0][
+        "content"
+    ]["parts"]
+    return intent, fixture_parts
 
-    async with httpx.AsyncClient() as http:
-        response = await GeminiClient(http).generate(req, api_key="sk-test", timeout_s=30)
 
-    body = json.loads(route.calls.last.request.content)
+def test_continuation_replay_round_trip_verbatim_parts():
+    intent, fixture_parts = _tooled_conversation()
+    body = _body(intent)
+    model_turn = body["contents"][1]
+    # The prior model turn is replayed verbatim — every part, thoughtSignatures
+    # included, never merged or rebuilt.
+    assert model_turn == {"role": "model", "parts": fixture_parts}
+
+
+def test_tool_results_coalesce_into_one_user_turn_by_synthesized_call_id():
+    intent, _ = _tooled_conversation()
+    body = _body(intent)
+    assert len(body["contents"]) == 3  # user, model, coalesced tool-result turn
+    assert body["contents"][2] == {
+        "role": "user",
+        "parts": [
+            {
+                "functionResponse": {
+                    "name": "app_search",
+                    "response": {"output": "42 results"},
+                }
+            },
+            {
+                "functionResponse": {
+                    "name": "other_tool",
+                    "response": {"error": "boom"},
+                }
+            },
+        ],
+    }
+
+
+def test_unknown_tool_result_call_id_is_planning_defect():
+    intent, _ = _tooled_conversation()
+    messages = intent.messages[:-1] + (
+        ToolResultMessage(call_id="call_9", output="?", is_error=False),
+    )
+    with pytest.raises(PlanningDefect):
+        gemini.encode(_intent(messages, tools=(SEARCH_TOOL,)), CONTRACT)
+
+
+def test_tool_result_names_resolve_turn_scoped_across_colliding_synthesized_ids():
+    # decode synthesizes call_0, call_1, ... per response, so a two-iteration
+    # tool loop has "call_0" recur in every turn. A flat intent-wide name map
+    # would let the second turn's call_0 -> read_resource overwrite the
+    # first's call_0 -> app_search, mis-naming the first functionResponse.
+    first_assistant = AssistantMessage(
+        text="",
+        tool_calls=(ToolCall(id="call_0", name="app_search", arguments={"query": "x"}),),
+        continuation=Absent(),
+    )
+    second_assistant = AssistantMessage(
+        text="",
+        tool_calls=(ToolCall(id="call_0", name="read_resource", arguments={"id": "42"}),),
+        continuation=Absent(),
+    )
+    intent = _intent(
+        (
+            SYSTEM,
+            USER,
+            first_assistant,
+            ToolResultMessage(call_id="call_0", output="found 3", is_error=False),
+            second_assistant,
+            ToolResultMessage(call_id="call_0", output="resource body", is_error=False),
+        ),
+        tools=(SEARCH_TOOL,),
+    )
+    contents = _body(intent)["contents"]
+    assert contents[2] == {
+        "role": "user",
+        "parts": [{"functionResponse": {"name": "app_search", "response": {"output": "found 3"}}}],
+    }
+    assert contents[4] == {
+        "role": "user",
+        "parts": [
+            {
+                "functionResponse": {
+                    "name": "read_resource",
+                    "response": {"output": "resource body"},
+                }
+            }
+        ],
+    }
+
+
+def test_tool_result_referencing_non_adjacent_turn_is_planning_defect():
+    first_assistant = AssistantMessage(
+        text="",
+        tool_calls=(ToolCall(id="call_0", name="app_search", arguments={}),),
+        continuation=Absent(),
+    )
+    second_assistant = AssistantMessage(text="done", tool_calls=(), continuation=Absent())
+    intent = _intent(
+        (
+            SYSTEM,
+            USER,
+            first_assistant,
+            second_assistant,
+            ToolResultMessage(call_id="call_0", output="stale", is_error=False),
+        ),
+        tools=(SEARCH_TOOL,),
+    )
+    with pytest.raises(PlanningDefect):
+        gemini.encode(intent, CONTRACT)
+
+
+def test_duplicate_tool_call_id_within_turn_is_planning_defect():
+    assistant = AssistantMessage(
+        text="",
+        tool_calls=(
+            ToolCall(id="call_0", name="app_search", arguments={}),
+            ToolCall(id="call_0", name="other_tool", arguments={}),
+        ),
+        continuation=Absent(),
+    )
+    with pytest.raises(PlanningDefect):
+        gemini.encode(_intent((SYSTEM, USER, assistant), tools=(SEARCH_TOOL,)), CONTRACT)
+
+
+def test_assistant_without_continuation_encodes_typed_fields():
+    assistant = AssistantMessage(
+        text="Searching.",
+        tool_calls=(ToolCall(id="call_0", name="app_search", arguments={"query": "x"}),),
+        continuation=Absent(),
+    )
+    body = _body(_intent((SYSTEM, USER, assistant), tools=(SEARCH_TOOL,)))
     assert body["contents"][1] == {
         "role": "model",
         "parts": [
-            {
-                "functionCall": {"name": "get_weather", "args": {"city": "Paris"}},
-                "thoughtSignature": "sig-abc",
-            }
+            {"text": "Searching."},
+            {"functionCall": {"name": "app_search", "args": {"query": "x"}}},
         ],
     }
-    # functionResponse still resolves the tool name through the call-id map.
-    assert body["contents"][2] == {
-        "role": "user",
-        "parts": [{"functionResponse": {"name": "get_weather", "response": {"output": "sunny"}}}],
-    }
-    assert response.tool_calls == (
-        ToolCall(
-            id="fc-123",
-            name="get_weather",
-            arguments={"city": "Paris"},
-        ),
+
+
+def test_continuation_codec_mismatch_is_planning_defect():
+    artifact = ContinuationArtifact(
+        target=TARGET, codec_id="openai_responses", opaque_payload={"parts": []}
     )
-    assert len(response.provider_artifacts) == 1
-    assert response.provider_artifacts[0].purpose == "signature"
-    assert response.provider_artifacts[0].to_provider_payload() == {
-        "type": "gemini.thought_signature",
-        "function_call_id": "fc-123",
-        "function_name": "get_weather",
-        "thoughtSignature": "sig-abc",
-    }
+    assistant = AssistantMessage(text="", tool_calls=(), continuation=Present(artifact))
+    with pytest.raises(PlanningDefect):
+        gemini.encode(_intent((SYSTEM, USER, assistant)), CONTRACT)
+
+
+def test_continuation_target_mismatch_is_planning_defect():
+    artifact = ContinuationArtifact(
+        target=ProviderTarget(provider="gemini", model="gemini-other"),
+        codec_id=gemini.CODEC_ID,
+        opaque_payload={"parts": []},
+    )
+    assistant = AssistantMessage(text="", tool_calls=(), continuation=Present(artifact))
+    with pytest.raises(PlanningDefect):
+        gemini.encode(_intent((SYSTEM, USER, assistant)), CONTRACT)
+
+
+def test_continuation_typed_call_mismatch_is_planning_defect():
+    artifact = ContinuationArtifact(
+        target=TARGET,
+        codec_id=gemini.CODEC_ID,
+        opaque_payload={"parts": [{"functionCall": {"name": "app_search", "args": {}}}]},
+    )
+    assistant = AssistantMessage(text="", tool_calls=(), continuation=Present(artifact))
+    with pytest.raises(PlanningDefect):
+        gemini.encode(_intent((SYSTEM, USER, assistant)), CONTRACT)
+
+
+# ---------------------------------------------------------------------------
+# finalize / stream_request / prefix_bytes
+
+
+def test_finalize_is_passthrough():
+    draft = gemini.encode(_intent(), CONTRACT)
+    final = gemini.finalize(draft, "affinity-abc123")
+    assert final.method == "POST"
+    assert final.url == draft.url
+    assert final.body == draft.body
+    assert dict(final.safe_headers) == dict(draft.safe_headers)
+    assert b"affinity-abc123" not in final.body
+
+
+def test_stream_request_derives_alt_sse_url_only():
+    final = gemini.finalize(gemini.encode(_intent(), CONTRACT), "aff")
+    streamed = gemini.stream_request(final)
+    assert streamed.url == (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-3.5-flash:streamGenerateContent?alt=sse"
+    )
+    assert streamed.body == final.body  # byte-identical body; URL selects streaming
+    assert streamed.method == "POST"
+    assert final.url.endswith(":generateContent")  # original value untouched
+
+
+def test_stream_request_rejects_foreign_url():
+    final = gemini.finalize(gemini.encode(_intent(), CONTRACT), "aff")
+    foreign = gemini.stream_request(final)  # already the stream variant
+    with pytest.raises(PlanningDefect):
+        gemini.stream_request(foreign)
+
+
+def test_prefix_bytes_deterministic_and_sensitive():
+    base = gemini.encode(_intent(), CONTRACT).prefix_bytes
+    assert base == gemini.encode(_intent(), CONTRACT).prefix_bytes
+    assert base != b""
+
+    # Dynamic-block changes do NOT touch the affinity input...
+    other_user = UserMessage(blocks=(PromptBlock(text="Different", stability=Dynamic()),))
+    assert gemini.encode(_intent((SYSTEM, other_user)), CONTRACT).prefix_bytes == base
+
+    # ...stable-block changes do...
+    other_system = SystemMessage(
+        blocks=(PromptBlock(text="You are a pirate.", stability=Stable(scope=GlobalScope())),)
+    )
+    assert gemini.encode(_intent((other_system, USER)), CONTRACT).prefix_bytes != base
+
+    # ...and so do tools and the output schema (both live in the cache prefix).
+    assert gemini.encode(_intent(tools=(SEARCH_TOOL,)), CONTRACT).prefix_bytes != base
+    strict = StrictJsonOutput(name="x", schema=SEARCH_TOOL.parameters)
+    assert gemini.encode(_intent(output=strict), CONTRACT).prefix_bytes != base
+
+
+def test_prefix_bytes_sensitive_to_role_move_system_vs_leading_user():
+    # The same stable text placed in systemInstruction vs. a leading user
+    # content turn must produce distinct prefix_bytes.
+    stable_text = "Same stable text."
+    as_system = gemini.encode(
+        _intent(
+            (
+                SystemMessage(
+                    blocks=(PromptBlock(text=stable_text, stability=Stable(scope=GlobalScope())),)
+                ),
+                USER,
+            )
+        ),
+        CONTRACT,
+    ).prefix_bytes
+    as_leading_user = gemini.encode(
+        _intent(
+            (
+                UserMessage(
+                    blocks=(PromptBlock(text=stable_text, stability=Stable(scope=GlobalScope())),)
+                ),
+                USER,
+            )
+        ),
+        CONTRACT,
+    ).prefix_bytes
+    assert as_system != as_leading_user
+
+
+def test_prefix_bytes_sensitive_to_message_regrouping():
+    # Two stable blocks in ONE system message vs. split across a system
+    # message and a leading user message must produce distinct prefix_bytes.
+    one_message = gemini.encode(
+        _intent(
+            (
+                SystemMessage(
+                    blocks=(
+                        PromptBlock(text="Alpha.", stability=Stable(scope=GlobalScope())),
+                        PromptBlock(text="Beta.", stability=Stable(scope=GlobalScope())),
+                    )
+                ),
+                USER,
+            )
+        ),
+        CONTRACT,
+    ).prefix_bytes
+    two_messages = gemini.encode(
+        _intent(
+            (
+                SystemMessage(
+                    blocks=(PromptBlock(text="Alpha.", stability=Stable(scope=GlobalScope())),)
+                ),
+                UserMessage(
+                    blocks=(PromptBlock(text="Beta.", stability=Stable(scope=GlobalScope())),)
+                ),
+                USER,
+            )
+        ),
+        CONTRACT,
+    ).prefix_bytes
+    assert one_message != two_messages
+
+
+def test_prefix_bytes_sensitive_to_stable_text_impersonating_tool_declaration():
+    # A stable block whose text is byte-equal to a real tool declaration's
+    # dump must never collide with an intent that actually declares that tool.
+    declaration_json = json.dumps(
+        {
+            "name": "app_search",
+            "description": "Search the library",
+            "parametersJsonSchema": TOOL_SCHEMA_JSON,
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    impersonating = gemini.encode(
+        _intent(
+            (
+                SystemMessage(
+                    blocks=(
+                        PromptBlock(text=declaration_json, stability=Stable(scope=GlobalScope())),
+                    )
+                ),
+                USER,
+            )
+        ),
+        CONTRACT,
+    ).prefix_bytes
+    with_matching_tool = gemini.encode(_intent(tools=(SEARCH_TOOL,)), CONTRACT).prefix_bytes
+    assert impersonating != with_matching_tool
+
+
+# ---------------------------------------------------------------------------
+# decode_response
+
+
+def test_decode_success_text_skips_thought_parts_and_folds_usage():
+    outcome = _decode_fixture("success_nonstream.json")
+    assert isinstance(outcome, Succeeded)
+    assert outcome.response.content == TextContent(
+        text="Tides are caused by the Moon.", tool_calls=()
+    )
+    assert outcome.response.continuation == Absent()
+    meta = outcome.meta
+    assert meta.provider == "gemini"
+    assert meta.model == "gemini-3.5-flash"
+    assert meta.provider_request_id == Absent()  # ALWAYS Absent on this wire
+    assert meta.upstream_provider == Absent()
+    assert meta.attempt_trace == ()
+    assert meta.billability == PossiblyBillable()
+    assert isinstance(meta.usage, Present)
+    usage = meta.usage.value
+    assert usage.input_tokens == 10
+    assert usage.output_tokens == 8
+    assert usage.total_tokens == 25  # reported total is authoritative
+    assert usage.reasoning_tokens == Present(7)
+    assert usage.cache_read_input_tokens == Present(4)
+    assert usage.cache_write_input_tokens == Absent()
+
+
+def test_decode_tool_calls_synthesize_ids_and_capture_signatures():
+    outcome = _decode_fixture("success_nonstream_tools.json")
+    assert isinstance(outcome, Succeeded)
+    content = outcome.response.content
+    assert isinstance(content, TextContent)
+    assert content.text == "Searching now."
+    assert content.tool_calls == (
+        ToolCall(id="call_0", name="app_search", arguments={"query": "tides", "limit": 3}),
+        ToolCall(id="call_1", name="other_tool", arguments={}),
+    )
+    continuation = outcome.response.continuation
+    assert isinstance(continuation, Present)
+    artifact = continuation.value
+    assert artifact.target == TARGET
+    assert artifact.codec_id == "gemini_generate_content"
+    fixture_parts = json.loads(_fixture_bytes("success_nonstream_tools.json"))["candidates"][0][
+        "content"
+    ]["parts"]
+    assert artifact.opaque_payload == {"parts": fixture_parts}
+
+
+def test_decode_non_object_tool_args_raises_expected_failure():
+    body = json.dumps(
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [{"functionCall": {"name": "app_search", "args": [1, 2]}}]
+                    },
+                    "finishReason": "STOP",
+                }
+            ],
+            "modelVersion": "gemini-3.5-flash",
+        }
+    ).encode()
+    with pytest.raises(ExpectedFailureSignal) as excinfo:
+        gemini.decode_response(200, {}, body)
+    assert isinstance(excinfo.value.failure, InvalidToolArguments)
+
+
+def _terminal_body(finish_reason: str) -> bytes:
+    return json.dumps(
+        {
+            "candidates": [
+                {"content": {"parts": [{"text": "partial"}]}, "finishReason": finish_reason}
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 3,
+                "totalTokenCount": 8,
+            },
+            "modelVersion": "gemini-3.5-flash",
+        }
+    ).encode()
+
+
+def test_decode_max_tokens_is_incomplete():
+    outcome = gemini.decode_response(200, {}, _terminal_body("MAX_TOKENS"))
+    assert isinstance(outcome, Incomplete)
+    assert outcome.reason == "max_output_tokens"
+    assert outcome.status == "provider_incomplete"
+    assert isinstance(outcome.meta.usage, Present)
+
+
+@pytest.mark.parametrize("finish_reason", ["SAFETY", "PROHIBITED_CONTENT"])
+def test_decode_safety_block_is_content_filter_incomplete(finish_reason: str):
+    outcome = gemini.decode_response(200, {}, _terminal_body(finish_reason))
+    assert isinstance(outcome, Incomplete)
+    assert outcome.reason == "content_filter_partial"
+    assert outcome.status == "provider_incomplete"
+    assert isinstance(outcome.safe_detail, Present)
+    assert finish_reason in outcome.safe_detail.value
+
+
+def test_decode_prompt_block_without_candidates_is_content_filter_incomplete():
+    body = json.dumps(
+        {
+            "promptFeedback": {"blockReason": "PROHIBITED_CONTENT"},
+            "usageMetadata": {"promptTokenCount": 5, "totalTokenCount": 5},
+        }
+    ).encode()
+    outcome = gemini.decode_response(200, {}, body)
+    assert isinstance(outcome, Incomplete)
+    assert outcome.reason == "content_filter_partial"
+    assert outcome.status == "provider_incomplete"
+
+
+def test_decode_malformed_function_call_finish_reason_is_expected_failure():
+    with pytest.raises(ExpectedFailureSignal) as excinfo:
+        gemini.decode_response(200, {}, _terminal_body("MALFORMED_FUNCTION_CALL"))
+    assert isinstance(excinfo.value.failure, InvalidToolArguments)
 
 
 @pytest.mark.parametrize(
-    "artifact",
+    "body",
     [
-        ProviderArtifact(
-            provider="openai",
-            model="gemini-2.5-pro",
-            purpose="signature",
-            payload={"thoughtSignature": "sig-abc", "function_call_id": "fc-123"},
-        ),
-        ProviderArtifact(
-            provider="gemini",
-            model="gemini-2.5-flash",
-            purpose="signature",
-            payload={"thoughtSignature": "sig-abc", "function_call_id": "fc-123"},
-        ),
-        ProviderArtifact(
-            provider="gemini",
-            model="gemini-2.5-pro",
-            purpose="reasoning",
-            payload={"thoughtSignature": "sig-abc", "function_call_id": "fc-123"},
-        ),
+        b"not json",
+        b'{"candidates": []}',
+        b'{"no_candidates": true}',
+        json.dumps({"candidates": [{"content": {"parts": []}}]}).encode(),  # no finishReason
     ],
+    ids=["malformed-json", "empty-candidates", "missing-candidates", "missing-finish-reason"],
 )
-@respx.mock
-async def test_rejects_mismatched_provider_artifact_before_request(
-    artifact: ProviderArtifact,
-) -> None:
-    route = respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
-    ).respond(200, json=load_json("success_nonstream.json"))
-    req = ModelCall(
-        model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
-        messages=[
-            ModelMessage(role="user", content="What's the weather?"),
-            ModelMessage(
-                role="assistant",
-                tool_calls=(
-                    ToolCall(
-                        id="fc-123",
-                        name="get_weather",
-                        arguments={"city": "Paris"},
-                    ),
-                ),
-                provider_artifacts=(artifact,),
+def test_decode_malformed_envelopes_raise_protocol_defect(body: bytes):
+    with pytest.raises(ProtocolDefect):
+        gemini.decode_response(200, {}, body)
+
+
+def test_decode_unknown_finish_reason_is_protocol_defect():
+    with pytest.raises(ProtocolDefect):
+        gemini.decode_response(200, {}, _terminal_body("SOMETHING_NEW"))
+
+
+# ---------------------------------------------------------------------------
+# decode_stream
+
+
+async def test_stream_happy_path_accumulates_chunks():
+    events = await _collect(_fixture_stream_events())
+    assert events[0] == StreamStart()
+    assert events[1] == TextDelta(text="Let me")
+    assert events[2] == TextDelta(text=" search.")
+    assert events[3] == ToolCallStart(call_id="call_0", name="app_search")
+    expected_call = ToolCall(id="call_0", name="app_search", arguments={"query": "tides"})
+    assert events[4] == ToolCallDone(tool_call=expected_call)
+    assert isinstance(events[5], ContinuationDelta)
+    terminal = events[6]
+    assert isinstance(terminal, TerminalEvent)
+    assert len(events) == 7
+
+    outcome = terminal.outcome
+    assert isinstance(outcome, Succeeded)
+    assert outcome.response.content == TextContent(
+        text="Let me search.", tool_calls=(expected_call,)
+    )
+    # Exactly one ContinuationDelta, complete, before the terminal.
+    continuation = outcome.response.continuation
+    assert isinstance(continuation, Present)
+    assert continuation.value == events[5].artifact
+    payload_parts = continuation.value.opaque_payload["parts"]
+    assert isinstance(payload_parts, list)
+    assert {"text": "Let me"} in payload_parts
+    assert any("thoughtSignature" in part for part in payload_parts)
+
+    meta = outcome.meta
+    assert meta.provider_request_id == Absent()
+    assert isinstance(meta.usage, Present)
+    assert meta.usage.value.total_tokens == 27  # folded from the final frame
+    assert meta.usage.value.reasoning_tokens == Present(6)
+
+
+async def test_stream_safety_terminal_is_content_filter_incomplete():
+    events = await _collect(
+        [
+            _sse('{"candidates":[{"content":{"parts":[{"text":"par"}]},"index":0}]}'),
+            _sse(
+                '{"candidates":[{"content":{"parts":[]},"finishReason":"SAFETY"}],'
+                '"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":1,'
+                '"totalTokenCount":5}}'
             ),
-        ],
-        max_output_tokens=100,
-        reasoning=ReasoningConfig(effort="default"),
-    )
-
-    async with httpx.AsyncClient() as http:
-        with pytest.raises(ModelCallError) as info:
-            await GeminiClient(http).generate(req, api_key="sk-test", timeout_s=30)
-
-    assert info.value.error_code == ModelCallErrorCode.BAD_REQUEST
-    assert route.call_count == 0
-
-
-@respx.mock
-async def test_rejects_unmatched_signature_artifact_before_request() -> None:
-    route = respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
-    ).respond(200, json=load_json("success_nonstream.json"))
-    req = ModelCall(
-        model=ModelRef(provider="gemini", model="gemini-2.5-pro"),
-        messages=[
-            ModelMessage(role="user", content="What's the weather?"),
-            ModelMessage(
-                role="assistant",
-                tool_calls=(
-                    ToolCall(
-                        id="fc-123",
-                        name="get_weather",
-                        arguments={"city": "Paris"},
-                    ),
-                ),
-                provider_artifacts=(
-                    ProviderArtifact(
-                        provider="gemini",
-                        model="gemini-2.5-pro",
-                        purpose="signature",
-                        payload={
-                            "type": "gemini.thought_signature",
-                            "function_call_id": "fc-other",
-                            "function_name": "other_tool",
-                            "thoughtSignature": "sig-abc",
-                        },
-                    ),
-                ),
-            ),
-        ],
-        max_output_tokens=100,
-        reasoning=ReasoningConfig(effort="default"),
-    )
-
-    async with httpx.AsyncClient() as http:
-        with pytest.raises(ModelCallError) as info:
-            await GeminiClient(http).generate(req, api_key="sk-test", timeout_s=30)
-
-    assert info.value.error_code == ModelCallErrorCode.BAD_REQUEST
-    assert route.call_count == 0
-
-
-@respx.mock
-async def test_nonstream_thought_parts_excluded_from_text() -> None:
-    response_json = load_json("success_nonstream.json")
-    response_json["candidates"][0]["content"]["parts"] = [
-        {"text": "Pondering...", "thought": True},
-        {"text": "Visible answer."},
-    ]
-    respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
-    ).respond(200, json=response_json)
-
-    async with httpx.AsyncClient() as http:
-        response = await GeminiClient(http).generate(request(), api_key="sk-test", timeout_s=30)
-
-    assert response.text == "Visible answer."
-
-
-@respx.mock
-async def test_stream_thought_parts_excluded_and_signature_captured() -> None:
-    stream = (
-        'data: {"candidates":[{"content":{"parts":[{"text":"Pondering...","thought":true},'
-        '{"text":"Visible"}],"role":"model"},"index":0}]}\n\n'
-        'data: {"candidates":[{"content":{"parts":[{"text":" answer."},'
-        '{"functionCall":{"id":"fc-123","name":"get_weather","args":{"city":"Paris"}},'
-        '"thoughtSignature":"sig-abc"}],"role":"model"},"index":0,"finishReason":"STOP"}],'
-        '"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3,"totalTokenCount":8}}\n\n'
-    )
-    respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
-    ).respond(200, content=stream)
-
-    async with httpx.AsyncClient() as http:
-        events = [
-            event
-            async for event in GeminiClient(http).generate_stream(
-                request(), api_key="sk-test", timeout_s=30
-            )
         ]
-
-    assert stream_text(events) == "Visible answer."
-    assert tool_calls(events)[0] == ToolCall(
-        id="fc-123",
-        name="get_weather",
-        arguments={"city": "Paris"},
     )
-    artifacts = provider_artifacts(events)
-    assert len(artifacts) == 1
-    assert artifacts[0].to_provider_payload() == {
-        "type": "gemini.thought_signature",
-        "function_call_id": "fc-123",
-        "function_name": "get_weather",
-        "thoughtSignature": "sig-abc",
-    }
-    assert terminal(events).terminal is True
+    terminal = events[-1]
+    assert isinstance(terminal, TerminalEvent)
+    assert isinstance(terminal.outcome, Incomplete)
+    assert terminal.outcome.reason == "content_filter_partial"
+    assert terminal.outcome.status == "provider_incomplete"
 
 
-@respx.mock
-async def test_stream_max_tokens_finish_reason_is_terminal_incomplete() -> None:
-    stream = (
-        'data: {"candidates":[{"content":{"parts":[{"text":"Partial"}],"role":"model"},'
-        '"index":0,"finishReason":"MAX_TOKENS"}],'
-        '"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3,"totalTokenCount":8}}\n\n'
+async def test_stream_max_tokens_terminal():
+    events = await _collect(
+        [_sse('{"candidates":[{"content":{"parts":[{"text":"x"}]},"finishReason":"MAX_TOKENS"}]}')]
     )
-    respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
-    ).respond(200, content=stream)
-
-    async with httpx.AsyncClient() as http:
-        events = [
-            event
-            async for event in GeminiClient(http).generate_stream(
-                request(), api_key="sk-test", timeout_s=30
-            )
-        ]
-
-    assert stream_text(events) == "Partial"
-    assert terminal(events).status == "incomplete"
-    assert terminal(events).incomplete_details == {"finish_reason": "MAX_TOKENS"}
+    terminal = events[-1]
+    assert isinstance(terminal, TerminalEvent)
+    assert isinstance(terminal.outcome, Incomplete)
+    assert terminal.outcome.reason == "max_output_tokens"
 
 
-@respx.mock
-async def test_stream_yields_tool_call_chunk() -> None:
-    stream = (
-        'data: {"candidates":[{"content":{"parts":[{"functionCall":'
-        '{"name":"get_weather","args":{"city":"Paris"}}}],"role":"model"},'
-        '"index":0,"finishReason":"STOP"}],'
-        '"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3,"totalTokenCount":8}}\n\n'
+async def test_stream_missing_terminal_raises_transient_stream_error():
+    with pytest.raises(TransientStreamError) as excinfo:
+        await _collect([_sse('{"candidates":[{"content":{"parts":[{"text":"x"}]}}]}')])
+    assert excinfo.value.cause == ProviderStreamInterrupted(partial_output=False)
+
+
+async def test_stream_malformed_frame_raises_protocol_defect():
+    with pytest.raises(ProtocolDefect):
+        await _collect([_sse("not json")])
+
+
+# ---------------------------------------------------------------------------
+# classify_error
+
+
+def test_classify_429_rate_limit_with_and_without_retry_after():
+    body = _fixture_bytes("error_429.json")
+    assert gemini.classify_error(429, {"retry-after": "2.5"}, body) == ProviderRateLimit(
+        retry_after=Present(2.5)
     )
-    respx.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
-    ).respond(200, content=stream)
+    assert gemini.classify_error(429, {}, body) == ProviderRateLimit(retry_after=Absent())
 
-    async with httpx.AsyncClient() as http:
-        events = [
-            event
-            async for event in GeminiClient(http).generate_stream(
-                request(), api_key="sk-test", timeout_s=30
-            )
-        ]
 
-    tools = tool_calls(events)
-    assert len(tools) == 1
-    assert tools[0] == ToolCall(id="get_weather", name="get_weather", arguments={"city": "Paris"})
-    assert terminal(events).terminal is True
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_classify_5xx_unavailable(status: int):
+    body = _fixture_bytes("error_500.json") if status == 500 else b"upstream hiccup"
+    assert gemini.classify_error(status, {}, body) == ProviderHttpUnavailable()
+
+
+def test_classify_rpc_status_unavailable_and_deadline():
+    for rpc in ["UNAVAILABLE", "DEADLINE_EXCEEDED"]:
+        body = json.dumps({"error": {"code": 503, "message": "x", "status": rpc}}).encode()
+        assert gemini.classify_error(503, {}, body) == ProviderHttpUnavailable()
+
+
+def test_classify_context_too_large():
+    body = _fixture_bytes("error_context_too_large.json")
+    assert gemini.classify_error(400, {}, body) == ProviderContextTooLarge()
+
+
+def test_classify_credential_rejections():
+    with pytest.raises(CredentialRejected):
+        gemini.classify_error(401, {}, _fixture_bytes("error_401.json"))
+    with pytest.raises(CredentialRejected):
+        gemini.classify_error(
+            403,
+            {},
+            json.dumps(
+                {"error": {"code": 403, "message": "denied", "status": "PERMISSION_DENIED"}}
+            ).encode(),
+        )
+    # Gemini reports an invalid key as HTTP 400 INVALID_ARGUMENT.
+    with pytest.raises(CredentialRejected):
+        gemini.classify_error(
+            400,
+            {},
+            json.dumps(
+                {
+                    "error": {
+                        "code": 400,
+                        "message": "API key not valid. Please pass a valid API key.",
+                        "status": "INVALID_ARGUMENT",
+                    }
+                }
+            ).encode(),
+        )
+
+
+@pytest.mark.parametrize("rpc_status", ["INVALID_ARGUMENT", "FAILED_PRECONDITION"])
+def test_classify_other_4xx_is_unclassified_defect(rpc_status: str):
+    body = json.dumps(
+        {"error": {"code": 400, "message": "something else", "status": rpc_status}}
+    ).encode()
+    with pytest.raises(RuntimeDefect) as excinfo:
+        gemini.classify_error(400, {}, body)
+    assert not isinstance(excinfo.value, CredentialRejected | ProtocolDefect)
+    assert excinfo.value.origin == "provider_http"
+    assert excinfo.value.code == "unclassified_provider_error"
+
+
+def test_classify_unparseable_body_where_parsing_needed_is_protocol_defect():
+    with pytest.raises(ProtocolDefect):
+        gemini.classify_error(404, {}, b"<html>not json</html>")
+
+
+def test_classify_error_detail_redacts_secrets():
+    secret = "AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ123456"
+    body = json.dumps(
+        {
+            "error": {
+                "code": 400,
+                "message": f"Bad request for key {secret}",
+                "status": "FAILED_PRECONDITION",
+            }
+        }
+    ).encode()
+    with pytest.raises(RuntimeDefect) as excinfo:
+        gemini.classify_error(400, {}, body)
+    assert secret not in excinfo.value.message
+    assert "redacted" in excinfo.value.message

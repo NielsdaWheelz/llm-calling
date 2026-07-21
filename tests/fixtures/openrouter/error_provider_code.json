@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": 400,
+    "message": "Provider returned error",
+    "metadata": {
+      "provider_name": "Moonshot AI",
+      "provider_code": "invalid_request_error"
+    }
+  }
+}

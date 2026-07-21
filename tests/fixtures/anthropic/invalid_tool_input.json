@@ -1,0 +1,20 @@
+{
+  "id": "msg_01BadTool",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-fable-5",
+  "content": [
+    {
+      "type": "tool_use",
+      "id": "toolu_01B",
+      "name": "get_weather",
+      "input": "not-an-object"
+    }
+  ],
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 40,
+    "output_tokens": 9
+  }
+}
