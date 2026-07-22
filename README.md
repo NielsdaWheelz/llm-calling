@@ -15,6 +15,9 @@ types.py      frozen value vocabulary (intents, outcomes, stream events, plans)
 schema.py     canonical JSON-Schema subset: parse/validate/serialize, no rewriting
 catalog.py    CATALOG — exact provider contracts (limits, reasoning levels,
               cache mechanism, pricing in usd micros, privacy, certification)
+errors.py     RuntimeDefect hierarchy (PlanningDefect, ProtocolDefect,
+              CredentialRejected, SchemaViolation) + provider-text redaction;
+              defects raise, they are never a returned value
 planning.py   plan_generate: intent -> FinalizedProviderCall | PlanRejected;
               cache affinity (CACHE_AFFINITY_VERSION), retry-policy constants
 openai.py / anthropic.py / gemini.py / moonshot.py / openrouter.py
@@ -24,6 +27,9 @@ transport.py  auth-header injection + HTTP + timeouts + raw SSE framing; parses
               nothing, classifies nothing
 runtime.py    ProviderRuntime: generate/stream (sole same-target retry owner),
               embed/transcribe (non-generation ports)
+embeddings.py OpenAI-only embedding port: request building + strict response
+              validation, dispatched by ProviderRuntime.embed through the
+              shared Transport and EXTERNAL_LLM_RETRY policy
 usage.py      cost_from_accounting over the plan's frozen Accounting — terminal
               costing never re-reads the catalog
 testing.py    NoNetworkRuntime / ScriptedRuntime test doubles
