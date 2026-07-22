@@ -38,10 +38,11 @@ from provider_runtime.catalog import (
     CATALOG,
     CATALOG_REVISION,
     AnthropicPrefixContract,
-    AutomaticPrefixContract,
     CacheContract,
     Catalog,
     ChatModelContract,
+    GeminiAutomaticPrefixContract,
+    MoonshotKeyedPrefixContract,
     OpenAIExplicitPrefixContract,
     OpenRouterPrefixContract,
     OperatorCertified,
@@ -62,15 +63,16 @@ from provider_runtime.types import (
     Dynamic,
     FinalizedProviderCall,
     FinalizedProviderRequest,
+    GeminiAutomaticPrefix,
     GenerateIntent,
     GlobalScope,
     IntentContextTooLarge,
+    MoonshotKeyedPrefix,
     OpenAIExplicitPrefix,
     OpenRouterCertifiedPrefix,
     OwnerScope,
     PlanRejected,
     Present,
-    ProviderAutomaticPrefix,
     ProviderProtocol,
     ProviderTarget,
     RetryPolicy,
@@ -97,7 +99,8 @@ __all__ = [
     "OpenAIExplicitPrefix",
     "OpenRouterCertifiedPrefix",
     "PlanRejected",
-    "ProviderAutomaticPrefix",
+    "GeminiAutomaticPrefix",
+    "MoonshotKeyedPrefix",
     "RetryPolicy",
     "cache_strategy",
     "cache_ttl",
@@ -139,7 +142,7 @@ OPENROUTER_SINGLE_ATTEMPT: Final[RetryPolicy] = RetryPolicy(
 # cross-worker golden vectors (tests/goldens/cache_affinity.json); an old value
 # is never recomputed under new rules.
 
-CACHE_AFFINITY_VERSION: Final = 2
+CACHE_AFFINITY_VERSION: Final = 3
 
 _AFFINITY_DOMAIN: Final = b"nexus-cache-affinity"
 
@@ -181,11 +184,19 @@ def canonical_cache_contract_bytes(contract: CacheContract) -> bytes:
                 "ttl": ttl,
                 "minimum_prefix_tokens": minimum,
             }
-        case AutomaticPrefixContract(provider=provider, minimum_prefix_tokens=maybe_minimum):
+        case GeminiAutomaticPrefixContract(minimum_prefix_tokens=maybe_minimum):
             payload = {
-                "strategy": "provider_automatic_prefix",
-                "provider": provider,
+                "strategy": "gemini_automatic_prefix",
             }
+            match maybe_minimum:
+                case Present(value=minimum):
+                    payload["minimum_prefix_tokens"] = minimum
+                case Absent():
+                    pass
+                case _:
+                    assert_never(maybe_minimum)
+        case MoonshotKeyedPrefixContract(minimum_prefix_tokens=maybe_minimum):
+            payload = {"strategy": "moonshot_keyed_prefix"}
             match maybe_minimum:
                 case Present(value=minimum):
                     payload["minimum_prefix_tokens"] = minimum
@@ -503,9 +514,9 @@ def _cache_plan(
                 stable_breakpoint=stable_breakpoint, ttl="5m", automatic_append_only=True
             )
         case "gemini_generate_content":
-            return ProviderAutomaticPrefix(provider="gemini")
+            return GeminiAutomaticPrefix()
         case "moonshot_chat":
-            return ProviderAutomaticPrefix(provider="moonshot")
+            return MoonshotKeyedPrefix(key=affinity)
         case "openrouter_chat":
             cache = contract.cache
             if not isinstance(cache, OpenRouterPrefixContract) or evidence_revision is None:

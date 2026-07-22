@@ -1,7 +1,7 @@
 """Catalog row facts pinned exactly, plus construction-rejection behavior.
 
-Every number here is transcribed from .dossiers/provider-facts.md (verified
-2026-07-20). A failing pin means either a provider fact changed (update the row
+Every number here is transcribed from .dossiers/provider-facts.md. A failing
+pin means either a provider fact changed (update the row
 AND bump CATALOG_REVISION) or the catalog drifted from the researched facts.
 """
 
@@ -15,11 +15,12 @@ from provider_runtime.catalog import (
     CATALOG,
     CATALOG_REVISION,
     AnthropicPrefixContract,
-    AutomaticPrefixContract,
     Catalog,
     ChatModelContract,
     DirectCertification,
     EmbeddingContract,
+    GeminiAutomaticPrefixContract,
+    MoonshotKeyedPrefixContract,
     OpenAIExplicitPrefixContract,
     OpenRouterPrefixContract,
     OperatorCertified,
@@ -45,7 +46,7 @@ def _with_chat(rows: tuple[ChatModelContract, ...]) -> Catalog:
 
 
 def test_catalog_revision_literal() -> None:
-    assert CATALOG_REVISION == "cat-2026-07-20-r1"
+    assert CATALOG_REVISION == "cat-2026-07-22-r1"
 
 
 def test_exactly_the_eight_chat_targets() -> None:
@@ -63,12 +64,13 @@ def test_exactly_the_eight_chat_targets() -> None:
     assert len(CATALOG.chat) == 8
 
 
-def test_every_chat_row_verified_2026_07_20_with_sources() -> None:
+def test_every_chat_row_has_current_verification_date_and_sources() -> None:
     for row in CATALOG.chat:
-        assert row.verified_at == date(2026, 7, 20), row.target
+        expected = date(2026, 7, 22) if row.target.provider == "moonshot" else date(2026, 7, 20)
+        assert row.verified_at == expected, row.target
         assert row.source_urls, row.target
         assert row.pricing.currency == "usd", row.target
-        assert row.pricing.verified_at == date(2026, 7, 20), row.target
+        assert row.pricing.verified_at == expected, row.target
 
 
 def test_native_mappings_are_identity_and_cover_levels_exactly() -> None:
@@ -186,9 +188,7 @@ def test_gemini_35_flash_row() -> None:
     assert row.output_limit == 65_536
     assert row.reasoning.levels == ("minimal", "low", "medium", "high")
     assert row.reasoning.provider_default == "medium"
-    assert row.cache == AutomaticPrefixContract(
-        provider="gemini", minimum_prefix_tokens=Present(4096)
-    )
+    assert row.cache == GeminiAutomaticPrefixContract(minimum_prefix_tokens=Present(4096))
     # $1.50 / $0.15 / implicit-cache no write billing / $9.00 per 1M.
     assert row.pricing.input_rate == 1_500_000
     assert row.pricing.cache_read_rate == 150_000
@@ -213,7 +213,7 @@ def test_kimi_k3_direct_row() -> None:
     assert row.output_limit == 131_072
     assert row.reasoning.levels == ("low", "high", "max")
     assert row.reasoning.provider_default == "max"
-    assert row.cache == AutomaticPrefixContract(provider="moonshot", minimum_prefix_tokens=Absent())
+    assert row.cache == MoonshotKeyedPrefixContract(minimum_prefix_tokens=Absent())
     # $3.00 (cache-miss) / $0.30 (cache-hit) / automatic no write billing / $15.00 per 1M.
     assert row.pricing.input_rate == 3_000_000
     assert row.pricing.cache_read_rate == 300_000
@@ -415,7 +415,7 @@ def test_operator_certified_row_with_non_openrouter_cache_rejected() -> None:
     routed = _chat("openrouter", "moonshotai/kimi-k3-20260715")
     broken = replace(
         routed,
-        cache=AutomaticPrefixContract(provider="moonshot", minimum_prefix_tokens=Absent()),
+        cache=MoonshotKeyedPrefixContract(minimum_prefix_tokens=Absent()),
         certification=OperatorCertified(
             certified_pinned_upstream="moonshotai/int4",
             certified_canonical_revision="moonshotai/kimi-k3-20260715",

@@ -13,10 +13,11 @@ Continuation: the response `reasoning_details` array is preserved VERBATIM in
 the artifact payload and replayed unmodified in sequence on the assistant
 message; typed fields supply content/tool_calls.
 
-upstream_provider precedence: `openrouter_metadata` (last attempt's endpoint
-slug, else the first listed endpoint) over the top-level `provider` field;
-Absent when neither is present. The generation id (in-band `id`) is the
-provider_request_id.
+upstream_provider is the provider display identity: the last attempt's
+provider, else the selected endpoint's provider, else the top-level `provider`
+field; Absent when none is present. Endpoint routing slugs remain request-side
+facts and are never conflated with this observed identity. The generation id
+(in-band `id`) is the provider_request_id.
 
 Mid-stream in-band error chunks ({"error": {code, message}}, HTTP stays 200)
 raise TransientStreamError — ProviderRateLimit when 429-shaped, otherwise
@@ -356,22 +357,18 @@ def _upstream_from_metadata(metadata: Mapping[str, object]) -> str | None:
     if attempts:
         last = wire.mapping_or_none(attempts[-1])
         if last is not None:
-            for key in ("endpoint", "provider"):
-                value = wire.str_or_none(last.get(key))
-                if value:
-                    return value
-    endpoints = wire.sequence_or_none(metadata.get("endpoints"))
-    if endpoints:
-        first = endpoints[0]
-        value = wire.str_or_none(first)
-        if value:
-            return value
-        entry = wire.mapping_or_none(first)
-        if entry is not None:
-            for key in ("endpoint", "provider", "name"):
-                value = wire.str_or_none(entry.get(key))
-                if value:
-                    return value
+            provider = wire.str_or_none(last.get("provider"))
+            if provider:
+                return provider
+    endpoints = wire.mapping_or_none(metadata.get("endpoints"))
+    available = wire.sequence_or_none(endpoints.get("available")) if endpoints else None
+    if available:
+        for raw_entry in available:
+            entry = wire.mapping_or_none(raw_entry)
+            if entry is not None and entry.get("selected") is True:
+                provider = wire.str_or_none(entry.get("provider"))
+                if provider:
+                    return provider
     return None
 
 

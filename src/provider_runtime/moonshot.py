@@ -3,7 +3,8 @@
 Wire facts (provider-facts.md): POST https://api.moonshot.ai/v1/chat/completions;
 `max_completion_tokens` (NOT the deprecated `max_tokens`); top-level
 `reasoning_effort` low|high|max; thinking + Preserved Thinking always on;
-caching fully automatic (no wire fields — `finalize` is passthrough);
+automatic cache management with `prompt_cache_key` affinity injected by
+`finalize`;
 continuation = the COMPLETE prior assistant message replayed as-is, including
 `reasoning_content` and `tool_calls`; NO sampling fields.
 
@@ -122,16 +123,16 @@ def encode(intent: GenerateIntent, contract: ChatModelContract) -> DraftRequest:
 
 
 def finalize(draft: DraftRequest, affinity: str) -> FinalizedProviderRequest:
-    """Passthrough: Moonshot caching is automatic — no affinity wire field.
-
-    The affinity value is retained plan-side for fingerprint/telemetry only."""
+    """Inject ``prompt_cache_key=affinity`` into a new finalized request."""
+    body = dict(wire.parse_json_object(draft.body, what="moonshot draft body"))
+    body["prompt_cache_key"] = affinity
     return FinalizedProviderRequest(
         target=draft.target,
         protocol=draft.protocol,
         url=draft.url,
         method="POST",
         safe_headers=draft.safe_headers,
-        body=draft.body,
+        body=wire.dump_body(body),
     )
 
 

@@ -742,8 +742,8 @@ class DraftRequest:
     tool_choice, and output schema where the provider's cache prefix includes
     them). compute_cache_affinity consumes it — the affinity input EXCLUDES the
     injected key — then codec.finalize(draft, affinity) constructs a NEW frozen
-    finalized request (prompt_cache_key for openai, session_id for openrouter,
-    passthrough for others).
+    finalized request (prompt_cache_key for OpenAI/Moonshot, session_id for
+    OpenRouter, passthrough for others).
     """
 
     target: ProviderTarget
@@ -784,8 +784,13 @@ class AnthropicPrefix:
 
 
 @dataclass(frozen=True, slots=True)
-class ProviderAutomaticPrefix:
-    provider: Literal["gemini", "moonshot"]
+class GeminiAutomaticPrefix:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class MoonshotKeyedPrefix:
+    key: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -797,7 +802,11 @@ class OpenRouterCertifiedPrefix:
 
 
 type CachePlan = (
-    OpenAIExplicitPrefix | AnthropicPrefix | ProviderAutomaticPrefix | OpenRouterCertifiedPrefix
+    OpenAIExplicitPrefix
+    | AnthropicPrefix
+    | GeminiAutomaticPrefix
+    | MoonshotKeyedPrefix
+    | OpenRouterCertifiedPrefix
 )
 
 
@@ -808,8 +817,10 @@ def cache_strategy(plan: CachePlan) -> str:
             return "openai_explicit_prefix"
         case AnthropicPrefix():
             return "anthropic_prefix"
-        case ProviderAutomaticPrefix():
-            return "provider_automatic_prefix"
+        case GeminiAutomaticPrefix():
+            return "gemini_automatic_prefix"
+        case MoonshotKeyedPrefix():
+            return "moonshot_keyed_prefix"
         case OpenRouterCertifiedPrefix():
             return "openrouter_certified_prefix"
         case _:
@@ -823,7 +834,7 @@ def cache_ttl(plan: CachePlan) -> str | None:
             return ttl
         case AnthropicPrefix(ttl=ttl):
             return ttl
-        case ProviderAutomaticPrefix():
+        case GeminiAutomaticPrefix() | MoonshotKeyedPrefix():
             return None
         case OpenRouterCertifiedPrefix():
             return None

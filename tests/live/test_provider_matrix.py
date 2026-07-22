@@ -25,7 +25,8 @@ The OpenRouter operator route is OperatorUncertified in CATALOG, so the planner
 refuses it by design. ``test_openrouter_certification`` is THE CERTIFIER: it
 plans through a hand-built OperatorCertified copy of the catalog row (pinned to
 ``moonshotai/int4``), proves routed Kimi ``low|high|max`` (spec §4 recheck, both
-arms: direct levels are covered by the matrix above), the pinned upstream, and a
+arms: direct levels are covered by the matrix above), the exact endpoint request
+pin plus its observed provider identity, and a
 NON-ZERO billed cache read, then writes the §8 evidence artifact
 (endpoint-metadata snapshot, probe generation ids, observed cache usage) to
 ``tests/live/evidence/openrouter-<date>.json`` and prints the
@@ -68,6 +69,7 @@ from provider_runtime import (
     Incomplete,
     OpenRouterCertifiedPrefix,
     OperatorCertified,
+    Presence,
     Present,
     PromptBlock,
     ProviderCredential,
@@ -94,8 +96,9 @@ from provider_runtime import (
 )
 from provider_runtime.catalog import (
     AnthropicPrefixContract,
-    AutomaticPrefixContract,
     Catalog,
+    GeminiAutomaticPrefixContract,
+    MoonshotKeyedPrefixContract,
     OpenAIExplicitPrefixContract,
     OpenRouterPrefixContract,
 )
@@ -139,6 +142,9 @@ _CERTIFYING_OPENROUTER_ROW: ChatModelContract = dataclasses.replace(
 )
 
 _EVIDENCE_DIR = Path(__file__).parent / "evidence"
+_CACHE_REFERENCE_CORPUS = (
+    Path(__file__).parent / "fixtures" / "family_picnic_reference.txt"
+).read_text(encoding="utf-8")
 _OPENROUTER_ENDPOINTS_URL = (
     f"https://openrouter.ai/api/v1/models/{_OPENROUTER_ROW.target.model}/endpoints"
 )
@@ -295,13 +301,9 @@ def _assert_input_bound(
     row: ChatModelContract, call: FinalizedProviderCall, usage: TokenUsage
 ) -> None:
     # §9 certification obligation: the bytes-as-tokens planner bound dominates
-    # billed input. Anthropic input_tokens excludes cache components; the other
-    # providers report cache reads as a subset of input_tokens.
+    # normalized billed input. Every codec's TokenUsage.input_tokens is already
+    # cache-inclusive.
     billed_input = usage.input_tokens
-    if row.target.provider == "anthropic":
-        billed_input += _count(usage.cache_read_input_tokens) + _count(
-            usage.cache_write_input_tokens
-        )
     assert call.planned_input_token_upper_bound >= billed_input, (
         f"{_row_id(row)}: planned bound {call.planned_input_token_upper_bound} "
         f"< billed input {billed_input}"
@@ -376,9 +378,9 @@ def _minimum_prefix_tokens(row: ChatModelContract) -> int:
             return minimum
         case AnthropicPrefixContract(minimum_prefix_tokens=minimum):
             return minimum
-        case AutomaticPrefixContract(minimum_prefix_tokens=Present(value=minimum)):
+        case GeminiAutomaticPrefixContract(minimum_prefix_tokens=Present(value=minimum)):
             return minimum
-        case AutomaticPrefixContract() | OpenRouterPrefixContract():
+        case MoonshotKeyedPrefixContract() | OpenRouterPrefixContract():
             # Moonshot direct/routed: no documented minimum — probe well above
             # every known threshold.
             return 4096
@@ -386,16 +388,34 @@ def _minimum_prefix_tokens(row: ChatModelContract) -> int:
 
 
 def _cache_probe_prefix(row: ChatModelContract) -> str:
-    # Fresh nonce per run: call one writes the cache, call two must read it.
-    # ~12 tokens per sentence; target 2x the contract minimum for headroom.
-    nonce = uuid.uuid4().hex
-    sentences = max(1, (_minimum_prefix_tokens(row) * 2) // 12)
-    body = " ".join(
-        f"Cache certification segment {index} of nonce {nonce}: the archive catalogs "
-        "resonance across ingested sources and preserves provenance for every claim."
-        for index in range(sentences)
+    # Fresh natural-language marker per run: call one writes the cache, call two
+    # must read it.
+    # The appendix is intentionally ordinary product-shaped prose: semantic
+    # refusal remains a failure, but the probe itself does not resemble a
+    # repetitive security-evaluation payload.
+    marker_value = uuid.uuid4().int
+    marker = "-".join(
+        (
+            ("willow", "maple", "cedar", "birch")[marker_value % 4],
+            ("daisy", "violet", "clover", "buttercup")[(marker_value // 4) % 4],
+            ("meadow", "pond", "hill", "village")[(marker_value // 16) % 4],
+            str((marker_value // 64) % 10_000),
+        )
     )
-    return f"{_SHORT_STABLE_PREFIX}\n{body}"
+    minimum_chars = _minimum_prefix_tokens(row) * 4
+    paragraphs = _CACHE_REFERENCE_CORPUS.split("\n\n")
+    body_parts: list[str] = []
+    body_length = 0
+    while body_length < minimum_chars:
+        paragraph = paragraphs[len(body_parts) % len(paragraphs)]
+        body_parts.append(paragraph)
+        body_length += len(paragraph) + 2
+    body = "\n\n".join(body_parts)
+    return (
+        "You are reading a gentle family picnic story. Answer briefly and factually.\n"
+        f"Picnic detail {marker}. Use this story as background.\n"
+        f"{body}"
+    )
 
 
 async def _cache_warm_read_pair(
@@ -417,12 +437,20 @@ async def _cache_warm_read_pair(
             reasoning=level,
         )
 
-    warm = await _generate(row, probe_intent("Reply with the single word: warm."), credential)
+    warm = await _generate(
+        row,
+        probe_intent("What foods did the family bring? Answer in one short sentence."),
+        credential,
+    )
     _accepted(row, warm[1])
     warm_usage = _assert_call_facts(row, warm[0], warm[1])
     assert warm[0].request_fingerprint != ""
     await asyncio.sleep(3)
-    read = await _generate(row, probe_intent("Reply with the single word: read."), credential)
+    read = await _generate(
+        row,
+        probe_intent("What did Mara draw? Answer in one short sentence."),
+        credential,
+    )
     _accepted(row, read[1])
     read_usage = _assert_call_facts(row, read[0], read[1])
     assert _count(read_usage.cache_read_input_tokens) > 0, (
@@ -503,9 +531,8 @@ _SEARCH_TOOL = CanonicalTool(
 
 
 def _tool_level(row: ChatModelContract) -> ReasoningLevel:
-    # Reasoning ON so the continuation artifact carries real native replay
-    # material (encrypted reasoning / thinking blocks / thought signatures /
-    # preserved reasoning) on every codec.
+    # Reasoning ON gives each provider an opportunity to emit its native replay
+    # material. Adaptive providers may still legally omit it for a simple turn.
     return "low" if "low" in row.reasoning.levels else _cheapest_level(row)
 
 
@@ -513,7 +540,7 @@ async def _stream_tool_turn(
     row: ChatModelContract,
     intent: GenerateIntent,
     credential: ProviderCredential,
-) -> tuple[FinalizedProviderCall, str, ToolCall, ContinuationArtifact]:
+) -> tuple[FinalizedProviderCall, str, ToolCall, Presence[ContinuationArtifact]]:
     call = _plan(row, intent)
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
@@ -541,10 +568,20 @@ async def _stream_tool_turn(
     outcome = terminals[0].outcome
     terminal = _accepted(row, outcome)
     _assert_call_facts(row, call, terminal)
+    assert isinstance(terminal, Succeeded), f"{_row_id(row)}: tool turn incomplete: {terminal}"
     assert tool_calls, f"{_row_id(row)}: model streamed no completed tool call"
     assert len(artifacts) <= 1, f"{_row_id(row)}: more than one ContinuationDelta"
-    assert artifacts, f"{_row_id(row)}: no continuation artifact for the tool turn"
-    return call, "".join(text_parts), tool_calls[0], artifacts[0]
+    continuation = terminal.response.continuation
+    match continuation:
+        case Present(value=artifact):
+            assert artifacts == [artifact], (
+                f"{_row_id(row)}: terminal continuation and streamed delta disagree"
+            )
+        case Absent():
+            assert not artifacts, (
+                f"{_row_id(row)}: streamed continuation delta absent from terminal response"
+            )
+    return call, "".join(text_parts), tool_calls[0], continuation
 
 
 @pytest.mark.parametrize("row", _DIRECT_ROWS, ids=_row_id)
@@ -563,7 +600,9 @@ async def test_live_tool_call_and_continuation(live_env: LiveEnv, row: ChatModel
         reasoning=level,
         tools=(_SEARCH_TOOL,),
     )
-    _, assistant_text, tool_call, artifact = await _stream_tool_turn(row, first_intent, credential)
+    _, assistant_text, tool_call, continuation = await _stream_tool_turn(
+        row, first_intent, credential
+    )
     assert tool_call.name == _SEARCH_TOOL.name
     assert "query" in dict(tool_call.arguments)
 
@@ -578,7 +617,7 @@ async def test_live_tool_call_and_continuation(live_env: LiveEnv, row: ChatModel
             AssistantMessage(
                 text=assistant_text,
                 tool_calls=(tool_call,),
-                continuation=Present(artifact),
+                continuation=continuation,
             ),
             ToolResultMessage(
                 call_id=tool_call.id,
@@ -659,12 +698,63 @@ async def _fetch_endpoint_metadata(credential: ProviderCredential) -> object:
     return response.json()
 
 
+def _openrouter_endpoint_provider(
+    metadata: object, *, routing_endpoint_slug: str, model: str
+) -> str:
+    assert isinstance(metadata, dict), "OpenRouter endpoint metadata is not an object"
+    data = metadata.get("data")
+    assert isinstance(data, dict), "OpenRouter endpoint metadata carries no data object"
+    endpoints = data.get("endpoints")
+    assert isinstance(endpoints, list), "OpenRouter endpoint metadata carries no endpoint list"
+    matches = [
+        endpoint
+        for endpoint in endpoints
+        if isinstance(endpoint, dict)
+        and endpoint.get("tag") == routing_endpoint_slug
+        and endpoint.get("model_variant_slug", model) == model
+    ]
+    assert len(matches) == 1, (
+        f"expected one endpoint tagged {routing_endpoint_slug!r}; found {len(matches)}"
+    )
+    endpoint = matches[0]
+    expected_quantization = routing_endpoint_slug.rpartition("/")[2]
+    assert endpoint.get("quantization") == expected_quantization, (
+        f"endpoint {routing_endpoint_slug!r} reports quantization "
+        f"{endpoint.get('quantization')!r}, expected {expected_quantization!r}"
+    )
+    provider_name = endpoint.get("provider_name")
+    assert isinstance(provider_name, str) and provider_name, (
+        f"endpoint {routing_endpoint_slug!r} carries no provider_name"
+    )
+    return provider_name
+
+
+def _assert_openrouter_request_pin(call: FinalizedProviderCall, routing_endpoint_slug: str) -> None:
+    body = json.loads(call.request.body)
+    variant = routing_endpoint_slug.rpartition("/")[2]
+    assert body.get("provider") == {
+        "only": [routing_endpoint_slug],
+        "order": [routing_endpoint_slug],
+        "allow_fallbacks": False,
+        "require_parameters": True,
+        "data_collection": "deny",
+        "zdr": True,
+        "quantizations": [variant],
+    }, f"OpenRouter request did not preserve the exact endpoint pin: {body.get('provider')!r}"
+
+
 async def test_openrouter_certification(live_env: LiveEnv) -> None:
     row = _CERTIFYING_OPENROUTER_ROW
     credential = live_env.credential_for("openrouter")
     cache_contract = row.cache
     assert isinstance(cache_contract, OpenRouterPrefixContract)
     pinned_upstream = cache_contract.pinned_upstream
+    endpoint_metadata = await _fetch_endpoint_metadata(credential)
+    observed_provider_name = _openrouter_endpoint_provider(
+        endpoint_metadata,
+        routing_endpoint_slug=pinned_upstream,
+        model=row.target.model,
+    )
 
     # Reasoning probes: routed Kimi low|high|max (spec §4 recheck, routed arm).
     reasoning_probes: list[dict[str, object]] = []
@@ -682,18 +772,20 @@ async def test_openrouter_certification(live_env: LiveEnv) -> None:
         )
         terminal = _accepted(row, outcome)
         _assert_call_facts(row, call, terminal)
+        _assert_openrouter_request_pin(call, pinned_upstream)
         cache_plan = call.cache_plan
         assert isinstance(cache_plan, OpenRouterCertifiedPrefix)
         assert cache_plan.pinned_upstream == pinned_upstream
         observed = _observed_upstream(row, terminal)
-        assert observed == pinned_upstream, (
-            f"routed to {observed!r}, not the pinned upstream {pinned_upstream!r}"
+        assert observed == observed_provider_name, (
+            f"observed provider {observed!r}, expected {observed_provider_name!r} "
+            f"for endpoint {pinned_upstream!r}"
         )
         reasoning_probes.append(
             {
                 "level": level,
                 "generation_id": _generation_id(terminal),
-                "observed_upstream": observed,
+                "observed_provider_name": observed,
             }
         )
 
@@ -701,20 +793,22 @@ async def test_openrouter_certification(live_env: LiveEnv) -> None:
     # metadata claims supports_implicit_caching=false; only this paid probe
     # settles it — zero read keeps the route uncertified).
     warm, read, read_usage = await _cache_warm_read_pair(row, credential)
-    assert _observed_upstream(row, warm[1]) == pinned_upstream
-    assert _observed_upstream(row, read[1]) == pinned_upstream
+    _assert_openrouter_request_pin(warm[0], pinned_upstream)
+    _assert_openrouter_request_pin(read[0], pinned_upstream)
+    assert _observed_upstream(row, warm[1]) == observed_provider_name
+    assert _observed_upstream(row, read[1]) == observed_provider_name
     cache_read_tokens = _count(read_usage.cache_read_input_tokens)
     assert cache_read_tokens > 0
 
     # Evidence artifact (§8): endpoint-metadata snapshot + probe generation ids
     # + observed cache usage. The revision id is content-addressed.
-    endpoint_metadata = await _fetch_endpoint_metadata(credential)
     captured_on = datetime.now(UTC).date().isoformat()
     artifact_body: dict[str, object] = {
         "captured_at": datetime.now(UTC).isoformat(),
         "catalog_revision": CATALOG_REVISION,
         "target": f"{row.target.provider}/{row.target.model}",
-        "pinned_upstream": pinned_upstream,
+        "routing_endpoint_slug": pinned_upstream,
+        "observed_provider_name": observed_provider_name,
         "canonical_revision": cache_contract.canonical_revision,
         "endpoint_metadata": endpoint_metadata,
         "reasoning_probes": reasoning_probes,

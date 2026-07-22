@@ -72,10 +72,16 @@ class AnthropicPrefixContract:
 
 
 @dataclass(frozen=True, slots=True)
-class AutomaticPrefixContract:
+class GeminiAutomaticPrefixContract:
     # Implicit provider-side caching: no wire control is invented; live
     # certification proves reported cache reads (§8).
-    provider: Literal["gemini", "moonshot"]
+    minimum_prefix_tokens: Presence[int]
+
+
+@dataclass(frozen=True, slots=True)
+class MoonshotKeyedPrefixContract:
+    # Moonshot automatically manages cache contents, while prompt_cache_key
+    # provides the stable request affinity needed to improve hit rates.
     minimum_prefix_tokens: Presence[int]
 
 
@@ -91,7 +97,8 @@ class OpenRouterPrefixContract:
 type CacheContract = (
     OpenAIExplicitPrefixContract
     | AnthropicPrefixContract
-    | AutomaticPrefixContract
+    | GeminiAutomaticPrefixContract
+    | MoonshotKeyedPrefixContract
     | OpenRouterPrefixContract
 )
 
@@ -355,7 +362,11 @@ def _validate_chat_row(row: ChatModelContract) -> None:
 
 def _implicit_cache_billing(cache: CacheContract) -> bool:
     match cache:
-        case AutomaticPrefixContract() | OpenRouterPrefixContract():
+        case (
+            GeminiAutomaticPrefixContract()
+            | MoonshotKeyedPrefixContract()
+            | OpenRouterPrefixContract()
+        ):
             return True
         case OpenAIExplicitPrefixContract() | AnthropicPrefixContract():
             return False
@@ -449,9 +460,10 @@ def _require_source_urls(source_urls: tuple[str, ...], label: str) -> None:
 
 # Bump on ANY row change (rate, limit, level, mapping, URL, certification, …);
 # flows into FinalizedProviderCall.catalog_revision and the nexus ledger.
-CATALOG_REVISION: Final[str] = "cat-2026-07-20-r1"
+CATALOG_REVISION: Final[str] = "cat-2026-07-22-r1"
 
 _CHAT_VERIFIED_AT: Final[date] = date(2026, 7, 20)
+_MOONSHOT_VERIFIED_AT: Final[date] = date(2026, 7, 22)
 # Embedding/transcription rows carry the old catalog's facts and verification
 # date forward unchanged; next certification re-verifies them.
 _LEGACY_VERIFIED_AT: Final[date] = date(2026, 6, 11)
@@ -464,7 +476,8 @@ _OPENAI_EMBEDDING_MODEL_URL: Final = (
 _ANTHROPIC_PRICING_URL: Final = "https://platform.claude.com/docs/en/about-claude/pricing"
 _ANTHROPIC_MODELS_URL: Final = "https://platform.claude.com/docs/en/about-claude/models/overview"
 _GEMINI_PRICING_URL: Final = "https://ai.google.dev/gemini-api/docs/pricing"
-_MOONSHOT_DOCS_URL: Final = "https://platform.moonshot.ai/docs/pricing/chat"
+_MOONSHOT_API_URL: Final = "https://platform.kimi.ai/docs/api/chat"
+_MOONSHOT_PRICING_URL: Final = "https://platform.kimi.ai/docs/pricing/chat-k3"
 _OPENROUTER_MODELS_URL: Final = "https://openrouter.ai/api/v1/models"
 
 # Conservative certification-validated framing-overhead allowances (§6).
@@ -680,7 +693,7 @@ _GEMINI_35_FLASH: Final = ChatModelContract(
         provider_default="medium",
         native_mapping=_GEMINI_NATIVE_MAPPING,
     ),
-    cache=AutomaticPrefixContract(provider="gemini", minimum_prefix_tokens=Present(4096)),
+    cache=GeminiAutomaticPrefixContract(minimum_prefix_tokens=Present(4096)),
     continuation_codec="gemini_generate_content",
     strict_schema_dialect="gemini_response_json_schema",
     # No provider request id — §5 correlation is guaranteed only where the
@@ -720,9 +733,9 @@ _KIMI_K3: Final = ChatModelContract(
         provider_default="max",
         native_mapping=_KIMI_NATIVE_MAPPING,
     ),
-    # Fully automatic caching, no params/ids; minimum prefix and TTL are
-    # UNCONFIRMED by the provider docs.
-    cache=AutomaticPrefixContract(provider="moonshot", minimum_prefix_tokens=Absent()),
+    # Automatic cache management with stable request affinity supplied through
+    # prompt_cache_key; minimum prefix and TTL are UNCONFIRMED by provider docs.
+    cache=MoonshotKeyedPrefixContract(minimum_prefix_tokens=Absent()),
     continuation_codec="moonshot_chat",
     strict_schema_dialect="chat_completions_response_format_json_schema",
     provider_request_id_available=True,
@@ -739,11 +752,11 @@ _KIMI_K3: Final = ChatModelContract(
         cache_write_rate=0,
         reasoning_billed_outside_output=False,
         reasoning_reserve_tokens=0,
-        source_url=_MOONSHOT_DOCS_URL,
-        verified_at=_CHAT_VERIFIED_AT,
+        source_url=_MOONSHOT_PRICING_URL,
+        verified_at=_MOONSHOT_VERIFIED_AT,
     ),
-    source_urls=(_MOONSHOT_DOCS_URL,),
-    verified_at=_CHAT_VERIFIED_AT,
+    source_urls=(_MOONSHOT_API_URL, _MOONSHOT_PRICING_URL),
+    verified_at=_MOONSHOT_VERIFIED_AT,
     certification=DirectCertification(),
     provider_framing_overhead_tokens=_DEFAULT_FRAMING_OVERHEAD,
 )

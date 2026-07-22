@@ -100,8 +100,8 @@ key never feeds itself). Checked-in golden vectors
 workers. Any framing, scope-encoding, prefix-encoding, or cache-contract
 semantic change MUST increment `CACHE_AFFINITY_VERSION` and regenerate the
 golden vectors; an old affinity value is never recomputed under new rules.
-OpenAI receives the affinity as `prompt_cache_key`, OpenRouter as
-`session_id`; Anthropic/Gemini/Moonshot use their native prefix mechanisms and
+OpenAI and Moonshot receive the affinity as `prompt_cache_key`, OpenRouter as
+`session_id`; Anthropic and Gemini use their native prefix mechanisms and
 retain the affinity for fingerprint/telemetry only.
 
 ## Development

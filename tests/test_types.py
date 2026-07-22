@@ -14,16 +14,17 @@ from provider_runtime.types import (
     Dynamic,
     Failed,
     FinalAttempt,
+    GeminiAutomaticPrefix,
     GlobalScope,
     Incomplete,
     IntentContextTooLarge,
     InvalidToolArguments,
+    MoonshotKeyedPrefix,
     OpenAIExplicitPrefix,
     OpenRouterCertifiedPrefix,
     PossiblyBillable,
     Present,
     PromptBlock,
-    ProviderAutomaticPrefix,
     ProviderContextTooLarge,
     ProviderHttpUnavailable,
     ProviderRateLimit,
@@ -399,11 +400,11 @@ def test_runtime_stream_event_seq_is_one_based() -> None:
 # Plan value types
 
 
-def test_cache_strategy_and_ttl_accessors_cover_all_four_plans() -> None:
+def test_cache_strategy_and_ttl_accessors_cover_all_five_plans() -> None:
     openai_plan = OpenAIExplicitPrefix(key="affinity", minimum_ttl="30m", breakpoints=1)
     anthropic_plan = AnthropicPrefix(stable_breakpoint=2, ttl="5m", automatic_append_only=True)
-    gemini_plan = ProviderAutomaticPrefix(provider="gemini")
-    moonshot_plan = ProviderAutomaticPrefix(provider="moonshot")
+    gemini_plan = GeminiAutomaticPrefix()
+    moonshot_plan = MoonshotKeyedPrefix(key="affinity")
     openrouter_plan = OpenRouterCertifiedPrefix(
         session_id="affinity",
         pinned_upstream="moonshotai/int4",
@@ -416,10 +417,10 @@ def test_cache_strategy_and_ttl_accessors_cover_all_four_plans() -> None:
     assert cache_strategy(anthropic_plan) == "anthropic_prefix"
     assert cache_ttl(anthropic_plan) == "5m"
 
-    assert cache_strategy(gemini_plan) == "provider_automatic_prefix"
+    assert cache_strategy(gemini_plan) == "gemini_automatic_prefix"
     assert cache_ttl(gemini_plan) is None, "automatic prefix plans declare no wire TTL"
 
-    assert cache_strategy(moonshot_plan) == "provider_automatic_prefix"
+    assert cache_strategy(moonshot_plan) == "moonshot_keyed_prefix"
     assert cache_ttl(moonshot_plan) is None
 
     assert cache_strategy(openrouter_plan) == "openrouter_certified_prefix"

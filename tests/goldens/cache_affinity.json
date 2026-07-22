@@ -1,6 +1,6 @@
 {
-  "_comment": "Cross-worker cache-affinity stability contract (spec §8, CACHE_AFFINITY_VERSION=2). These pinned values must never change without bumping CACHE_AFFINITY_VERSION; never regenerate casually.",
-  "cache_affinity_version": 2,
+  "_comment": "Cross-worker cache-affinity stability contract (spec §8, CACHE_AFFINITY_VERSION=3). These pinned values must never change without bumping CACHE_AFFINITY_VERSION; never regenerate casually.",
+  "cache_affinity_version": 3,
   "vectors": [
     {
       "name": "global-openai-sol-base",
@@ -20,7 +20,7 @@
       "prefix_components_utf8": [
         "{\"type\":\"input_text\",\"text\":\"You are terse.\"}"
       ],
-      "affinity": "RUIcphnt2NjLRbey55xeHE0pFhD6ftEAsImMQw1ycAU"
+      "affinity": "BsMcNV2yS0tRiOhaFEBgiFg4T4tjwTgiSNCquZa51sk"
     },
     {
       "name": "owner-a-openai-sol",
@@ -41,7 +41,7 @@
       "prefix_components_utf8": [
         "{\"type\":\"input_text\",\"text\":\"You are terse.\"}"
       ],
-      "affinity": "4Jpe-mD2s88MQKqEdV-yPlnd_tg99SsdevoZCOe5XQY"
+      "affinity": "Sbr5K1vFVvEUkJnzQci10cjfK5g6bvveTgGlf2ZGefA"
     },
     {
       "name": "owner-b-openai-sol",
@@ -62,7 +62,7 @@
       "prefix_components_utf8": [
         "{\"type\":\"input_text\",\"text\":\"You are terse.\"}"
       ],
-      "affinity": "Q-hcIH_sRRjwzBY8aRcGLOjjT1DE6IehVWARRo4g5OI"
+      "affinity": "BxBBgjxUK4Ku036Dy7nXuo_Af5v7EPi1aJSuXDdIJU8"
     },
     {
       "name": "conversation-a-openai-sol",
@@ -83,7 +83,7 @@
       "prefix_components_utf8": [
         "{\"type\":\"input_text\",\"text\":\"You are terse.\"}"
       ],
-      "affinity": "cGiFmVvkfrm5B5kDuFezthBPVNLyqs1HVf2lsg_KneE"
+      "affinity": "xDhgSyrPNvolPn-IWD6ZtJjleOUd5ItUiiULSokXrDU"
     },
     {
       "name": "conversation-b-openai-sol",
@@ -104,7 +104,7 @@
       "prefix_components_utf8": [
         "{\"type\":\"input_text\",\"text\":\"You are terse.\"}"
       ],
-      "affinity": "w4vVWz35Ypki3kf5PuFxyQkM-qMFDgI37MVuJdbQoEc"
+      "affinity": "8WmjyyqHZrcP8ZJ-EM3Hyj5svWpnmIwrsuVq2zhx3Jw"
     },
     {
       "name": "global-openai-sol-tools",
@@ -126,7 +126,7 @@
         "{\"type\":\"function\",\"name\":\"search_library\",\"description\":\"Search the library\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"],\"additionalProperties\":false},\"strict\":true}",
         "\"auto\""
       ],
-      "affinity": "RZJPuV6ocVZTdN8DO6XLvwjlg-nfTRFlbe5qbVw5cqs"
+      "affinity": "-qusHfhOSri2zaxMaki3HbUY6KZuUocCCXquec5eMLc"
     },
     {
       "name": "global-openai-sol-altprefix",
@@ -146,7 +146,7 @@
       "prefix_components_utf8": [
         "{\"type\":\"input_text\",\"text\":\"You are verbose.\"}"
       ],
-      "affinity": "HrPHOgmQfJYNbZsReqzDjcdMkNjAgjw-ECUIUxt_59w"
+      "affinity": "aTUD4aooOH0ZjK_-YChFNJlXq1RwMYw-1cjHRwUU1n4"
     },
     {
       "name": "global-openai-terra-base",
@@ -166,7 +166,7 @@
       "prefix_components_utf8": [
         "{\"type\":\"input_text\",\"text\":\"You are terse.\"}"
       ],
-      "affinity": "0fgq1DdLctBs48_m3Aolt0q07Bf2R3mK67qSdEXruIM"
+      "affinity": "ukTRAmmTa7MkCFjxJeCmJZUs2zCu9z8NE1M6VKt4oIU"
     },
     {
       "name": "global-anthropic-sonnet",
@@ -186,7 +186,7 @@
       "prefix_components_utf8": [
         "{\"type\":\"input_text\",\"text\":\"You are terse.\"}"
       ],
-      "affinity": "bsCR-swFVImzL0zkbeLJiXH1LpMjK8p13aGN0WFgRrk"
+      "affinity": "3ARuRCQfNH8XP5Giu8ehQ3FsIM_wpRzmZFLP3cxRE-U"
     },
     {
       "name": "owner-a-anthropic-fable",
@@ -207,7 +207,7 @@
       "prefix_components_utf8": [
         "{\"type\":\"input_text\",\"text\":\"You are terse.\"}"
       ],
-      "affinity": "-j0H1DSAO2qMxLAIrO-fbnj-E7_ZENwbRXIlDdx6Nyc"
+      "affinity": "pjNtnUmQe-YtL1d8k5U9ebDt8Wk6AWaWG-fVu1qhX0Q"
     },
     {
       "name": "global-gemini-flash",
@@ -220,14 +220,13 @@
       },
       "protocol": "gemini_generate_content",
       "cache_contract": {
-        "kind": "automatic",
-        "provider": "gemini",
+        "kind": "gemini_automatic",
         "minimum_prefix_tokens": 4096
       },
       "prefix_components_utf8": [
         "{\"type\":\"input_text\",\"text\":\"You are terse.\"}"
       ],
-      "affinity": "Npf60af85sIgkou9kSM6Q76cCBZRL8ynp9zzs0zfSso"
+      "affinity": "GQ5ulM2PK-8HeidBMf2vhnvmqQuY7j7ap_qLt150DcE"
     },
     {
       "name": "global-moonshot-kimi",
@@ -240,13 +239,12 @@
       },
       "protocol": "moonshot_chat",
       "cache_contract": {
-        "kind": "automatic",
-        "provider": "moonshot"
+        "kind": "moonshot_keyed"
       },
       "prefix_components_utf8": [
         "{\"type\":\"input_text\",\"text\":\"You are terse.\"}"
       ],
-      "affinity": "QrpoVhlXz6H2VPuLrpjpi5ENpX3TW_IyOaSsrlghwxY"
+      "affinity": "Cc-uVqyrWyTCTZhqftMZK0V0T-ekwQuEZM5CQk736D0"
     },
     {
       "name": "global-moonshot-kimi-openrouter-protocol",
@@ -259,13 +257,12 @@
       },
       "protocol": "openrouter_chat",
       "cache_contract": {
-        "kind": "automatic",
-        "provider": "moonshot"
+        "kind": "moonshot_keyed"
       },
       "prefix_components_utf8": [
         "{\"type\":\"input_text\",\"text\":\"You are terse.\"}"
       ],
-      "affinity": "Zv4PgnTfJfFPR6TJL44GJ1DUKbQGoJCU1jd3tEA7wjg"
+      "affinity": "2F69RXBD19ZF6MK9tby_yj1g1YrVvlQx9DLgjtjXLhg"
     },
     {
       "name": "conversation-a-openrouter-kimi",
@@ -286,7 +283,7 @@
       "prefix_components_utf8": [
         "{\"type\":\"input_text\",\"text\":\"You are terse.\"}"
       ],
-      "affinity": "VovXd4H-EDWvoUkFKU17Y9C4uZaTyoHhFfEbMq0Bt7Q"
+      "affinity": "eCjJhTKiNvvncJDsrm4-jNDwFFGW5XOz-wOdnK8OKrU"
     }
   ]
 }

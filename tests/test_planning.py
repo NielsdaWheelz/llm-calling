@@ -1,7 +1,7 @@
 """Planner tests (spec §6 seven steps, §8 affinity formula + goldens, §9 reservation).
 
 The golden-vector suite is the cross-worker stability contract for
-CACHE_AFFINITY_VERSION=2: it recomputes every checked-in vector through the
+CACHE_AFFINITY_VERSION=3: it recomputes every checked-in vector through the
 module AND through an independent reimplementation of the §8 formula, and
 proves version-bump sensitivity. Never regenerate the goldens casually.
 """
@@ -16,15 +16,17 @@ from uuid import UUID
 import pytest
 
 from provider_runtime import anthropic as anthropic_codec
+from provider_runtime import moonshot as moonshot_codec
 from provider_runtime import openai as openai_codec
 from provider_runtime import openrouter as openrouter_codec
 from provider_runtime.catalog import (
     CATALOG,
     CATALOG_REVISION,
     AnthropicPrefixContract,
-    AutomaticPrefixContract,
     CacheContract,
     Catalog,
+    GeminiAutomaticPrefixContract,
+    MoonshotKeyedPrefixContract,
     OpenAIExplicitPrefixContract,
     OpenRouterPrefixContract,
     OperatorCertified,
@@ -50,8 +52,10 @@ from provider_runtime.types import (
     ConversationScope,
     Dynamic,
     FinalizedProviderCall,
+    GeminiAutomaticPrefix,
     GenerateIntent,
     GlobalScope,
+    MoonshotKeyedPrefix,
     OpenAIExplicitPrefix,
     OpenRouterCertifiedPrefix,
     OwnerScope,
@@ -59,7 +63,6 @@ from provider_runtime.types import (
     Present,
     PromptBlock,
     PromptMessage,
-    ProviderAutomaticPrefix,
     ProviderTarget,
     ReasoningLevel,
     Stable,
@@ -171,10 +174,14 @@ def _contract_from_spec(spec: dict[str, object]) -> CacheContract:
                 ttl="5m",
                 minimum_prefix_tokens=int(spec["minimum_prefix_tokens"]),  # type: ignore[arg-type]
             )
-        case "automatic":
+        case "gemini_automatic":
             minimum = spec.get("minimum_prefix_tokens")
-            return AutomaticPrefixContract(
-                provider=spec["provider"],  # type: ignore[arg-type]
+            return GeminiAutomaticPrefixContract(
+                minimum_prefix_tokens=Absent() if minimum is None else Present(int(minimum)),  # type: ignore[arg-type]
+            )
+        case "moonshot_keyed":
+            minimum = spec.get("minimum_prefix_tokens")
+            return MoonshotKeyedPrefixContract(
                 minimum_prefix_tokens=Absent() if minimum is None else Present(int(minimum)),  # type: ignore[arg-type]
             )
         case "openrouter":
@@ -236,7 +243,7 @@ def _independent_affinity(
 
 def _golden_vectors() -> list[dict[str, object]]:
     doc = json.loads(GOLDENS.read_text())
-    assert doc["cache_affinity_version"] == CACHE_AFFINITY_VERSION == 2
+    assert doc["cache_affinity_version"] == CACHE_AFFINITY_VERSION == 3
     vectors = doc["vectors"]
     assert len(vectors) >= 12
     return vectors
@@ -250,13 +257,13 @@ class TestCacheAffinityGoldens:
 
     def test_independent_formula_reimplementation_agrees(self) -> None:
         for vector in _golden_vectors():
-            computed = _independent_affinity(2, *_vector_inputs(vector))
+            computed = _independent_affinity(3, *_vector_inputs(vector))
             assert computed == vector["affinity"], vector["name"]
 
     def test_version_bump_changes_every_vector(self) -> None:
         for vector in _golden_vectors():
-            recomputed_v3 = _independent_affinity(3, *_vector_inputs(vector))
-            assert recomputed_v3 != vector["affinity"], vector["name"]
+            recomputed_v4 = _independent_affinity(4, *_vector_inputs(vector))
+            assert recomputed_v4 != vector["affinity"], vector["name"]
 
     def test_pairwise_distinct(self) -> None:
         affinities = [vector["affinity"] for vector in _golden_vectors()]
@@ -297,18 +304,17 @@ class TestCanonicalCacheContractBytes:
         )
         assert raw == b'{"minimum_prefix_tokens":512,"strategy":"anthropic_prefix","ttl":"5m"}'
 
-    def test_automatic_presence_field_serialized_only_when_present(self) -> None:
+    def test_provider_cache_presence_fields_serialize_only_when_present(self) -> None:
         with_minimum = canonical_cache_contract_bytes(
-            AutomaticPrefixContract(provider="gemini", minimum_prefix_tokens=Present(4096))
+            GeminiAutomaticPrefixContract(minimum_prefix_tokens=Present(4096))
         )
         assert (
-            with_minimum
-            == b'{"minimum_prefix_tokens":4096,"provider":"gemini","strategy":"provider_automatic_prefix"}'
+            with_minimum == b'{"minimum_prefix_tokens":4096,"strategy":"gemini_automatic_prefix"}'
         )
         without_minimum = canonical_cache_contract_bytes(
-            AutomaticPrefixContract(provider="moonshot", minimum_prefix_tokens=Absent())
+            MoonshotKeyedPrefixContract(minimum_prefix_tokens=Absent())
         )
-        assert without_minimum == b'{"provider":"moonshot","strategy":"provider_automatic_prefix"}'
+        assert without_minimum == b'{"strategy":"moonshot_keyed_prefix"}'
 
     def test_openrouter(self) -> None:
         raw = canonical_cache_contract_bytes(
@@ -571,13 +577,15 @@ class TestCachePlans:
 
     def test_gemini_automatic_prefix(self) -> None:
         plan = plan_ok(intent_for(GEMINI_TARGET, "medium"))
-        assert plan.cache_plan == ProviderAutomaticPrefix(provider="gemini")
-        assert cache_strategy(plan.cache_plan) == "provider_automatic_prefix"
+        assert plan.cache_plan == GeminiAutomaticPrefix()
+        assert cache_strategy(plan.cache_plan) == "gemini_automatic_prefix"
         assert cache_ttl(plan.cache_plan) is None
 
-    def test_moonshot_automatic_prefix(self) -> None:
+    def test_moonshot_keyed_prefix(self) -> None:
         plan = plan_ok(intent_for(MOONSHOT_TARGET, "max"))
-        assert plan.cache_plan == ProviderAutomaticPrefix(provider="moonshot")
+        assert isinstance(plan.cache_plan, MoonshotKeyedPrefix)
+        assert json.loads(plan.request.body)["prompt_cache_key"] == plan.cache_plan.key
+        assert cache_strategy(plan.cache_plan) == "moonshot_keyed_prefix"
         assert cache_ttl(plan.cache_plan) is None
 
     def test_openrouter_certified_prefix_strategy(self) -> None:
@@ -623,6 +631,23 @@ class TestAffinityInjection:
         assert body == json.loads(draft.body)
         assert isinstance(plan.cache_plan, OpenRouterCertifiedPrefix)
         assert plan.cache_plan.session_id == expected_affinity
+
+    def test_moonshot_body_carries_the_affinity_as_prompt_cache_key(self) -> None:
+        intent = intent_for(MOONSHOT_TARGET, "max")
+        contract = CATALOG.chat_contract(MOONSHOT_TARGET)
+        plan = plan_ok(intent)
+        draft = moonshot_codec.encode(intent, contract)
+        expected_affinity = compute_cache_affinity(
+            GlobalScope(),
+            MOONSHOT_TARGET,
+            contract.protocol,
+            canonical_cache_contract_bytes(contract.cache),
+            draft.prefix_bytes,
+        )
+        body = json.loads(plan.request.body)
+        assert body.pop("prompt_cache_key") == expected_affinity
+        assert body == json.loads(draft.body)
+        assert plan.cache_plan == MoonshotKeyedPrefix(key=expected_affinity)
 
     def test_anthropic_body_carries_no_affinity_field(self) -> None:
         plan = plan_ok(intent_for(ANTHROPIC_TARGET, "high"))

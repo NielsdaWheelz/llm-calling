@@ -28,7 +28,7 @@ Codec decisions (documented here because they are wire-observable):
   ``required``, ``anyOf`` nullable unions, and annotations all reach the wire
   verbatim. The old ``_strip_gemini_tool_schema_unsupported_fields`` behavior
   MUST NOT reappear; release certification validates provider acceptance.
-- Caching: implicit only (``ProviderAutomaticPrefix``). NO cache field of any
+- Caching: implicit only (``GeminiAutomaticPrefix``). NO cache field of any
   kind is sent; ``prefix_bytes`` is still computed per the codec seam because
   cache affinity is telemetry for Gemini.
 - Continuation: a Succeeded model turn that contains functionCall parts or

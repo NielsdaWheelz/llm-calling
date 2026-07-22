@@ -399,7 +399,7 @@ def test_decode_response_success_with_metadata() -> None:
     assert outcome.meta.provider == "openrouter"
     assert outcome.meta.model == "moonshotai/kimi-k3-20260715"
     assert outcome.meta.provider_request_id == Present("gen-or-001")  # generation id
-    assert outcome.meta.upstream_provider == Present("moonshotai/int4")
+    assert outcome.meta.upstream_provider == Present("Moonshot AI")
     assert outcome.meta.usage == Present(
         TokenUsage(
             input_tokens=200,
@@ -415,6 +415,16 @@ def test_decode_response_success_with_metadata() -> None:
 def test_upstream_provider_extraction_precedence() -> None:
     data = fixture_json("success_reasoning_details.json")
 
+    attempts_first = dict(data)
+    raw_metadata = attempts_first["openrouter_metadata"]
+    assert isinstance(raw_metadata, dict)
+    metadata = dict(raw_metadata)
+    metadata["attempts"] = [{"provider": "Attempt Provider", "model": TARGET.model, "status": 200}]
+    attempts_first["openrouter_metadata"] = metadata
+    outcome = openrouter.decode_response(200, {}, json.dumps(attempts_first).encode())
+    assert isinstance(outcome, Succeeded)
+    assert outcome.meta.upstream_provider == Present("Attempt Provider")
+
     metadata_less = dict(data)
     del metadata_less["openrouter_metadata"]
     outcome = openrouter.decode_response(200, {}, json.dumps(metadata_less).encode())
@@ -422,10 +432,17 @@ def test_upstream_provider_extraction_precedence() -> None:
     assert outcome.meta.upstream_provider == Present("Moonshot AI")
 
     endpoints_only = dict(data)
-    endpoints_only["openrouter_metadata"] = {"endpoints": ["moonshotai/int4"]}
+    endpoints_only["openrouter_metadata"] = {
+        "endpoints": {
+            "total": 1,
+            "available": [
+                {"provider": "Selected Provider", "model": TARGET.model, "selected": True}
+            ],
+        }
+    }
     outcome = openrouter.decode_response(200, {}, json.dumps(endpoints_only).encode())
     assert isinstance(outcome, Succeeded)
-    assert outcome.meta.upstream_provider == Present("moonshotai/int4")
+    assert outcome.meta.upstream_provider == Present("Selected Provider")
 
     bare = dict(data)
     del bare["openrouter_metadata"]
@@ -491,7 +508,7 @@ async def test_stream_happy_path() -> None:
     assert isinstance(outcome, Succeeded)
     assert outcome.response.content == TextContent(text="Tides follow the moon.", tool_calls=())
     assert outcome.meta.provider_request_id == Present("gen-or-002")
-    assert outcome.meta.upstream_provider == Present("moonshotai/int4")  # from metadata chunk
+    assert outcome.meta.upstream_provider == Present("Moonshot AI")
     assert outcome.meta.usage == Present(
         TokenUsage(
             input_tokens=150,

@@ -1,4 +1,4 @@
-"""Moonshot codec tests: encode goldens, passthrough finalize, stream_request
+"""Moonshot codec tests: encode goldens, affinity finalize, stream_request
 injection determinism, prefix-bytes sensitivity, non-stream/stream decode
 (usage nesting: choices[0].usage REAL shape + tolerated top-level chunk),
 complete-native-message continuation replay, and the classify_error table."""
@@ -271,14 +271,17 @@ def test_encode_rejects_mismatched_continuation() -> None:
 # finalize / stream_request
 
 
-def test_finalize_is_passthrough() -> None:
+def test_finalize_injects_affinity_without_mutating_draft() -> None:
     draft = moonshot.encode(make_intent(), CONTRACT)
+    draft_body = json.loads(draft.body)
     final = moonshot.finalize(draft, "affinity-xyz")
-    assert final.body == draft.body
+    parsed = json.loads(final.body)
+    assert parsed == {**draft_body, "prompt_cache_key": "affinity-xyz"}
+    assert list(parsed)[-1] == "prompt_cache_key"
+    assert "prompt_cache_key" not in json.loads(draft.body)
     assert final.method == "POST"
     assert final.url == draft.url
     assert final.safe_headers == draft.safe_headers
-    assert "affinity-xyz" not in final.body.decode()
 
 
 def test_stream_request_appends_stream_fields_deterministically() -> None:
