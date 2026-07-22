@@ -765,6 +765,9 @@ async def test_openrouter_certification(live_env: LiveEnv) -> None:
         routing_endpoint_slug=pinned_upstream,
         model=row.target.model,
     )
+    # Leave a clean provider window after endpoint discovery or the preceding
+    # invalid-key probe before the first paid generation.
+    await asyncio.sleep(3)
 
     # Reasoning probes: routed Kimi low|high|max (spec §4 recheck, routed arm).
     reasoning_probes: list[dict[str, object]] = []
@@ -800,7 +803,7 @@ async def test_openrouter_certification(live_env: LiveEnv) -> None:
         )
         # The operator route is deliberately single-attempt. Pace independent
         # paid probes instead of turning provider 429s into runtime retries.
-        await asyncio.sleep(1)
+        await asyncio.sleep(3)
 
     # Billed cache read on the warm/read pair (the §8 hard gate: endpoint
     # metadata claims supports_implicit_caching=false; only this paid probe
