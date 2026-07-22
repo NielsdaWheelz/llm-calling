@@ -249,9 +249,7 @@ async def _generate(
     return call, outcome
 
 
-_SHORT_STABLE_PREFIX = (
-    "You are the Nexus live-certification assistant. Answer briefly and factually."
-)
+_SHORT_STABLE_PREFIX = "You are a concise reference assistant. Answer briefly and factually."
 
 
 def _cheapest_level(row: ChatModelContract) -> ReasoningLevel:
@@ -402,7 +400,10 @@ def _cache_probe_prefix(row: ChatModelContract) -> str:
             str((marker_value // 64) % 10_000),
         )
     )
-    minimum_chars = _minimum_prefix_tokens(row) * 4
+    # Six UTF-8 characters per declared token minimum keeps the actual
+    # provider-reported input above every current threshold without relying on
+    # a provider tokenizer in the shared probe.
+    minimum_chars = _minimum_prefix_tokens(row) * 6
     paragraphs = _CACHE_REFERENCE_CORPUS.split("\n\n")
     body_parts: list[str] = []
     body_length = 0
