@@ -1,0 +1,32 @@
+{
+  "id": "chatcmpl-msh-004",
+  "object": "chat.completion",
+  "model": "kimi-k3",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "reasoning_content": "The tide table tool has the answer.",
+        "tool_calls": [
+          {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"query\": \"tides\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 90,
+    "completion_tokens": 25,
+    "total_tokens": 115,
+    "cached_tokens": 0
+  }
+}

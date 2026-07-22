@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": 400,
+    "message": "This request exceeds the maximum context length of the pinned endpoint",
+    "metadata": {
+      "provider_name": "Moonshot AI",
+      "provider_code": "context_length_exceeded"
+    }
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "id": "chatcmpl-msh-001",
+  "object": "chat.completion",
+  "model": "kimi-k3",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Venus is the hottest planet.",
+        "reasoning_content": "Compared mean surface temperatures across the solar system."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 120,
+    "completion_tokens": 40,
+    "total_tokens": 160,
+    "cached_tokens": 96
+  }
+}

@@ -1,137 +1,93 @@
-"""Provider error classification."""
+"""Runtime defect hierarchy and provider-text redaction.
+
+Defects are broken invariants, impossible states, and contract violations —
+never product control flow. Expected, modelable failures live in
+`provider_runtime.types` as the closed `ExpectedModelFailure` union (returned as
+values); defects raise.
+
+Transient signals are runtime-internal (`_TransientSignal` in the retry
+boundary); `classify_error` RETURNS values and never returns a defect as a value
+— it raises `ProtocolDefect`.
+
+Every defect carries safe context only: no prompts, provider bodies,
+credentials, or hidden reasoning. Callers embed provider diagnostics only via
+`safe_provider_error_body_snippet` / `sanitize_provider_text`.
+"""
 
 from __future__ import annotations
 
+import json
 import re
-from enum import StrEnum
 
-import httpx
-
-from provider_runtime.types import RetryAttempt
+from provider_runtime.types import FailureOrigin
 
 
-class ModelCallErrorCode(StrEnum):
-    INVALID_KEY = "invalid_key"
-    RATE_LIMIT = "rate_limit"
-    CONTEXT_TOO_LARGE = "context_too_large"
-    TIMEOUT = "timeout"
-    PROVIDER_DOWN = "provider_down"
-    BAD_REQUEST = "bad_request"
-    MODEL_NOT_AVAILABLE = "model_not_available"
-    QUOTA_EXCEEDED = "quota_exceeded"
-    TOOL_ARGUMENTS_INVALID = "tool_arguments_invalid"
+class RuntimeDefect(Exception):
+    """A broken runtime invariant.
 
+    Carries the §9 ledger `origin`, a closed per-subclass `code`, and a
+    safe-context `message`. The worker boundary reports/re-raises defects and
+    records origin/code/trace operator-side; a defect never becomes a product
+    failure variant.
+    """
 
-class ModelCallError(Exception):
-    def __init__(
-        self,
-        error_code: ModelCallErrorCode,
-        message: str,
-        provider: str | None = None,
-        *,
-        status_code: int | None = None,
-        retry_after_seconds: float | None = None,
-        provider_request_id: str | None = None,
-        retryable: bool | None = None,
-        safe_body_snippet: str | None = None,
-        attempts: tuple[RetryAttempt, ...] = (),
-    ):
-        self.error_code = error_code
-        self.message = message
-        self.provider = provider
-        self.status_code = status_code
-        self.retry_after_seconds = retry_after_seconds
-        self.provider_request_id = provider_request_id
-        self.retryable = _is_retryable_error(error_code) if retryable is None else retryable
-        self.safe_body_snippet = safe_body_snippet
-        self.attempts = attempts
+    origin: FailureOrigin
+    code: str
+    message: str
+
+    def __init__(self, *, origin: FailureOrigin, code: str, message: str) -> None:
         super().__init__(message)
-
-    @property
-    def attempt_count(self) -> int:
-        return len(self.attempts) if self.attempts else 1
-
-    @property
-    def retry_count(self) -> int:
-        return max(0, self.attempt_count - 1)
-
-    def with_attempts(self, attempts: tuple[RetryAttempt, ...]) -> ModelCallError:
-        self.attempts = attempts
-        return self
+        self.origin = origin
+        self.code = code
+        self.message = message
 
 
-async def raise_for_provider_error(response: httpx.Response, provider: str) -> None:
-    """Raise a typed provider error without retaining provider response bodies."""
-    if response.status_code < 400:
-        return
-    try:
-        await response.aread()
-    except Exception:
-        pass
-    try:
-        json_body = response.json()
-    except Exception:
-        json_body = None
-    code = classify_provider_error(
-        provider,
-        response.status_code,
-        json_body if isinstance(json_body, dict) else None,
-        None,
-    )
-    message = f"{provider} HTTP {response.status_code}"
-    raise ModelCallError(
-        code,
-        message,
-        provider=provider,
-        status_code=response.status_code,
-        retry_after_seconds=_retry_after_seconds(response.headers.get("retry-after")),
-        provider_request_id=response.headers.get("x-request-id")
-        or response.headers.get("request-id"),
-    )
+class PlanningDefect(RuntimeDefect):
+    """A planner-detected invariant violation.
+
+    Covers invalid schemas, invalid/mismatched cache scopes,
+    continuation target/codec mismatch, and unsupported cache intent.
+
+    EXPLICITLY EXCLUDES the expected oversize case: an intent measuring over the
+    contract's context limit is returned as ``PlanRejected(IntentContextTooLarge)``
+    — the expected planner rejection channel — never raised as a defect.
+    """
+
+    def __init__(self, *, code: str, message: str) -> None:
+        super().__init__(origin="plan", code=code, message=message)
 
 
-def classify_provider_error(
-    provider: str,
-    status_code: int | None,
-    json_body: dict | None,
-    exception: Exception | None,
-) -> ModelCallErrorCode:
-    if exception is not None:
-        exception_type = type(exception).__name__
-        if "Timeout" in exception_type or "timeout" in str(exception).lower():
-            return ModelCallErrorCode.TIMEOUT
-        if "Network" in exception_type or "Connection" in exception_type:
-            return ModelCallErrorCode.PROVIDER_DOWN
+class SchemaViolation(PlanningDefect):
+    """An authored schema falls outside the canonical JSON Schema subset (§5)."""
 
-    if status_code is None:
-        return ModelCallErrorCode.PROVIDER_DOWN
-
-    if provider in ("openai", "openrouter", "cloudflare"):
-        return _classify_openai_error(status_code, json_body)
-    if provider == "anthropic":
-        return _classify_anthropic_error(status_code, json_body)
-    if provider == "gemini":
-        return _classify_gemini_error(status_code, json_body)
-    return ModelCallErrorCode.PROVIDER_DOWN
+    def __init__(self, message: str) -> None:
+        super().__init__(code="schema_violation", message=message)
 
 
-def _is_retryable_error(error_code: ModelCallErrorCode) -> bool:
-    return error_code in {
-        ModelCallErrorCode.RATE_LIMIT,
-        ModelCallErrorCode.TIMEOUT,
-        ModelCallErrorCode.PROVIDER_DOWN,
-    }
+class ProtocolDefect(RuntimeDefect):
+    """A malformed provider envelope or unknown terminal provider response.
+
+    Raised (never returned) by codec decode/classify ingress.
+    """
+
+    def __init__(self, *, code: str, message: str) -> None:
+        super().__init__(origin="provider_response", code=code, message=message)
 
 
-def _retry_after_seconds(raw: str | None) -> float | None:
-    if not raw:
-        return None
-    try:
-        parsed = float(raw)
-    except ValueError:
-        return None
-    return parsed if parsed >= 0 else None
+class CredentialRejected(RuntimeDefect):
+    """The platform credential was rejected by the provider (HTTP 401/403).
 
+    A defect per §9 — platform configuration is an operator fact, so rejection is
+    never a product-facing failure.
+    """
+
+    def __init__(self, *, message: str) -> None:
+        super().__init__(origin="provider_http", code="credential_rejected", message=message)
+
+
+# ---------------------------------------------------------------------------
+# Secret redaction — preserved verbatim-in-behavior from the pre-cutover
+# errors.py (patterns + 500-char bound).
 
 _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"), "...redacted"),
@@ -181,100 +137,35 @@ def sanitize_provider_text(text: str, *, limit: int = 500) -> str:
     return snippet
 
 
-def _safe_body_snippet(body_text: str) -> str:
-    return sanitize_provider_text(body_text, limit=500)
+def safe_provider_error_body_snippet(
+    json_body: dict | None,
+    body_text: str | None,
+) -> str | None:
+    summary = _provider_error_summary(json_body)
+    if summary:
+        return sanitize_provider_text(
+            json.dumps(summary, sort_keys=True, separators=(",", ":")),
+            limit=500,
+        )
+    return None
 
 
-def _classify_openai_error(status_code: int, json_body: dict | None) -> ModelCallErrorCode:
-    if status_code in (401, 403):
-        return ModelCallErrorCode.INVALID_KEY
-
-    if status_code in (408, 504):
-        return ModelCallErrorCode.TIMEOUT
-
-    if status_code == 429:
-        error = (json_body or {}).get("error", {})
-        # Billing exhaustion, not throughput: distinct because it is not retryable.
-        if "insufficient_quota" in (error.get("code", ""), error.get("type", "")):
-            return ModelCallErrorCode.QUOTA_EXCEEDED
-        return ModelCallErrorCode.RATE_LIMIT
-
-    if status_code == 404:
-        return ModelCallErrorCode.MODEL_NOT_AVAILABLE
-
-    if status_code >= 500:
-        return ModelCallErrorCode.PROVIDER_DOWN
-
-    if status_code == 400 and json_body:
-        error = json_body.get("error", {})
-        error_code = error.get("code", "")
-        error_message = error.get("message", "").lower()
-
-        if error_code == "context_length_exceeded":
-            return ModelCallErrorCode.CONTEXT_TOO_LARGE
-        if "maximum context length" in error_message:
-            return ModelCallErrorCode.CONTEXT_TOO_LARGE
-        if "model" in error_message and "not found" in error_message:
-            return ModelCallErrorCode.MODEL_NOT_AVAILABLE
-
-    if status_code is not None and status_code < 500:
-        return ModelCallErrorCode.BAD_REQUEST
-
-    return ModelCallErrorCode.PROVIDER_DOWN
-
-
-def _classify_anthropic_error(status_code: int, json_body: dict | None) -> ModelCallErrorCode:
-    if status_code in (401, 403):
-        return ModelCallErrorCode.INVALID_KEY
-
-    if status_code == 429:
-        return ModelCallErrorCode.RATE_LIMIT
-
-    if status_code == 404:
-        return ModelCallErrorCode.MODEL_NOT_AVAILABLE
-
-    if status_code >= 500:
-        return ModelCallErrorCode.PROVIDER_DOWN
-
-    if status_code == 400 and json_body:
-        error = json_body.get("error", {})
-        error_type = error.get("type", "")
-        error_message = error.get("message", "").lower()
-
-        if error_type == "invalid_request_error" and "too long" in error_message:
-            return ModelCallErrorCode.CONTEXT_TOO_LARGE
-        # Out-of-credit is a 400 invalid_request_error on this provider.
-        if "credit balance is too low" in error_message:
-            return ModelCallErrorCode.QUOTA_EXCEEDED
-
-    if status_code is not None and status_code < 500:
-        return ModelCallErrorCode.BAD_REQUEST
-
-    return ModelCallErrorCode.PROVIDER_DOWN
-
-
-def _classify_gemini_error(status_code: int, json_body: dict | None) -> ModelCallErrorCode:
-    body_str = str(json_body).lower() if json_body else ""
-
-    if "api_key_invalid" in body_str or ("api key" in body_str and "invalid" in body_str):
-        return ModelCallErrorCode.INVALID_KEY
-
-    if status_code in (401, 403):
-        return ModelCallErrorCode.INVALID_KEY
-
-    if status_code == 429 or "resource_exhausted" in body_str:
-        return ModelCallErrorCode.RATE_LIMIT
-
-    if "exceeds the maximum" in body_str:
-        return ModelCallErrorCode.CONTEXT_TOO_LARGE
-
-    if status_code == 404 or "model not found" in body_str:
-        return ModelCallErrorCode.MODEL_NOT_AVAILABLE
-
-    if status_code >= 500:
-        return ModelCallErrorCode.PROVIDER_DOWN
-
-    if status_code is not None and status_code < 500:
-        return ModelCallErrorCode.BAD_REQUEST
-
-    return ModelCallErrorCode.PROVIDER_DOWN
+def _provider_error_summary(json_body: dict | None) -> dict[str, object]:
+    if not json_body:
+        return {}
+    summary: dict[str, object] = {}
+    error = json_body.get("error")
+    if isinstance(error, dict):
+        for key in ("message", "type", "code", "param", "status"):
+            value = error.get(key)
+            if isinstance(value, str | int | float | bool) or value is None:
+                if value is not None:
+                    summary[key] = value
+        return summary
+    if isinstance(error, str):
+        summary["message"] = error
+    for key in ("message", "error_description", "code", "status"):
+        value = json_body.get(key)
+        if isinstance(value, str | int | float | bool):
+            summary[key] = value
+    return summary

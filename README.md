@@ -1,143 +1,120 @@
 # provider-runtime
 
-Small async Python package for provider-level model calls.
+Small async Python package (`>=3.12`, httpx only, no provider SDKs) for
+provider-level LLM calls against a pinned, live-certified contract catalog.
 
-The package owns the shared runtime contract: catalog validation, high-level request lowering,
-HTTP request formatting, response parsing, streaming chunks, bounded provider retries, normalized
-provider errors, key probes, embeddings, transcription, no-network test fakes, and deterministic cost estimates
-from explicit catalog pricing. It supports OpenAI, Anthropic, Gemini, OpenRouter,
-Cloudflare/OpenAI-compatible chat, OpenAI-compatible embeddings, and OpenAI
-audio transcription.
+The package owns one thing: turning a typed generation intent into exactly one
+immutable finalized provider request, executing it, and returning a closed
+terminal outcome. Callers (Nexus) own prompts, credentials, HTTP client
+lifecycle, persistence, budgets, and product behavior.
 
-Callers own prompts, API keys, HTTP client lifecycle, logging, persistence, application
-idempotency, and product behavior. Provider adapter modules are internal implementation details;
-application code should use `provider_runtime.ModelRuntime`.
+## Architecture
 
-## Install
+```
+types.py      frozen value vocabulary (intents, outcomes, stream events, plans)
+schema.py     canonical JSON-Schema subset: parse/validate/serialize, no rewriting
+catalog.py    CATALOG — exact provider contracts (limits, reasoning levels,
+              cache mechanism, pricing in usd micros, privacy, certification)
+errors.py     RuntimeDefect hierarchy (PlanningDefect, ProtocolDefect,
+              CredentialRejected, SchemaViolation) + provider-text redaction;
+              defects raise, they are never a returned value
+planning.py   plan_generate: intent -> FinalizedProviderCall | PlanRejected;
+              cache affinity (CACHE_AFFINITY_VERSION), retry-policy constants
+openai.py / anthropic.py / gemini.py / moonshot.py / openrouter.py
+              codecs: encode/finalize, decode_response, decode_stream,
+              classify_error, stream_request (private; not exported)
+transport.py  auth-header injection + HTTP + timeouts + raw SSE framing; parses
+              nothing, classifies nothing
+runtime.py    ProviderRuntime: generate/stream (sole same-target retry owner),
+              embed/transcribe (non-generation ports)
+embeddings.py OpenAI-only embedding port: request building + strict response
+              validation, dispatched by ProviderRuntime.embed through the
+              shared Transport and EXTERNAL_LLM_RETRY policy
+usage.py      cost_from_accounting over the plan's frozen Accounting — terminal
+              costing never re-reads the catalog
+testing.py    NoNetworkRuntime / ScriptedRuntime test doubles
+```
+
+Data flow: `GenerateIntent -> plan_generate(CATALOG) -> FinalizedProviderCall
+-> ProviderRuntime.generate/stream -> CallOutcome / RuntimeStreamEvent`.
+
+## The pinned-contract philosophy
+
+Every callable model is a checked-in `ChatModelContract` row in `CATALOG`:
+exact provider/model target, protocol, context/output limits, the declared
+reasoning levels with their exact native wire values, the cache mechanism and
+minimum prefix, integer usd-micro pricing with source URLs and a verification
+date, privacy posture, and a certification arm. The catalog is a transcription
+of verified provider facts — never a place to remember them. Any row change
+bumps `CATALOG_REVISION`, which is stamped into every plan and flows into the
+consumer's ledger.
+
+There is no dynamic control plane, no BYOK, no fallback, no sampling knobs, no
+response cache, and no JSON repair. Changes are reviewed, live-certified, and
+deployed like code. Nexus pins this repository at an exact revision (the Nexus
+root `Makefile` owns the pin and the `make certify-llm-providers` gate) and
+consumes only the package surface in `provider_runtime.__all__`; a new
+catalog/contract revision reaches production only through a pin bump plus a
+fresh paid certification run.
+
+The OpenRouter operator route is special: its catalog row stays
+`OperatorUncertified` (representable but unplannable) until the live
+certification test observes the pinned upstream (`moonshotai/int4`), routed
+Kimi `low|high|max` acceptance, and a non-zero billed cache read. The test
+writes the evidence artifact to `tests/live/evidence/` and prints the
+`evidence_revision` to pin in the row as `OperatorCertified(...)`.
+
+## Certification (paid live matrix)
 
 ```bash
-uv add provider-runtime
+LLM_RUNTIME_LIVE=1 uv run pytest -m live_provider tests/live/test_provider_matrix.py
 ```
 
-Python `>=3.12` is required.
+Required environment:
 
-## Runtime
+- `LLM_RUNTIME_LIVE=1` — the matrix fails closed without it;
+- `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `MOONSHOT_API_KEY`
+  for the direct routes;
+- `OPENROUTER_API_KEY` for the operator route (the certification and
+  invalid-key probes);
+- optional `LLM_RUNTIME_LIVE_PROVIDERS=openai,gemini,...` narrows a local run;
+  narrowed runs are debugging aids — release certification runs unfiltered.
 
-```python
-import httpx
+Per chat target the matrix proves: one minimal call per declared reasoning
+level, an above-minimum-prefix cache warm/read probe with an observed cache
+read (bounded successful-call sampling for Gemini's non-guaranteed implicit
+cache), strict JSON (including a required-nullable field), a streamed tool call
+plus same-target continuation replay, invalid-key classification,
+request-id/usage presence per contract facts, and the planner's input-token
+upper bound dominating billed input on every call — plus minimal OpenAI
+embedding and transcription calls. The default `uv run pytest` suite is fully
+deterministic and makes no network calls (`live_provider` is deselected by
+`addopts`).
 
-from provider_runtime import (
-    ModelCall,
-    ModelMessage,
-    ModelRef,
-    ModelRuntime,
-    ProviderApiKey,
-    RetryPolicy,
-)
+## Cache-affinity versioning rule
 
-async with httpx.AsyncClient() as http:
-    runtime = ModelRuntime(http)
-    response = await runtime.generate(
-        ModelCall(
-            model=ModelRef(provider="openai", model="gpt-5.4-mini"),
-            messages=[ModelMessage(role="user", content="Write one sentence.")],
-            max_output_tokens=128,
-            retry=RetryPolicy(max_attempts=2),
-        ),
-        key=ProviderApiKey("sk-...", source="platform"),
-        timeout_s=45,
-    )
-    print(response.text)
-```
+`planning.py` solely owns `CACHE_AFFINITY_VERSION` and the length-framed
+affinity formula (scope, target, protocol, canonical cache-contract bytes, and
+the codec's exact native prefix bytes — computed pre-finalize so the injected
+key never feeds itself). Checked-in golden vectors
+(`tests/goldens/cache_affinity.json`) pin the values across processes and
+workers. Any framing, scope-encoding, prefix-encoding, or cache-contract
+semantic change MUST increment `CACHE_AFFINITY_VERSION` and regenerate the
+golden vectors; an old affinity value is never recomputed under new rules.
+OpenAI and Moonshot receive the affinity as `prompt_cache_key`, OpenRouter as
+`session_id`; Anthropic and Gemini use their native prefix mechanisms and
+retain the affinity for fingerprint/telemetry only.
 
-## Catalog And Cost
-
-`DEFAULT_CATALOG` is the hard provider contract. Each row declares its operation surface
-(`generation`, `embeddings`, `transcription`), provider-owned model ID, supported reasoning
-controls, prompt-cache shape, normalized usage claims, artifact support, and pricing provenance.
-The runtime rejects operation mismatches before provider I/O.
-
-Catalog pricing is advisory and fail-closed. Runtime responses expose normalized usage; callers
-pass that usage and the selected catalog row to `estimate_catalog_cost(...)` when they need an
-advisory cost estimate. The estimator returns `estimated` only when verified catalog rates are
-sufficient for the selected model and input size. Rates with provider thresholds use
-`Pricing.applies_up_to_input_tokens`; calls above that threshold return `missing_pricing` rather
-than a flattened under-estimate. Prices without a provider source URL and verification date are
-treated as absent.
-
-## Reasoning
-
-`reasoning=ReasoningConfig(effort="default")` is the runtime-owned safe default for the
-selected catalog row. Direct OpenAI catalog rows omit `reasoning` for `default`; explicit direct
-OpenAI values currently include `"none"`, `"low"`, `"medium"`, and `"high"`, while product
-`"max"` maps to OpenAI `"xhigh"`.
-
-Gemini lowering is model-specific. Gemini 2.5 models use `thinkingBudget`; Gemini 3 models use
-`thinkingLevel`. The runtime maps Gemini `default` to a cost-safe visible-output setting for each
-model family instead of blindly using provider defaults that can consume small responses with
-thinking tokens. Unsupported thinking-off modes, such as `none` on Gemini Pro models, are rejected
-by catalog validation before a request reaches the provider adapter.
-
-OpenRouter receives explicit `reasoning` controls, including `exclude=true`, for every catalog
-reasoning mode. This keeps hidden reasoning out of the response while still letting callers choose
-supported reasoning effort levels.
-
-OpenAI responses preserve `status`, `incomplete_details`, `provider_request_id`, and
-`usage.output_tokens_details.reasoning_tokens`. A `response.incomplete` result is returned
-with `status="incomplete"` instead of being marked as a successful completion.
-
-## Streaming
-
-```python
-import httpx
-
-from provider_runtime import (
-    ModelCall,
-    ModelMessage,
-    ModelRef,
-    ModelRuntime,
-    ProviderApiKey,
-    RetryPolicy,
-)
-
-async with httpx.AsyncClient() as http:
-    runtime = ModelRuntime(http, enable_openai=True)
-    async for event in runtime.stream(
-        ModelCall(
-            model=ModelRef(provider="openai", model="gpt-5.4-mini"),
-            messages=[ModelMessage(role="user", content="Stream one sentence.")],
-            max_output_tokens=128,
-            retry=RetryPolicy(max_attempts=2),
-        ),
-        key=ProviderApiKey("sk-...", source="platform"),
-    ):
-        if event.type == "text_delta":
-            print(event.text, end="")
-```
-
-Retries are bounded and limited to normalized retryable provider failures: timeouts, connection
-failures, rate limits, and 5xx-class provider outages. Streaming calls retry only before any chunk
-has been yielded; after a visible delta, tool call, or provider artifact escapes, the error is
-returned to the caller so the application can restart the durable run under its own idempotency
-rules.
-
-## Tests
-
-Use `ScriptedRuntime` or `NoNetworkRuntime` from `provider_runtime.testing` for application tests.
-They expose the runtime interface without opening provider network connections.
-
-Default tests exclude live provider calls. The shared live matrix is the strict
-provider-runtime acceptance gate and must be run explicitly after real keys are
-available:
+## Development
 
 ```bash
-LLM_RUNTIME_LIVE=1 uv run pytest -v -m live_provider tests/live/test_provider_matrix.py
+uv sync --all-groups
+uv run pytest            # deterministic suite (unit/golden + HTTP-boundary)
+uv run ruff check .
+uv run ruff format --check .
+uv run pyright
 ```
 
-By default it covers every generation row in `DEFAULT_CATALOG`, every declared reasoning effort,
-OpenAI, Anthropic, Gemini, OpenRouter, Cloudflare, embeddings, and transcription.
-For focused diagnosis, set `LLM_RUNTIME_LIVE_PROVIDERS=openai,anthropic`; narrowed runs are
-debugging aids and do not count as acceptance proof.
-Required key env vars are `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-`GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and for Cloudflare both
-`CLOUDFLARE_AI_API_TOKEN` and `CLOUDFLARE_AI_ACCOUNT_ID`.
+Application tests should use `ScriptedRuntime` / `NoNetworkRuntime` from
+`provider_runtime.testing`: the runtime interface without provider network
+connections, with scripts that must end in exactly one terminal.

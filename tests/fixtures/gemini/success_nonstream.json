@@ -3,9 +3,8 @@
     {
       "content": {
         "parts": [
-          {
-            "text": "Hello! How can I help you today?"
-          }
+          {"text": "Thinking about tides.", "thought": true},
+          {"text": "Tides are caused by the Moon."}
         ],
         "role": "model"
       },
@@ -16,6 +15,9 @@
   "usageMetadata": {
     "promptTokenCount": 10,
     "candidatesTokenCount": 8,
-    "totalTokenCount": 18
-  }
+    "totalTokenCount": 25,
+    "thoughtsTokenCount": 7,
+    "cachedContentTokenCount": 4
+  },
+  "modelVersion": "gemini-3.5-flash"
 }

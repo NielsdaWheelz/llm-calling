@@ -1,0 +1,60 @@
+{
+  "id": "gen-or-001",
+  "object": "chat.completion",
+  "model": "moonshotai/kimi-k3-20260715",
+  "provider": "Moonshot AI",
+  "openrouter_metadata": {
+    "requested": "moonshotai/kimi-k3-20260715",
+    "strategy": "order",
+    "region": "eu-west",
+    "attempt": 1,
+    "is_byok": false,
+    "endpoints": {
+      "total": 1,
+      "available": [
+        {
+          "provider": "Moonshot AI",
+          "model": "moonshotai/kimi-k3-20260715",
+          "selected": true
+        }
+      ]
+    },
+    "attempts": [
+      {"provider": "Moonshot AI", "model": "moonshotai/kimi-k3-20260715", "status": 200}
+    ]
+  },
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Tides follow the moon.",
+        "reasoning": "Lunar gravity dominates.",
+        "reasoning_details": [
+          {
+            "type": "reasoning.encrypted",
+            "id": "rd-1",
+            "format": "openrouter-v1",
+            "index": 0,
+            "data": "opaque-block-a"
+          },
+          {
+            "type": "reasoning.text",
+            "id": "rd-2",
+            "format": "openrouter-v1",
+            "index": 1,
+            "text": "Lunar gravity dominates."
+          }
+        ]
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 200,
+    "completion_tokens": 60,
+    "total_tokens": 260,
+    "prompt_tokens_details": {"cached_tokens": 128, "cache_write_tokens": 16},
+    "completion_tokens_details": {"reasoning_tokens": 24}
+  }
+}

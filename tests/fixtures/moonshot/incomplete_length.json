@@ -1,0 +1,20 @@
+{
+  "id": "chatcmpl-msh-006",
+  "object": "chat.completion",
+  "model": "kimi-k3",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Tides are caused by"
+      },
+      "finish_reason": "length"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 50,
+    "completion_tokens": 8,
+    "total_tokens": 58
+  }
+}

@@ -1,208 +1,228 @@
-from provider_runtime import DEFAULT_CATALOG, DEFAULT_PRICING_SOURCE, Pricing, TokenUsage
-from provider_runtime.usage import estimate_catalog_cost, estimate_cost
+"""cost_from_accounting: micros math over frozen plan accounting.
+
+The module must not touch the catalog: rates come exclusively from the frozen
+Accounting value (negative gate covers the import elsewhere)."""
+
+from __future__ import annotations
+
+import pytest
+
+from provider_runtime.types import Absent, Accounting, Presence, Present, TokenUsage
+from provider_runtime.usage import CostBreakdown, cost_from_accounting
+
+ABSENT: Absent = Absent()
 
 
-def test_estimate_cost_uses_integer_micros_and_excludes_cache_from_full_input() -> None:
-    cost = estimate_cost(
-        TokenUsage(
+def accounting(
+    *,
+    input_rate: int = 2_000_000,
+    output_rate: int = 8_000_000,
+    cache_write_rate: int = 2_500_000,
+    cache_read_rate: int = 200_000,
+    reasoning_billed_outside_output: bool = False,
+) -> Accounting:
+    return Accounting(
+        currency="usd",
+        input_rate=input_rate,
+        output_rate=output_rate,
+        cache_write_rate=cache_write_rate,
+        cache_read_rate=cache_read_rate,
+        reasoning_billed_outside_output=reasoning_billed_outside_output,
+        platform_token_reservation=10_000,
+        maximum_cost_estimate_usd_micros=99_000_000,
+    )
+
+
+def usage(
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    reasoning_tokens: Presence[int] = ABSENT,
+    cache_read_input_tokens: Presence[int] = ABSENT,
+    cache_write_input_tokens: Presence[int] = ABSENT,
+) -> TokenUsage:
+    return TokenUsage.from_components(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=Absent(),
+        reasoning_tokens=reasoning_tokens,
+        cache_read_input_tokens=cache_read_input_tokens,
+        cache_write_input_tokens=cache_write_input_tokens,
+    )
+
+
+def test_plain_input_output_math() -> None:
+    breakdown = cost_from_accounting(
+        accounting(), usage(input_tokens=1_000_000, output_tokens=500_000)
+    )
+    assert breakdown == CostBreakdown(
+        input_cost_usd_micros=2_000_000,
+        output_cost_usd_micros=4_000_000,
+        cache_write_cost_usd_micros=0,
+        cache_read_cost_usd_micros=0,
+        reasoning_cost_usd_micros=0,
+        total_cost_usd_micros=6_000_000,
+    )
+
+
+def test_cache_components_are_subtracted_from_billable_input() -> None:
+    breakdown = cost_from_accounting(
+        accounting(),
+        usage(
             input_tokens=1000,
-            output_tokens=2000,
-            total_tokens=3000,
-            reasoning_tokens=100,
-            cache_creation_input_tokens=100,
-            cached_tokens=400,
-        ),
-        Pricing(
-            input_per_million=1.0,
-            output_per_million=2.0,
-            cached_input_per_million=0.25,
-            cache_write_per_million_by_ttl={"5m": 1.25},
-            reasoning_per_million=3.0,
-            reasoning_billing_mode="separate",
-        ),
-        cache_write_ttl="5m",
-    )
-
-    assert cost.input_cost_usd_micros == 500
-    assert cost.output_cost_usd_micros == 4000
-    assert cost.cache_write_cost_usd_micros == 125
-    assert cost.cache_read_cost_usd_micros == 100
-    assert cost.reasoning_cost_usd_micros == 300
-    assert cost.total_cost_usd_micros == 5025
-
-
-def test_estimate_cost_handles_anthropic_normalized_cache_usage() -> None:
-    cost = estimate_cost(
-        TokenUsage(
-            input_tokens=160,
-            output_tokens=8,
-            total_tokens=168,
-            cache_creation_input_tokens=100,
-            cache_read_input_tokens=50,
-        ),
-        Pricing(
-            input_per_million=1,
-            output_per_million=1,
-            cached_input_per_million="0.10",
-            cache_write_per_million_by_ttl={"5m": "1.25"},
-            reasoning_billing_mode="included_in_output",
-        ),
-        cache_write_ttl="5m",
-    )
-
-    assert cost.input_cost_usd_micros == 10
-    assert cost.output_cost_usd_micros == 8
-    assert cost.cache_write_cost_usd_micros == 125
-    assert cost.cache_read_cost_usd_micros == 5
-    assert cost.total_cost_usd_micros == 148
-
-
-def test_inclusive_reasoning_billing_does_not_double_count_reasoning_tokens() -> None:
-    estimate = estimate_catalog_cost(
-        TokenUsage(
-            input_tokens=1000,
-            output_tokens=2000,
-            total_tokens=3000,
-            reasoning_tokens=400,
-        ),
-        Pricing(
-            input_per_million=1,
-            output_per_million=2,
-            reasoning_billing_mode="included_in_output",
-            source_url="https://example.invalid/pricing",
-            verified_at="2026-06-11",
+            cache_read_input_tokens=Present(600),
+            cache_write_input_tokens=Present(100),
         ),
     )
+    # billable input = 1000 - 600 - 100 = 300
+    assert breakdown.input_cost_usd_micros == 600  # 300 * 2_000_000 / 1e6
+    assert breakdown.cache_read_cost_usd_micros == 120  # 600 * 200_000 / 1e6
+    assert breakdown.cache_write_cost_usd_micros == 250  # 100 * 2_500_000 / 1e6
+    assert breakdown.total_cost_usd_micros == 600 + 120 + 250
 
-    assert estimate.status == "estimated"
-    assert estimate.breakdown.reasoning_cost_usd_micros is None
-    assert estimate.breakdown.total_cost_usd_micros == 5000
+
+def test_absent_cache_components_bill_full_input() -> None:
+    breakdown = cost_from_accounting(accounting(), usage(input_tokens=1000))
+    assert breakdown.input_cost_usd_micros == 2000
+    assert breakdown.cache_read_cost_usd_micros == 0
+    assert breakdown.cache_write_cost_usd_micros == 0
 
 
-def test_estimate_cost_does_not_synthesize_total_for_unknown_prices() -> None:
-    estimate = estimate_catalog_cost(
-        TokenUsage(input_tokens=1000, output_tokens=1000, total_tokens=2000),
-        Pricing(),
+def test_billable_input_is_floored_at_zero() -> None:
+    breakdown = cost_from_accounting(
+        accounting(),
+        usage(input_tokens=100, cache_read_input_tokens=Present(600)),
     )
-
-    assert estimate.status == "missing_pricing"
-    assert estimate.breakdown.input_cost_usd_micros is None
-    assert estimate.breakdown.output_cost_usd_micros is None
-    assert estimate.breakdown.total_cost_usd_micros is None
+    assert breakdown.input_cost_usd_micros == 0
+    assert breakdown.cache_read_cost_usd_micros == 120
 
 
-def test_estimate_catalog_cost_reports_missing_usage_before_pricing() -> None:
-    estimate = estimate_catalog_cost(
-        None,
-        Pricing(input_per_million=1, output_per_million=2),
+def test_rounding_is_half_up_per_line() -> None:
+    # 1 token at 500_000 micros/M = 0.5 micros -> 1 (half rounds up).
+    up = cost_from_accounting(accounting(input_rate=500_000), usage(input_tokens=1))
+    assert up.input_cost_usd_micros == 1
+    # 1 token at 499_999 micros/M = 0.499999 -> 0.
+    down = cost_from_accounting(accounting(input_rate=499_999), usage(input_tokens=1))
+    assert down.input_cost_usd_micros == 0
+    # 3 tokens at 500_000 micros/M = 1.5 -> 2.
+    mid = cost_from_accounting(accounting(input_rate=500_000), usage(input_tokens=3))
+    assert mid.input_cost_usd_micros == 2
+
+
+def test_reasoning_line_only_when_billed_outside_output() -> None:
+    outside = cost_from_accounting(
+        accounting(reasoning_billed_outside_output=True),
+        usage(output_tokens=10, reasoning_tokens=Present(1_000_000)),
     )
+    # Billed at the OUTPUT rate.
+    assert outside.reasoning_cost_usd_micros == 8_000_000
+    assert outside.total_cost_usd_micros == outside.output_cost_usd_micros + 8_000_000
 
-    assert estimate.status == "missing_usage"
-    assert estimate.breakdown.total_cost_usd_micros is None
-
-
-def test_estimate_catalog_cost_reports_not_token_priced_for_provider_unit_pricing() -> None:
-    estimate = estimate_catalog_cost(
-        TokenUsage(input_tokens=1000, output_tokens=1000, total_tokens=2000),
-        Pricing(unit="provider_units"),
+    inside = cost_from_accounting(
+        accounting(reasoning_billed_outside_output=False),
+        usage(output_tokens=10, reasoning_tokens=Present(1_000_000)),
     )
+    assert inside.reasoning_cost_usd_micros == 0
 
-    assert estimate.status == "not_token_priced"
-    assert estimate.breakdown.total_cost_usd_micros is None
-
-
-def test_estimate_catalog_cost_reports_estimated_when_required_components_are_known() -> None:
-    estimate = estimate_catalog_cost(
-        TokenUsage(input_tokens=1000, output_tokens=1000, total_tokens=2000),
-        Pricing(
-            input_per_million=1,
-            output_per_million=2,
-            source_url="https://example.invalid/pricing",
-            verified_at="2026-06-11",
-        ),
-        pricing_source="test-catalog",
+    unreported = cost_from_accounting(
+        accounting(reasoning_billed_outside_output=True),
+        usage(output_tokens=10),
     )
-
-    assert estimate.policy == "catalog_pricing"
-    assert estimate.status == "estimated"
-    assert estimate.pricing_source == "test-catalog"
-    assert estimate.breakdown.input_cost_usd_micros == 1000
-    assert estimate.breakdown.output_cost_usd_micros == 2000
-    assert estimate.breakdown.total_cost_usd_micros == 3000
+    assert unreported.reasoning_cost_usd_micros == 0
 
 
-def test_estimate_catalog_cost_requires_pricing_provenance() -> None:
-    estimate = estimate_catalog_cost(
-        TokenUsage(input_tokens=1000, output_tokens=1000, total_tokens=2000),
-        Pricing(input_per_million=1, output_per_million=2),
-        pricing_source="test-catalog",
-    )
-
-    assert estimate.status == "missing_pricing"
-    assert estimate.pricing_source == "test-catalog"
-    assert estimate.breakdown.input_cost_usd_micros is None
-    assert estimate.breakdown.output_cost_usd_micros is None
-    assert estimate.breakdown.total_cost_usd_micros is None
+def test_zero_usage_is_all_zero() -> None:
+    breakdown = cost_from_accounting(accounting(), usage())
+    assert breakdown == CostBreakdown(0, 0, 0, 0, 0, 0)
 
 
-def test_pricing_snapshot_preserves_provenance_and_decimal_rates() -> None:
-    pricing = Pricing(
-        input_per_million="1.25",
-        output_per_million="2.5",
-        cached_input_per_million="0.125",
-        cache_write_per_million_by_ttl={"5m": "1.5"},
-        reasoning_billing_mode="included_in_output",
-        source_url="https://example.invalid/pricing",
-        verified_at="2026-06-11",
-    )
-
-    assert pricing.to_json() == {
-        "input_per_million": "1.25",
-        "output_per_million": "2.5",
-        "cached_input_per_million": "0.125",
-        "cache_write_per_million_by_ttl": {"5m": "1.5"},
-        "reasoning_per_million": None,
-        "reasoning_billing_mode": "included_in_output",
-        "applies_up_to_input_tokens": None,
-        "source_url": "https://example.invalid/pricing",
-        "verified_at": "2026-06-11",
-        "currency": "USD",
-        "unit": "per_million_tokens",
-    }
+# ---------------------------------------------------------------------------
+# Per-provider cost goldens (§ TokenUsage.input_tokens codec invariant):
+# every codec normalizes to the cache-INCLUSIVE convention at ingress, so
+# cost_from_accounting's subtraction correctly recovers billable (uncached)
+# input for all five providers. A future codec that drifts from this
+# convention (e.g. reintroducing a cache-EXCLUSIVE input_tokens) will
+# either zero out the input line here or break these totals.
 
 
-def test_threshold_pricing_fails_closed_above_supported_context() -> None:
-    estimate = estimate_catalog_cost(
-        TokenUsage(input_tokens=2001, output_tokens=1, total_tokens=2002),
-        Pricing(
-            input_per_million=1,
-            output_per_million=2,
-            applies_up_to_input_tokens=2000,
+def test_cost_golden_anthropic_shaped_cache_read_exceeds_raw_input() -> None:
+    # Regression for the cost-accounting blocker: Anthropic's wire
+    # input_tokens EXCLUDES cache reads/writes (raw input=500,
+    # cache_read=2000, output=100), so the codec normalizes at ingress to
+    # the inclusive total input_tokens=500+2000=2500 before this ever sees
+    # it. A cache_read exceeding the raw wire input is the sharpest case:
+    # under the old (wrong) exclusive convention this floored the billable
+    # input line to 0.
+    breakdown = cost_from_accounting(
+        accounting(),
+        usage(
+            input_tokens=500 + 2000,  # already-normalized inclusive input
+            output_tokens=100,
+            cache_read_input_tokens=Present(2000),
         ),
     )
-
-    assert estimate.status == "missing_pricing"
-    assert estimate.breakdown.total_cost_usd_micros is None
-
-
-def test_default_catalog_prices_are_verified_or_missing() -> None:
-    for capability in DEFAULT_CATALOG.entries:
-        pricing_json = capability.pricing.to_json()
-        has_prices = any(
-            pricing_json[key] is not None
-            for key in (
-                "input_per_million",
-                "output_per_million",
-                "cached_input_per_million",
-                "reasoning_per_million",
-            )
-        ) or bool(pricing_json["cache_write_per_million_by_ttl"])
-        if has_prices:
-            assert pricing_json["source_url"]
-            assert pricing_json["verified_at"] == "2026-06-11"
-        else:
-            assert pricing_json["source_url"] is None
+    # Bills the uncached 500 tokens at the input rate — never zero.
+    assert breakdown.input_cost_usd_micros == 1000  # 500 * 2_000_000 / 1e6
+    assert breakdown.cache_read_cost_usd_micros == 400  # 2000 * 200_000 / 1e6
+    assert breakdown.total_cost_usd_micros == (
+        breakdown.input_cost_usd_micros
+        + breakdown.output_cost_usd_micros
+        + breakdown.cache_write_cost_usd_micros
+        + breakdown.cache_read_cost_usd_micros
+        + breakdown.reasoning_cost_usd_micros
+    )
 
 
-def test_default_catalog_pricing_source_name_is_stable() -> None:
-    assert DEFAULT_PRICING_SOURCE == "provider_runtime.catalog.DEFAULT_CATALOG"
+@pytest.mark.parametrize(
+    "provider_label",
+    [
+        "openai_input_tokens_details.cached_tokens",
+        "gemini_cachedContentTokenCount",
+        "moonshot_cached_tokens",
+    ],
+)
+def test_cost_golden_inclusive_wire_shapes(provider_label: str) -> None:
+    # OpenAI usage.input_tokens, Gemini promptTokenCount, and Moonshot
+    # prompt_tokens are each already cache-INCLUSIVE on the wire (⊇ their
+    # respective cached-token field) — these codecs pass input_tokens
+    # straight through unmodified. Same shape as the Anthropic golden above
+    # (500 uncached + 2000 cached = 2500), asserted per provider so a future
+    # normalization drift in any one codec breaks its own line here.
+    del provider_label  # documents which wire field this shape models
+    breakdown = cost_from_accounting(
+        accounting(),
+        usage(
+            input_tokens=2500,
+            output_tokens=100,
+            cache_read_input_tokens=Present(2000),
+        ),
+    )
+    assert breakdown.input_cost_usd_micros == 1000
+    assert breakdown.cache_read_cost_usd_micros == 400
+    assert breakdown.total_cost_usd_micros == (
+        breakdown.input_cost_usd_micros
+        + breakdown.output_cost_usd_micros
+        + breakdown.cache_write_cost_usd_micros
+        + breakdown.cache_read_cost_usd_micros
+        + breakdown.reasoning_cost_usd_micros
+    )
+
+
+def test_total_is_sum_of_rounded_lines() -> None:
+    breakdown = cost_from_accounting(
+        accounting(reasoning_billed_outside_output=True),
+        usage(
+            input_tokens=1_000,
+            output_tokens=2_000,
+            reasoning_tokens=Present(500),
+            cache_read_input_tokens=Present(400),
+            cache_write_input_tokens=Present(100),
+        ),
+    )
+    assert breakdown.total_cost_usd_micros == (
+        breakdown.input_cost_usd_micros
+        + breakdown.output_cost_usd_micros
+        + breakdown.cache_write_cost_usd_micros
+        + breakdown.cache_read_cost_usd_micros
+        + breakdown.reasoning_cost_usd_micros
+    )

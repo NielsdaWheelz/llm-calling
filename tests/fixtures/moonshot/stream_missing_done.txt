@@ -1,0 +1,2 @@
+data: {"id":"chatcmpl-msh-007","object":"chat.completion.chunk","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","content":"Tides "}}]}
+data: {"id":"chatcmpl-msh-007","object":"chat.completion.chunk","model":"kimi-k3","choices":[{"index":0,"delta":{"content":"rise"}}]}
