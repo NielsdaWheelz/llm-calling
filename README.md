@@ -81,8 +81,9 @@ Required environment:
   narrowed runs are debugging aids — release certification runs unfiltered.
 
 Per chat target the matrix proves: one minimal call per declared reasoning
-level, an above-minimum-prefix cache warm/read pair with an observed cache
-read, strict JSON (including a required-nullable field), a streamed tool call
+level, an above-minimum-prefix cache warm/read probe with an observed cache
+read (bounded successful-call sampling for Gemini's non-guaranteed implicit
+cache), strict JSON (including a required-nullable field), a streamed tool call
 plus same-target continuation replay, invalid-key classification,
 request-id/usage presence per contract facts, and the planner's input-token
 upper bound dominating billed input on every call — plus minimal OpenAI

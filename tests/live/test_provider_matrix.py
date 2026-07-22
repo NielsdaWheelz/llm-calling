@@ -15,7 +15,7 @@ Environment contract (preserved from the pre-cutover matrix):
   ``GEMINI_API_KEY``, ``MOONSHOT_API_KEY``, ``OPENROUTER_API_KEY``.
 
 Per direct chat target the matrix proves: every declared reasoning level, an
-above-minimum-prefix cache warm/read pair with a reported cache read, strict
+above-minimum-prefix cache warm/read probe with a reported cache read, strict
 JSON with a required-nullable field, a streamed tool call + same-target
 continuation replay, invalid-key classification, request-id/usage presence per
 contract facts, and the §9 input-bound obligation
@@ -446,19 +446,28 @@ async def _cache_warm_read_pair(
     _accepted(row, warm[1])
     warm_usage = _assert_call_facts(row, warm[0], warm[1])
     assert warm[0].request_fingerprint != ""
-    await asyncio.sleep(3)
-    read = await _generate(
-        row,
-        probe_intent("What did Mara draw? Answer in one short sentence."),
-        credential,
+    read_prompts = (
+        "What did Mara draw? Answer in one short sentence.",
+        "What shape did Theo see in the clouds? Answer in one short sentence.",
+        "Where did the family shelter from the rain? Answer in one short sentence.",
     )
-    _accepted(row, read[1])
-    read_usage = _assert_call_facts(row, read[0], read[1])
-    assert _count(read_usage.cache_read_input_tokens) > 0, (
-        f"{_row_id(row)}: no cache read reported on the second above-minimum-prefix call "
-        f"(warm usage: {warm_usage}, read usage: {read_usage})"
+    # GenerateContent implicit caching is opportunistic, not a guaranteed
+    # write/read primitive. Sample up to three successful distinct reads for
+    # Gemini; every other cache contract remains a strict warm/read pair.
+    maximum_reads = 3 if isinstance(row.cache, GeminiAutomaticPrefixContract) else 1
+    read_usages: list[TokenUsage] = []
+    for index, prompt in enumerate(read_prompts[:maximum_reads]):
+        await asyncio.sleep(3 if index == 0 else 1)
+        read = await _generate(row, probe_intent(prompt), credential)
+        _accepted(row, read[1])
+        read_usage = _assert_call_facts(row, read[0], read[1])
+        read_usages.append(read_usage)
+        if _count(read_usage.cache_read_input_tokens) > 0:
+            return warm, read, read_usage
+    pytest.fail(
+        f"{_row_id(row)}: no cache read reported after {maximum_reads} "
+        f"above-minimum-prefix reads (warm usage: {warm_usage}, read usages: {read_usages})"
     )
-    return warm, read, read_usage
 
 
 @pytest.mark.parametrize("row", _DIRECT_ROWS, ids=_row_id)
@@ -789,6 +798,9 @@ async def test_openrouter_certification(live_env: LiveEnv) -> None:
                 "observed_provider_name": observed,
             }
         )
+        # The operator route is deliberately single-attempt. Pace independent
+        # paid probes instead of turning provider 429s into runtime retries.
+        await asyncio.sleep(1)
 
     # Billed cache read on the warm/read pair (the §8 hard gate: endpoint
     # metadata claims supports_implicit_caching=false; only this paid probe
