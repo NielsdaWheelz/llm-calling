@@ -392,18 +392,28 @@ def _cache_probe_prefix(row: ChatModelContract) -> str:
     # refusal remains a failure, but the probe itself does not resemble a
     # repetitive security-evaluation payload.
     marker_value = uuid.uuid4().int
-    marker = "-".join(
-        (
-            ("willow", "maple", "cedar", "birch")[marker_value % 4],
-            ("daisy", "violet", "clover", "buttercup")[(marker_value // 4) % 4],
-            ("meadow", "pond", "hill", "village")[(marker_value // 16) % 4],
-            str((marker_value // 64) % 10_000),
-        )
+    marker_details = (
+        ("red", "blue", "green", "yellow", "orange", "purple", "white", "silver")[marker_value % 8],
+        ("apple", "pear", "plum", "peach", "orange", "cherry", "apricot", "melon")[
+            (marker_value // 8) % 8
+        ],
+        ("daisy", "violet", "clover", "buttercup", "rose", "lily", "aster", "poppy")[
+            (marker_value // 64) % 8
+        ],
+        ("robin", "sparrow", "finch", "wren", "swallow", "lark", "thrush", "blackbird")[
+            (marker_value // 512) % 8
+        ],
+        ("round", "long", "small", "wide", "soft", "striped", "spotted", "bright")[
+            (marker_value // 4096) % 8
+        ],
+        ("rabbit", "boat", "hat", "whale", "flower", "castle", "shell", "ribbon")[
+            (marker_value // 32_768) % 8
+        ],
     )
-    # Six UTF-8 characters per declared token minimum keeps the actual
-    # provider-reported input above every current threshold without relying on
-    # a provider tokenizer in the shared probe.
-    minimum_chars = _minimum_prefix_tokens(row) * 6
+    # Conservative character headroom keeps provider-reported input above each
+    # threshold without pulling provider tokenizers into the shared probe.
+    characters_per_token = 4 if isinstance(row.cache, AnthropicPrefixContract) else 6
+    minimum_chars = _minimum_prefix_tokens(row) * characters_per_token
     paragraphs = _CACHE_REFERENCE_CORPUS.split("\n\n")
     body_parts: list[str] = []
     body_length = 0
@@ -414,7 +424,10 @@ def _cache_probe_prefix(row: ChatModelContract) -> str:
     body = "\n\n".join(body_parts)
     return (
         "You are reading a gentle family picnic story. Answer briefly and factually.\n"
-        f"Picnic detail {marker}. Use this story as background.\n"
+        f"In this telling, Mara wore a {marker_details[0]} scarf, Theo packed a "
+        f"{marker_details[1]}, their aunt chose a {marker_details[2]}, their uncle "
+        f"noticed a {marker_details[3]}, the picnic cloth was {marker_details[4]}, "
+        f"and one cloud resembled a {marker_details[5]}.\n"
         f"{body}"
     )
 
