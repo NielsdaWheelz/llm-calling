@@ -58,13 +58,13 @@ TARGET = ProviderTarget(provider="openrouter", model="moonshotai/kimi-k3-2026071
 CONTRACT = CATALOG.chat_contract(TARGET)
 
 EXPECTED_PROVIDER_BLOCK: dict[str, object] = {
-    "only": ["moonshotai/int4"],
-    "order": ["moonshotai/int4"],
+    "only": ["moonshotai/mxfp4"],
+    "order": ["moonshotai/mxfp4"],
     "allow_fallbacks": False,
     "require_parameters": True,
     "data_collection": "deny",
     "zdr": True,
-    "quantizations": ["int4"],
+    "quantizations": ["mxfp4"],
 }
 
 TOOL_PARAMETERS_RAW: dict[str, object] = {

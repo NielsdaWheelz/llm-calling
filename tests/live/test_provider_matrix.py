@@ -24,7 +24,7 @@ contract facts, and the §9 input-bound obligation
 The OpenRouter operator route is OperatorUncertified in CATALOG, so the planner
 refuses it by design. ``test_openrouter_certification`` is THE CERTIFIER: it
 plans through a hand-built OperatorCertified copy of the catalog row (pinned to
-``moonshotai/int4``), proves routed Kimi ``low|high|max`` (spec §4 recheck, both
+``moonshotai/mxfp4``), proves routed Kimi ``low|high|max`` (spec §4 recheck, both
 arms: direct levels are covered by the matrix above), the exact endpoint request
 pin plus its observed provider identity, and a
 NON-ZERO billed cache read, then writes the §8 evidence artifact
@@ -734,7 +734,9 @@ def _openrouter_endpoint_provider(
         for endpoint in endpoints
         if isinstance(endpoint, dict)
         and endpoint.get("tag") == routing_endpoint_slug
-        and endpoint.get("model_variant_slug", model) == model
+        # OpenRouter omits the variant for a model's default endpoint and
+        # currently serializes that omission as JSON null.
+        and endpoint.get("model_variant_slug") in {None, model}
     ]
     assert len(matches) == 1, (
         f"expected one endpoint tagged {routing_endpoint_slug!r}; found {len(matches)}"

@@ -460,10 +460,11 @@ def _require_source_urls(source_urls: tuple[str, ...], label: str) -> None:
 
 # Bump on ANY row change (rate, limit, level, mapping, URL, certification, …);
 # flows into FinalizedProviderCall.catalog_revision and the nexus ledger.
-CATALOG_REVISION: Final[str] = "cat-2026-07-22-r1"
+CATALOG_REVISION: Final[str] = "cat-2026-07-28-r1"
 
 _CHAT_VERIFIED_AT: Final[date] = date(2026, 7, 20)
 _MOONSHOT_VERIFIED_AT: Final[date] = date(2026, 7, 22)
+_OPENROUTER_VERIFIED_AT: Final[date] = date(2026, 7, 28)
 # Embedding/transcription rows carry the old catalog's facts and verification
 # date forward unchanged; next certification re-verifies them.
 _LEGACY_VERIFIED_AT: Final[date] = date(2026, 6, 11)
@@ -778,7 +779,7 @@ _OPENROUTER_KIMI_K3: Final = ChatModelContract(
         native_mapping=_KIMI_NATIVE_MAPPING,
     ),
     cache=OpenRouterPrefixContract(
-        pinned_upstream="moonshotai/int4",
+        pinned_upstream="moonshotai/mxfp4",
         canonical_revision="moonshotai/kimi-k3-20260715",
     ),
     continuation_codec="openrouter_chat",
@@ -797,10 +798,10 @@ _OPENROUTER_KIMI_K3: Final = ChatModelContract(
         reasoning_billed_outside_output=False,
         reasoning_reserve_tokens=0,
         source_url=_OPENROUTER_MODELS_URL,
-        verified_at=_CHAT_VERIFIED_AT,
+        verified_at=_OPENROUTER_VERIFIED_AT,
     ),
     source_urls=(_OPENROUTER_MODELS_URL,),
-    verified_at=_CHAT_VERIFIED_AT,
+    verified_at=_OPENROUTER_VERIFIED_AT,
     certification=OperatorUncertified(),
     provider_framing_overhead_tokens=_DEFAULT_FRAMING_OVERHEAD,
 )

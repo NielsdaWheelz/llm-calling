@@ -319,13 +319,13 @@ class TestCanonicalCacheContractBytes:
     def test_openrouter(self) -> None:
         raw = canonical_cache_contract_bytes(
             OpenRouterPrefixContract(
-                pinned_upstream="moonshotai/int4",
+                pinned_upstream="moonshotai/mxfp4",
                 canonical_revision="moonshotai/kimi-k3-20260715",
             )
         )
         assert raw == (
             b'{"canonical_revision":"moonshotai/kimi-k3-20260715",'
-            b'"pinned_upstream":"moonshotai/int4",'
+            b'"pinned_upstream":"moonshotai/mxfp4",'
             b'"strategy":"openrouter_certified_prefix"}'
         )
 
@@ -543,7 +543,7 @@ class TestOperatorGate:
         intent = intent_for(OPENROUTER_TARGET, "max")
         plan = plan_ok(intent, catalog)
         assert isinstance(plan.cache_plan, OpenRouterCertifiedPrefix)
-        assert plan.cache_plan.pinned_upstream == "moonshotai/int4"
+        assert plan.cache_plan.pinned_upstream == "moonshotai/mxfp4"
         assert plan.cache_plan.evidence_revision == "ev-cert-42"
         body = json.loads(plan.request.body)
         assert body["session_id"] == plan.cache_plan.session_id

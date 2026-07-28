@@ -59,7 +59,7 @@ fresh paid certification run.
 
 The OpenRouter operator route is special: its catalog row stays
 `OperatorUncertified` (representable but unplannable) until the live
-certification test observes the pinned upstream (`moonshotai/int4`), routed
+certification test observes the pinned upstream (`moonshotai/mxfp4`), routed
 Kimi `low|high|max` acceptance, and a non-zero billed cache read. The test
 writes the evidence artifact to `tests/live/evidence/` and prints the
 `evidence_revision` to pin in the row as `OperatorCertified(...)`.

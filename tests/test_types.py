@@ -407,7 +407,7 @@ def test_cache_strategy_and_ttl_accessors_cover_all_five_plans() -> None:
     moonshot_plan = MoonshotKeyedPrefix(key="affinity")
     openrouter_plan = OpenRouterCertifiedPrefix(
         session_id="affinity",
-        pinned_upstream="moonshotai/int4",
+        pinned_upstream="moonshotai/mxfp4",
         evidence_revision="cert-2026-07",
     )
 

@@ -46,7 +46,7 @@ def _with_chat(rows: tuple[ChatModelContract, ...]) -> Catalog:
 
 
 def test_catalog_revision_literal() -> None:
-    assert CATALOG_REVISION == "cat-2026-07-22-r1"
+    assert CATALOG_REVISION == "cat-2026-07-28-r1"
 
 
 def test_exactly_the_eight_chat_targets() -> None:
@@ -66,7 +66,10 @@ def test_exactly_the_eight_chat_targets() -> None:
 
 def test_every_chat_row_has_current_verification_date_and_sources() -> None:
     for row in CATALOG.chat:
-        expected = date(2026, 7, 22) if row.target.provider == "moonshot" else date(2026, 7, 20)
+        expected = {
+            "moonshot": date(2026, 7, 22),
+            "openrouter": date(2026, 7, 28),
+        }.get(row.target.provider, date(2026, 7, 20))
         assert row.verified_at == expected, row.target
         assert row.source_urls, row.target
         assert row.pricing.currency == "usd", row.target
@@ -233,7 +236,7 @@ def test_openrouter_kimi_k3_operator_row() -> None:
     assert row.reasoning.levels == ("low", "high", "max")
     assert row.reasoning.provider_default == "max"
     assert row.cache == OpenRouterPrefixContract(
-        pinned_upstream="moonshotai/int4",
+        pinned_upstream="moonshotai/mxfp4",
         canonical_revision="moonshotai/kimi-k3-20260715",
     )
     assert row.pricing.input_rate == 3_000_000
@@ -417,7 +420,7 @@ def test_operator_certified_row_with_non_openrouter_cache_rejected() -> None:
         routed,
         cache=MoonshotKeyedPrefixContract(minimum_prefix_tokens=Absent()),
         certification=OperatorCertified(
-            certified_pinned_upstream="moonshotai/int4",
+            certified_pinned_upstream="moonshotai/mxfp4",
             certified_canonical_revision="moonshotai/kimi-k3-20260715",
             evidence_revision="ev-wrong-cache-1",
         ),

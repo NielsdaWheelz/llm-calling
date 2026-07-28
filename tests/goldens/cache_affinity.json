@@ -277,13 +277,13 @@
       "protocol": "openrouter_chat",
       "cache_contract": {
         "kind": "openrouter",
-        "pinned_upstream": "moonshotai/int4",
+        "pinned_upstream": "moonshotai/mxfp4",
         "canonical_revision": "moonshotai/kimi-k3-20260715"
       },
       "prefix_components_utf8": [
         "{\"type\":\"input_text\",\"text\":\"You are terse.\"}"
       ],
-      "affinity": "eCjJhTKiNvvncJDsrm4-jNDwFFGW5XOz-wOdnK8OKrU"
+      "affinity": "vf5f9rpulMN5_V598snLY4aAsgMzLnMgTFyr0gKkeJk"
     }
   ]
 }
