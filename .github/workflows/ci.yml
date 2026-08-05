@@ -19,10 +19,80 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: uv sync --all-extras --locked
+      - run: uv sync --all-extras --all-groups --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run pyright
       - run: uv run pytest
       - run: uv run pip-audit
-      - run: uv build --no-sources
+      - run: uv build --no-sources --out-dir dist
+      - name: Verify the base wheel in a clean environment
+        run: |
+          uv venv --python 3.12 /tmp/provider-runtime-base-wheel
+          agent_runtime_wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
+          uv pip install --python /tmp/provider-runtime-base-wheel/bin/python "$agent_runtime_wheel"
+          /tmp/provider-runtime-base-wheel/bin/python -c "import importlib.util; import provider_runtime.agent_runtime; assert importlib.util.find_spec('openai_codex') is None; assert importlib.util.find_spec('claude_agent_sdk') is None"
+      - name: Verify the Codex SDK extra from the wheel
+        run: |
+          uv venv --python 3.12 /tmp/provider-runtime-codex-sdk-wheel
+          agent_runtime_wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
+          uv pip install --python /tmp/provider-runtime-codex-sdk-wheel/bin/python "${agent_runtime_wheel}[codex-sdk]"
+          /tmp/provider-runtime-codex-sdk-wheel/bin/python -c "import openai_codex; import provider_runtime.agent_runtime"
+      - name: Verify the Claude SDK extra from the wheel
+        run: |
+          uv venv --python 3.12 /tmp/provider-runtime-claude-sdk-wheel
+          agent_runtime_wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
+          uv pip install --python /tmp/provider-runtime-claude-sdk-wheel/bin/python "${agent_runtime_wheel}[claude-sdk]"
+          /tmp/provider-runtime-claude-sdk-wheel/bin/python -c "import claude_agent_sdk; import provider_runtime.agent_runtime"
+      - name: Verify the combined agent SDK extra from the wheel
+        run: |
+          uv venv --python 3.12 /tmp/provider-runtime-agent-sdks-wheel
+          agent_runtime_wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
+          uv pip install --python /tmp/provider-runtime-agent-sdks-wheel/bin/python "${agent_runtime_wheel}[agent-sdks]"
+          /tmp/provider-runtime-agent-sdks-wheel/bin/python -c "import openai_codex; import claude_agent_sdk; import provider_runtime.agent_runtime"
+
+  # Both official agent SDKs stay optional so the base provider-only wheel imports neither.
+  # With no raw CLI or protocol fallback, selecting either lane without its extra must fail as
+  # typed SdkUnavailable rather than leaking ImportError from an adapter.
+  test-without-optional-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked
+      - name: Prove both agent SDK extras are absent
+        run: >-
+          uv run python -c
+          "import importlib.util;
+          assert importlib.util.find_spec('openai_codex') is None;
+          assert importlib.util.find_spec('claude_agent_sdk') is None"
+      - name: Prove both SdkUnavailable paths really ran
+        env:
+          ABSENT_SDK_REPORT: ${{ runner.temp }}/absent-sdk-extra.xml
+        run: |
+          uv run pytest \
+            'tests/test_agent_codex_sdk.py::test_absent_sdk_extra_is_sdk_unavailable' \
+            'tests/test_agent_claude_sdk.py::test_absent_sdk_extra_is_sdk_unavailable' \
+            --junitxml="$ABSENT_SDK_REPORT"
+          uv run python - <<'PY'
+          import os
+          import sys
+          import xml.etree.ElementTree as ElementTree
+
+          report = ElementTree.parse(os.environ["ABSENT_SDK_REPORT"]).getroot()
+          cases = list(report.iter("testcase"))
+          if len(cases) != 2:
+              sys.exit(f"expected exactly two testcases, collected {len(cases)}")
+          skipped = [case for case in cases if case.findall("skipped")]
+          if skipped:
+              sys.exit(
+                  "the no-extras job skipped a real SdkUnavailable proof: "
+                  + "; ".join(case.get("name", "unknown") for case in skipped)
+              )
+          PY
+      - run: uv run pytest

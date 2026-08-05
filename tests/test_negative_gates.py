@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import importlib.util
 import json
 import re
+import sys
 from pathlib import Path
 
 from provider_runtime import (
@@ -28,6 +30,7 @@ from provider_runtime import (
     UserMessage,
     plan_generate,
 )
+from provider_runtime.agent_runtime.types import AGENT_ROUTES
 from provider_runtime.catalog import Catalog, OpenRouterPrefixContract
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -79,6 +82,111 @@ def test_no_raw_provider_sdk_imports() -> None:
     assert not hits, f"raw provider SDK import present:\n{_fmt(hits)}"
 
 
+# One allowlist per SDK name, never a shared one: a file audited for one vendor's SDK is
+# not thereby audited for another's. The scan matches the bare module name anywhere, not
+# just an import statement, because the audited adapter resolves its SDK through
+# importlib.import_module("...") — a name in a string is a real dependency here.
+_AGENT_SDK_ALLOWLIST: dict[str, frozenset[Path]] = {
+    # The Claude Agent SDK is the pinned optional extra; only its adapter may name it.
+    "claude_agent_sdk": frozenset({SRC / "agent_runtime" / "claude_sdk.py"}),
+    # The pinned optional Codex SDK belongs only to its audited adapter.
+    "openai_codex": frozenset({SRC / "agent_runtime" / "codex_sdk.py"}),
+    # The SDK's public runtime package resolves the exact bundled executable used only by the
+    # Codex adapter's environment-replacing launcher.
+    "codex_cli_bin": frozenset({SRC / "agent_runtime" / "codex_sdk.py"}),
+}
+
+
+def test_agent_sdk_imports_are_confined_to_audited_adapters() -> None:
+    hits: list[Hit] = []
+    for module, allowed in _AGENT_SDK_ALLOWLIST.items():
+        hits.extend(hit for hit in _scan(rf"\b{module}\b") if hit.path not in allowed)
+
+    assert not hits, f"agent SDK name outside its audited adapter:\n{_fmt(hits)}"
+
+
+def test_raw_agent_protocol_substrates_stay_deleted() -> None:
+    agent_runtime = SRC / "agent_runtime"
+    forbidden = (
+        "codex_app_server.py",
+        "codex_cli.py",
+        "claude_cli.py",
+        "_jsonrpc.py",
+        "_jsonl.py",
+    )
+
+    present = [name for name in forbidden if (agent_runtime / name).exists()]
+    assert not present, f"deleted raw agent substrates returned: {present}"
+    assert AGENT_ROUTES == frozenset({("codex", "sdk"), ("claude", "sdk")})
+
+
+# The package ships exactly two transports, one per backend. The gate below is what keeps
+# that a fact about the code rather than a claim in a doc: a third lane added later joins
+# this tuple, and until it does no file here may reach into another adapter at all.
+_AGENT_ADAPTER_MODULES = (
+    "codex_sdk",
+    "claude_sdk",
+)
+
+
+def test_no_agent_adapter_imports_another_agent_adapter() -> None:
+    """Each transport is an independent lane; one importing another fuses their lifecycles.
+
+    `ClaudeSdkAdapter` once read the installed Claude Code version by constructing the CLI
+    adapter and asking it for capabilities, which spawned `claude --version` *and*
+    `claude auth status --json` and enforced that lane's version pin on this one. Two lanes
+    that answer to different process lifecycles must not be able to do that to each other,
+    whichever two they are: a shared backend fact belongs to the module that owns it, or to
+    a helper both import, never to a sibling adapter.
+    """
+    agent_runtime = SRC / "agent_runtime"
+    hits: list[Hit] = []
+    for name in _AGENT_ADAPTER_MODULES:
+        path = agent_runtime / f"{name}.py"
+        siblings = "|".join(other for other in _AGENT_ADAPTER_MODULES if other != name)
+        hits.extend(
+            _scan(
+                rf"^\s*(from|import)\s+\.?({siblings})\b"
+                rf"|^\s*from\s+[\w.]*agent_runtime\.({siblings})\b"
+                rf"|import_module\(\s*[\"'][\w.]*({siblings})[\"']",
+                [path],
+            )
+        )
+    assert not hits, f"agent adapter imports a sibling adapter:\n{_fmt(hits)}"
+
+
+def test_release_certification_covers_every_shipped_route() -> None:
+    """The live matrix must certify the whole route algebra, and this must be checkable in CI.
+
+    The gate itself lives in ``tests/live/test_agent_matrix.py``, but that whole module carries
+    the ``live_provider`` mark and ``addopts`` deselects it, so the one assertion in it that
+    needs no provider — a pure in-process comparison of the matrix's route table against
+    ``AGENT_ROUTES`` — could never fail in CI either. A release gate that cannot fail is not a
+    gate, which is the exact defect class this file exists to prevent. Importing the module
+    rather than restating its tables keeps a single owner: if a route is added to the algebra
+    and the matrix is not taught to certify it, this fails deterministically.
+    """
+    matrix_path = ROOT / "tests" / "live" / "test_agent_matrix.py"
+    spec = importlib.util.spec_from_file_location("_live_agent_matrix_gate", matrix_path)
+    assert spec is not None and spec.loader is not None
+    matrix = importlib.util.module_from_spec(spec)
+    # dataclass() resolves its module from sys.modules while the body executes, so the
+    # registration has to precede exec_module rather than follow it.
+    sys.modules[spec.name] = matrix
+    try:
+        spec.loader.exec_module(matrix)
+    finally:
+        del sys.modules[spec.name]
+
+    routes = matrix._ROUTES
+    assert matrix._DEFAULT_ROUTES == frozenset(routes), (
+        "release certification omits a shipped route by default"
+    )
+    assert {(route.backend, route.transport) for route in routes} == AGENT_ROUTES, (
+        "the live route table drifted from the package's closed routing table"
+    )
+
+
 def test_no_legacy_llm_calling_name() -> None:
     hits = _scan(r"\bllm_calling\b")
     assert not hits, f"legacy llm_calling name present:\n{_fmt(hits)}"
@@ -102,6 +210,7 @@ def test_no_json_repair() -> None:
 _ALLOWED_FALLBACK_LINE = re.compile(
     r"^\s*#"  # comment
     r"|\"allow_fallbacks\": False"  # openrouter routing block: fallbacks OFF
+    r"|\"allowProviderModelFallback\": False"  # Codex thread policy: fallback OFF
     r"|fallback_arguments"  # openai decode: accumulated-arguments default, not provider fallback
     r"|fallbacks? (off|of any kind)"  # docstring prose rejecting fallback
 )

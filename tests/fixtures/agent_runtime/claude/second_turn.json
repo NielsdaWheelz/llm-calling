@@ -1,0 +1,36 @@
+[
+  {
+    "message_type": "StreamEvent",
+    "uuid": "stream-second-1",
+    "session_id": "0198a200-0000-7000-8000-000000000001",
+    "parent_tool_use_id": null,
+    "event": {
+      "type": "content_block_delta",
+      "index": 0,
+      "delta": {
+        "type": "text_delta",
+        "text": "Second turn."
+      }
+    }
+  },
+  {
+    "message_type": "ResultMessage",
+    "subtype": "success",
+    "duration_ms": 400,
+    "duration_api_ms": 300,
+    "is_error": false,
+    "num_turns": 1,
+    "session_id": "0198a200-0000-7000-8000-000000000001",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 12,
+      "output_tokens": 4
+    },
+    "result": "Second turn.",
+    "structured_output": null,
+    "terminal_reason": "completed",
+    "errors": null,
+    "api_error_status": null,
+    "uuid": "result-second-1"
+  }
+]
