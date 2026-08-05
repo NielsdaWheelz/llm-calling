@@ -14,6 +14,7 @@ from provider_runtime.errors import SchemaViolation
 from provider_runtime.schema import (
     ArrayNode,
     CanonicalJsonSchema,
+    Node,
     NullableUnion,
     NullNode,
     ObjectNode,
@@ -610,6 +611,64 @@ def test_schema_constructor_rejects_cyclic_defs() -> None:
     root = ObjectNode(properties={"a": Ref(name="a")})
     with pytest.raises(SchemaViolation, match="recursive \\$ref cycle"):
         CanonicalJsonSchema(root=root, defs={"a": ArrayNode(items=Ref(name="a"))})
+
+
+def test_object_node_snapshots_the_properties_mapping_it_was_given() -> None:
+    """A node's properties are its own; the caller keeps no handle on them.
+
+    The node is validated once and read much later — the agent lane writes the schema to
+    the backend at turn time — so an alias to a live caller dict is a schema that can grow
+    an unvalidated property between acceptance and use.
+    """
+    authored: dict[str, Node] = {"a": scalar("string")}
+    node = ObjectNode(properties=authored)
+
+    authored["injected"] = scalar("integer")
+    authored.pop("a")
+
+    assert dict(node.properties) == {"a": scalar("string")}
+    with pytest.raises(TypeError):
+        cast(dict[str, Node], node.properties)["late"] = scalar("string")
+
+
+def test_schema_constructor_snapshots_defs_it_has_already_validated() -> None:
+    """`_validate_ref_graph` accepts a graph; that exact graph is what later readers see."""
+    root_properties: dict[str, Node] = {"a": Ref(name="d")}
+    defs: dict[str, Node] = {"d": scalar("string")}
+    schema = CanonicalJsonSchema(root=ObjectNode(properties=root_properties), defs=defs)
+
+    # Both mutations would break an already-accepted schema: a dangling $ref and a
+    # property no rule ever saw.
+    defs.pop("d")
+    defs["ghost"] = ArrayNode(items=Ref(name="missing"))
+    root_properties["injected"] = NullNode()
+
+    assert to_json_schema(schema, inline_defs=True, include_annotations=True) == obj({"a": STR})
+    assert to_json_schema(schema, inline_defs=False, include_annotations=True) == obj(
+        {"a": {"$ref": "#/$defs/d"}}, **{"$defs": {"d": STR}}
+    )
+    assert canonical_schema_bytes(schema) == canonical_schema_bytes(
+        CanonicalJsonSchema(
+            root=ObjectNode(properties={"a": Ref(name="d")}), defs={"d": scalar("string")}
+        )
+    )
+
+
+@pytest.mark.parametrize("mapping", [None, [("a", scalar("string"))], "properties"])
+def test_node_mappings_reject_non_mapping_values(mapping: object) -> None:
+    supplied = cast(Mapping[str, Node], mapping)
+    with pytest.raises(SchemaViolation, match="must be a mapping of name to schema node"):
+        ObjectNode(properties=supplied)
+    with pytest.raises(SchemaViolation, match="must be a mapping of name to schema node"):
+        CanonicalJsonSchema(root=ObjectNode(properties={}), defs=supplied)
+
+
+def test_node_mappings_reject_non_string_keys() -> None:
+    supplied = cast(Mapping[str, Node], {1: scalar("string")})
+    with pytest.raises(SchemaViolation, match="mapping keys must be strings"):
+        ObjectNode(properties=supplied)
+    with pytest.raises(SchemaViolation, match="mapping keys must be strings"):
+        CanonicalJsonSchema(root=ObjectNode(properties={}), defs=supplied)
 
 
 def test_schema_constructor_rejects_misplaced_null_node() -> None:

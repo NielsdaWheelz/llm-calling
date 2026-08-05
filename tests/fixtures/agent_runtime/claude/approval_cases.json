@@ -1,0 +1,186 @@
+[
+  {
+    "name": "policy_allow",
+    "policy": {
+      "filesystem": "workspace_write",
+      "approval": "allow",
+      "allowed_tools": ["Bash"],
+      "acknowledged": ["approval_allow"]
+    },
+    "tool_name": "Bash",
+    "input": {"command": "touch generated.txt", "description": "Create a file"},
+    "context": {
+      "tool_use_id": "tool-approval-1",
+      "title": "Claude wants to run a command",
+      "display_name": "Run command",
+      "description": "Create a generated file",
+      "blocked_path": null
+    },
+    "answer": null,
+    "expected_behavior": "allow",
+    "expected_interrupt": false,
+    "expected_terminal": "turn_completed",
+    "expected_failure": null
+  },
+  {
+    "name": "policy_deny",
+    "policy": {
+      "filesystem": "workspace_write",
+      "approval": "deny",
+      "allowed_tools": ["Bash"],
+      "acknowledged": []
+    },
+    "tool_name": "Bash",
+    "input": {"command": "touch generated.txt", "description": "Create a file"},
+    "context": {
+      "tool_use_id": "tool-approval-2",
+      "title": "Claude wants to run a command",
+      "display_name": "Run command",
+      "description": "Create a generated file",
+      "blocked_path": null
+    },
+    "answer": null,
+    "expected_behavior": "deny",
+    "expected_interrupt": false,
+    "expected_terminal": "turn_completed",
+    "expected_failure": null
+  },
+  {
+    "name": "read_only_denies_command",
+    "policy": {
+      "filesystem": "read_only",
+      "approval": "allow",
+      "allowed_tools": ["Bash"],
+      "acknowledged": ["approval_allow"]
+    },
+    "tool_name": "Bash",
+    "input": {"command": "touch generated.txt", "description": "Create a file"},
+    "context": {
+      "tool_use_id": "tool-approval-3",
+      "title": "Claude wants to run a command",
+      "display_name": "Run command",
+      "description": "Create a generated file",
+      "blocked_path": null
+    },
+    "answer": null,
+    "expected_behavior": "deny",
+    "expected_interrupt": false,
+    "expected_terminal": "turn_completed",
+    "expected_failure": null
+  },
+  {
+    "name": "workspace_escape_denied_under_approval_allow",
+    "policy": {
+      "filesystem": "workspace_write",
+      "approval": "allow",
+      "allowed_tools": ["Write"],
+      "acknowledged": ["approval_allow"]
+    },
+    "tool_name": "Write",
+    "input": {"file_path": "/etc/example.conf", "content": "VALUE = 2\n"},
+    "context": {
+      "tool_use_id": "tool-approval-4",
+      "title": "Claude wants to write example.conf",
+      "display_name": "Write file",
+      "description": "Write outside the workspace",
+      "blocked_path": "/etc/example.conf"
+    },
+    "answer": null,
+    "expected_behavior": "deny",
+    "expected_interrupt": false,
+    "expected_terminal": "turn_completed",
+    "expected_failure": null
+  },
+  {
+    "name": "handler_allow",
+    "policy": {
+      "filesystem": "workspace_write",
+      "approval": "ask",
+      "allowed_tools": ["Bash"],
+      "acknowledged": []
+    },
+    "tool_name": "Bash",
+    "input": {"command": "touch generated.txt", "description": "Create a file"},
+    "context": {
+      "tool_use_id": "tool-approval-5",
+      "title": "Claude wants to run a command",
+      "display_name": "Run command",
+      "description": "Create a generated file",
+      "blocked_path": null
+    },
+    "answer": "allow",
+    "expected_behavior": "allow",
+    "expected_interrupt": false,
+    "expected_terminal": "turn_completed",
+    "expected_failure": null
+  },
+  {
+    "name": "handler_deny",
+    "policy": {
+      "filesystem": "workspace_write",
+      "approval": "ask",
+      "allowed_tools": ["Bash"],
+      "acknowledged": []
+    },
+    "tool_name": "Bash",
+    "input": {"command": "touch generated.txt", "description": "Create a file"},
+    "context": {
+      "tool_use_id": "tool-approval-6",
+      "title": "Claude wants to run a command",
+      "display_name": "Run command",
+      "description": "Create a generated file",
+      "blocked_path": null
+    },
+    "answer": "deny",
+    "expected_behavior": "deny",
+    "expected_interrupt": false,
+    "expected_terminal": "turn_completed",
+    "expected_failure": null
+  },
+  {
+    "name": "handler_abort",
+    "policy": {
+      "filesystem": "workspace_write",
+      "approval": "ask",
+      "allowed_tools": ["Bash"],
+      "acknowledged": []
+    },
+    "tool_name": "Bash",
+    "input": {"command": "touch generated.txt", "description": "Create a file"},
+    "context": {
+      "tool_use_id": "tool-approval-7",
+      "title": "Claude wants to run a command",
+      "display_name": "Run command",
+      "description": "Create a generated file",
+      "blocked_path": null
+    },
+    "answer": "abort",
+    "expected_behavior": "deny",
+    "expected_interrupt": true,
+    "expected_terminal": "turn_cancelled",
+    "expected_failure": null
+  },
+  {
+    "name": "handler_raises",
+    "policy": {
+      "filesystem": "workspace_write",
+      "approval": "ask",
+      "allowed_tools": ["Bash"],
+      "acknowledged": []
+    },
+    "tool_name": "Bash",
+    "input": {"command": "touch generated.txt", "description": "Create a file"},
+    "context": {
+      "tool_use_id": "tool-approval-8",
+      "title": "Claude wants to run a command",
+      "display_name": "Run command",
+      "description": "Create a generated file",
+      "blocked_path": null
+    },
+    "answer": "raise",
+    "expected_behavior": "deny",
+    "expected_interrupt": true,
+    "expected_terminal": "turn_failed",
+    "expected_failure": "approval_unanswered"
+  }
+]

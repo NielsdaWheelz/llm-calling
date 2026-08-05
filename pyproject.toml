@@ -1,11 +1,25 @@
 [project]
 name = "provider-runtime"
 version = "0.1.0"
-description = "Small async Python package for provider-level LLM calls"
+description = "Strict async runtimes for provider calls and local agent sessions"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.28.0",
+]
+
+[project.optional-dependencies]
+codex-sdk = [
+    "openai-codex==0.144.4",
+    "openai-codex-cli-bin==0.144.4",
+]
+claude-sdk = [
+    "claude-agent-sdk==0.2.130",
+]
+agent-sdks = [
+    "openai-codex==0.144.4",
+    "openai-codex-cli-bin==0.144.4",
+    "claude-agent-sdk==0.2.130",
 ]
 
 [build-system]

@@ -37,6 +37,7 @@ import json
 import math
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Literal, assert_never, cast
 
 from .errors import SchemaViolation
@@ -63,6 +64,9 @@ type EnumValue = str | int | float | bool
 type Node = ObjectNode | ArrayNode | ScalarNode | NullNode | NullableUnion | Ref
 
 _SCALAR_TYPES: tuple[ScalarType, ...] = ("string", "number", "integer", "boolean")
+# `Absent` is an empty frozen value, so one shared instance is every instance; the public
+# node constructors read their unauthored-annotation default from here.
+_ABSENT: Absent = Absent()
 
 _NULL_ONLY_IN_UNION = (
     'the null schema {"type": "null"} is legal only as one branch of a nullable anyOf union'
@@ -107,6 +111,28 @@ def _validate_enum_values(
     return cast(tuple[EnumValue, ...], values)  # each element proven compatible above
 
 
+def _frozen_node_map(value: Mapping[str, Node], field: str) -> Mapping[str, Node]:
+    """Snapshot a caller-supplied node mapping into a read-only view of our own copy.
+
+    Both mapping-valued fields in this module are validated once, at construction, and
+    then read again much later — a fingerprint at plan time, a wire document at turn
+    time. Storing the caller's live dict would leave the accepted value aliased to a
+    mapping the caller can still mutate, so a schema :func:`_validate_ref_graph` already
+    accepted could grow an unvalidated property (or an unresolvable ``$ref``) before it
+    reaches a provider. Copy first, then expose the copy read-only.
+    """
+    if not isinstance(value, Mapping):
+        raise SchemaViolation(
+            f"{field}: must be a mapping of name to schema node, got {type(value).__name__}"
+        )
+    snapshot: dict[str, Node] = {}
+    for key, node in value.items():
+        if type(key) is not str:
+            raise SchemaViolation(f"{field}: mapping keys must be strings, got {key!r}")
+        snapshot[key] = node
+    return MappingProxyType(snapshot)
+
+
 @dataclass(frozen=True, slots=True)
 class NullNode:
     """The null schema ``{"type": "null"}``; only ever a nullable-union branch."""
@@ -132,13 +158,38 @@ class ScalarNode:
 
 
 @dataclass(frozen=True, slots=True)
-class ObjectNode:
-    """Closed object: ``required`` == all property names and
-    ``additionalProperties: false`` are implied by construction, not stored."""
+class _ObjectNodeFields:
+    """Field carrier for :class:`ObjectNode`; never constructed directly.
+
+    A frozen dataclass cannot replace a field value in ``__post_init__`` without the
+    attribute-assignment bypass ``tests/test_negative_gates.py`` bans as hidden mutation.
+    Splitting the fields out lets the public class own the conversion in its own
+    ``__init__`` and the stdlib-generated one do the assignment, with no bypass anywhere
+    in our own source.
+    """
 
     properties: Mapping[str, Node]
-    title: Presence[str] = Absent()
-    description: Presence[str] = Absent()
+    title: Presence[str] = _ABSENT
+    description: Presence[str] = _ABSENT
+
+
+class ObjectNode(_ObjectNodeFields):
+    """Closed object: ``required`` == all property names and
+    ``additionalProperties: false`` are implied by construction, not stored.
+
+    ``properties`` is snapshotted at construction (see :func:`_frozen_node_map`): the
+    stored mapping is this class's own read-only copy, never the caller's live dict.
+    """
+
+    __slots__ = ()
+
+    def __init__(
+        self,
+        properties: Mapping[str, Node],
+        title: Presence[str] = _ABSENT,
+        description: Presence[str] = _ABSENT,
+    ) -> None:
+        super().__init__(_frozen_node_map(properties, "ObjectNode.properties"), title, description)
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,12 +291,27 @@ def _validate_ref_graph(root: ObjectNode, defs: Mapping[str, Node]) -> None:
 
 
 @dataclass(frozen=True, slots=True)
-class CanonicalJsonSchema:
+class _CanonicalJsonSchemaFields:
+    """Field carrier for :class:`CanonicalJsonSchema`; see :class:`_ObjectNodeFields`."""
+
     root: ObjectNode
     defs: Mapping[str, Node]
 
     def __post_init__(self) -> None:
         _validate_ref_graph(self.root, self.defs)
+
+
+class CanonicalJsonSchema(_CanonicalJsonSchemaFields):
+    """A validated schema document: an object root plus its ``$defs`` map.
+
+    ``defs`` is snapshotted at construction, so the ref graph ``__post_init__`` accepts is
+    the graph every later reader — fingerprint, serializer, adapter — sees.
+    """
+
+    __slots__ = ()
+
+    def __init__(self, root: ObjectNode, defs: Mapping[str, Node]) -> None:
+        super().__init__(root, _frozen_node_map(defs, "CanonicalJsonSchema.defs"))
 
 
 # --- parser -----------------------------------------------------------------
