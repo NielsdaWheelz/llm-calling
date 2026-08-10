@@ -5,9 +5,9 @@ never product control flow. Expected, modelable failures live in
 `provider_runtime.types` as the closed `ExpectedModelFailure` union (returned as
 values); defects raise.
 
-Transient signals are runtime-internal (`_TransientSignal` in the retry
-boundary); `classify_error` RETURNS values and never returns a defect as a value
-— it raises `ProtocolDefect`.
+Retryable trouble is runtime-internal (`TransientAttempt` in
+`provider_runtime.engines`); it never crosses the facade — exhaustion surfaces
+as the `Failed(TransientExhausted)` value.
 
 Every defect carries safe context only: no prompts, provider bodies,
 credentials, or hidden reasoning. Callers embed provider diagnostics only via
@@ -25,7 +25,7 @@ from provider_runtime.types import FailureOrigin
 class RuntimeDefect(Exception):
     """A broken runtime invariant.
 
-    Carries the §9 ledger `origin`, a closed per-subclass `code`, and a
+    Carries the ledger `origin`, a closed per-subclass `code`, and a
     safe-context `message`. The worker boundary reports/re-raises defects and
     records origin/code/trace operator-side; a defect never becomes a product
     failure variant.
@@ -42,32 +42,25 @@ class RuntimeDefect(Exception):
         self.message = message
 
 
-class PlanningDefect(RuntimeDefect):
-    """A planner-detected invariant violation.
+class InvalidRequest(RuntimeDefect):
+    """A request that violates the contract or the resolved registry row.
 
-    Covers invalid schemas, invalid/mismatched cache scopes,
-    continuation target/codec mismatch, and unsupported cache intent.
-
-    EXPLICITLY EXCLUDES the expected oversize case: an intent measuring over the
-    contract's context limit is returned as ``PlanRejected(IntentContextTooLarge)``
-    — the expected planner rejection channel — never raised as a defect.
+    Raised for request validation failures: a continuation bound to a
+    different target/codec, a `provider_options` key colliding with a core
+    intent field the engine maps itself, image blocks sent to a text-only row,
+    an unknown registry ref, or tools requested on a `tools=False` row.
+    (Strict output on a `structured="json_mode"` row is NOT invalid —
+    json_mode plus validation handles it.)
     """
 
-    def __init__(self, *, code: str, message: str) -> None:
-        super().__init__(origin="plan", code=code, message=message)
-
-
-class SchemaViolation(PlanningDefect):
-    """An authored schema falls outside the canonical JSON Schema subset (§5)."""
-
-    def __init__(self, message: str) -> None:
-        super().__init__(code="schema_violation", message=message)
+    def __init__(self, *, message: str) -> None:
+        super().__init__(origin="intent", code="invalid_request", message=message)
 
 
 class ProtocolDefect(RuntimeDefect):
     """A malformed provider envelope or unknown terminal provider response.
 
-    Raised (never returned) by codec decode/classify ingress.
+    Raised (never returned) by engine decode/classify ingress.
     """
 
     def __init__(self, *, code: str, message: str) -> None:
@@ -77,7 +70,7 @@ class ProtocolDefect(RuntimeDefect):
 class CredentialRejected(RuntimeDefect):
     """The platform credential was rejected by the provider (HTTP 401/403).
 
-    A defect per §9 — platform configuration is an operator fact, so rejection is
+    A defect — platform configuration is an operator fact, so rejection is
     never a product-facing failure.
     """
 
@@ -85,9 +78,19 @@ class CredentialRejected(RuntimeDefect):
         super().__init__(origin="provider_http", code="credential_rejected", message=message)
 
 
+class CredentialMissing(RuntimeDefect):
+    """No key configured for the resolved row's provider.
+
+    Raised at dispatch, before any bytes reach the provider — like rejection,
+    a missing key is an operator fact, never a product-facing failure.
+    """
+
+    def __init__(self, *, message: str) -> None:
+        super().__init__(origin="transport", code="credential_missing", message=message)
+
+
 # ---------------------------------------------------------------------------
-# Secret redaction — preserved verbatim-in-behavior from the pre-cutover
-# errors.py (patterns + 500-char bound).
+# Secret redaction (patterns + 500-char bound).
 
 _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"), "...redacted"),
@@ -137,10 +140,7 @@ def sanitize_provider_text(text: str, *, limit: int = 500) -> str:
     return snippet
 
 
-def safe_provider_error_body_snippet(
-    json_body: dict | None,
-    body_text: str | None,
-) -> str | None:
+def safe_provider_error_body_snippet(json_body: dict | None) -> str | None:
     summary = _provider_error_summary(json_body)
     if summary:
         return sanitize_provider_text(

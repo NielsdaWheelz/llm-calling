@@ -242,10 +242,24 @@ What Nexus consumes and what v2 guarantees:
 | `GenerateIntent`, `CanonicalTool`, `Presence`, outcome unions | names kept; `plan_generate` call path becomes `rt.generate(intent)` |
 | `EmbeddingCall` → `runtime.embed` (`semantic_chunks.py`) | port kept, same shape |
 | `ScriptedRuntime` (tests), `nexus_test_control` wire-level SSE scripting | IR-level `ScriptedRuntime`/`FakeEngine`; wire scripting has no replacement (by design) |
-| `CATALOG`, `ChatModelContract`, `DirectCertification` imports | replaced by `registry` rows; mechanical rename |
+| `CATALOG`, `ChatModelContract` imports | replaced by `registry` rows; mostly mechanical, semantic edits called out below |
+| `DirectCertification` startup gate (`llm_profiles.py`) | **deleted** — `ModelRow` has no certification field; the gate is re-founded on live-matrix evidence (out-of-band), or removed |
+| `contract.reasoning.levels` (`llm_profiles.py`) | `row.reasoning` mapping keys; `Absent` = model has no reasoning knob |
+| `contract.output_limit`, `contract.pricing.reasoning_reserve_tokens` (`chat_runs.py`) | `row.max_output_tokens`; v2 has **no reserve-tokens fact** — Nexus owns its reserve policy locally |
+| `plan.request_fingerprint` (`llm_ledger.py`) | **deleted, no replacement** — the `llm_calls.request_fingerprint` column is retired at pin bump |
+| `cache_strategy`/`cache_ttl` (`llm_ledger.py` → ledger columns) | **deleted with the cache plans** — columns retired at pin bump |
+| `Accounting`/`CostBreakdown`/`cost_from_accounting`/`_accounting_snapshot` (`llm_ledger.py`) | replaced by derived `estimate_cost(meta) → Presence[CostEstimate]` (single micros amount, source, as_of; no rate breakdown) — ledger cost columns re-founded on it or retired |
+| `PlanningDefect`/`PlanRejected` (`llm_execution.py`) | `InvalidRequest` defect; **observable defect origin changes `"plan"` → `"intent"`** in ledger writes |
+| `NonGenerationCallFailed` (`search/embedding.py`) | kept — the embed failure channel is unchanged |
+| `PromptBlock(text, stability=…)` construction (`dawn_write.py`) | `PromptBlock(text)` — stability vocabulary deleted |
+| Persisted `BlockStabilityState`/`*ScopeState` round-trip (`chat_run_steps.py`) | **persisted-state migration**: stored stability/scope state is dropped or ignored on read; no v2 type round-trips it |
+| `to_json_schema`/`parse_canonical_schema` (`chat_runs.py`, `chat_run_steps.py`) | deleted — `CanonicalTool.parameters`/`StrictJsonOutput.schema` take plain JSON-schema mappings |
+| `ProviderName` widened `+deepseek, +xai` | `llm_credentials._PLATFORM_KEY_ATTRS` must become an exhaustive match (dict indexing is not totality-checked; today it would `KeyError` at dispatch) |
 
 Exit criterion for the pin bump (verified in nexus-web, not here): Nexus type-checks and its
 contract tests pass against v2, with a live-matrix evidence file dated ≥ the v2 revision.
+The persisted-state row above means the pin bump includes a data-handling decision, not
+only code edits.
 
 ## 14. Decision log
 

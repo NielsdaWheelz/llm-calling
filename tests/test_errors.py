@@ -1,13 +1,13 @@
-"""Tests for the rewritten defect hierarchy and the preserved redaction machinery."""
+"""Tests for the defect hierarchy and the preserved redaction machinery."""
 
 import pytest
 
 from provider_runtime.errors import (
+    CredentialMissing,
     CredentialRejected,
-    PlanningDefect,
+    InvalidRequest,
     ProtocolDefect,
     RuntimeDefect,
-    SchemaViolation,
     safe_provider_error_body_snippet,
     sanitize_provider_text,
 )
@@ -33,20 +33,19 @@ SECRET_FRAGMENTS = (
 
 
 def test_defect_hierarchy_and_fixed_origin_code_pairs() -> None:
-    schema = SchemaViolation("root must be an object schema")
-    assert isinstance(schema, PlanningDefect), "SchemaViolation must sit under PlanningDefect"
-    assert isinstance(schema, RuntimeDefect)
-    assert isinstance(schema, Exception)
-    assert schema.origin == "plan"
-    assert schema.code == "schema_violation"
-    assert str(schema) == "root must be an object schema"
+    invalid = InvalidRequest(message="continuation artifact targets anthropic:claude-sonnet-5")
+    assert isinstance(invalid, RuntimeDefect), "InvalidRequest must sit under RuntimeDefect"
+    assert isinstance(invalid, Exception)
+    assert invalid.origin == "intent", "request validation failures carry origin=intent"
+    assert invalid.code == "invalid_request"
+    assert str(invalid) == "continuation artifact targets anthropic:claude-sonnet-5"
 
-    planning = PlanningDefect(
-        code="continuation_mismatch",
-        message="continuation artifact targets anthropic/claude-sonnet-5",
+    missing = CredentialMissing(message="no key configured for provider 'xai'")
+    assert isinstance(missing, RuntimeDefect)
+    assert missing.origin == "transport", (
+        "a missing key is detected at dispatch, before any provider contact"
     )
-    assert planning.origin == "plan", "every planning defect carries origin=plan"
-    assert planning.code == "continuation_mismatch"
+    assert missing.code == "credential_missing"
 
     protocol = ProtocolDefect(code="malformed_envelope", message="missing terminal frame")
     assert protocol.origin == "provider_response", (
@@ -58,14 +57,6 @@ def test_defect_hierarchy_and_fixed_origin_code_pairs() -> None:
     assert credential.origin == "provider_http"
     assert credential.code == "credential_rejected"
     assert str(credential) == "anthropic HTTP 401"
-
-
-def test_planning_defect_documents_the_plan_rejected_exclusion() -> None:
-    doc = PlanningDefect.__doc__ or ""
-    assert "PlanRejected" in doc, (
-        "PlanningDefect's contract must state that the expected oversize case is "
-        "PlanRejected, not a defect"
-    )
 
 
 def test_defects_raise_with_their_safe_message() -> None:
@@ -107,8 +98,7 @@ def test_error_body_snippet_summarizes_and_redacts_json_error_bodies() -> None:
                 "type": "invalid_request_error",
                 "code": "bad_key",
             }
-        },
-        None,
+        }
     )
     assert snippet is not None
     assert "invalid_request_error" in snippet
@@ -118,7 +108,7 @@ def test_error_body_snippet_summarizes_and_redacts_json_error_bodies() -> None:
 
 
 def test_error_body_snippet_redacts_every_secret_shape() -> None:
-    snippet = safe_provider_error_body_snippet({"error": {"message": SECRET_TEXT}}, None)
+    snippet = safe_provider_error_body_snippet({"error": {"message": SECRET_TEXT}})
     assert snippet is not None
     assert "...redacted" in snippet
     for fragment in SECRET_FRAGMENTS:
@@ -126,28 +116,23 @@ def test_error_body_snippet_redacts_every_secret_shape() -> None:
 
 
 def test_error_body_snippet_is_bounded_to_500_chars() -> None:
-    snippet = safe_provider_error_body_snippet({"error": {"message": "x" * 2000}}, None)
+    snippet = safe_provider_error_body_snippet({"error": {"message": "x" * 2000}})
     assert snippet is not None
     assert len(snippet) <= 500, f"snippet must respect the 500-char bound, got {len(snippet)}"
 
 
 def test_error_body_snippet_reads_top_level_and_string_error_shapes() -> None:
-    top_level = safe_provider_error_body_snippet({"message": "boom", "code": "oops"}, None)
+    top_level = safe_provider_error_body_snippet({"message": "boom", "code": "oops"})
     assert top_level is not None
     assert "boom" in top_level
     assert "oops" in top_level
 
-    string_error = safe_provider_error_body_snippet({"error": "upstream exploded"}, None)
+    string_error = safe_provider_error_body_snippet({"error": "upstream exploded"})
     assert string_error is not None
     assert "upstream exploded" in string_error
 
 
-def test_plain_text_bodies_are_never_persisted_as_snippets() -> None:
-    # Non-JSON provider prose may embed prompt content; it is dropped entirely.
-    snippet = safe_provider_error_body_snippet(
-        None,
-        "Rejected prompt fragment: user private content",
-    )
-    assert snippet is None, "plain-text bodies must not become operator snippets"
-    assert safe_provider_error_body_snippet({}, None) is None
-    assert safe_provider_error_body_snippet({"unrelated": {"nested": 1}}, None) is None
+def test_empty_and_unrecognized_bodies_produce_no_snippet() -> None:
+    assert safe_provider_error_body_snippet(None) is None
+    assert safe_provider_error_body_snippet({}) is None
+    assert safe_provider_error_body_snippet({"unrelated": {"nested": 1}}) is None

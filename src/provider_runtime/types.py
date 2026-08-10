@@ -1,10 +1,9 @@
 """Value types for the provider runtime.
 
-Layering: this module imports nothing from the package (stdlib only). Every other
-module (errors, schema, catalog, planning, codecs, transport, runtime) may import
-from it. Computation modules (schema.py, planning.py) own only computation and
-re-export the value types they conceptually govern; the pure data lives here so
-imports never cycle.
+Layering: this module imports nothing from the package (stdlib only). Every
+other module (errors, registry, engines, retry, runtime) may import from it.
+The pure data lives here so imports never cycle; the registry owns model facts
+and the engines own wire handling.
 
 Style: closed types, exhaustive matches, no hidden mutation, derived fields are
 constructor fields.
@@ -14,20 +13,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, Protocol, assert_never
-from uuid import UUID
+from datetime import date
+from typing import Literal, Protocol, assert_never
 
 # ---------------------------------------------------------------------------
 # Provider identity
 
-type ProviderName = Literal["openai", "anthropic", "gemini", "moonshot", "openrouter"]
-
-type ProviderProtocol = Literal[
-    "openai_responses",
-    "anthropic_messages",
-    "gemini_generate_content",
-    "moonshot_chat",
-    "openrouter_chat",
+type ProviderName = Literal[
+    "openai", "anthropic", "gemini", "moonshot", "openrouter", "deepseek", "xai"
 ]
 
 
@@ -38,7 +31,7 @@ class ProviderTarget:
 
 
 # Closed superset of per-model reasoning levels; no "default" — provider defaults
-# are catalog facts, not selectable behavior.
+# are registry facts, not selectable behavior.
 type ReasoningLevel = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 
@@ -60,65 +53,24 @@ type Presence[T] = Present[T] | Absent
 
 
 def presence_of[T](value: T | None) -> Presence[T]:
-    """Normalize a nullable boundary value into owned absence (codec ingress)."""
+    """Normalize a nullable boundary value into owned absence (engine ingress)."""
     return Absent() if value is None else Present(value)
 
 
 # ---------------------------------------------------------------------------
-# Cache scoping (§8)
-
-
-@dataclass(frozen=True, slots=True)
-class GlobalScope:
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class OwnerScope:
-    owner_id: UUID
-
-
-@dataclass(frozen=True, slots=True)
-class ConversationScope:
-    conversation_id: UUID
-
-
-type CacheScope = GlobalScope | OwnerScope | ConversationScope
-# RequiredCache and GenerateIntent.cache are deliberately absent (a required field
-# encoding zero bits). "Caching has no off state" is realized solely by the planner
-# check: stable prefix NON-EMPTY + contiguous + scope-consistent. GenerateIntent.tools
-# and output participate in cache affinity and inherit the narrowest contributing
-# scope (§8) — they carry no stability marker.
-
-
-@dataclass(frozen=True, slots=True)
-class Dynamic:
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class Stable:
-    scope: CacheScope
-
-
-type BlockStability = Dynamic | Stable
+# Prompt blocks
 
 
 @dataclass(frozen=True, slots=True)
 class PromptBlock:
-    # Empty text is legal (dynamic blocks may be empty); the planner owns
-    # stable-prefix validation.
+    # Empty text is legal.
     text: str
-    stability: BlockStability
 
 
-# ---------------------------------------------------------------------------
-# Canonical JSON Schema subset (§5): schema.py owns the immutable schema value
-# and its parser/serializer (spec §5). Imported here type-only to annotate
-# CanonicalTool/StrictJsonOutput without a runtime import cycle.
-
-if TYPE_CHECKING:
-    from .schema import CanonicalJsonSchema
+@dataclass(frozen=True, slots=True)
+class ImageBlock:
+    media_type: str
+    data: bytes = field(repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +89,9 @@ class ToolCall:
 class CanonicalTool:
     name: str
     description: str
-    parameters: CanonicalJsonSchema
+    # Plain JSON Schema; engines apply per-provider strictness (e.g. Anthropic
+    # additionalProperties: false) at encode.
+    parameters: Mapping[str, object]
 
 
 type ToolChoice = Literal["auto", "none"]
@@ -151,7 +105,7 @@ class TextOutput:
 @dataclass(frozen=True, slots=True)
 class StrictJsonOutput:
     name: str
-    schema: CanonicalJsonSchema
+    schema: Mapping[str, object]
 
 
 type OutputSpec = TextOutput | StrictJsonOutput
@@ -166,19 +120,12 @@ class ContinuationArtifact:
     """Opaque native replay material.
 
     Ephemeral, never logged/rendered; replayable only to the identical
-    target+codec (planner-validated).
+    target+codec (engine-validated).
     """
 
     target: ProviderTarget
     codec_id: str
     opaque_payload: Mapping[str, object] = field(repr=False)
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.opaque_payload, Mapping):
-            raise TypeError(
-                "ContinuationArtifact.opaque_payload must be a Mapping; "
-                f"got {type(self.opaque_payload).__name__}"
-            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,7 +135,7 @@ class SystemMessage:
 
 @dataclass(frozen=True, slots=True)
 class UserMessage:
-    blocks: tuple[PromptBlock, ...]
+    blocks: tuple[PromptBlock | ImageBlock, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,11 +165,14 @@ class GenerateIntent:
     tools: tuple[CanonicalTool, ...]
     tool_choice: ToolChoice
     output: OutputSpec
+    # Per-engine extension passthrough, never overrides: any key the engine
+    # itself maps from core intent fields raises InvalidRequest.
+    provider_options: Mapping[str, object] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
-# Usage — normalized ONCE at codec ingress; raw nullable provider JSON is
-# codec-private.
+# Usage — normalized ONCE at engine ingress; raw nullable provider JSON is
+# engine-private.
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,23 +211,22 @@ class TokenUsage:
         cache_read_input_tokens: Presence[int],
         cache_write_input_tokens: Presence[int],
     ) -> TokenUsage:
-        """The one total-derivation rule shared by every codec.
+        """The one total-derivation rule shared by every engine.
 
         Invariant: ``TokenUsage.input_tokens`` is ALWAYS the cache-INCLUSIVE
         total prompt token count — it already contains any cache_read/
         cache_write components the provider reports separately, matching
-        OpenAI/Gemini/Moonshot/OpenRouter wire semantics. A codec whose
+        OpenAI/Gemini/Moonshot/OpenRouter wire semantics. An engine whose
         native wire input count excludes cache components (Anthropic) MUST
         normalize it to the inclusive total at ingress, before calling this
-        constructor, so every codec conforms. `usage.cost_from_accounting`
-        relies on this invariant to recover billable (uncached) input by
-        subtracting the cache components back out.
+        constructor, so every engine conforms. `prices.estimate_cost` relies
+        on this invariant to recover billable (uncached) input by subtracting
+        the cache components back out.
 
-        Where the provider reports a total, it is authoritative (the
-        reservation commits provider-reported totals, §9). Where it reports
-        none, the total is derived at construction as plain input_tokens +
-        output_tokens — input_tokens already includes cache, so adding the
-        cache components again would double-count them.
+        Where the provider reports a total, it is authoritative. Where it
+        reports none, the total is derived at construction as plain
+        input_tokens + output_tokens — input_tokens already includes cache, so
+        adding the cache components again would double-count them.
         """
         match total_tokens:
             case Present(value=reported):
@@ -297,8 +246,7 @@ class TokenUsage:
 
 
 # ---------------------------------------------------------------------------
-# Attempt trace — on CallMeta so EVERY outcome branch retains it (§11 "retain
-# attempt traces").
+# Attempt trace — on CallMeta so EVERY outcome branch retains it.
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,7 +282,7 @@ class AttemptRecord:
 # ---------------------------------------------------------------------------
 # Billability — nexus reservation settlement: NotDispatched|ConfirmedNonBillable
 # → release; usage Present → commit actuals; PossiblyBillable + usage Absent →
-# commit full reservation (§9).
+# commit full reservation.
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,18 +308,41 @@ class CallMeta:
     provider: ProviderName
     model: str
     # Header-borne (anthropic request-id, openai x-request-id) or in-band;
-    # Gemini: always Absent — the catalog records that correlation fact.
+    # Gemini: always Absent — the registry records that correlation fact.
     provider_request_id: Presence[str]
-    # openrouter codec fills from response provider/openrouter_metadata; direct
-    # codecs: Absent. Feeds llm_calls.upstream_provider (§11.4).
+    # openrouter engine fills from response provider metadata; direct engines:
+    # Absent. Feeds llm_calls.upstream_provider.
     upstream_provider: Presence[str]
     usage: Presence[TokenUsage]
     attempt_trace: tuple[AttemptRecord, ...]
     billability: Billability
+    # The exact native reasoning wire value the engine sent (e.g. "high",
+    # "thinkingBudget=8192"); Absent when the model has no reasoning knob.
+    # Ledger-consumed.
+    native_reasoning: Presence[str]
+    registry_revision: str
 
 
 # ---------------------------------------------------------------------------
-# Expected failures (§9) — closed leaves with FIXED origin/code pairs.
+# Cost — derived on demand by prices.estimate_cost(meta); indicative, never
+# authoritative, and never stored on CallMeta.
+
+
+@dataclass(frozen=True, slots=True)
+class CostEstimate:
+    amount_usd_micros: int
+    source: str  # e.g. "genai-prices@2026-08-01"
+    as_of: date
+
+    def __post_init__(self) -> None:
+        if self.amount_usd_micros < 0:
+            raise ValueError(
+                f"CostEstimate.amount_usd_micros must be >= 0; got {self.amount_usd_micros}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Expected failures — closed leaves with FIXED origin/code pairs.
 
 
 @dataclass(frozen=True, slots=True)
@@ -427,6 +398,14 @@ class InvalidToolArguments:
 
 
 @dataclass(frozen=True, slots=True)
+class InvalidStructuredOutput:
+    # The provider returned structured output that failed caller-schema
+    # validation (json_out) — native and json_mode rows alike. No repair, no
+    # retry.
+    safe_detail: str
+
+
+@dataclass(frozen=True, slots=True)
 class TransientExhausted:
     # attempts == len(meta.attempt_trace)
     attempts: int
@@ -438,11 +417,15 @@ class TransientExhausted:
 
 
 type ExpectedModelFailure = (
-    IntentContextTooLarge | ProviderContextTooLarge | InvalidToolArguments | TransientExhausted
+    IntentContextTooLarge
+    | ProviderContextTooLarge
+    | InvalidToolArguments
+    | InvalidStructuredOutput
+    | TransientExhausted
 )
 
-# Exact §9 ledger union; the runtime's own image is a subset — plan/budget exist
-# for nexus ledger writes.
+# Ledger union; the runtime's own image is a subset — plan/budget exist for
+# nexus ledger writes.
 type FailureOrigin = Literal[
     "intent",
     "plan",
@@ -461,14 +444,15 @@ type FailureCode = Literal[
     "stream_interrupted",
     "context_too_large",
     "invalid_tool_arguments",
+    "invalid_structured_output",
 ]
 
-# Rationale for the fixed pairs (runtime-fixed, propagated to spec §9): intent =
-# local pre-network measurement (origin=plan is reserved for planning defects);
+# Rationale for the fixed pairs: intent = local pre-network measurement;
 # provider_http = context overflow is classified from the provider's HTTP error
-# body at codec classify_error ingress; provider_response stays operator-side for
-# malformed/unknown terminal envelopes (ProtocolDefect), which never map to
-# expected failures.
+# body at engine ingress; provider_response = the provider answered with a
+# well-formed envelope whose CONTENT is the failure (invalid structured
+# output). Malformed/unknown terminal envelopes stay operator-side as
+# ProtocolDefect and never map to expected failures.
 
 
 def failure_origin(failure: ExpectedModelFailure) -> FailureOrigin:
@@ -480,6 +464,8 @@ def failure_origin(failure: ExpectedModelFailure) -> FailureOrigin:
             return "provider_http"
         case InvalidToolArguments():
             return "tool_arguments"
+        case InvalidStructuredOutput():
+            return "provider_response"
         case TransientExhausted(cause=cause):
             match cause:
                 case ProviderRateLimit():
@@ -507,6 +493,8 @@ def failure_code(failure: ExpectedModelFailure) -> FailureCode:
             return "context_too_large"
         case InvalidToolArguments():
             return "invalid_tool_arguments"
+        case InvalidStructuredOutput():
+            return "invalid_structured_output"
         case TransientExhausted(cause=cause):
             match cause:
                 case ProviderRateLimit():
@@ -526,7 +514,8 @@ def failure_code(failure: ExpectedModelFailure) -> FailureCode:
 
 
 # ---------------------------------------------------------------------------
-# Response payload — output arm determined by the PLAN, never re-inferred.
+# Response payload — output arm determined by the intent's OutputSpec, never
+# re-inferred.
 
 
 @dataclass(frozen=True, slots=True)
@@ -541,7 +530,7 @@ class StructuredContent:
     text: str
 
 
-# tools+strict-output rejected at plan ⇒ no impossible state.
+# tools+strict-output rejected at intent validation ⇒ no impossible state.
 type ResponseContent = TextContent | StructuredContent
 
 
@@ -563,7 +552,7 @@ class Succeeded:
 
 @dataclass(frozen=True, slots=True)
 class Refused:
-    # NON-STREAM ONLY (spec §9).
+    # NON-STREAM ONLY.
     meta: CallMeta
     safe_detail: str
 
@@ -589,16 +578,24 @@ class Failed:
 
 
 type CallOutcome = Succeeded | Refused | Incomplete | Cancelled | Failed  # non-stream generate()
-# Stream terminal: Refused excluded BY CONSTRUCTION — the four-kind terminal
-# grammar of the built streaming cutover is preserved. Anthropic codec: streamed
-# HTTP-200 stop_reason=refusal ⇒ Incomplete(status="refused", safe_detail),
-# discarding partial output downstream per §1/§9; non-streamed keeps distinct
-# Refused.
+# Stream terminal: Refused excluded BY CONSTRUCTION — streams end in exactly
+# one of these four kinds. Anthropic engine:
+# streamed HTTP-200 stop_reason=refusal ⇒ Incomplete(status="refused",
+# safe_detail), discarding partial output downstream; non-streamed keeps
+# distinct Refused.
 type StreamOutcome = Succeeded | Incomplete | Cancelled | Failed
 
 
+@dataclass(frozen=True, slots=True)
+class StructuredReply[T]:
+    """json_out's success arm: the typed value never travels without its metadata."""
+
+    value: T
+    outcome: Succeeded
+
+
 # ---------------------------------------------------------------------------
-# Stream events — codecs yield payloads; the runtime owns the envelope
+# Stream events — engines yield payloads; the runtime owns the envelope
 # (no replace(), no post-hoc stamping).
 
 
@@ -640,13 +637,13 @@ class ContinuationDelta:
 @dataclass(frozen=True, slots=True)
 class UsageEvent:
     # Progressive telemetry ONLY; never the ledger source; still a retry-blocking
-    # semantic event (§9).
+    # semantic event.
     usage: TokenUsage
 
 
 @dataclass(frozen=True, slots=True)
 class TerminalEvent:
-    # outcome.meta carries the AUTHORITATIVE final call facts: the codec folds
+    # outcome.meta carries the AUTHORITATIVE final call facts: the engine folds
     # all provider usage frames into one merged TokenUsage + request id +
     # upstream_provider before emission.
     outcome: StreamOutcome
@@ -684,7 +681,7 @@ class RuntimeStreamEvent:
 
 @dataclass(frozen=True, slots=True)
 class ProviderCredential:
-    # Transport-only; never part of a plan. The key never appears in repr.
+    # Transport-only; never part of an intent. The key never appears in repr.
     provider: ProviderName
     key: str = field(repr=False)
 
@@ -698,15 +695,14 @@ class CancelSignal(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Plan value types — planning.py owns only computation (plan_generate,
-# compute_cache_affinity, the policy constants) and re-exports these.
+# Retry policy — RetryPolicy( is constructed only in retry.py (tests excepted).
 
 
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
-    """Same-target retry budget resolved by the planner from the central policy catalog.
+    """Same-target retry budget.
 
-    Which signals are retryable is NOT policy state: codecs classify exact
+    Which signals are retryable is NOT policy state: engines classify exact
     transients (TransientCause) and the runtime retries only those, only before
     any semantic provider event.
     """
@@ -732,169 +728,9 @@ class RetryPolicy:
             raise ValueError(f"RetryPolicy.deadline_s must be > 0; got {self.deadline_s.value}")
 
 
-@dataclass(frozen=True, slots=True)
-class DraftRequest:
-    """Phase-one codec encoding: the complete native request WITHOUT the injected
-    cache-affinity field.
-
-    prefix_bytes is the codec's exact length-framed serialization of every
-    cache-affecting input (stable-prefix blocks PLUS tool definitions,
-    tool_choice, and output schema where the provider's cache prefix includes
-    them). compute_cache_affinity consumes it — the affinity input EXCLUDES the
-    injected key — then codec.finalize(draft, affinity) constructs a NEW frozen
-    finalized request (prompt_cache_key for OpenAI/Moonshot, session_id for
-    OpenRouter, passthrough for others).
-    """
-
-    target: ProviderTarget
-    protocol: ProviderProtocol
-    url: str
-    safe_headers: Mapping[str, str]
-    native_reasoning: str
-    provider_framing_overhead_tokens: int
-    prefix_bytes: bytes
-    body: bytes
-
-
-@dataclass(frozen=True, slots=True)
-class FinalizedProviderRequest:
-    target: ProviderTarget
-    protocol: ProviderProtocol
-    url: str
-    method: Literal["POST"]
-    safe_headers: Mapping[str, str]
-    body: bytes
-
-
-# Cache plans (§8) — a provider-tagged union, not a generic TTL field.
-
-
-@dataclass(frozen=True, slots=True)
-class OpenAIExplicitPrefix:
-    key: str
-    minimum_ttl: Literal["30m"]
-    breakpoints: int
-
-
-@dataclass(frozen=True, slots=True)
-class AnthropicPrefix:
-    stable_breakpoint: int
-    ttl: Literal["5m"]
-    automatic_append_only: bool
-
-
-@dataclass(frozen=True, slots=True)
-class GeminiAutomaticPrefix:
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class MoonshotKeyedPrefix:
-    key: str
-
-
-@dataclass(frozen=True, slots=True)
-class OpenRouterCertifiedPrefix:
-    # evidence_revision is the immutable id of the paid certification artifact.
-    session_id: str
-    pinned_upstream: str
-    evidence_revision: str
-
-
-type CachePlan = (
-    OpenAIExplicitPrefix
-    | AnthropicPrefix
-    | GeminiAutomaticPrefix
-    | MoonshotKeyedPrefix
-    | OpenRouterCertifiedPrefix
-)
-
-
-def cache_strategy(plan: CachePlan) -> str:
-    """The §11.4 ledger strategy string — this accessor is its only owner."""
-    match plan:
-        case OpenAIExplicitPrefix():
-            return "openai_explicit_prefix"
-        case AnthropicPrefix():
-            return "anthropic_prefix"
-        case GeminiAutomaticPrefix():
-            return "gemini_automatic_prefix"
-        case MoonshotKeyedPrefix():
-            return "moonshot_keyed_prefix"
-        case OpenRouterCertifiedPrefix():
-            return "openrouter_certified_prefix"
-        case _:
-            assert_never(plan)
-
-
-def cache_ttl(plan: CachePlan) -> str | None:
-    """The §11.4 ledger TTL string (nullable ledger-column boundary)."""
-    match plan:
-        case OpenAIExplicitPrefix(minimum_ttl=ttl):
-            return ttl
-        case AnthropicPrefix(ttl=ttl):
-            return ttl
-        case GeminiAutomaticPrefix() | MoonshotKeyedPrefix():
-            return None
-        case OpenRouterCertifiedPrefix():
-            return None
-        case _:
-            assert_never(plan)
-
-
-@dataclass(frozen=True, slots=True)
-class Accounting:
-    # Frozen at plan time so terminal costing never re-reads the catalog. Rates
-    # are usd micros per million tokens.
-    currency: Literal["usd"]
-    input_rate: int
-    output_rate: int
-    cache_write_rate: int
-    cache_read_rate: int
-    reasoning_billed_outside_output: bool
-    platform_token_reservation: int
-    maximum_cost_estimate_usd_micros: int
-
-
-@dataclass(frozen=True, slots=True)
-class FinalizedProviderCall:
-    # Fingerprints: sha256 base64url over (finalized body bytes) / (framed
-    # canonical tool encodings) / (framed canonical output-schema encoding);
-    # request_fingerprint computed AFTER finalize.
-    request: FinalizedProviderRequest
-    accounting: Accounting
-    requested_reasoning: ReasoningLevel
-    effective_reasoning: ReasoningLevel
-    native_reasoning: str
-    cache_plan: CachePlan
-    retry_policy: RetryPolicy
-    catalog_revision: str
-    request_fingerprint: str
-    tool_fingerprint: str
-    schema_fingerprint: str
-    planned_input_token_upper_bound: int
-    # The plan's output arm, carried so the runtime can promote the decoded
-    # terminal text to StructuredContent (codecs decode TextContent only; the
-    # plan-owning layer owns the promotion). "strict_json" iff the intent's
-    # output is StrictJsonOutput.
-    output_kind: Literal["text", "strict_json"]
-
-
-@dataclass(frozen=True, slots=True)
-class PlanRejected:
-    """The expected planner rejection channel (oversize intent) — not a defect."""
-
-    failure: IntentContextTooLarge
-
-
 # ---------------------------------------------------------------------------
-# Non-generation ports (openai-only embedding/transcription; §5 keeps separate
-# typed contracts). Field shapes preserve the pre-cutover types minus
-# ModelRef (a bare model string suffices — the catalog rows are openai-only),
-# per-call RetryPolicy (the runtime applies the central EXTERNAL_LLM_RETRY
-# policy from planning), provider_request_id, and the attempts trace (both
-# were consumer-less on these ports; expected failures surface via
-# runtime.NonGenerationCallFailed instead).
+# Non-generation port (openai-only embeddings; live Nexus consumer). A bare
+# model string suffices — the rows are openai-only.
 
 
 @dataclass(frozen=True, slots=True)
@@ -908,18 +744,4 @@ class EmbeddingCall:
 class EmbeddingResponse:
     # One vector per input, in input order (index coverage validated at decode).
     embeddings: tuple[tuple[float, ...], ...]
-    usage: Presence[TokenUsage]
-
-
-@dataclass(frozen=True, slots=True)
-class TranscriptionCall:
-    model: str
-    filename: str
-    content: bytes = field(repr=False)
-    media_type: str = "application/octet-stream"
-
-
-@dataclass(frozen=True, slots=True)
-class TranscriptionResponse:
-    text: str
     usage: Presence[TokenUsage]

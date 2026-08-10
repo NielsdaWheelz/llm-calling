@@ -5,7 +5,13 @@ description = "Strict async runtimes for provider calls and local agent sessions
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "anthropic>=0.69,<1",
+    "google-genai>=1.38,<2",
     "httpx>=0.28.0",
+    "openai>=2.0,<3",
+    "opentelemetry-api>=1.36,<2",
+    "pydantic>=2.11,<3",
+    "stamina>=25.1,<26",
 ]
 
 [project.optional-dependencies]

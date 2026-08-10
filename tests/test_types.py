@@ -1,32 +1,33 @@
-"""Tests for the rewritten provider_runtime.types value contract."""
+"""Tests for the provider_runtime.types value contract."""
 
 import dataclasses
+from datetime import date
+from typing import get_args
 
 import pytest
 
 from provider_runtime.types import (
     Absent,
-    AnthropicPrefix,
     AttemptRecord,
     CallMeta,
     Cancelled,
     ContinuationArtifact,
-    Dynamic,
+    CostEstimate,
+    ExpectedModelFailure,
     Failed,
     FinalAttempt,
-    GeminiAutomaticPrefix,
-    GlobalScope,
+    GenerateIntent,
+    ImageBlock,
     Incomplete,
     IntentContextTooLarge,
+    InvalidStructuredOutput,
     InvalidToolArguments,
-    MoonshotKeyedPrefix,
-    OpenAIExplicitPrefix,
-    OpenRouterCertifiedPrefix,
     PossiblyBillable,
     Present,
     PromptBlock,
     ProviderContextTooLarge,
     ProviderHttpUnavailable,
+    ProviderName,
     ProviderRateLimit,
     ProviderStreamInterrupted,
     ProviderTarget,
@@ -34,23 +35,25 @@ from provider_runtime.types import (
     ResponsePayload,
     RetryPolicy,
     RuntimeStreamEvent,
-    Stable,
     StreamStart,
+    StructuredContent,
+    StructuredReply,
     Succeeded,
     TextContent,
+    TextOutput,
     TokenUsage,
     ToolCall,
+    TransientCause,
     TransientExhausted,
     TransportUnavailable,
-    cache_strategy,
-    cache_ttl,
+    UserMessage,
     failure_code,
     failure_origin,
     presence_of,
 )
 
 # ---------------------------------------------------------------------------
-# failure_origin / failure_code — exhaustive 8-leaf golden table
+# failure_origin / failure_code — exhaustive 9-leaf golden table
 
 
 def _exhausted(cause) -> TransientExhausted:
@@ -106,14 +109,24 @@ GOLDEN_FAILURE_TABLE = [
         "invalid_tool_arguments",
         id="invalid-tool-arguments",
     ),
+    pytest.param(
+        InvalidStructuredOutput(safe_detail="payload failed Invoice schema validation"),
+        "provider_response",
+        "invalid_structured_output",
+        id="invalid-structured-output",
+    ),
 ]
 
 
-def test_golden_failure_table_covers_all_eight_leaves() -> None:
-    # 3 non-transient leaves + 5 transient causes wrapped in TransientExhausted.
-    assert len(GOLDEN_FAILURE_TABLE) == 8, (
+def test_golden_failure_table_covers_all_leaves() -> None:
+    # Non-transient leaves + every transient cause wrapped in TransientExhausted,
+    # derived from the unions so a new leaf breaks this test until tabled.
+    non_transient = len(get_args(ExpectedModelFailure.__value__)) - 1
+    transient = len(get_args(TransientCause.__value__))
+    assert len(GOLDEN_FAILURE_TABLE) == non_transient + transient, (
         "the golden failure table must stay exhaustive over the closed "
-        "ExpectedModelFailure x TransientCause leaf set (8 pairs)"
+        f"ExpectedModelFailure x TransientCause leaf set "
+        f"(expected {non_transient + transient}, tabled {len(GOLDEN_FAILURE_TABLE)})"
     )
 
 
@@ -127,6 +140,22 @@ def test_failure_origin_and_code_golden_pairs(failure, expected_origin, expected
     assert code == expected_code, (
         f"failure_code({failure!r}) must be {expected_code!r}, got {code!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Provider identity
+
+
+def test_provider_name_covers_the_seven_v2_providers() -> None:
+    assert set(get_args(ProviderName.__value__)) == {
+        "openai",
+        "anthropic",
+        "gemini",
+        "moonshot",
+        "openrouter",
+        "deepseek",
+        "xai",
+    }, "ProviderName must cover all seven v2 providers, including deepseek and xai"
 
 
 # ---------------------------------------------------------------------------
@@ -149,8 +178,8 @@ def test_from_components_uses_provider_reported_total_when_present() -> None:
 
 def test_from_components_derives_input_plus_output_when_total_absent() -> None:
     # TokenUsage.input_tokens is ALWAYS the cache-INCLUSIVE total prompt token
-    # count (the codec-invariant convention) — the derived total must be
-    # plain input + output, never re-adding the cache components, or a codec
+    # count (the engine-invariant convention) — the derived total must be
+    # plain input + output, never re-adding the cache components, or an engine
     # that already folded cache into input_tokens (Anthropic, post-
     # normalization) would be double-counted.
     usage = TokenUsage.from_components(
@@ -301,6 +330,8 @@ def _sample_meta() -> CallMeta:
             ),
         ),
         billability=PossiblyBillable(),
+        native_reasoning=Present("high"),
+        registry_revision="2026-08-09.1",
     )
 
 
@@ -308,7 +339,7 @@ def test_value_types_are_frozen() -> None:
     meta = _sample_meta()
     with pytest.raises(dataclasses.FrozenInstanceError):
         meta.provider = "gemini"  # type: ignore
-    block = PromptBlock(text="system prompt", stability=Stable(scope=GlobalScope()))
+    block = PromptBlock(text="system prompt")
     with pytest.raises(dataclasses.FrozenInstanceError):
         block.text = "mutated"  # type: ignore
     event = RuntimeStreamEvent(seq=1, event=StreamStart())
@@ -317,7 +348,65 @@ def test_value_types_are_frozen() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Prompt content and intent
+
+
+def test_prompt_block_permits_empty_text() -> None:
+    assert PromptBlock(text="").text == "", "empty blocks are legal"
+
+
+def test_image_block_repr_hides_image_bytes() -> None:
+    block = ImageBlock(media_type="image/png", data=b"SECRET-IMAGE-BYTES")
+    assert block.media_type == "image/png"
+    assert "SECRET-IMAGE-BYTES" not in repr(block), (
+        "raw image bytes must never be rendered into repr/logs"
+    )
+
+
+def test_user_message_accepts_mixed_text_and_image_blocks() -> None:
+    message = UserMessage(
+        blocks=(
+            PromptBlock(text="what is in this image?"),
+            ImageBlock(media_type="image/jpeg", data=b"\xff\xd8\xff"),
+        )
+    )
+    assert message.blocks[0] == PromptBlock(text="what is in this image?"), (
+        "text blocks must survive alongside image blocks in a user message"
+    )
+    assert isinstance(message.blocks[1], ImageBlock)
+
+
+def test_generate_intent_provider_options_default_to_empty() -> None:
+    intent = GenerateIntent(
+        target=ProviderTarget(provider="deepseek", model="deepseek-chat"),
+        messages=(UserMessage(blocks=(PromptBlock(text="hello"),)),),
+        max_output_tokens=256,
+        reasoning="none",
+        tools=(),
+        tool_choice="auto",
+        output=TextOutput(),
+    )
+    assert intent.provider_options == {}, (
+        "provider_options is a per-engine extension passthrough and must default to empty"
+    )
+
+
+# ---------------------------------------------------------------------------
 # CallMeta / outcome construction
+
+
+def test_call_meta_carries_native_reasoning_and_registry_revision() -> None:
+    meta = _sample_meta()
+    assert meta.native_reasoning == Present("high"), (
+        "native_reasoning must carry the exact reasoning wire value the engine sent"
+    )
+    assert meta.registry_revision == "2026-08-09.1", (
+        "every CallMeta is stamped with the registry revision it was resolved against"
+    )
+    knobless = dataclasses.replace(meta, native_reasoning=Absent())
+    assert knobless.native_reasoning == Absent(), (
+        "models without a reasoning knob carry Absent, never an empty string"
+    )
 
 
 def test_succeeded_outcome_retains_meta_and_attempt_trace() -> None:
@@ -363,22 +452,6 @@ def test_failed_and_cancelled_outcomes_carry_meta() -> None:
     assert Cancelled(meta=meta).meta == meta
 
 
-def test_continuation_artifact_requires_a_mapping_payload() -> None:
-    target = ProviderTarget(provider="openai", model="gpt-5.6-terra")
-    artifact = ContinuationArtifact(
-        target=target,
-        codec_id="openai_responses",
-        opaque_payload={"output": []},
-    )
-    assert artifact.codec_id == "openai_responses"
-    with pytest.raises(TypeError, match="opaque_payload must be a Mapping"):
-        ContinuationArtifact(
-            target=target,
-            codec_id="openai_responses",
-            opaque_payload=[("output", [])],  # type: ignore
-        )
-
-
 def test_continuation_artifact_payload_never_enters_repr() -> None:
     artifact = ContinuationArtifact(
         target=ProviderTarget(provider="openai", model="gpt-5.6-terra"),
@@ -397,34 +470,41 @@ def test_runtime_stream_event_seq_is_one_based() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Plan value types
+# Cost estimate and structured reply
 
 
-def test_cache_strategy_and_ttl_accessors_cover_all_five_plans() -> None:
-    openai_plan = OpenAIExplicitPrefix(key="affinity", minimum_ttl="30m", breakpoints=1)
-    anthropic_plan = AnthropicPrefix(stable_breakpoint=2, ttl="5m", automatic_append_only=True)
-    gemini_plan = GeminiAutomaticPrefix()
-    moonshot_plan = MoonshotKeyedPrefix(key="affinity")
-    openrouter_plan = OpenRouterCertifiedPrefix(
-        session_id="affinity",
-        pinned_upstream="moonshotai/int4",
-        evidence_revision="cert-2026-07",
+def test_cost_estimate_is_a_dated_indicative_value() -> None:
+    estimate = CostEstimate(
+        amount_usd_micros=1_234,
+        source="genai-prices@2026-08-01",
+        as_of=date(2026, 8, 1),
     )
+    assert estimate.amount_usd_micros == 1_234
+    assert estimate.source == "genai-prices@2026-08-01"
+    assert estimate.as_of == date(2026, 8, 1)
+    with pytest.raises(ValueError, match="amount_usd_micros must be >= 0"):
+        CostEstimate(amount_usd_micros=-1, source="genai-prices@2026-08-01", as_of=date(2026, 8, 1))
 
-    assert cache_strategy(openai_plan) == "openai_explicit_prefix"
-    assert cache_ttl(openai_plan) == "30m"
 
-    assert cache_strategy(anthropic_plan) == "anthropic_prefix"
-    assert cache_ttl(anthropic_plan) == "5m"
+def test_structured_reply_binds_the_typed_value_to_its_outcome() -> None:
+    outcome = Succeeded(
+        meta=_sample_meta(),
+        response=ResponsePayload(
+            content=StructuredContent(payload={"total": 7}, text='{"total": 7}'),
+            continuation=Absent(),
+        ),
+    )
+    reply = StructuredReply(value={"total": 7}, outcome=outcome)
+    assert reply.value == {"total": 7}
+    assert reply.outcome.meta.registry_revision == "2026-08-09.1", (
+        "the typed value never travels without its call metadata"
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        reply.value = {}  # type: ignore
 
-    assert cache_strategy(gemini_plan) == "gemini_automatic_prefix"
-    assert cache_ttl(gemini_plan) is None, "automatic prefix plans declare no wire TTL"
 
-    assert cache_strategy(moonshot_plan) == "moonshot_keyed_prefix"
-    assert cache_ttl(moonshot_plan) is None
-
-    assert cache_strategy(openrouter_plan) == "openrouter_certified_prefix"
-    assert cache_ttl(openrouter_plan) is None
+# ---------------------------------------------------------------------------
+# Retry policy
 
 
 def test_retry_policy_validates_its_budget() -> None:
@@ -452,8 +532,3 @@ def test_retry_policy_validates_its_budget() -> None:
             jitter_s=0.0,
             deadline_s=Present(0.0),
         )
-
-
-def test_prompt_block_permits_empty_dynamic_text() -> None:
-    block = PromptBlock(text="", stability=Dynamic())
-    assert block.text == "", "empty dynamic blocks are legal; the planner owns prefix rules"
