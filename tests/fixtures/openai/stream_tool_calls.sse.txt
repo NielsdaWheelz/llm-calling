@@ -1,7 +1,0 @@
-data: {"type":"response.created","response":{"id":"resp_s2","model":"gpt-5.6-sol","status":"in_progress"}}
-data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_s1","type":"function_call","call_id":"call_abc","name":"search_library","arguments":""}}
-data: {"type":"response.function_call_arguments.delta","item_id":"fc_s1","delta":"{\"query\":"}
-data: {"type":"response.function_call_arguments.delta","item_id":"fc_s1","delta":"\"hyperion\"}"}
-data: {"type":"response.function_call_arguments.done","item_id":"fc_s1","arguments":"{\"query\":\"hyperion\"}"}
-data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_s1","type":"function_call","call_id":"call_abc","name":"search_library","arguments":"{\"query\":\"hyperion\"}","status":"completed"}}
-data: {"type":"response.completed","response":{"id":"resp_s2","status":"completed","model":"gpt-5.6-sol","usage":{"input_tokens":300,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":300},"output_tokens":18,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":318}}}

@@ -1,6 +1,0 @@
-{
-  "error": {
-    "message": "Your account has exhausted its current quota, please check your plan and billing details",
-    "type": "exceeded_current_quota_error"
-  }
-}

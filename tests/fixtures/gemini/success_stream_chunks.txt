@@ -1,7 +1,0 @@
-data: {"candidates":[{"content":{"parts":[{"text":"Let me"}],"role":"model"},"index":0}],"modelVersion":"gemini-3.5-flash"}
-
-data: {"candidates":[{"content":{"parts":[{"text":" search."}],"role":"model"},"index":0}]}
-
-data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"app_search","args":{"query":"tides"}},"thoughtSignature":"sig-abc"}],"role":"model"},"index":0}]}
-
-data: {"candidates":[{"content":{"parts":[],"role":"model"},"index":0,"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":9,"totalTokenCount":27,"thoughtsTokenCount":6},"modelVersion":"gemini-3.5-flash"}

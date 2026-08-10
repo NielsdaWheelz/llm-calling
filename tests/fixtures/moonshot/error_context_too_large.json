@@ -1,6 +1,0 @@
-{
-  "error": {
-    "message": "Your request exceeded model token limit: 1200000 tokens",
-    "type": "invalid_request_error"
-  }
-}

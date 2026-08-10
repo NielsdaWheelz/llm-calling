@@ -1,3 +1,0 @@
-data: {"id":"gen-or-006","object":"chat.completion.chunk","model":"moonshotai/kimi-k3-20260715","provider":"Moonshot AI","choices":[{"index":0,"delta":{"role":"assistant","content":"Partial"}}]}
-data: {"id":"gen-or-006","object":"chat.completion.chunk","model":"moonshotai/kimi-k3-20260715","provider":"Moonshot AI","choices":[{"index":0,"delta":{},"finish_reason":"error"}]}
-data: [DONE]

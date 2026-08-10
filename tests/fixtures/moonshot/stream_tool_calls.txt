@@ -1,6 +1,0 @@
-data: {"id":"chatcmpl-msh-003","object":"chat.completion.chunk","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Need the tide tool."}}]}
-data: {"id":"chatcmpl-msh-003","object":"chat.completion.chunk","model":"kimi-k3","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":""}}]}}]}
-data: {"id":"chatcmpl-msh-003","object":"chat.completion.chunk","model":"kimi-k3","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"query\""}}]}}]}
-data: {"id":"chatcmpl-msh-003","object":"chat.completion.chunk","model":"kimi-k3","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":": \"tides\"}"}}]}}]}
-data: {"id":"chatcmpl-msh-003","object":"chat.completion.chunk","model":"kimi-k3","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls","usage":{"prompt_tokens":80,"completion_tokens":20,"total_tokens":100}}]}
-data: [DONE]
