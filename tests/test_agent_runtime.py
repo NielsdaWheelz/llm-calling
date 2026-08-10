@@ -133,8 +133,8 @@ class Cancel:
     def is_set(self) -> bool:
         return self._event.is_set()
 
-    async def wait(self) -> None:
-        await self._event.wait()
+    async def wait(self) -> bool:
+        return await self._event.wait()
 
 
 class ScriptedAdapter:

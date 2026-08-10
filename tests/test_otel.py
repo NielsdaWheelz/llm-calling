@@ -233,7 +233,9 @@ def test_semconv_version_is_pinned_and_recorded() -> None:
 
 def test_call_span_ends_the_span_on_exit() -> None:
     provider = RecordingTracerProvider()
-    with call_span("chat", provider=ROW.provider, model=ROW.model_id, tracer_provider=provider) as span:
+    with call_span(
+        "chat", provider=ROW.provider, model=ROW.model_id, tracer_provider=provider
+    ) as span:
         assert isinstance(span, RecordedSpan)
         assert not span.ended
     assert span.ended, "exiting call_span must end the span"
@@ -245,7 +247,9 @@ def test_call_span_ends_the_span_on_exit() -> None:
 
 def test_record_outcome_sets_attempt_count_billability_and_revision() -> None:
     provider = RecordingTracerProvider()
-    with call_span("chat", provider=ROW.provider, model=ROW.model_id, tracer_provider=provider) as span:
+    with call_span(
+        "chat", provider=ROW.provider, model=ROW.model_id, tracer_provider=provider
+    ) as span:
         record_outcome(span, make_meta(attempts=3, billability=PossiblyBillable()))
     (recorded,) = provider.tracer.spans
     assert recorded.attributes == START_ATTRIBUTES | {
@@ -259,7 +263,9 @@ def test_each_billability_variant_has_a_distinct_tag() -> None:
     tags: dict[str, object] = {}
     for billability in (NotDispatched(), PossiblyBillable(), ConfirmedNonBillable()):
         provider = RecordingTracerProvider()
-        with call_span("chat", provider=ROW.provider, model=ROW.model_id, tracer_provider=provider) as span:
+        with call_span(
+            "chat", provider=ROW.provider, model=ROW.model_id, tracer_provider=provider
+        ) as span:
             record_outcome(span, make_meta(billability=billability))
         tag = provider.tracer.spans[0].attributes["provider_runtime.billability"]
         tags[type(billability).__name__] = tag
@@ -280,7 +286,9 @@ def test_usage_counts_are_recorded_without_summing_cache_reads() -> None:
         cache_write_input_tokens=Present(50),
     )
     provider = RecordingTracerProvider()
-    with call_span("chat", provider=ROW.provider, model=ROW.model_id, tracer_provider=provider) as span:
+    with call_span(
+        "chat", provider=ROW.provider, model=ROW.model_id, tracer_provider=provider
+    ) as span:
         record_outcome(span, make_meta(usage=Present(usage)))
     attributes = provider.tracer.spans[0].attributes
     assert attributes == START_ATTRIBUTES | {
@@ -311,7 +319,9 @@ def test_absent_usage_and_cache_components_record_no_usage_attributes() -> None:
         (Present(bare), {"gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens"}),
     ):
         provider = RecordingTracerProvider()
-        with call_span("chat", provider=ROW.provider, model=ROW.model_id, tracer_provider=provider) as span:
+        with call_span(
+            "chat", provider=ROW.provider, model=ROW.model_id, tracer_provider=provider
+        ) as span:
             record_outcome(span, make_meta(usage=usage))
         attributes = provider.tracer.spans[0].attributes
         usage_keys = {key for key in attributes if "usage" in key}

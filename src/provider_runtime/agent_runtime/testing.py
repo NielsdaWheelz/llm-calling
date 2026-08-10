@@ -9,7 +9,7 @@ signals, or resolved credential material.
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import AsyncIterator, Iterable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -199,7 +199,7 @@ class ScriptedAgentRuntime(NoNetworkAgentRuntime):
         *,
         approvals: ApprovalHandler | None = None,
         cancel: CancelSignal | None = None,
-    ) -> AsyncIterator[AgentEvent]:
+    ) -> AsyncGenerator[AgentEvent, None]:
         subject = (session, request)
         self.calls.append(
             CapturedAgentCall(
