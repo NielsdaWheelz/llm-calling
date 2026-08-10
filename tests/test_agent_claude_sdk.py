@@ -7,7 +7,7 @@ import json
 import os
 import signal
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -27,10 +27,6 @@ from provider_runtime.agent_runtime.auth import (
     build_child_environment,
     child_home_directory,
 )
-from provider_runtime.agent_runtime.capabilities import (
-    AgentCapabilityScope,
-    validate_session_capabilities,
-)
 from provider_runtime.agent_runtime.claude_sdk import ClaudeSdkAdapter
 from provider_runtime.agent_runtime.errors import (
     AgentRuntimeDefect,
@@ -44,8 +40,13 @@ from provider_runtime.agent_runtime.errors import (
 )
 from provider_runtime.agent_runtime.events import (
     AgentEvent,
-    DiagnosticData,
-    terminal_event_to_result,
+    AgentFailure,
+    AgentNative,
+    AgentPermissionRequest,
+    AgentQuotaExhausted,
+    AgentTerminal,
+    AgentToolUse,
+    AgentUsage,
     validate_event_stream,
 )
 from provider_runtime.agent_runtime.policy import (
@@ -54,7 +55,6 @@ from provider_runtime.agent_runtime.policy import (
     UnsafeConfirmation,
 )
 from provider_runtime.agent_runtime.sessions import (
-    AgentSession,
     SessionQuery,
     SessionReadOptions,
     fingerprint_path,
@@ -76,7 +76,7 @@ from provider_runtime.agent_runtime.types import (
     TurnRequest,
     thaw_json_value,
 )
-from provider_runtime.schema import parse_canonical_schema
+from provider_runtime.types import Absent, Present, TokenUsage
 
 FIXTURES = Path(__file__).parent / "fixtures" / "agent_runtime" / "claude"
 CLAUDE_EXECUTABLE = (
@@ -85,6 +85,12 @@ CLAUDE_EXECUTABLE = (
 AUTH = CredentialRef(kind="local_account", profile_key="fixture")
 APPROVAL_CASES: list[dict[str, Any]] = json.loads((FIXTURES / "approval_cases.json").read_text())
 FIXTURE_TOOLS = ("Read", "Write")
+ANSWER_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {"answer": {"type": "string"}},
+    "required": ["answer"],
+    "additionalProperties": False,
+}
 
 
 class ClaudeSDKError(Exception):
@@ -469,10 +475,18 @@ class ClaudeSDKClient:
                 uuid="result-approval-1",
             )
             return
-        if self.fixture in ("structured_failure", "structured_success"):
+        if self.fixture.startswith("minimal"):
+            # A synthesized init+result corpus: the shortest stream that can carry the
+            # `init_overrides` the effective-configuration tests plant, plus the three
+            # structured-output shapes (native value, text-only, violation).
             session_id = "0198a200-0000-7000-8000-000000000051"
-            valid = self.fixture == "structured_success"
             yield self._init_message(session_id)
+            result, structured = {
+                "minimal": ("Done.", None),
+                "minimal_native": ('{"answer": "ok"}', {"answer": "ok"}),
+                "minimal_text": ('{"answer": "ok"}', None),
+                "minimal_violation": ("no structured answer", None),
+            }[self.fixture]
             yield ResultMessage(
                 subtype="success",
                 duration_ms=100,
@@ -480,10 +494,10 @@ class ClaudeSDKClient:
                 is_error=False,
                 num_turns=1,
                 session_id=session_id,
-                result='{"answer": "ok"}' if valid else '{"answer": 3}',
-                structured_output={"answer": "ok"} if valid else {"answer": 3},
+                result=result,
+                structured_output=structured,
                 terminal_reason="completed",
-                uuid="result-structured-1",
+                uuid="result-minimal-1",
             )
             return
         values = json.loads((FIXTURES / f"{self.fixture}.json").read_text())
@@ -636,13 +650,25 @@ def fixture_policy(**changes: object) -> PermissionPolicy:
     return replace(PermissionPolicy(allowed_tools=FIXTURE_TOOLS), **changes)
 
 
+def terminal_of(events: list[AgentEvent]) -> AgentTerminal:
+    event = events[-1]
+    assert isinstance(event, AgentTerminal), (
+        f"stream must end on AgentTerminal, got {[type(item).__name__ for item in events]}"
+    )
+    return event
+
+
+def native_of(event: AgentEvent) -> AgentNative:
+    assert isinstance(event, AgentNative), f"expected AgentNative, got {event!r}"
+    return event
+
+
 async def stream_fixture(
     tmp_path: Path, name: str, installed_sdk: SimpleNamespace
 ) -> list[AgentEvent]:
     adapter = ClaudeSdkAdapter()
     try:
-        session = await open_session(
-            adapter,
+        session = await adapter.open_session(
             session_request(tmp_path, policy=fixture_policy()),
             environment=environment(tmp_path),
         )
@@ -793,9 +819,7 @@ async def test_a_child_that_is_not_its_own_group_leader_fails_the_open_closed(
     adapter = ClaudeSdkAdapter()
     try:
         with pytest.raises(ProtocolDefect) as captured:
-            await open_session(
-                adapter, session_request(tmp_path), environment=environment(tmp_path)
-            )
+            await adapter.open_session(session_request(tmp_path), environment=environment(tmp_path))
     finally:
         await adapter.close()
 
@@ -812,14 +836,13 @@ async def test_missing_optional_dependency_is_a_typed_error(
 
     def missing(name: str, package: str | None = None):
         if name == "claude_agent_sdk":
-            raise ModuleNotFoundError(name)
+            raise ModuleNotFoundError(name, name=name)
         return original(name, package)
 
     monkeypatch.setattr(importlib, "import_module", missing)
     with pytest.raises(SdkUnavailable, match="claude-agent-sdk"):
-        await ClaudeSdkAdapter().capabilities(
-            AgentCapabilityScope(backend="claude", transport="sdk", auth=AUTH),
-            environment=environment(tmp_path),
+        await ClaudeSdkAdapter().open_session(
+            session_request(tmp_path), environment=environment(tmp_path)
         )
 
 
@@ -834,59 +857,83 @@ async def test_absent_sdk_extra_is_sdk_unavailable(tmp_path: Path) -> None:
     same whether or not the extra is installed. Only this one can fail when `_load_sdk` stops
     raising the precise typed error the spec's no-extras job asserts on.
     """
-    adapter = ClaudeSdkAdapter()
-    scope = AgentCapabilityScope(backend="claude", transport="sdk", auth=AUTH)
     with pytest.raises(SdkUnavailable, match="install the 'claude-sdk' extra"):
-        await adapter.capabilities(scope, environment=environment(tmp_path))
-    with pytest.raises(SdkUnavailable, match="install the 'claude-sdk' extra"):
-        await open_session(adapter, session_request(tmp_path), environment=environment(tmp_path))
+        await ClaudeSdkAdapter().open_session(
+            session_request(tmp_path), environment=environment(tmp_path)
+        )
 
 
-async def test_capabilities_are_sdk_native_and_auth_identity_is_honest(
+async def test_sdk_version_drift_is_one_runtime_warning_and_the_session_still_opens(
     installed_sdk: SimpleNamespace, tmp_path: Path
 ) -> None:
-    capabilities = await ClaudeSdkAdapter().capabilities(
-        AgentCapabilityScope(backend="claude", transport="sdk", auth=AUTH),
-        environment=environment(tmp_path),
-    )
+    """There is no version hard-fail: a drifted SDK warns once and then answers to the
+    behavioral `system/init` verification like every other install."""
+    installed_sdk.__version__ = "0.0.7"
+    adapter = ClaudeSdkAdapter()
+    try:
+        with pytest.warns(RuntimeWarning, match=r"claude-agent-sdk 0\.0\.7 is not the vetted"):
+            session = await adapter.open_session(
+                session_request(tmp_path), environment=environment(tmp_path)
+            )
+        assert session.ref_is_complete is False
+        assert ClaudeSDKClient.instances[-1].disconnected is False
+    finally:
+        await adapter.close()
 
-    assert capabilities.sdk_version == "0.2.130"
-    assert capabilities.session_operations == ("new", "resume", "fork")
-    assert capabilities.discovery_operations == ()
-    assert capabilities.additional_dirs is True
-    assert capabilities.network_allowlist is True
-    assert capabilities.max_turns is False
-    assert capabilities.turn_overrides == ()
-    assert capabilities.persistent_turn_overrides == ()
-    assert capabilities.reports_auth_identity is False
-    assert capabilities.reports_effective_effort is False
-    assert capabilities.builtin_tool_families == ("file_read", "file_write", "command")
-    assert capabilities.builtin_tool_names == (
-        ("file_read", ("Read", "Glob", "Grep")),
-        ("file_write", ("Write", "Edit", "NotebookEdit")),
-        ("command", ("Bash",)),
-    )
+
+@pytest.mark.parametrize(
+    ("reported", "expectation"),
+    [
+        ("9.9.9 (Claude Code)", r"Claude Code 9\.9\.9 is not the vetted"),
+        ("a build with no version", "unrecognized version string"),
+    ],
+)
+async def test_cli_version_drift_is_one_runtime_warning_and_the_session_still_opens(
+    installed_sdk: SimpleNamespace, tmp_path: Path, reported: str, expectation: str
+) -> None:
+    values = {**environment(tmp_path), "LLM_CALLING_FAKE_CLAUDE_VERSION": reported}
+    adapter = ClaudeSdkAdapter()
+    try:
+        with pytest.warns(RuntimeWarning, match=expectation):
+            await adapter.open_session(session_request(tmp_path), environment=values)
+        assert ClaudeSDKClient.instances[-1].disconnected is False
+    finally:
+        await adapter.close()
+
+
+async def test_network_allowlist_without_the_sandbox_probe_fails_closed_before_sdk_startup(
+    installed_sdk: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`network: allowlist` is only enforceable through the bubblewrap/socat proxy, so a host
+    that cannot run it must refuse the session before any billable SDK work."""
+
+    async def unavailable(**_kwargs: object) -> bool:
+        return False
+
+    monkeypatch.setattr(claude_module, "_network_sandbox_available", unavailable)
+    policy = PermissionPolicy(network="allowlist", network_allowlist=("example.invalid",))
+    with pytest.raises(UnsupportedCapability, match="network allowlist"):
+        await ClaudeSdkAdapter().open_session(
+            session_request(tmp_path, policy=policy), environment=environment(tmp_path)
+        )
+    assert ClaudeSDKClient.instances == []
 
 
 @pytest.mark.parametrize(
     ("family", "name"),
     [(family, name) for family, names in claude_module._BUILTIN_TOOL_NAMES for name in names],
 )
-async def test_every_published_native_tool_name_is_one_a_policy_may_actually_name(
+async def test_every_accepted_native_tool_name_is_classified_the_way_it_is_admitted(
     installed_sdk: SimpleNamespace, tmp_path: Path, family: str, name: str
 ) -> None:
-    """`builtin_tool_names` carries accepted names, so every one of them must be accepted.
-
-    This is the disagreement class the audit was about: a capability report that advertises
-    what the adapter then refuses. A caller has no other source for the exact spellings —
-    `builtin_tool_families` is a normalized cross-backend vocabulary and `system/init` only
-    echoes the tools the session already asked for — so an advertised name the policy
-    validator rejects would strand it with no working value at all.
-    """
+    """`_BUILTIN_TOOL_NAMES` is behavioral policy enforcement, so both of its readings must
+    agree: a name the policy validator admits reaches the SDK tool list verbatim, and the
+    approval path classifies it from the same table — `filesystem: read_only` refuses
+    `command`/`file_change` outright, so a file write filed as an ordinary tool use would
+    run under a read-only policy."""
     adapter = ClaudeSdkAdapter()
     try:
-        await open_session(
-            adapter,
+        await adapter.open_session(
             session_request(tmp_path, policy=PermissionPolicy(allowed_tools=(name,))),
             environment=environment(tmp_path),
         )
@@ -895,9 +942,6 @@ async def test_every_published_native_tool_name_is_one_a_policy_may_actually_nam
         await adapter.close()
 
     assert options.tools == [name]
-    # The approval path must classify the name the same way the table files it, because
-    # `filesystem: read_only` refuses `command`/`file_change` outright: a published file
-    # write that the approval path called an ordinary tool use would run under read-only.
     operation = ClaudeSdkAdapter._operation(name)
     assert (
         operation
@@ -909,37 +953,6 @@ async def test_every_published_native_tool_name_is_one_a_policy_may_actually_nam
     )
 
 
-async def test_refused_tool_names_are_never_advertised_as_accepted(
-    installed_sdk: SimpleNamespace, tmp_path: Path
-) -> None:
-    """The other half of the same invariant: what the adapter refuses stays out of the table.
-
-    `WebFetch`/`WebSearch` reach the network through Claude Code's own client rather than the
-    sandbox this lane always engages, so `_validate_policy_mapping` refuses them. Advertising
-    either — as a name, or as a `web_fetch`/`web_search` family a caller would then look for
-    a name in — would be the capability report promising a route no request can take.
-    """
-    capabilities = await ClaudeSdkAdapter().capabilities(
-        AgentCapabilityScope(backend="claude", transport="sdk", auth=AUTH),
-        environment=environment(tmp_path),
-    )
-    published = {name for _family, names in capabilities.builtin_tool_names for name in names}
-
-    assert published.isdisjoint(claude_module._REFUSED_TOOL_NAMES)
-    assert set(capabilities.builtin_tool_families) == {
-        family for family, _names in capabilities.builtin_tool_names
-    }
-    for refused in claude_module._REFUSED_TOOL_NAMES:
-        adapter = ClaudeSdkAdapter()
-        with pytest.raises(UnsupportedCapability):
-            await open_session(
-                adapter,
-                session_request(tmp_path, policy=PermissionPolicy(allowed_tools=(refused,))),
-                environment=environment(tmp_path),
-            )
-        await adapter.close()
-
-
 async def test_api_key_auth_is_rejected_before_sdk_client_side_effects(
     installed_sdk: SimpleNamespace, tmp_path: Path
 ) -> None:
@@ -948,8 +961,7 @@ async def test_api_key_auth_is_rejected_before_sdk_client_side_effects(
     )
     adapter = ClaudeSdkAdapter()
     with pytest.raises(UnsupportedCapability, match="authentication identity"):
-        await open_session(
-            adapter,
+        await adapter.open_session(
             session_request(tmp_path, auth=auth),
             environment={**environment(tmp_path), "ANTHROPIC_API_KEY": "fixture-secret"},
         )
@@ -965,8 +977,7 @@ async def test_sdk_options_scrub_ambient_credentials_and_fail_closed_sandbox(
     additional.mkdir()
     adapter = ClaudeSdkAdapter()
     try:
-        await open_session(
-            adapter,
+        await adapter.open_session(
             session_request(tmp_path, additional_dirs=(str(additional),)),
             environment=environment(tmp_path),
         )
@@ -998,7 +1009,7 @@ async def test_child_process_controls_are_usable_rather_than_blanked(
     values = environment(tmp_path)
     adapter = ClaudeSdkAdapter()
     try:
-        await open_session(adapter, session_request(tmp_path), environment=values)
+        await adapter.open_session(session_request(tmp_path), environment=values)
         options = ClaudeSDKClient.instances[-1].options
     finally:
         await adapter.close()
@@ -1030,8 +1041,8 @@ async def test_sdk_never_uses_behavior_changing_permission_modes(
     )
     adapter = ClaudeSdkAdapter()
     try:
-        await open_session(
-            adapter, session_request(tmp_path, policy=policy), environment=environment(tmp_path)
+        await adapter.open_session(
+            session_request(tmp_path, policy=policy), environment=environment(tmp_path)
         )
         options = ClaudeSDKClient.instances[-1].options
     finally:
@@ -1049,8 +1060,7 @@ async def test_sdk_rejects_unenforceable_tool_availability_before_client_start(
 ) -> None:
     adapter = ClaudeSdkAdapter()
     with pytest.raises(UnsupportedCapability):
-        await open_session(
-            adapter,
+        await adapter.open_session(
             session_request(tmp_path, policy=PermissionPolicy(allowed_tools=(tool,))),
             environment=environment(tmp_path),
         )
@@ -1061,8 +1071,7 @@ async def test_sdk_rejects_per_turn_policy_it_cannot_reconfigure(
     installed_sdk: SimpleNamespace, tmp_path: Path
 ) -> None:
     adapter = ClaudeSdkAdapter()
-    session = await open_session(
-        adapter,
+    session = await adapter.open_session(
         session_request(
             tmp_path,
             policy=PermissionPolicy(filesystem="workspace_write", allowed_tools=("Read", "Edit")),
@@ -1088,63 +1097,112 @@ async def test_sdk_rejects_per_turn_policy_it_cannot_reconfigure(
         await adapter.close()
 
 
-async def test_success_fixture_normalizes_visible_thinking_tools_files_and_usage(
+async def test_success_fixture_normalizes_text_tools_usage_and_native_frames(
     installed_sdk: SimpleNamespace, tmp_path: Path
 ) -> None:
     events = await stream_fixture(tmp_path, "success", installed_sdk)
 
-    assert [event.seq for event in events] == list(range(1, len(events) + 1))
-    assert events[0].kind == "session_started"
-    assert events[-1].kind == "turn_completed"
-    assert terminal_event_to_result(events[-1]).final_text == "Inspection complete."
-    assert {event.kind for event in events} >= {
-        "turn_started",
-        "text_delta",
-        "reasoning",
-        "tool_started",
-        "tool_completed",
-        "file_change",
-        "usage",
-        "unknown",
-        "diagnostic",
+    assert [type(event).__name__ for event in events] == [
+        "AgentNative",  # SystemMessage:init
+        "AgentNative",  # StreamEvent:thinking_delta
+        "AgentUsage",
+        "AgentToolUse",  # Read started
+        "AgentToolUse",  # Read completed
+        "AgentUsage",
+        "AgentToolUse",  # Write started
+        "AgentToolUse",  # Write completed
+        "AgentText",
+        "AgentText",
+        "AgentUsage",
+        "AgentNative",  # SystemMessage:compact_boundary
+        "AgentNative",  # SystemMessage:task_notification
+        "AgentNative",  # ResultMessage
+        "AgentTerminal",
+    ], f"unexpected normalization for the success corpus: {events!r}"
+
+    assert native_of(events[0]).native_type == "SystemMessage:init"
+    thinking = native_of(events[1])
+    assert thinking.native_type == "StreamEvent:thinking_delta"
+    thinking_payload = cast(dict[str, Any], thaw_json_value(thinking.payload))
+    assert "inspect the package boundary" in thinking_payload["event"]["delta"]["thinking"]
+
+    # Claude's wire input_tokens EXCLUDES cache tokens; the normalized noun is
+    # cache-inclusive, so the components must be folded back in.
+    usage_values = [event.usage for event in events if isinstance(event, AgentUsage)]
+    first = usage_values[0]
+    assert first.input_tokens == 100 + 15 + 0, (
+        f"input_tokens must include cache read/write components; got {first!r}"
+    )
+    assert first.output_tokens == 20
+    assert first.total_tokens == first.input_tokens + first.output_tokens
+    assert first.cache_read_input_tokens == Present(15)
+    assert first.cache_write_input_tokens == Present(0)
+    assert first.reasoning_tokens == Absent()
+
+    tool_events = [event for event in events if isinstance(event, AgentToolUse)]
+    assert [(event.tool_call_id, event.name, event.phase) for event in tool_events] == [
+        ("tool-read-1", "Read", "started"),
+        ("tool-read-1", "Read", "completed"),
+        ("tool-write-1", "Write", "started"),
+        ("tool-write-1", "Write", "completed"),
+    ]
+    assert tool_events[0].succeeded is None
+    assert tool_events[1].succeeded is True
+    assert tool_events[1].payload == "VALUE = 1\n"
+    assert thaw_json_value(tool_events[2].payload) == {
+        "file_path": "/workspace/repo/src/example.py",
+        "content": "VALUE = 2\n",
     }
+    assert tool_events[3].succeeded is True
+
     # An unmodelled `system` subtype is the forward-compatibility surface the pinned SDK can
     # actually deliver, and its payload must survive redaction with no credential in it.
-    unknown = next(event for event in events if event.kind == "unknown")
-    assert unknown.native_type == "SystemMessage:compact_boundary"
-    assert unknown.native_payload is not None
-    wire = json.dumps(thaw_json_value(unknown.native_payload))
+    compact = native_of(events[11])
+    assert compact.native_type == "SystemMessage:compact_boundary"
+    wire = json.dumps(thaw_json_value(compact.payload))
     assert "secret-value-123456" not in wire
     assert "future-secret-token-value" not in wire
-    # Failed background work must not vanish from the stream.
-    task_diagnostic = next(
-        event
-        for event in events
-        if isinstance(event.data, DiagnosticData) and event.data.code == "claude_task_notification"
+    # Failed background work must not vanish from the stream either.
+    assert native_of(events[12]).native_type == "SystemMessage:task_notification"
+
+    assert native_of(events[13]).native_type == "ResultMessage"
+    terminal = terminal_of(events)
+    assert terminal.status == "succeeded"
+    assert terminal.failure is None
+    assert terminal.final_text == "Inspection complete."
+    assert terminal.structured_output is None
+    assert terminal.diagnostics == ()
+    assert terminal.usage == Present(
+        TokenUsage(
+            input_tokens=160,
+            output_tokens=32,
+            total_tokens=192,
+            reasoning_tokens=Absent(),
+            cache_read_input_tokens=Present(20),
+            cache_write_input_tokens=Present(0),
+        )
     )
-    assert task_diagnostic.native_type == "SystemMessage:task_notification"
+    assert terminal.session_ref.native_session_id == "0198a200-0000-7000-8000-000000000001"
 
 
-async def test_terminal_native_payload_keeps_every_field_the_sdk_reports(
+async def test_result_message_native_frame_retains_backend_reported_facts(
     installed_sdk: SimpleNamespace, tmp_path: Path
 ) -> None:
-    """`redact_native_payload` treats the field list as an allowlist, so an omission is a loss.
+    """The terminal is the owned summary; the ResultMessage travels beside it as a redacted
+    native frame so backend facts like cost and per-model usage are not lost.
 
-    `total_cost_usd`, `model_usage`, `permission_denials`, and `deferred_tool_use` all exist
-    on `claude_agent_sdk.types.ResultMessage` and are all filled by `parse_message`; leaving
-    them out silently dropped them from the one event the spec says retains native data.
+    The per-model counts survive `redact_native_payload`'s sensitive-key rule: they are
+    backend-reported usage, not auth material, and the rule exempts a `token` word that
+    sits beside a counting word (`input`/`output`). See tests/test_agent_auth.py for both
+    directions of that predicate.
     """
     events = await stream_fixture(tmp_path, "success", installed_sdk)
 
-    terminal = events[-1]
-    assert terminal.native_payload is not None
-    payload = thaw_json_value(terminal.native_payload)
-    assert isinstance(payload, dict)
+    frame = native_of(events[-2])
+    assert frame.native_type == "ResultMessage"
+    payload = cast(dict[str, Any], thaw_json_value(frame.payload))
     assert payload["total_cost_usd"] == 0.0731
-    # The per-model counts survive `redact_native_payload`'s sensitive-key rule: they are
-    # backend-reported usage, not auth material, and the rule exempts a `token` word that
-    # sits beside a counting word (`input`/`output`). See tests/test_agent_auth.py for both
-    # directions of that predicate.
+    assert payload["num_turns"] == 3
     assert payload["model_usage"] == {
         "native-model": {
             "input_tokens": 140,
@@ -1172,8 +1230,7 @@ async def test_an_interrupted_turn_does_not_hand_its_tail_to_the_next_turn(
     Without the drain the second turn here terminates on the *first* turn's result.
     """
     adapter = ClaudeSdkAdapter()
-    session = await open_session(
-        adapter,
+    session = await adapter.open_session(
         session_request(tmp_path, policy=fixture_policy()),
         environment=environment(tmp_path),
     )
@@ -1185,7 +1242,7 @@ async def test_an_interrupted_turn_does_not_hand_its_tail_to_the_next_turn(
         )
         iterator = stream.__aiter__()
         first = [await anext(iterator) for _ in range(3)]
-        await adapter.interrupt(session, first[-1].turn_id)
+        await adapter.interrupt(session)
         await stream.aclose()
 
         second = await drain(
@@ -1198,15 +1255,32 @@ async def test_an_interrupted_turn_does_not_hand_its_tail_to_the_next_turn(
     finally:
         await adapter.close()
 
-    assert [event.kind for event in first] == ["session_started", "turn_started", "reasoning"]
-    terminal = second[-1]
-    assert terminal.kind == "turn_completed"
-    assert terminal_event_to_result(terminal).final_text == "Second turn."
-    assert terminal.native_payload is not None
-    payload = thaw_json_value(terminal.native_payload)
-    assert isinstance(payload, dict)
-    assert payload["uuid"] == "result-second-1"
-    assert all(event.turn_id == terminal.turn_id for event in second)
+    assert [type(event).__name__ for event in first] == [
+        "AgentNative",
+        "AgentNative",
+        "AgentUsage",
+    ]
+    assert [type(event).__name__ for event in second] == [
+        "AgentText",
+        "AgentNative",
+        "AgentTerminal",
+    ], f"the second turn inherited the interrupted turn's tail: {second!r}"
+    terminal = terminal_of(second)
+    assert terminal.status == "succeeded"
+    assert terminal.final_text == "Second turn."
+    # The second turn's result usage has no cache components at all: absent stays Absent.
+    assert terminal.usage == Present(
+        TokenUsage(
+            input_tokens=12,
+            output_tokens=4,
+            total_tokens=16,
+            reasoning_tokens=Absent(),
+            cache_read_input_tokens=Absent(),
+            cache_write_input_tokens=Absent(),
+        )
+    )
+    frame = native_of(second[-2])
+    assert cast(dict[str, Any], thaw_json_value(frame.payload))["uuid"] == "result-second-1"
 
 
 async def test_a_permission_request_on_a_retired_turns_tail_never_reaches_the_caller(
@@ -1231,8 +1305,7 @@ async def test_a_permission_request_on_a_retired_turns_tail_never_reaches_the_ca
         return "allow"
 
     adapter = ClaudeSdkAdapter()
-    session = await open_session(
-        adapter,
+    session = await adapter.open_session(
         session_request(
             tmp_path,
             policy=replace(case_policy(case), allowed_tools=(*FIXTURE_TOOLS, case["tool_name"])),
@@ -1246,8 +1319,8 @@ async def test_a_permission_request_on_a_retired_turns_tail_never_reaches_the_ca
             approvals=approvals,
         )
         iterator = stream.__aiter__()
-        first = [await anext(iterator) for _ in range(3)]
-        await adapter.interrupt(session, first[-1].turn_id)
+        _ = [await anext(iterator) for _ in range(3)]
+        await adapter.interrupt(session)
         await stream.aclose()
 
         # The idle window: the request lands while no turn is being read at all.
@@ -1273,22 +1346,27 @@ async def test_a_permission_request_on_a_retired_turns_tail_never_reaches_the_ca
     assert not any(
         isinstance(result, PermissionResultAllow) for result in client.permission_results
     )
-    assert [event.kind for event in second] == ["turn_started", "text_delta", "turn_completed"]
-    assert terminal_event_to_result(second[-1]).final_text == "Second turn."
+    assert not any(isinstance(event, AgentPermissionRequest) for event in second)
+    assert [type(event).__name__ for event in second] == [
+        "AgentText",
+        "AgentNative",
+        "AgentTerminal",
+    ]
+    assert terminal_of(second).final_text == "Second turn."
 
 
 async def test_a_turn_that_never_named_itself_releases_the_whole_session(
     installed_sdk: SimpleNamespace, tmp_path: Path
 ) -> None:
-    """`interrupt(session, None)` means no turn was ever identified, so nothing can be kept."""
+    """With no identifiable active turn, `interrupt(session)` can keep nothing: no native
+    turn was ever named, so nothing identifies the frames still coming."""
     adapter = ClaudeSdkAdapter()
-    session = await open_session(
-        adapter,
+    session = await adapter.open_session(
         session_request(tmp_path, policy=fixture_policy()),
         environment=environment(tmp_path),
     )
     try:
-        await adapter.interrupt(session, None)
+        await adapter.interrupt(session)
 
         assert ClaudeSDKClient.instances[-1].disconnected is True
         with pytest.raises(SessionUnavailable):
@@ -1309,8 +1387,7 @@ async def test_effective_permission_mode_widening_is_a_policy_mismatch_defect(
     """`system/init` echoes the mode the CLI actually runs in; a different one is a security fact."""
     ClaudeSDKClient.init_overrides = {"permissionMode": "bypassPermissions"}
     adapter = ClaudeSdkAdapter()
-    session = await open_session(
-        adapter,
+    session = await adapter.open_session(
         session_request(tmp_path, policy=fixture_policy()),
         environment=environment(tmp_path),
     )
@@ -1319,7 +1396,7 @@ async def test_effective_permission_mode_widening_is_a_policy_mismatch_defect(
             await drain(
                 adapter.stream_turn(
                     session,
-                    TurnRequest(input=(TextContent("fixture:structured_success"),)),
+                    TurnRequest(input=(TextContent("fixture:minimal"),)),
                     approvals=None,
                 )
             )
@@ -1333,8 +1410,7 @@ async def test_effective_tool_widening_is_a_policy_mismatch_defect(
 ) -> None:
     ClaudeSDKClient.init_overrides = {"tools": ["Read", "Write", "Bash"]}
     adapter = ClaudeSdkAdapter()
-    session = await open_session(
-        adapter,
+    session = await adapter.open_session(
         session_request(tmp_path, policy=fixture_policy()),
         environment=environment(tmp_path),
     )
@@ -1343,7 +1419,7 @@ async def test_effective_tool_widening_is_a_policy_mismatch_defect(
             await drain(
                 adapter.stream_turn(
                     session,
-                    TurnRequest(input=(TextContent("fixture:structured_success"),)),
+                    TurnRequest(input=(TextContent("fixture:minimal"),)),
                     approvals=None,
                 )
             )
@@ -1365,8 +1441,7 @@ async def test_effective_tools_accept_the_cli_rename_and_mcp_namespaced_tools(
         required=True,
     )
     adapter = ClaudeSdkAdapter()
-    session = await open_session(
-        adapter,
+    session = await adapter.open_session(
         session_request(
             tmp_path,
             policy=fixture_policy(
@@ -1382,22 +1457,23 @@ async def test_effective_tools_accept_the_cli_rename_and_mcp_namespaced_tools(
         events = await drain(
             adapter.stream_turn(
                 session,
-                TurnRequest(input=(TextContent("fixture:structured_success"),)),
+                TurnRequest(input=(TextContent("fixture:minimal"),)),
                 approvals=None,
             )
         )
     finally:
         await adapter.close()
-    assert events[-1].kind == "turn_completed"
+    assert terminal_of(events).status == "succeeded"
 
 
-async def test_effective_model_substitution_is_a_diagnostic(
+async def test_effective_model_substitution_is_a_terminal_diagnostic(
     installed_sdk: SimpleNamespace, tmp_path: Path
 ) -> None:
+    """A substituted model is the backend's own prerogative: the terminal records the fact
+    and the init frame's native payload carries the effective name."""
     ClaudeSDKClient.init_overrides = {"model": "substituted-model"}
     adapter = ClaudeSdkAdapter()
-    session = await open_session(
-        adapter,
+    session = await adapter.open_session(
         session_request(tmp_path, policy=fixture_policy()),
         environment=environment(tmp_path),
     )
@@ -1405,18 +1481,19 @@ async def test_effective_model_substitution_is_a_diagnostic(
         events = await drain(
             adapter.stream_turn(
                 session,
-                TurnRequest(input=(TextContent("fixture:structured_success"),)),
+                TurnRequest(input=(TextContent("fixture:minimal"),)),
                 approvals=None,
             )
         )
     finally:
         await adapter.close()
 
-    assert any(
-        isinstance(event.data, DiagnosticData) and event.data.code == "effective_model_changed"
-        for event in events
+    assert "effective_model_changed" in terminal_of(events).diagnostics
+    init = native_of(events[0])
+    assert init.native_type == "SystemMessage:init"
+    assert cast(dict[str, Any], thaw_json_value(init.payload))["data"]["model"] == (
+        "substituted-model"
     )
-    assert "effective_model_changed" in terminal_event_to_result(events[-1]).diagnostics
 
 
 async def test_quota_cancel_and_missing_terminal_are_not_collapsed(
@@ -1425,9 +1502,19 @@ async def test_quota_cancel_and_missing_terminal_are_not_collapsed(
     quota = await stream_fixture(tmp_path, "quota_failed", installed_sdk)
     cancelled = await stream_fixture(tmp_path, "cancelled", installed_sdk)
 
-    assert quota[-1].kind == "turn_failed"
-    assert terminal_event_to_result(quota[-1]).failure == "quota_exhausted"
-    assert cancelled[-1].kind == "turn_cancelled"
+    quota_terminal = terminal_of(quota)
+    assert quota_terminal.status == "failed"
+    assert quota_terminal.failure == AgentQuotaExhausted()
+    assert "Usage limit reached." in quota_terminal.diagnostics
+    assert any(
+        isinstance(event, AgentNative) and event.native_type == "RateLimitEvent" for event in quota
+    )
+
+    cancelled_terminal = terminal_of(cancelled)
+    assert cancelled_terminal.status == "cancelled"
+    assert cancelled_terminal.failure is None
+    assert cancelled_terminal.final_text == "Partial output"
+
     with pytest.raises(MissingTerminalEvent):
         await stream_fixture(tmp_path, "missing_terminal", installed_sdk)
 
@@ -1456,12 +1543,20 @@ def case_handler(case: dict[str, Any]) -> ApprovalHandler | None:
     return handler
 
 
+def case_decision(case: dict[str, Any]) -> ApprovalDecision:
+    """The decision the emitted `AgentPermissionRequest` must record for one case."""
+    answer = case["answer"]
+    if answer in ("allow", "deny", "abort"):
+        return cast(ApprovalDecision, answer)
+    # Policy-decided or a failed handler: the recorded decision is what was enforced.
+    return "allow" if case["expected_behavior"] == "allow" else "deny"
+
+
 async def _run_approval(
     tmp_path: Path, case: dict[str, Any]
 ) -> tuple[list[AgentEvent], ClaudeSDKClient]:
     adapter = ClaudeSdkAdapter()
-    session = await open_session(
-        adapter,
+    session = await adapter.open_session(
         session_request(tmp_path, policy=case_policy(case)),
         environment=environment(tmp_path),
     )
@@ -1485,31 +1580,51 @@ async def test_declared_approval_matrix_is_answered_and_observable(
 ) -> None:
     events, client = await _run_approval(tmp_path, case)
 
-    kinds = [event.kind for event in events]
-    assert kinds.count("approval_requested") == 1
-    assert kinds.count("approval_answered") == 1
-    # The SDK answers the permission request from a task it spawned, so the pair must still
-    # be numbered in stream order and must precede the tool call it gated.
-    assert kinds.index("approval_requested") < kinds.index("approval_answered")
-    assert kinds.index("approval_answered") < kinds.index("tool_started")
-    assert [event.seq for event in events] == list(range(1, len(events) + 1))
+    permissions = [event for event in events if isinstance(event, AgentPermissionRequest)]
+    assert len(permissions) == 1, (
+        f"exactly one permission event per native request; got "
+        f"{[type(event).__name__ for event in events]}"
+    )
+    answered = permissions[0]
+    assert answered.decision == case_decision(case)
+    assert answered.request.operation == ClaudeSdkAdapter._operation(case["tool_name"])
+    assert answered.request.native_payload is not None
+    native = cast(dict[str, Any], thaw_json_value(answered.request.native_payload))
+    assert native["tool_name"] == case["tool_name"]
+    # The SDK answers the permission request from a task it spawned, so the auditable event
+    # must still precede the tool call it gated.
+    started = next(
+        index
+        for index, event in enumerate(events)
+        if isinstance(event, AgentToolUse) and event.phase == "started"
+    )
+    assert events.index(answered) < started
 
     result = client.permission_results[-1]
     assert isinstance(result, (PermissionResultAllow, PermissionResultDeny))
     assert result.behavior == case["expected_behavior"]
     assert getattr(result, "interrupt", False) is case["expected_interrupt"]
     assert client.interrupt_calls == (1 if case["expected_interrupt"] else 0)
-    assert events[-1].kind == case["expected_terminal"]
-    assert terminal_event_to_result(events[-1]).failure == case["expected_failure"]
-    assert "fixture-secret" not in repr(terminal_event_to_result(events[-1]))
+
+    terminal = terminal_of(events)
+    expected_status = {
+        "turn_completed": "succeeded",
+        "turn_cancelled": "cancelled",
+        "turn_failed": "failed",
+    }[case["expected_terminal"]]
+    assert terminal.status == expected_status
+    expected_failure = (
+        None if case["expected_failure"] is None else AgentFailure(case["expected_failure"])
+    )
+    assert terminal.failure == expected_failure
+    assert "fixture-secret" not in repr(events)
 
 
 async def test_ask_without_handler_rejects_before_sdk_query(
     installed_sdk: SimpleNamespace, tmp_path: Path
 ) -> None:
     adapter = ClaudeSdkAdapter()
-    session = await open_session(
-        adapter,
+    session = await adapter.open_session(
         session_request(
             tmp_path,
             policy=PermissionPolicy(
@@ -1535,8 +1650,8 @@ async def test_sdk_max_turns_rejects_before_query_because_client_option_is_sessi
     installed_sdk: SimpleNamespace, tmp_path: Path
 ) -> None:
     adapter = ClaudeSdkAdapter()
-    session = await open_session(
-        adapter, session_request(tmp_path), environment=environment(tmp_path)
+    session = await adapter.open_session(
+        session_request(tmp_path), environment=environment(tmp_path)
     )
     client = ClaudeSDKClient.instances[-1]
     try:
@@ -1569,12 +1684,12 @@ async def test_new_resume_and_fork_preserve_native_sdk_session_options(
     )
     adapter = ClaudeSdkAdapter()
     try:
-        new_session = await open_session(adapter, request, environment=values)
-        resumed = await open_session(
-            adapter, session_request(tmp_path, open=ResumeSession(ref)), environment=values
+        new_session = await adapter.open_session(request, environment=values)
+        resumed = await adapter.open_session(
+            session_request(tmp_path, open=ResumeSession(ref)), environment=values
         )
-        forked = await open_session(
-            adapter, session_request(tmp_path, open=ForkSession(ref)), environment=values
+        forked = await adapter.open_session(
+            session_request(tmp_path, open=ForkSession(ref)), environment=values
         )
     finally:
         await adapter.close()
@@ -1588,76 +1703,65 @@ async def test_new_resume_and_fork_preserve_native_sdk_session_options(
     assert ClaudeSDKClient.instances[-1].options.fork_session is True
 
 
-async def test_structured_output_and_native_option_are_preserved_and_validated(
-    installed_sdk: SimpleNamespace, tmp_path: Path
-) -> None:
-    schema = parse_canonical_schema(
-        {
-            "type": "object",
-            "properties": {"answer": {"type": "string"}},
-            "required": ["answer"],
-            "additionalProperties": False,
-        }
-    )
+async def _stream_structured(
+    tmp_path: Path, fixture: str
+) -> tuple[list[AgentEvent], ClaudeAgentOptions]:
     adapter = ClaudeSdkAdapter()
-    session = await open_session(
-        adapter,
+    session = await adapter.open_session(
         session_request(
             tmp_path,
-            output=JsonSchemaAgentOutput(name="answer", schema=schema),
+            output=JsonSchemaAgentOutput(name="answer", schema=ANSWER_SCHEMA),
             native=ClaudeNativeOptions(include_partial_messages=False),
         ),
         environment=environment(tmp_path),
     )
     try:
-        events = [
-            event
-            async for event in adapter.stream_turn(
+        events = await drain(
+            adapter.stream_turn(
                 session,
-                TurnRequest(input=(TextContent("fixture:structured_failure"),)),
+                TurnRequest(input=(TextContent(f"fixture:{fixture}"),)),
                 approvals=None,
             )
-        ]
-        options = ClaudeSDKClient.instances[-1].options
+        )
+        return events, ClaudeSDKClient.instances[-1].options
     finally:
         await adapter.close()
 
-    assert options.include_partial_messages is False
-    assert options.output_format is not None
-    assert options.output_format["type"] == "json_schema"
-    assert terminal_event_to_result(events[-1]).failure == "output_schema_violation"
 
-
-async def test_sdk_accepts_native_structured_output_that_matches_schema(
+async def test_structured_output_is_sent_natively_and_a_violation_is_a_terminal_failure(
     installed_sdk: SimpleNamespace, tmp_path: Path
 ) -> None:
-    schema = parse_canonical_schema(
-        {
-            "type": "object",
-            "properties": {"answer": {"type": "string"}},
-            "required": ["answer"],
-            "additionalProperties": False,
-        }
-    )
-    adapter = ClaudeSdkAdapter()
-    session = await open_session(
-        adapter,
-        session_request(tmp_path, output=JsonSchemaAgentOutput(name="answer", schema=schema)),
-        environment=environment(tmp_path),
-    )
-    try:
-        events = [
-            event
-            async for event in adapter.stream_turn(
-                session,
-                TurnRequest(input=(TextContent("fixture:structured_success"),)),
-                approvals=None,
-            )
-        ]
-    finally:
-        await adapter.close()
+    """The plain JSON Schema passes through the SDK's native option — the backend enforces
+    it — and a final answer that is not strict JSON is an expected model-output failure."""
+    events, options = await _stream_structured(tmp_path, "minimal_violation")
 
-    assert terminal_event_to_result(events[-1]).structured_output == {"answer": "ok"}
+    assert options.include_partial_messages is False
+    assert options.output_format == {"type": "json_schema", "schema": ANSWER_SCHEMA}
+    terminal = terminal_of(events)
+    assert terminal.status == "failed"
+    assert terminal.failure == AgentFailure("output_schema_violation")
+    assert terminal.structured_output is None
+
+
+async def test_sdk_native_structured_output_value_is_frozen_into_the_terminal(
+    installed_sdk: SimpleNamespace, tmp_path: Path
+) -> None:
+    events, _options = await _stream_structured(tmp_path, "minimal_native")
+
+    terminal = terminal_of(events)
+    assert terminal.status == "succeeded"
+    assert thaw_json_value(terminal.structured_output) == {"answer": "ok"}
+
+
+async def test_structured_output_falls_back_to_strict_parsing_of_final_text(
+    installed_sdk: SimpleNamespace, tmp_path: Path
+) -> None:
+    events, _options = await _stream_structured(tmp_path, "minimal_text")
+
+    terminal = terminal_of(events)
+    assert terminal.status == "succeeded"
+    assert terminal.final_text == '{"answer": "ok"}'
+    assert thaw_json_value(terminal.structured_output) == {"answer": "ok"}
 
 
 async def test_policy_and_mcp_configuration_are_mapped_and_startup_is_fail_closed(
@@ -1689,8 +1793,7 @@ async def test_policy_and_mcp_configuration_are_mapped_and_startup_is_fail_close
     )
     adapter = ClaudeSdkAdapter()
     try:
-        await open_session(
-            adapter,
+        await adapter.open_session(
             session_request(tmp_path, policy=policy, mcp_servers=(server,)),
             environment=environment(tmp_path),
         )
@@ -1724,8 +1827,7 @@ async def test_policy_and_mcp_configuration_are_mapped_and_startup_is_fail_close
             "mcpServers": [{"name": "fixture", "status": reported, "error": "handshake refused"}]
         }
         with pytest.raises(McpUnavailable, match=f"required.*{reported}"):
-            await open_session(
-                ClaudeSdkAdapter(),
+            await ClaudeSdkAdapter().open_session(
                 session_request(tmp_path, policy=policy, mcp_servers=(server,)),
                 environment=environment(tmp_path),
             )
@@ -1733,8 +1835,7 @@ async def test_policy_and_mcp_configuration_are_mapped_and_startup_is_fail_close
     # A server the CLI never mentions is not available either.
     ClaudeSDKClient.mcp_status = {"mcpServers": []}
     with pytest.raises(McpUnavailable, match="unreported"):
-        await open_session(
-            ClaudeSdkAdapter(),
+        await ClaudeSdkAdapter().open_session(
             session_request(tmp_path, policy=policy, mcp_servers=(server,)),
             environment=environment(tmp_path),
         )
@@ -1753,8 +1854,8 @@ async def test_mcp_status_shape_mismatch_is_a_defect_not_an_expected_error(
         "pid": 4242,
     }
     with pytest.raises(ProtocolDefect) as captured:
-        await open_session(
-            ClaudeSdkAdapter(), session_request(tmp_path), environment=environment(tmp_path)
+        await ClaudeSdkAdapter().open_session(
+            session_request(tmp_path), environment=environment(tmp_path)
         )
     assert captured.value.code == "sdk_shape_mismatch"
 
@@ -1764,8 +1865,8 @@ async def test_unrequested_mcp_server_is_refused_even_with_no_requested_servers(
 ) -> None:
     ClaudeSDKClient.mcp_status = {"mcpServers": [{"name": "ambient", "status": "connected"}]}
     with pytest.raises(ProtocolDefect, match="unrequested"):
-        await open_session(
-            ClaudeSdkAdapter(), session_request(tmp_path), environment=environment(tmp_path)
+        await ClaudeSdkAdapter().open_session(
+            session_request(tmp_path), environment=environment(tmp_path)
         )
 
 
@@ -1780,8 +1881,7 @@ async def test_sdk_rejects_mcp_tool_filters_it_cannot_preserve_before_client_sta
     )
 
     with pytest.raises(UnsupportedCapability, match="MCP tool filters"):
-        await open_session(
-            ClaudeSdkAdapter(),
+        await ClaudeSdkAdapter().open_session(
             session_request(
                 tmp_path,
                 policy=PermissionPolicy(
@@ -1795,9 +1895,11 @@ async def test_sdk_rejects_mcp_tool_filters_it_cannot_preserve_before_client_sta
     assert ClaudeSDKClient.instances == []
 
 
-async def test_optional_mcp_failure_is_a_stream_diagnostic(
+async def test_optional_mcp_failure_heads_the_first_stream_and_lands_in_the_terminal(
     installed_sdk: SimpleNamespace, tmp_path: Path
 ) -> None:
+    """Observed by `open_session` before any turn existed, so the first stream carries it at
+    its head as a native frame and the turn's terminal records it as a diagnostic."""
     server = McpServerSpec(
         name="optional",
         transport="streamable_http",
@@ -1808,8 +1910,7 @@ async def test_optional_mcp_failure_is_a_stream_diagnostic(
         "mcpServers": [{"name": "optional", "status": "failed", "error": "connect ECONNREFUSED"}]
     }
     adapter = ClaudeSdkAdapter()
-    session = await open_session(
-        adapter,
+    session = await adapter.open_session(
         session_request(
             tmp_path,
             policy=fixture_policy(network="allowlist", network_allowlist=("example.invalid",)),
@@ -1828,22 +1929,15 @@ async def test_optional_mcp_failure_is_a_stream_diagnostic(
     finally:
         await adapter.close()
 
-    diagnostic = next(
-        event
-        for event in events
-        if isinstance(event.data, DiagnosticData) and event.data.code == "optional_mcp_unavailable"
+    head = native_of(events[0])
+    assert head.native_type == "mcp_status"
+    diagnostic = cast(dict[str, Any], thaw_json_value(head.payload))["diagnostic"]
+    assert isinstance(diagnostic, str) and "connect ECONNREFUSED" in diagnostic
+    assert native_of(events[1]).native_type == "SystemMessage:init"
+    terminal = terminal_of(events)
+    assert any("connect ECONNREFUSED" in item for item in terminal.diagnostics), (
+        f"the terminal lost the startup diagnostic: {terminal.diagnostics!r}"
     )
-    assert "connect ECONNREFUSED" in cast(DiagnosticData, diagnostic.data).message
-    # Reported by the SDK at session startup, so the consumer sees it there: in the
-    # session-scope window `events.SESSION_SCOPE_EVENT_KINDS` opens between `session_started`
-    # and `turn_started`, not held back until the turn had opened. Both lanes of this package
-    # show the backend's own ordering; neither reorders its frames to suit the grammar.
-    assert [event.kind for event in events[:3]] == [
-        "session_started",
-        "diagnostic",
-        "turn_started",
-    ]
-    assert diagnostic.seq == 2
 
 
 async def test_sdk_retained_text_limit_becomes_one_terminal_failure(
@@ -1852,17 +1946,18 @@ async def test_sdk_retained_text_limit_becomes_one_terminal_failure(
     monkeypatch.setattr(claude_module, "_MAX_FINAL_TEXT_BYTES", 4)
     events = await stream_fixture(tmp_path, "success", installed_sdk)
 
-    assert [event.kind for event in events].count("turn_failed") == 1
-    assert events[-1].kind == "turn_failed"
-    assert terminal_event_to_result(events[-1]).failure == "output_limit_exceeded"
+    assert sum(isinstance(event, AgentTerminal) for event in events) == 1
+    terminal = terminal_of(events)
+    assert terminal.status == "failed"
+    assert terminal.failure == AgentFailure("output_limit_exceeded")
 
 
 async def test_sdk_turn_setup_failure_does_not_expose_provider_text(
     installed_sdk: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     adapter = ClaudeSdkAdapter()
-    session = await open_session(
-        adapter, session_request(tmp_path), environment=environment(tmp_path)
+    session = await adapter.open_session(
+        session_request(tmp_path), environment=environment(tmp_path)
     )
     client = ClaudeSDKClient.instances[-1]
 
@@ -1890,8 +1985,7 @@ async def test_sdk_stream_failure_is_one_backend_failed_terminal(
     installed_sdk: SimpleNamespace, tmp_path: Path
 ) -> None:
     adapter = ClaudeSdkAdapter()
-    session = await open_session(
-        adapter,
+    session = await adapter.open_session(
         session_request(tmp_path, policy=fixture_policy()),
         environment=environment(tmp_path),
     )
@@ -1907,8 +2001,11 @@ async def test_sdk_stream_failure_is_one_backend_failed_terminal(
     finally:
         await adapter.close()
 
-    assert [event.kind for event in events].count("turn_failed") == 1
-    assert terminal_event_to_result(events[-1]).failure == "backend_failed"
+    assert sum(isinstance(event, AgentTerminal) for event in events) == 1
+    terminal = terminal_of(events)
+    assert terminal.status == "failed"
+    assert terminal.failure == AgentFailure("backend_failed")
+    assert terminal.diagnostics == ("Claude SDK stream failed",)
 
 
 async def test_non_sdk_stream_exception_propagates_instead_of_becoming_a_turn_result(
@@ -1916,8 +2013,7 @@ async def test_non_sdk_stream_exception_propagates_instead_of_becoming_a_turn_re
 ) -> None:
     """A defect of ours must never be dressed up as a `backend_failed` turn the caller retries."""
     adapter = ClaudeSdkAdapter()
-    session = await open_session(
-        adapter,
+    session = await adapter.open_session(
         session_request(tmp_path, policy=fixture_policy()),
         environment=environment(tmp_path),
     )
@@ -1940,7 +2036,7 @@ async def test_unreapable_owned_process_is_a_cleanup_defect_not_sdk_unavailable(
 ) -> None:
     """`SdkUnavailable` means the optional extra is missing; a surviving child is a defect."""
     adapter = ClaudeSdkAdapter()
-    await open_session(adapter, session_request(tmp_path), environment=environment(tmp_path))
+    await adapter.open_session(session_request(tmp_path), environment=environment(tmp_path))
     client = ClaudeSDKClient.instances[-1]
     spawned = client.process
     assert spawned is not None
@@ -1975,12 +2071,11 @@ async def test_permission_callback_defect_reaches_the_stream(
     """The SDK swallows a callback exception into a control response, so it must be handed over."""
     case = approval_case("handler_allow")
     adapter = ClaudeSdkAdapter()
-    session = await open_session(
-        adapter,
+    session = await adapter.open_session(
         session_request(tmp_path, policy=case_policy(case)),
         environment=environment(tmp_path),
     )
-    state = claude_module.ClaudeSdkAdapter._state(adapter, session)
+    state = adapter._state(session)
 
     async def missing_handler(_request: ApprovalRequest) -> ApprovalDecision:
         raise AssertionError("handler must not run")
@@ -2014,7 +2109,6 @@ async def test_session_discovery_never_reads_the_ambient_sdk_store(
     installed_sdk.list_sessions = ambient_store_access
     installed_sdk.get_session_info = ambient_store_access
     adapter = ClaudeSdkAdapter()
-    scope = AgentCapabilityScope(backend="claude", transport="sdk", auth=AUTH)
     values = environment(tmp_path)
     ref = AgentSessionRef(
         schema_version="agent-session-ref.v1",
@@ -2027,31 +2121,8 @@ async def test_session_discovery_never_reads_the_ambient_sdk_store(
     )
 
     with pytest.raises(UnsupportedCapability, match="isolated state root"):
-        await adapter.list_sessions(SessionQuery(scope=scope), environment=values)
-    with pytest.raises(UnsupportedCapability, match="isolated state root"):
-        await adapter.read_session(
-            ref,
-            SessionReadOptions(auth=AUTH, include_turns=False, include_items=False),
-            environment=values,
+        await adapter.list_sessions(
+            SessionQuery(backend="claude", transport="sdk", auth=AUTH), environment=values
         )
-
-
-async def open_session(
-    selected: ClaudeSdkAdapter,
-    request: AgentSessionRequest,
-    *,
-    environment: Mapping[str, str],
-) -> AgentSession:
-    """Open a session the way ``AgentRuntime`` does: discover once, validate, then hand over.
-
-    The adapter no longer rediscovers its own capability table, so a direct-adapter test that
-    skipped this step would be exercising a call the runtime never makes.
-    """
-    capabilities = await selected.capabilities(
-        AgentCapabilityScope(
-            backend=request.backend, transport=request.transport, auth=request.auth
-        ),
-        environment=environment,
-    )
-    validate_session_capabilities(request, capabilities)
-    return await selected.open_session(request, capabilities=capabilities, environment=environment)
+    with pytest.raises(UnsupportedCapability, match="isolated state root"):
+        await adapter.read_session(ref, SessionReadOptions(auth=AUTH), environment=values)

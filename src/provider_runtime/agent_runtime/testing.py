@@ -13,32 +13,24 @@ from collections.abc import AsyncIterator, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from provider_runtime.agent_runtime.capabilities import (
-    AgentCapabilities,
-    AgentCapabilityScope,
-)
-from provider_runtime.agent_runtime.events import (
-    AgentEvent,
-    terminal_event_to_result,
-)
-from provider_runtime.agent_runtime.sessions import (
+from provider_runtime.types import CancelSignal
+
+from .events import AgentEvent, AgentTerminal
+from .sessions import (
     AgentSession,
     SessionPage,
     SessionQuery,
     SessionReadOptions,
     SessionSnapshot,
 )
-from provider_runtime.agent_runtime.types import (
-    AgentResult,
+from .types import (
     AgentSessionRef,
     AgentSessionRequest,
     ApprovalHandler,
     TurnRequest,
 )
-from provider_runtime.types import CancelSignal
 
 type AgentRuntimeOperation = Literal[
-    "capabilities",
     "list_sessions",
     "read_session",
     "open_session",
@@ -46,8 +38,7 @@ type AgentRuntimeOperation = Literal[
     "stream_turn",
 ]
 type CapturedAgentSubject = (
-    AgentCapabilityScope
-    | SessionQuery
+    SessionQuery
     | tuple[AgentSessionRef, SessionReadOptions]
     | AgentSessionRequest
     | tuple[AgentSession, TurnRequest]
@@ -64,10 +55,8 @@ class CapturedAgentCall:
 
 def _unexpected(operation: AgentRuntimeOperation, subject: object) -> str:
     route = "unknown"
-    if isinstance(subject, AgentCapabilityScope):
+    if isinstance(subject, SessionQuery):
         route = f"{subject.backend}/{subject.transport}"
-    elif isinstance(subject, SessionQuery):
-        route = f"{subject.scope.backend}/{subject.scope.transport}"
     elif isinstance(subject, AgentSessionRequest):
         route = f"{subject.backend}/{subject.transport}"
     elif isinstance(subject, tuple) and subject:
@@ -88,9 +77,6 @@ class NoNetworkAgentRuntime:
     async def __aexit__(self, *_exc: object) -> None:
         await self.close()
 
-    async def capabilities(self, scope: AgentCapabilityScope) -> AgentCapabilities:
-        raise AssertionError(_unexpected("capabilities", scope))
-
     async def list_sessions(self, query: SessionQuery) -> SessionPage:
         raise AssertionError(_unexpected("list_sessions", query))
 
@@ -109,7 +95,7 @@ class NoNetworkAgentRuntime:
         *,
         approvals: ApprovalHandler | None = None,
         cancel: CancelSignal | None = None,
-    ) -> AgentResult:
+    ) -> AgentTerminal:
         del approvals, cancel
         raise AssertionError(_unexpected("run_turn", (session, request)))
 
@@ -131,7 +117,6 @@ class NoNetworkAgentRuntime:
 
 @dataclass(slots=True)
 class _Scripts:
-    capabilities: deque[AgentCapabilities]
     pages: deque[SessionPage]
     snapshots: deque[SessionSnapshot]
     sessions: deque[AgentSession]
@@ -142,31 +127,11 @@ def _validated_script(script: Sequence[AgentEvent]) -> tuple[AgentEvent, ...]:
     events = tuple(script)
     if not events:
         raise AssertionError("Scripted agent-runtime stream must not be empty")
-    session_ref = events[0].session_ref
-    turn_id = events[0].turn_id
-    turn_started = False
-    for expected_seq, event in enumerate(events, start=1):
-        if event.seq != expected_seq:
-            raise AssertionError("Scripted agent-runtime stream sequence must be gap-free")
-        if event.session_ref != session_ref or event.turn_id != turn_id:
-            raise AssertionError("Scripted agent-runtime stream identity must not change")
-        if event.kind == "session_started":
-            if expected_seq != 1:
-                raise AssertionError("Scripted session_started must be the first event")
-        elif event.kind == "turn_started":
-            if turn_started:
-                raise AssertionError("Scripted agent-runtime stream has two turn_started events")
-            turn_started = True
-        elif not turn_started:
-            raise AssertionError("Scripted agent-runtime content requires turn_started first")
-        if event.kind in ("turn_completed", "turn_failed", "turn_cancelled"):
-            if expected_seq != len(events):
-                raise AssertionError("Scripted agent-runtime stream has events after terminal")
-    if not turn_started:
-        raise AssertionError("Scripted agent-runtime stream requires turn_started")
-    if events[-1].kind not in ("turn_completed", "turn_failed", "turn_cancelled"):
-        raise AssertionError("Scripted agent-runtime stream must end with a terminal event")
-    terminal_event_to_result(events[-1])
+    for index, event in enumerate(events):
+        if isinstance(event, AgentTerminal) and index != len(events) - 1:
+            raise AssertionError("Scripted agent-runtime stream has events after terminal")
+    if not isinstance(events[-1], AgentTerminal):
+        raise AssertionError("Scripted agent-runtime stream must end with AgentTerminal")
     return events
 
 
@@ -176,7 +141,6 @@ class ScriptedAgentRuntime(NoNetworkAgentRuntime):
     def __init__(
         self,
         *,
-        capabilities: Iterable[AgentCapabilities] = (),
         session_pages: Iterable[SessionPage] = (),
         session_snapshots: Iterable[SessionSnapshot] = (),
         sessions: Iterable[AgentSession] = (),
@@ -184,17 +148,11 @@ class ScriptedAgentRuntime(NoNetworkAgentRuntime):
     ) -> None:
         self.calls: list[CapturedAgentCall] = []
         self._scripts = _Scripts(
-            capabilities=deque(capabilities),
             pages=deque(session_pages),
             snapshots=deque(session_snapshots),
             sessions=deque(sessions),
             streams=deque(_validated_script(script) for script in stream_scripts),
         )
-        self._started_sessions: set[AgentSession] = set()
-
-    async def capabilities(self, scope: AgentCapabilityScope) -> AgentCapabilities:
-        self.calls.append(CapturedAgentCall("capabilities", scope))
-        return _pop(self._scripts.capabilities, "capabilities")
 
     async def list_sessions(self, query: SessionQuery) -> SessionPage:
         self.calls.append(CapturedAgentCall("list_sessions", query))
@@ -217,7 +175,7 @@ class ScriptedAgentRuntime(NoNetworkAgentRuntime):
         *,
         approvals: ApprovalHandler | None = None,
         cancel: CancelSignal | None = None,
-    ) -> AgentResult:
+    ) -> AgentTerminal:
         subject = (session, request)
         self.calls.append(
             CapturedAgentCall(
@@ -227,12 +185,12 @@ class ScriptedAgentRuntime(NoNetworkAgentRuntime):
                 cancel_supplied=cancel is not None,
             )
         )
-        terminal = None
+        terminal: AgentEvent | None = None
         async for event in self._replay_stream(session):
             terminal = event
-        if terminal is None:  # guarded by script validation
+        if not isinstance(terminal, AgentTerminal):  # guarded by script validation
             raise AssertionError("Scripted agent-runtime stream had no terminal event")
-        return terminal_event_to_result(terminal)
+        return terminal
 
     async def stream_turn(
         self,
@@ -256,29 +214,15 @@ class ScriptedAgentRuntime(NoNetworkAgentRuntime):
 
     async def _replay_stream(self, session: AgentSession) -> AsyncIterator[AgentEvent]:
         script = _pop(self._scripts.streams, "stream_turn")
-        first_stream = session not in self._started_sessions
-        has_session_started = script[0].kind == "session_started"
-        if first_stream != has_session_started:
-            expected = "requires" if first_stream else "must not repeat"
-            raise AssertionError(f"Scripted agent-runtime session {expected} session_started")
-        first_ref = script[0].session_ref
-        if session.ref_is_complete:
-            if session.ref != first_ref:
-                raise AssertionError("Scripted agent-runtime event ref differs from session.ref")
-        elif has_session_started:
-            session.complete_ref(first_ref)
-        else:  # guarded by first-stream grammar, kept explicit for future changes
-            raise AssertionError("Scripted agent-runtime session ref is incomplete")
-
+        terminal = script[-1]
+        assert isinstance(terminal, AgentTerminal)
+        if not session.ref_is_complete:
+            session.complete_ref(terminal.session_ref)
+        elif session.ref != terminal.session_ref:
+            raise AssertionError("Scripted agent-runtime terminal ref differs from session.ref")
         session.begin_turn()
         try:
-            if first_stream:
-                self._started_sessions.add(session)
             for event in script:
-                if event.session_ref != session.ref:
-                    raise AssertionError(
-                        "Scripted agent-runtime event ref differs from session.ref"
-                    )
                 yield event
         finally:
             session.end_turn()

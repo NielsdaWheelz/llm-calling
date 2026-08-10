@@ -130,10 +130,6 @@ _CHILD_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # the operator's locale, and the system temporary directory both sandboxes already allow.
 _CHILD_LOCALE = "C.UTF-8"
 _CHILD_TMPDIR = "/tmp"
-_SECRET_ENVIRONMENT: dict[Backend, str] = {
-    "codex": "OPENAI_API_KEY",
-    "claude": "ANTHROPIC_API_KEY",
-}
 _PROFILE_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _SENSITIVE_FIELD = re.compile(
     r"(?i)(?:authorization|api[_-]?key|token|secret|password|credential|cookie)"
@@ -206,13 +202,6 @@ def _is_sensitive_payload_key(key: str) -> bool:
 def credential_environment_names(backend: Backend) -> tuple[str, ...]:
     try:
         return _CREDENTIAL_ENVIRONMENT[backend]
-    except KeyError as error:
-        raise InvalidAgentRequest(f"unknown agent backend {backend!r}") from error
-
-
-def secret_environment_name(backend: Backend) -> str:
-    try:
-        return _SECRET_ENVIRONMENT[backend]
     except KeyError as error:
         raise InvalidAgentRequest(f"unknown agent backend {backend!r}") from error
 
@@ -327,14 +316,18 @@ class AuthEnvironmentRequest:
     inherited_environment: Mapping[str, str] = field(repr=False, compare=False)
     allowed_environment: tuple[str, ...]
     state_root: Path
-    resolved_secret: str | None = field(default=None, repr=False, compare=False)
-    secret_environment_name: str | None = None
 
     def __post_init__(self) -> None:
         if self.backend not in _STATE_ROOT_ENVIRONMENT:
             raise InvalidAgentRequest(f"unknown agent backend {self.backend!r}")
         if not isinstance(self.credential, CredentialRef):
             raise InvalidAgentRequest("AuthEnvironmentRequest.credential must be CredentialRef")
+        if self.credential.kind != "local_account":
+            # Subscription auth only. An API-key or secret-reference session credential is
+            # rejected here as well as at every route, so no path can forward one.
+            raise InvalidAgentRequest(
+                "agent sessions accept only local_account subscription credentials"
+            )
         if not isinstance(self.inherited_environment, Mapping) or any(
             type(key) is not str or type(value) is not str
             for key, value in self.inherited_environment.items()
@@ -348,17 +341,6 @@ class AuthEnvironmentRequest:
             raise InvalidAgentRequest("allowed_environment must not contain duplicates")
         if not isinstance(self.state_root, Path) or not self.state_root.is_absolute():
             raise InvalidAgentRequest("state_root must be an absolute Path")
-        if self.credential.kind == "secret_reference":
-            if self.secret_environment_name not in credential_environment_names(self.backend):
-                raise InvalidAgentRequest(
-                    "secret_reference requires an explicit recognized backend credential target"
-                )
-            if type(self.resolved_secret) is not str or not self.resolved_secret:
-                raise CredentialUnavailable("secret_reference could not be resolved")
-        elif self.resolved_secret is not None or self.secret_environment_name is not None:
-            raise InvalidAgentRequest(
-                "resolved_secret and secret_environment_name are only valid for secret_reference"
-            )
 
 
 def build_child_environment(request: AuthEnvironmentRequest) -> dict[str, str]:
@@ -367,7 +349,8 @@ def build_child_environment(request: AuthEnvironmentRequest) -> dict[str, str]:
     The base map below is owned outright: every one of its names is a process-control name
     that `validate_policy_environment` already refuses in `policy.environment`, so a caller
     can neither set nor unset one. It is applied first so the caller's allowlist can only ever
-    add names beside it, never over it.
+    add names beside it, never over it. Credential-class names never pass the allowlist, so
+    the child sees no API key regardless of the operator's environment.
     """
     validate_policy_environment(
         request.backend, PermissionPolicy(environment=request.allowed_environment)
@@ -388,29 +371,6 @@ def build_child_environment(request: AuthEnvironmentRequest) -> dict[str, str]:
         }
     )
     child[_STATE_ROOT_ENVIRONMENT[request.backend]] = str(state_root)
-    credential = request.credential
-    if credential.kind == "local_account":
-        return child
-    if credential.kind == "api_key_environment":
-        credential_name = credential.name
-        if credential_name is None:
-            raise InvalidAgentRequest("api_key_environment has no source name")
-        if credential_name not in credential_environment_names(request.backend):
-            raise InvalidAgentRequest(
-                f"{credential_name!r} is not a recognized credential variable for {request.backend}"
-            )
-        value = request.inherited_environment.get(credential_name)
-        if not value:
-            raise CredentialUnavailable(
-                f"credential environment {credential_name!r} is unavailable"
-            )
-        child[credential_name] = value
-        return child
-    secret_environment_name = request.secret_environment_name
-    resolved_secret = request.resolved_secret
-    if secret_environment_name is None or resolved_secret is None:
-        raise CredentialUnavailable("secret_reference resolution is incomplete")
-    child[secret_environment_name] = resolved_secret
     return child
 
 
@@ -479,31 +439,23 @@ def _dropped(reason: Literal["size_limit", "shape_limit"]) -> JsonObject:
 def redact_native_payload(
     payload: Mapping[str, object],
     *,
-    allowed_fields: tuple[str, ...] | None,
     max_bytes: int = 16_384,
     max_depth: int = 8,
     max_items: int = 512,
     max_string_length: int = 2_000,
 ) -> JsonObject:
-    """Allowlist known payloads; recursively scrub and bound every retained string."""
+    """Recursively scrub credential-shaped keys and bound every retained value.
+
+    This is the one representation native frames may cross the public boundary
+    in: no per-version field allowlists exist — every key is kept unless its
+    name is credential-shaped, every string is sanitized and bounded, and a
+    payload that exceeds its depth/item/byte bounds is dropped whole.
+    """
     if not isinstance(payload, Mapping):
         return _dropped("shape_limit")
-    selected: Mapping[str, object]
-    if allowed_fields is None:
-        selected = payload
-    else:
-        if not isinstance(allowed_fields, tuple) or any(
-            type(name) is not str or not name for name in allowed_fields
-        ):
-            raise InvalidAgentRequest("allowed_fields must be a tuple of field names")
-        selected = {
-            key: payload[key]
-            for key in allowed_fields
-            if key in payload and not _is_sensitive_payload_key(key)
-        }
     try:
         redacted = _redact_value(
-            selected,
+            payload,
             depth=0,
             max_depth=max_depth,
             counter=[0],

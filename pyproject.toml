@@ -14,18 +14,25 @@ dependencies = [
     "stamina>=25.1,<26",
 ]
 
+# Agent SDK extras use bounded constraints, not exact pins: the lockfile pins the exact
+# resolution for this repo, and the runtime meets a drifted install with one warning plus a
+# behavioral capability probe instead of a version hard-fail. `<1` is the honest bound for
+# all three pre-1.0 upstreams — they publish frequently with no semver compatibility promise,
+# so any tighter bound would be a guess restated as a contract. The one real pairing rule
+# (openai-codex and its bundled runtime should match) is enforced at runtime by the probe,
+# which is the only place it can be honestly checked.
 [project.optional-dependencies]
 codex-sdk = [
-    "openai-codex==0.144.4",
-    "openai-codex-cli-bin==0.144.4",
+    "openai-codex>=0.144.4,<1",
+    "openai-codex-cli-bin>=0.144.4,<1",
 ]
 claude-sdk = [
-    "claude-agent-sdk==0.2.130",
+    "claude-agent-sdk>=0.2.130,<1",
 ]
 agent-sdks = [
-    "openai-codex==0.144.4",
-    "openai-codex-cli-bin==0.144.4",
-    "claude-agent-sdk==0.2.130",
+    "openai-codex>=0.144.4,<1",
+    "openai-codex-cli-bin>=0.144.4,<1",
+    "claude-agent-sdk>=0.2.130,<1",
 ]
 
 [build-system]

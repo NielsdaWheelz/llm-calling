@@ -1,4 +1,4 @@
-"""Session identity, discovery values, and one-active-turn state."""
+"""Session identity, metadata-only discovery values, and one-active-turn state."""
 
 from __future__ import annotations
 
@@ -6,9 +6,7 @@ import hashlib
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-from .capabilities import AgentCapabilityScope
 from .errors import (
     ConcurrentTurn,
     InvalidAgentRequest,
@@ -16,10 +14,13 @@ from .errors import (
     SessionMismatch,
     SessionUnavailable,
 )
-from .types import AgentSessionRef, CredentialRef
-
-if TYPE_CHECKING:
-    from .events import AgentEvent
+from .types import (
+    AGENT_ROUTES,
+    AgentSessionRef,
+    AgentTransport,
+    Backend,
+    CredentialRef,
+)
 
 
 def fingerprint_path(path: str | Path) -> str:
@@ -31,77 +32,56 @@ def fingerprint_path(path: str | Path) -> str:
 
 def validate_session_ref(
     ref: AgentSessionRef,
-    scope: AgentCapabilityScope,
     *,
+    backend: Backend,
+    transport: AgentTransport,
+    profile_key: str,
     state_root_fingerprint: str,
     cwd: str | Path,
     cwd_scopes_sessions: bool,
 ) -> None:
     """Reject caller-scope mismatches; native absence is adapter-owned."""
-    if ref.backend != scope.backend:
-        raise SessionMismatch("AgentSessionRef.backend does not match the requesting scope")
-    if ref.transport != scope.transport:
-        raise SessionMismatch("AgentSessionRef.transport does not match the requesting scope")
-    if ref.profile_key != scope.auth.profile_key:
-        raise SessionMismatch("AgentSessionRef.profile_key does not match the requesting scope")
+    if ref.backend != backend:
+        raise SessionMismatch("AgentSessionRef.backend does not match the requesting route")
+    if ref.transport != transport:
+        raise SessionMismatch("AgentSessionRef.transport does not match the requesting route")
+    if ref.profile_key != profile_key:
+        raise SessionMismatch("AgentSessionRef.profile_key does not match the requesting profile")
     if ref.state_root_fingerprint != state_root_fingerprint:
         raise SessionMismatch(
-            "AgentSessionRef.state_root_fingerprint does not match the requesting scope"
+            "AgentSessionRef.state_root_fingerprint does not match the requesting state root"
         )
     if cwd_scopes_sessions and ref.cwd_fingerprint != fingerprint_path(cwd):
-        raise SessionMismatch("AgentSessionRef.cwd_fingerprint does not match the requesting scope")
-
-
-@dataclass(frozen=True, slots=True)
-class CodexSessionFilters:
-    archived: bool | None = None
-
-    def __post_init__(self) -> None:
-        if self.archived is not None and type(self.archived) is not bool:
-            raise InvalidAgentRequest("CodexSessionFilters.archived must be bool when present")
-
-
-@dataclass(frozen=True, slots=True)
-class ClaudeSessionFilters:
-    tags: tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        _validate_string_tuple(self.tags, "ClaudeSessionFilters.tags")
-
-
-type SessionFilters = CodexSessionFilters | ClaudeSessionFilters
+        raise SessionMismatch(
+            "AgentSessionRef.cwd_fingerprint does not match the requesting directory"
+        )
 
 
 @dataclass(frozen=True, slots=True)
 class SessionQuery:
-    scope: AgentCapabilityScope
+    backend: Backend
+    transport: AgentTransport
+    auth: CredentialRef
     cursor: str | None = None
     limit: int = 50
-    native: SessionFilters | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.scope, AgentCapabilityScope):
-            raise InvalidAgentRequest("SessionQuery.scope must be AgentCapabilityScope")
-        _validate_page(self.cursor, self.limit, "SessionQuery")
-        if self.native is not None:
-            if self.scope.backend == "codex" and not isinstance(self.native, CodexSessionFilters):
-                raise InvalidAgentRequest("codex session queries require CodexSessionFilters")
-            if self.scope.backend == "claude" and not isinstance(self.native, ClaudeSessionFilters):
-                raise InvalidAgentRequest("claude session queries require ClaudeSessionFilters")
+        if (self.backend, self.transport) not in AGENT_ROUTES:
+            raise InvalidAgentRequest("SessionQuery has an unsupported backend/transport pair")
+        if not isinstance(self.auth, CredentialRef):
+            raise InvalidAgentRequest("SessionQuery.auth must be CredentialRef")
+        _validate_cursor(self.cursor, "SessionQuery.cursor")
+        if type(self.limit) is not int or self.limit <= 0:
+            raise InvalidAgentRequest("SessionQuery.limit must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)
 class SessionMetadata:
     name: str | None = None
-    archived: bool | None = None
-    tags: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.name is not None and (type(self.name) is not str or not self.name):
             raise InvalidAgentRequest("SessionMetadata.name must be non-empty when present")
-        if self.archived is not None and type(self.archived) is not bool:
-            raise InvalidAgentRequest("SessionMetadata.archived must be bool when present")
-        _validate_string_tuple(self.tags, "SessionMetadata.tags")
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,19 +112,10 @@ class SessionPage:
 @dataclass(frozen=True, slots=True)
 class SessionReadOptions:
     auth: CredentialRef
-    cursor: str | None = None
-    limit: int = 50
-    include_turns: bool = True
-    include_items: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.auth, CredentialRef):
             raise InvalidAgentRequest("SessionReadOptions.auth must be CredentialRef")
-        _validate_page(self.cursor, self.limit, "SessionReadOptions")
-        if type(self.include_turns) is not bool or type(self.include_items) is not bool:
-            raise InvalidAgentRequest("SessionReadOptions include flags must be bool")
-        if self.include_items and not self.include_turns:
-            raise InvalidAgentRequest("SessionReadOptions.include_items requires include_turns")
 
 
 def validate_read_session_auth(ref: AgentSessionRef, options: SessionReadOptions) -> None:
@@ -156,44 +127,21 @@ def validate_read_session_auth(ref: AgentSessionRef, options: SessionReadOptions
 
 @dataclass(frozen=True, slots=True)
 class SessionSnapshot:
+    """Metadata-only view of one native session; no history contract is bound."""
+
     ref: AgentSessionRef
     metadata: SessionMetadata
-    items: tuple[AgentEvent, ...]
-    continuation_cursor: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.ref, AgentSessionRef):
             raise InvalidAgentRequest("SessionSnapshot.ref must be AgentSessionRef")
         if not isinstance(self.metadata, SessionMetadata):
             raise InvalidAgentRequest("SessionSnapshot.metadata must be SessionMetadata")
-        if not isinstance(self.items, tuple):
-            raise InvalidAgentRequest("SessionSnapshot.items must be a tuple of AgentEvent")
-        if self.items:
-            from .events import AgentEvent
-
-            if any(not isinstance(item, AgentEvent) for item in self.items):
-                raise InvalidAgentRequest("SessionSnapshot.items must contain AgentEvent values")
-        _validate_cursor(self.continuation_cursor, "SessionSnapshot.continuation_cursor")
-
-
-def _validate_string_tuple(value: object, field_name: str) -> None:
-    if not isinstance(value, tuple):
-        raise InvalidAgentRequest(f"{field_name} must be a tuple")
-    if any(type(item) is not str or not item for item in value):
-        raise InvalidAgentRequest(f"{field_name} entries must be non-empty strings")
-    if len(value) != len(set(value)):
-        raise InvalidAgentRequest(f"{field_name} must not contain duplicates")
 
 
 def _validate_cursor(cursor: object, field_name: str) -> None:
     if cursor is not None and (type(cursor) is not str or not cursor):
         raise InvalidAgentRequest(f"{field_name} must be non-empty when present")
-
-
-def _validate_page(cursor: object, limit: object, owner: str) -> None:
-    _validate_cursor(cursor, f"{owner}.cursor")
-    if type(limit) is not int or limit <= 0:
-        raise InvalidAgentRequest(f"{owner}.limit must be a positive integer")
 
 
 class AgentSession:
@@ -220,14 +168,14 @@ class AgentSession:
             ref = self._ref
         if ref is None:
             raise ProtocolDefect(
-                "AgentSession ref is not complete before session_started",
+                "AgentSession ref is not complete before the first stream event",
                 code="incomplete_session_ref",
             )
         return ref
 
     def complete_ref(self, ref: AgentSessionRef) -> None:
         if not isinstance(ref, AgentSessionRef):
-            raise ProtocolDefect("session_started carried an invalid AgentSessionRef")
+            raise ProtocolDefect("session ref completion carried an invalid AgentSessionRef")
         with self._state_lock:
             if self._ref is not None:
                 raise ProtocolDefect(

@@ -6,48 +6,31 @@ import math
 import os.path
 import re
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from typing import Literal
 from urllib.parse import urlsplit
 
-from provider_runtime.schema import CanonicalJsonSchema
 from provider_runtime.types import ProviderName, ProviderTarget
 
-from .errors import InvalidAgentRequest
+from .errors import InvalidAgentRequest, UnsupportedCapability
 from .policy import PermissionPolicy, PermissionPolicyPatch
 
 type Backend = Literal["codex", "claude"]
 type AgentTransport = Literal["sdk"]
 type CredentialKind = Literal["local_account", "api_key_environment", "secret_reference"]
-type AgentFailureCause = Literal[
-    "backend_failed",
-    "quota_exhausted",
-    "turn_timeout",
-    "output_limit_exceeded",
-    "approval_unanswered",
-    "output_schema_violation",
-]
 type ApprovalDecision = Literal["allow", "deny", "abort"]
 
 _BACKENDS: tuple[Backend, ...] = ("codex", "claude")
 _TRANSPORTS: tuple[AgentTransport, ...] = ("sdk",)
-# The closed routing table and the closed failure-cause set have exactly one owner in the
-# package; capabilities.py, runtime.py, and events.py read these names instead of re-listing.
-# One transport per backend is not an invariant this table asserts — it is what the two
-# shipped lanes happen to be. Consumers key off the pair, never off the backend alone.
+# The closed routing table has exactly one owner in the package; runtime.py and the adapters
+# read this name instead of re-listing. One transport per backend is not an invariant this
+# table asserts — it is what the two shipped lanes happen to be. Consumers key off the pair,
+# never off the backend alone.
 AGENT_ROUTES: frozenset[tuple[Backend, AgentTransport]] = frozenset(
     {
         ("codex", "sdk"),
         ("claude", "sdk"),
     }
-)
-AGENT_FAILURE_CAUSES: tuple[AgentFailureCause, ...] = (
-    "backend_failed",
-    "quota_exhausted",
-    "turn_timeout",
-    "output_limit_exceeded",
-    "approval_unanswered",
-    "output_schema_violation",
 )
 _PROFILE_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -358,14 +341,22 @@ class TextAgentOutput:
 
 @dataclass(frozen=True, slots=True)
 class JsonSchemaAgentOutput:
+    """A plain JSON Schema passed through the SDK's native output-schema option.
+
+    The schema is not interpreted here; it is frozen so events stay immutable and
+    validated only for JSON-safety. Callers with a pydantic model pass
+    ``model_json_schema()``.
+    """
+
     name: str
-    schema: CanonicalJsonSchema
+    schema: Mapping[str, object]
     kind: Literal["json_schema"] = field(default="json_schema", init=False)
 
     def __post_init__(self) -> None:
         _require_non_empty(self.name, "JsonSchemaAgentOutput.name")
-        if not isinstance(self.schema, CanonicalJsonSchema):
-            raise InvalidAgentRequest("JsonSchemaAgentOutput.schema must be CanonicalJsonSchema")
+        object.__setattr__(
+            self, "schema", freeze_json_object(self.schema, context="JsonSchemaAgentOutput.schema")
+        )
 
 
 type AgentOutputSpec = TextAgentOutput | JsonSchemaAgentOutput
@@ -520,6 +511,31 @@ class McpServerSpec:
                 raise InvalidAgentRequest("streamable_http MCP forbids environment_refs")
 
 
+def validate_mcp_network_policy(
+    servers: tuple[McpServerSpec, ...], policy: PermissionPolicy
+) -> None:
+    """The fail-closed coupling between MCP transports and the permission policy.
+
+    A stdio server is a local executable outside sandbox attestation, so it runs
+    only under explicitly confirmed full filesystem and unrestricted network
+    access. A remote server must fit the network policy, including an exact
+    hostname allowlist where the policy carries one.
+    """
+    for server in servers:
+        if server.transport == "stdio":
+            if policy.filesystem != "full_access" or policy.network != "unrestricted":
+                raise UnsupportedCapability(
+                    "stdio MCP requires explicit full filesystem and unrestricted network policy"
+                )
+            continue
+        if policy.network == "disabled":
+            raise UnsupportedCapability("remote MCP is outside the disabled network policy")
+        if policy.network == "allowlist":
+            hostname = urlsplit(server.url).hostname if type(server.url) is str else None
+            if hostname is None or hostname not in policy.network_allowlist:
+                raise UnsupportedCapability("remote MCP host is absent from the network allowlist")
+
+
 @dataclass(frozen=True, slots=True)
 class CodexNativeOptions:
     web_search: bool | None = None
@@ -544,10 +560,6 @@ class ClaudeNativeOptions:
 
 
 type NativeOptions = CodexNativeOptions | ClaudeNativeOptions
-
-
-def native_option_names(native: NativeOptions) -> tuple[str, ...]:
-    return tuple(item.name for item in fields(native) if getattr(native, item.name) is not None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -814,46 +826,6 @@ class ApprovalRequest:
 
 
 type ApprovalHandler = Callable[[ApprovalRequest], Awaitable[ApprovalDecision]]
-
-
-@dataclass(frozen=True, slots=True)
-class AgentResult:
-    status: Literal["succeeded", "failed", "cancelled"]
-    failure: AgentFailureCause | None
-    final_text: str
-    structured_output: JsonValue | None
-    session_ref: AgentSessionRef
-    turn_id: str
-    usage: JsonObject | None = None
-    diagnostics: tuple[str, ...] = ()
-    terminal_native_type: str | None = None
-    terminal_native_payload: JsonObject | None = None
-
-    def __post_init__(self) -> None:
-        if self.status not in ("succeeded", "failed", "cancelled"):
-            raise InvalidAgentRequest(f"unknown AgentResult.status {self.status!r}")
-        if self.status == "failed" and self.failure not in AGENT_FAILURE_CAUSES:
-            raise InvalidAgentRequest("failed results require a typed failure cause")
-        if self.status != "failed" and self.failure is not None:
-            raise InvalidAgentRequest("only failed results may carry a failure cause")
-        if type(self.final_text) is not str:
-            raise InvalidAgentRequest("AgentResult.final_text must be a string")
-        if self.structured_output is not None:
-            require_frozen_json(self.structured_output, "AgentResult.structured_output")
-        if not isinstance(self.session_ref, AgentSessionRef):
-            raise InvalidAgentRequest("AgentResult.session_ref must be AgentSessionRef")
-        _require_non_empty(self.turn_id, "AgentResult.turn_id")
-        if self.usage is not None:
-            if not isinstance(self.usage, FrozenJsonDict):
-                raise InvalidAgentRequest("AgentResult.usage must be frozen JSON")
-            require_frozen_json(self.usage, "AgentResult.usage")
-        _require_unique_strings(self.diagnostics, "AgentResult.diagnostics")
-        if self.terminal_native_type is not None:
-            _require_non_empty(self.terminal_native_type, "AgentResult.terminal_native_type")
-        if self.terminal_native_payload is not None:
-            if not isinstance(self.terminal_native_payload, FrozenJsonDict):
-                raise InvalidAgentRequest("AgentResult.terminal_native_payload must be frozen JSON")
-            require_frozen_json(self.terminal_native_payload, "AgentResult.terminal_native_payload")
 
 
 def require_frozen_json(value: object, field_name: str) -> None:

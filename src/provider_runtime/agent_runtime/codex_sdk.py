@@ -1,4 +1,12 @@
-"""Native Codex Python SDK adapter with a lazy optional dependency boundary."""
+"""Native Codex Python SDK adapter with a lazy optional dependency boundary.
+
+The adapter owns official ``openai-codex`` clients and normalizes their public
+notification stream into the closed six-kind event vocabulary. Validation is
+behavioral: there is no capability table, so every backend fact this transport
+cannot enforce is refused at ``open_session``/``stream_turn`` before billable
+work, and version drift is a warning backed by the behavioral probe
+(``client.account()`` plus the initialize metadata), never a hard failure.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +16,7 @@ import importlib.metadata
 import os
 import re
 import sys
+import warnings
 import weakref
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
@@ -16,24 +25,19 @@ from types import ModuleType
 from typing import Any, Literal, cast
 
 from provider_runtime.errors import sanitize_provider_text
-from provider_runtime.schema import to_json_schema
+from provider_runtime.types import Absent, Presence, Present, TokenUsage
 
 from ._codex_launcher import ensure_codex_launcher
 from ._limits import OutputLimitExceeded, bounded_payload_size
 from ._sandbox import bubblewrap_network_namespace_available
 from ._structured_output import OutputSchemaMismatch, parse_structured_output
 from .auth import (
-    freeze_native_json_object as freeze_json_object,
-)
-from .auth import (
-    freeze_native_json_value as freeze_json_value,
-)
-from .auth import (
+    freeze_native_json_object,
+    freeze_native_json_value,
     mcp_header_environment_name,
     redact_native_payload,
     state_root_from_environment,
 )
-from .capabilities import AgentCapabilities, AgentCapabilityScope, validate_mcp_network_policy
 from .errors import (
     CredentialRejected,
     CredentialUnavailable,
@@ -49,28 +53,18 @@ from .errors import (
 )
 from .events import (
     AgentEvent,
-    AgentEventData,
-    AgentEventKind,
-    DiagnosticData,
-    FileChangeData,
-    NativeRetryObservedData,
-    ReasoningData,
-    SessionStartedData,
-    TextDeltaData,
-    ToolCompletedData,
-    ToolStartedData,
-    ToolUpdatedData,
-    TurnCancelledData,
-    TurnCompletedData,
-    TurnFailedData,
-    TurnStartedData,
-    UnknownData,
-    UsageData,
+    AgentFailure,
+    AgentNative,
+    AgentQuotaExhausted,
+    AgentTerminal,
+    AgentTerminalFailure,
+    AgentText,
+    AgentToolUse,
+    AgentUsage,
 )
 from .policy import PermissionPolicy
 from .sessions import (
     AgentSession,
-    CodexSessionFilters,
     SessionMetadata,
     SessionPage,
     SessionQuery,
@@ -82,27 +76,26 @@ from .sessions import (
     validate_session_ref,
 )
 from .types import (
-    AgentOutputSpec,
     AgentSessionRef,
     AgentSessionRequest,
     ApprovalHandler,
     CodexNativeOptions,
     CredentialRef,
     ForkSession,
-    FrozenJsonDict,
     ImageContent,
-    JsonObject,
     JsonSchemaAgentOutput,
     NewSession,
     ResumeSession,
     TextContent,
     TurnRequest,
+    thaw_json_value,
+    validate_mcp_network_policy,
 )
 
-_MCP_REFERENCE_FORMS = ("environment_reference", "header_reference")
-
-_SUPPORTED_SDK_VERSION = "0.144.4"
-_SUPPORTED_RUNTIME_VERSION = "0.144.4"
+# The one version the adapter was certified against. Drift from it is reported as a
+# RuntimeWarning and the behavioral probe decides fitness; only a missing module or a
+# missing public surface remains a hard `SdkUnavailable`.
+_CERTIFIED_SDK_VERSION = "0.144.4"
 _RUNTIME_VERSION_PREFIX = re.compile(
     r"(?P<version>[0-9]+(?:\.[0-9]+){2}(?:[-+][0-9A-Za-z.-]+)?)(?:\s|$)"
 )
@@ -115,33 +108,6 @@ _MAX_EVENT_TEXT_BYTES = 4 * 1024 * 1024
 _MAX_FINAL_TEXT_BYTES = 16 * 1024 * 1024
 _MAX_DIAGNOSTICS = 256
 _REQUIRED_MCP_STARTUP_FAILURE = "required MCP servers failed to initialize"
-
-_KNOWN_FIELDS: dict[str, tuple[str, ...]] = {
-    "thread/started": ("thread",),
-    "turn/started": ("threadId", "turn"),
-    "turn/completed": ("threadId", "turn"),
-    "item/started": ("threadId", "turnId", "item"),
-    "item/completed": ("threadId", "turnId", "item"),
-    "item/agentMessage/delta": ("threadId", "turnId", "itemId", "delta"),
-    "item/reasoning/summaryTextDelta": (
-        "threadId",
-        "turnId",
-        "itemId",
-        "summaryIndex",
-        "delta",
-    ),
-    "item/reasoning/textDelta": ("threadId", "turnId", "itemId", "contentIndex", "delta"),
-    "item/commandExecution/outputDelta": ("threadId", "turnId", "itemId", "delta"),
-    "item/fileChange/patchUpdated": ("threadId", "turnId", "itemId", "changes"),
-    "item/fileChange/outputDelta": ("threadId", "turnId", "itemId", "delta"),
-    "item/mcpToolCall/progress": ("threadId", "turnId", "itemId", "message"),
-    "mcpServer/startupStatus/updated": ("name", "status", "error", "failureReason", "threadId"),
-    "thread/tokenUsage/updated": ("threadId", "turnId", "tokenUsage"),
-    "error": ("threadId", "turnId", "willRetry", "error"),
-    "configWarning": ("summary", "details", "path", "range"),
-    "warning": ("message", "threadId"),
-    "account/rateLimits/updated": ("rateLimits",),
-}
 
 _TURN_SCOPED_METHODS = frozenset(
     {
@@ -177,20 +143,14 @@ class _CodexSessionState:
     thread: Any
     request: AgentSessionRequest
     ref: AgentSessionRef
-    sdk_version: str
-    executable_version: str
-    session_started_emitted: bool = False
     turn: Any | None = None
     turn_id: str | None = None
-    seq: int = 0
     message_count: int = 0
     output_bytes: int = 0
     final_text: str = ""
     final_text_bytes: int = 0
-    usage: FrozenJsonDict | None = None
-    current_output: AgentOutputSpec | None = None
+    usage: TokenUsage | None = None
     diagnostics: list[str] = field(default_factory=list)
-    retry_count: int = 0
     active_mcp_calls: dict[str, tuple[str, str]] = field(default_factory=dict)
     quota_exhausted: bool = False
 
@@ -200,6 +160,8 @@ class CodexSdkAdapter:
 
     backend: Literal["codex"] = "codex"
     transport: Literal["sdk"] = "sdk"
+    # Codex threads resume from any directory; the ref keeps cwd as provenance only.
+    cwd_scopes_sessions: Literal[False] = False
 
     def __init__(self) -> None:
         self._sessions: dict[AgentSession, _CodexSessionState] = {}
@@ -209,87 +171,20 @@ class CodexSdkAdapter:
     def validate_auth(self, credential: CredentialRef) -> None:
         self._require_local_auth(credential.kind)
 
-    async def capabilities(
-        self,
-        scope: AgentCapabilityScope,
-        *,
-        environment: Mapping[str, str],
-    ) -> AgentCapabilities:
-        self._require_scope(scope)
-        self._require_local_auth(scope.auth.kind)
-        sdk, client = await self._open_client(cwd=None, environment=environment)
-        try:
-            await self._verify_auth(client)
-            models, efforts, model_efforts = self._decode_models(
-                await self._call(client.models(), operation="model discovery", failure="executable")
-            )
-            executable_version = self._executable_version(client)
-            state_root = state_root_from_environment("codex", environment)
-            restricted_write = await bubblewrap_network_namespace_available(
-                cwd=state_root, environment=environment
-            )
-            return AgentCapabilities(
-                scope=scope,
-                executable_version=executable_version,
-                sdk_version=self._sdk_version(sdk),
-                session_operations=("new", "resume", "fork"),
-                discovery_operations=("list", "read"),
-                models=models,
-                reasoning_efforts=efforts,
-                model_reasoning_efforts=model_efforts,
-                reasoning_summaries=("none", "auto", "concise", "detailed"),
-                content_kinds=("text", "image"),
-                attachment_kinds=("image",),
-                session_instruction_roles=("developer",),
-                turn_instruction_roles=(),
-                streaming=True,
-                cancellation=True,
-                structured_output=True,
-                native_output_schema=True,
-                builtin_tool_families=("file_read", "file_write", "command", "web_search"),
-                tool_controls=False,
-                mcp_transports=("stdio", "streamable_http"),
-                mcp_auth_forms=_MCP_REFERENCE_FORMS,
-                filesystem_modes=(
-                    ("read_only", "workspace_write", "full_access")
-                    if restricted_write
-                    else ("read_only", "full_access")
-                ),
-                network_modes=("disabled", "unrestricted"),
-                approval_modes=("deny", "provider_review"),
-                additional_dirs=True,
-                max_turns=False,
-                timeouts=True,
-                turn_overrides=(),
-                persistent_turn_overrides=(),
-                native_extension_version="openai-codex.v1",
-                native_option_names=("web_search",),
-                cwd_scopes_sessions=False,
-                reports_auth_identity=False,
-                reports_effective_effort=False,
-                session_name_metadata=True,
-                session_archive_metadata=False,
-                session_tag_metadata=False,
-            )
-        finally:
-            await self._close_client(client)
-
     async def list_sessions(
         self,
         query: SessionQuery,
         *,
         environment: Mapping[str, str],
     ) -> SessionPage:
-        self._require_scope(query.scope)
-        self._require_local_auth(query.scope.auth.kind)
+        if query.backend != self.backend or query.transport != self.transport:
+            raise InvalidAgentRequest("CodexSdkAdapter received a different route")
+        self._require_local_auth(query.auth.kind)
         _sdk, client = await self._open_client(cwd=None, environment=environment)
         try:
             await self._verify_auth(client)
-            archived = (
-                query.native.archived if isinstance(query.native, CodexSessionFilters) else None
-            )
             response = await self._call(
-                client.thread_list(archived=archived, cursor=query.cursor, limit=query.limit),
+                client.thread_list(archived=None, cursor=query.cursor, limit=query.limit),
                 operation="thread listing",
                 failure="executable",
             )
@@ -301,7 +196,7 @@ class CodexSdkAdapter:
             sessions = tuple(
                 self._session_summary(
                     self._mapping(item, "Codex SDK thread_list thread"),
-                    profile_key=query.scope.auth.profile_key,
+                    profile_key=query.auth.profile_key,
                     state_root=state_root,
                 )
                 for item in data
@@ -328,8 +223,6 @@ class CodexSdkAdapter:
             state_root_from_environment("codex", environment)
         ):
             raise SessionMismatch("session state root does not match the supplied environment")
-        if options.cursor is not None or options.include_turns or options.include_items:
-            raise UnsupportedCapability("Codex SDK adapter currently supports metadata-only reads")
         _sdk, client = await self._open_client(cwd=None, environment=environment)
         try:
             await self._verify_auth(client)
@@ -348,8 +241,6 @@ class CodexSdkAdapter:
             return SessionSnapshot(
                 ref=ref,
                 metadata=SessionMetadata(name=self._optional_string(native_thread.get("name"))),
-                items=(),
-                continuation_cursor=None,
             )
         finally:
             await self._close_client(client)
@@ -358,22 +249,24 @@ class CodexSdkAdapter:
         self,
         request: AgentSessionRequest,
         *,
-        capabilities: AgentCapabilities,
         environment: Mapping[str, str],
     ) -> AgentSession:
         if request.backend != self.backend or request.transport != self.transport:
             raise InvalidAgentRequest("CodexSdkAdapter received a different route")
-        self._require_scope(capabilities.scope)
         self._require_local_auth(request.auth.kind)
         self._validate_policy_mapping(request.policy)
         validate_mcp_network_policy(request.mcp_servers, request.policy)
         self._validate_mcp_filters(request)
-        if (
-            isinstance(request.native, CodexNativeOptions)
-            and request.native.web_search is True
-            and request.policy.network != "unrestricted"
-        ):
-            raise UnsupportedCapability("Codex web search requires unrestricted network policy")
+        state_root = state_root_from_environment("codex", environment)
+        if request.policy.filesystem == "workspace_write":
+            # Restricted writes ride on bubblewrap network namespaces; a host without
+            # them gets a fail-closed refusal before any thread is started.
+            if not await bubblewrap_network_namespace_available(
+                cwd=state_root, environment=environment
+            ):
+                raise UnsupportedCapability(
+                    "Codex workspace_write requires bubblewrap network namespaces on this host"
+                )
 
         sdk, client = await self._open_client(cwd=request.cwd, environment=environment)
         try:
@@ -427,7 +320,7 @@ class CodexSdkAdapter:
             ref = self._make_ref(
                 native_session_id=native_session_id,
                 profile_key=request.auth.profile_key,
-                state_root=state_root_from_environment("codex", environment),
+                state_root=state_root,
                 cwd=request.cwd,
             )
             session = AgentSession(ref)
@@ -437,8 +330,6 @@ class CodexSdkAdapter:
                 thread=thread,
                 request=request,
                 ref=ref,
-                sdk_version=self._sdk_version(sdk),
-                executable_version=self._executable_version(client),
             )
             return session
         except BaseException:
@@ -483,9 +374,8 @@ class CodexSdkAdapter:
                 kwargs["summary"] = reasoning.summary
         output = state.request.output
         if isinstance(output, JsonSchemaAgentOutput):
-            kwargs["output_schema"] = to_json_schema(
-                output.schema, inline_defs=False, include_annotations=True
-            )
+            # The schema is a plain frozen JSON mapping; the backend enforces it natively.
+            kwargs["output_schema"] = thaw_json_value(output.schema)
 
         turn = await self._call(
             state.thread.turn(inputs, **kwargs), operation="turn start", failure="session"
@@ -496,46 +386,14 @@ class CodexSdkAdapter:
             raise ProtocolDefect("Codex SDK returned no turn id")
         state.turn = turn
         state.turn_id = turn_id
-        state.seq = 0
         state.message_count = 0
         state.output_bytes = 0
         state.final_text = ""
         state.final_text_bytes = 0
         state.usage = None
-        state.current_output = state.request.output
         state.diagnostics.clear()
-        state.retry_count = 0
         state.active_mcp_calls.clear()
         state.quota_exhausted = False
-
-        if not state.session_started_emitted:
-            state.session_started_emitted = True
-            yield self._event(
-                state,
-                "session_started",
-                SessionStartedData(),
-                native_type="thread/start",
-                native_payload=redact_native_payload(
-                    {
-                        "id": state.ref.native_session_id,
-                        "cwd": state.request.cwd,
-                        "model": state.request.model,
-                        "sdkVersion": state.sdk_version,
-                        "cliVersion": state.executable_version,
-                        "approvalMode": state.request.policy.approval,
-                        "sandbox": state.request.policy.filesystem,
-                    },
-                    allowed_fields=(
-                        "id",
-                        "cwd",
-                        "model",
-                        "sdkVersion",
-                        "cliVersion",
-                        "approvalMode",
-                        "sandbox",
-                    ),
-                ),
-            )
 
         terminal_seen = False
         try:
@@ -543,7 +401,7 @@ class CodexSdkAdapter:
             async for notification in stream:
                 for event in self._notification_events(state, notification):
                     yield event
-                    if event.kind in ("turn_completed", "turn_failed", "turn_cancelled"):
+                    if isinstance(event, AgentTerminal):
                         terminal_seen = True
                         state.turn = None
                         return
@@ -552,15 +410,13 @@ class CodexSdkAdapter:
                 await turn.interrupt()
             finally:
                 await self._destroy_session(session, state)
-            yield self._event(
-                state,
-                "turn_failed",
-                TurnFailedData(
-                    failure="output_limit_exceeded",
-                    final_text=state.final_text,
-                    usage=state.usage,
-                    diagnostics=tuple(state.diagnostics),
-                ),
+            yield AgentTerminal(
+                status="failed",
+                failure=AgentFailure("output_limit_exceeded"),
+                final_text=state.final_text,
+                session_ref=state.ref,
+                usage=self._terminal_usage(state),
+                diagnostics=tuple(state.diagnostics),
             )
             return
         except ProtocolDefect:
@@ -573,32 +429,29 @@ class CodexSdkAdapter:
             message = sanitize_provider_text(str(error)) or "Codex SDK turn failed"
             self._append_diagnostic(state, message)
             await self._destroy_session(session, state)
-            yield self._event(
-                state,
-                "turn_failed",
-                TurnFailedData(
-                    failure="quota_exhausted"
-                    if self._is_quota_error_text(message)
-                    else "backend_failed",
-                    final_text=state.final_text,
-                    usage=state.usage,
-                    diagnostics=tuple(state.diagnostics),
-                ),
+            yield AgentTerminal(
+                status="failed",
+                failure=AgentQuotaExhausted()
+                if self._is_quota_error_text(message)
+                else AgentFailure("backend_failed"),
+                final_text=state.final_text,
+                session_ref=state.ref,
+                usage=self._terminal_usage(state),
+                diagnostics=tuple(state.diagnostics),
             )
             return
         if not terminal_seen:
             await self._destroy_session(session, state)
             raise MissingTerminalEvent()
 
-    async def interrupt(self, session: AgentSession, turn_id: str | None) -> None:
+    async def interrupt(self, session: AgentSession) -> None:
         if session in self._dead_sessions:
             return
         state = self._state(session)
-        if turn_id is None:
+        if state.turn is None:
+            # Block-and-stop: a turn that never became identifiable releases the session.
             await self._destroy_session(session, state)
             return
-        if state.turn_id != turn_id or state.turn is None:
-            raise InvalidAgentRequest("interrupt turn id does not match the active Codex turn")
         await self._call(state.turn.interrupt(), operation="turn interrupt", failure="session")
 
     async def close_session(self, session: AgentSession) -> None:
@@ -630,16 +483,21 @@ class CodexSdkAdapter:
     ) -> tuple[ModuleType, Any]:
         sdk = self._load_sdk()
         sdk_version = self._sdk_version(sdk)
-        if sdk_version != _SUPPORTED_SDK_VERSION:
-            raise SdkUnavailable(
-                f"Codex SDK {_SUPPORTED_SDK_VERSION} is required; found {sdk_version}"
+        if sdk_version != _CERTIFIED_SDK_VERSION:
+            warnings.warn(
+                f"Codex SDK {sdk_version} differs from the certified "
+                f"{_CERTIFIED_SDK_VERSION}; continuing on the behavioral probe",
+                RuntimeWarning,
+                stacklevel=2,
             )
         runtime = self._load_runtime_package()
         runtime_version = self._runtime_version(runtime)
-        if runtime_version != _SUPPORTED_RUNTIME_VERSION:
-            raise SdkUnavailable(
-                f"Codex bundled runtime {_SUPPORTED_RUNTIME_VERSION} is required; "
-                f"found {runtime_version}"
+        if runtime_version != sdk_version:
+            warnings.warn(
+                f"Codex bundled runtime {runtime_version} differs from SDK "
+                f"{sdk_version}; continuing on the behavioral probe",
+                RuntimeWarning,
+                stacklevel=2,
             )
         try:
             child_environment = dict(environment)
@@ -673,15 +531,16 @@ class CodexSdkAdapter:
             async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
                 await client.__aenter__()
             executable_version = self._executable_version(client)
-            if executable_version != _SUPPORTED_RUNTIME_VERSION:
-                await client.close()
-                raise SdkUnavailable(
-                    f"Codex runtime {_SUPPORTED_RUNTIME_VERSION} is required; "
-                    f"found {executable_version}"
+            if executable_version != runtime_version:
+                warnings.warn(
+                    f"Codex server reported version {executable_version}, the bundled "
+                    f"runtime is {runtime_version}; continuing on the behavioral probe",
+                    RuntimeWarning,
+                    stacklevel=2,
                 )
         except TimeoutError:
             raise ExecutableUnavailable("Codex SDK initialization timed out") from None
-        except (SdkUnavailable, CredentialUnavailable):
+        except CredentialUnavailable:
             raise
         except Exception as error:
             raise ExecutableUnavailable(
@@ -777,22 +636,13 @@ class CodexSdkAdapter:
         state.output_bytes += size
         params = self._mapping(raw_params, f"Codex SDK {method} notification")
         self._validate_notification_identity(state, method, params)
-        native = redact_native_payload(params, allowed_fields=_KNOWN_FIELDS.get(method))
-        if method in ("item/started", "item/completed"):
-            item = self._mapping(params.get("item"), f"{method} item")
-            if item.get("type") == "fileChange":
-                return self._file_change_events(
-                    state,
-                    item.get("changes"),
-                    self._patch_status(item.get("status"), method),
-                    method,
-                    native,
-                )
-        if method == "item/fileChange/patchUpdated":
-            return self._file_change_events(
-                state, params.get("changes"), "in_progress", method, native
+        if method == "turn/completed":
+            # The native completion frame travels first; the owned terminal is last.
+            return (
+                AgentNative(native_type=method, payload=redact_native_payload(params)),
+                self._turn_terminal(state, params),
             )
-        event = self._notification_event(state, method, params, native)
+        event = self._notification_event(state, method, params)
         return () if event is None else (event,)
 
     def _notification_event(
@@ -800,7 +650,6 @@ class CodexSdkAdapter:
         state: _CodexSessionState,
         method: str,
         params: Mapping[str, object],
-        native: FrozenJsonDict,
     ) -> AgentEvent | None:
         if method == "thread/started":
             thread = self._mapping(params.get("thread"), "thread/started thread")
@@ -808,67 +657,53 @@ class CodexSdkAdapter:
                 raise ProtocolDefect("Codex event changed thread identity")
             return None
         if method == "turn/started":
-            return self._event(
-                state, "turn_started", TurnStartedData(), native_type=method, native_payload=native
-            )
+            return AgentNative(native_type=method, payload=redact_native_payload(params))
         if method == "item/agentMessage/delta":
             delta = self._string(params, "delta", method)
             self._append_final_text(state, delta)
-            return self._event(
-                state,
-                "text_delta",
-                TextDeltaData(delta),
-                native_type=method,
-                native_payload=native,
-            )
+            return AgentText(delta)
         if method in ("item/reasoning/summaryTextDelta", "item/reasoning/textDelta"):
-            return self._event(
-                state,
-                "reasoning",
-                ReasoningData(
-                    self._string(params, "delta", method),
-                    visibility="summary" if method.endswith("summaryTextDelta") else "full",
-                ),
-                native_type=method,
-                native_payload=native,
-            )
+            return AgentNative(native_type=method, payload=redact_native_payload(params))
         if method in ("item/commandExecution/outputDelta", "item/fileChange/outputDelta"):
-            return self._event(
-                state,
-                "tool_updated",
-                ToolUpdatedData(
-                    tool_call_id=self._string(params, "itemId", method),
-                    update=freeze_json_object(
-                        {"output_delta": self._string(params, "delta", method)}
-                    ),
+            return AgentToolUse(
+                tool_call_id=self._string(params, "itemId", method),
+                name="commandExecution"
+                if method == "item/commandExecution/outputDelta"
+                else "fileChange",
+                phase="updated",
+                payload=freeze_native_json_object(
+                    {"output_delta": self._string(params, "delta", method)}
                 ),
-                native_type=method,
-                native_payload=native,
             )
         if method == "item/mcpToolCall/progress":
             item_id = self._string(params, "itemId", method)
-            if item_id not in state.active_mcp_calls:
+            identity = state.active_mcp_calls.get(item_id)
+            if identity is None:
                 raise ProtocolDefect("MCP tool progress arrived before its start")
-            return self._event(
-                state,
-                "tool_updated",
-                ToolUpdatedData(
-                    tool_call_id=item_id,
-                    update=freeze_json_object({"message": self._string(params, "message", method)}),
+            server, tool = identity
+            return AgentToolUse(
+                tool_call_id=item_id,
+                name=f"{server}/{tool}",
+                phase="updated",
+                payload=freeze_native_json_object(
+                    {"message": self._string(params, "message", method)}
                 ),
-                native_type=method,
-                native_payload=native,
             )
         if method == "item/started":
-            return self._item_started(state, params, method, native)
+            return self._item_started(state, params, method)
         if method == "item/completed":
-            return self._item_completed(state, params, method, native)
-        if method == "thread/tokenUsage/updated":
-            usage = freeze_json_object(self._mapping(params.get("tokenUsage"), "token usage"))
-            state.usage = usage
-            return self._event(
-                state, "usage", UsageData(usage), native_type=method, native_payload=native
+            return self._item_completed(state, params, method)
+        if method == "item/fileChange/patchUpdated":
+            return AgentToolUse(
+                tool_call_id=self._string(params, "itemId", method),
+                name="fileChange",
+                phase="updated",
+                payload=freeze_native_json_object({"changes": params.get("changes")}),
             )
+        if method == "thread/tokenUsage/updated":
+            usage = self._token_usage(params)
+            state.usage = usage
+            return AgentUsage(usage)
         if method == "error":
             error = self._mapping(params.get("error"), "error notification")
             message = error.get("message")
@@ -880,47 +715,20 @@ class CodexSdkAdapter:
             self._append_diagnostic(state, normalized)
             if self._is_quota_error(error):
                 state.quota_exhausted = True
-            if params.get("willRetry") is True:
-                state.retry_count += 1
-                return self._event(
-                    state,
-                    "native_retry_observed",
-                    NativeRetryObservedData(state.retry_count),
-                    native_type=method,
-                    native_payload=native,
-                )
-            return self._event(
-                state,
-                "diagnostic",
-                DiagnosticData(code="codex_error", message=normalized, detail=native),
-                native_type=method,
-                native_payload=native,
-            )
-        if method == "turn/completed":
-            return self._turn_completed(state, params, method, native)
+            # Retries the backend performs itself are visible here too (willRetry);
+            # the bounded native frame is their only representation.
+            return AgentNative(native_type=method, payload=redact_native_payload(params))
         if method in ("configWarning", "warning"):
             message = params.get("summary", params.get("message"))
             if not isinstance(message, str) or not message:
                 raise ProtocolDefect(f"{method} carried no message")
-            return self._event(
-                state,
-                "diagnostic",
-                DiagnosticData(
-                    code="codex_config_warning" if method == "configWarning" else "codex_warning",
-                    message=sanitize_provider_text(message),
-                    detail=native,
-                ),
-                native_type=method,
-                native_payload=native,
-            )
+            self._append_diagnostic(state, sanitize_provider_text(message))
+            return AgentNative(native_type=method, payload=redact_native_payload(params))
         if method in ("thread/status/changed", "mcpServer/startupStatus/updated"):
             return None
-        return self._event(
-            state,
-            "unknown",
-            UnknownData(),
+        return AgentNative(
             native_type=sanitize_provider_text(method, limit=128),
-            native_payload=native,
+            payload=redact_native_payload(params),
         )
 
     def _item_started(
@@ -928,23 +736,17 @@ class CodexSdkAdapter:
         state: _CodexSessionState,
         params: Mapping[str, object],
         method: str,
-        native: FrozenJsonDict,
     ) -> AgentEvent | None:
         item = self._mapping(params.get("item"), "item/started item")
         item_type = item.get("type")
         if item_type == "commandExecution":
-            return self._event(
-                state,
-                "tool_started",
-                ToolStartedData(
-                    tool_call_id=self._string(item, "id", method),
-                    name="commandExecution",
-                    arguments=freeze_json_object(
-                        {"command": item.get("command"), "cwd": item.get("cwd")}
-                    ),
+            return AgentToolUse(
+                tool_call_id=self._string(item, "id", method),
+                name="commandExecution",
+                phase="started",
+                payload=freeze_native_json_object(
+                    {"command": item.get("command"), "cwd": item.get("cwd")}
                 ),
-                native_type=method,
-                native_payload=native,
             )
         if item_type == "mcpToolCall":
             server = self._string(item, "server", method)
@@ -958,32 +760,30 @@ class CodexSdkAdapter:
                 raise ProtocolDefect("MCP tool call violated its exact tool policy")
             if item_id in state.active_mcp_calls:
                 raise ProtocolDefect("MCP tool call started more than once")
-            arguments = item.get("arguments")
-            normalized = (
-                freeze_json_object(arguments)
-                if isinstance(arguments, Mapping)
-                else freeze_json_object({"value": freeze_json_value(arguments)})
-            )
             state.active_mcp_calls[item_id] = (server, tool)
-            return self._event(
-                state,
-                "tool_started",
-                ToolStartedData(
-                    tool_call_id=item_id,
-                    name=f"{server}/{tool}",
-                    arguments=normalized,
-                ),
-                native_type=method,
-                native_payload=native,
+            return AgentToolUse(
+                tool_call_id=item_id,
+                name=f"{server}/{tool}",
+                phase="started",
+                payload=freeze_native_json_value(item.get("arguments")),
             )
-        if item_type in ("reasoning", "agentMessage", "fileChange"):
+        if item_type == "fileChange":
+            return AgentToolUse(
+                tool_call_id=self._string(item, "id", method),
+                name="fileChange",
+                phase="started",
+                payload=freeze_native_json_object(
+                    {
+                        "changes": item.get("changes"),
+                        "status": self._patch_status(item.get("status"), method),
+                    }
+                ),
+            )
+        if item_type in ("reasoning", "agentMessage"):
             return None
-        return self._event(
-            state,
-            "unknown",
-            UnknownData(),
+        return AgentNative(
             native_type=f"{method}:unknownItem",
-            native_payload=native,
+            payload=redact_native_payload(params),
         )
 
     def _item_completed(
@@ -991,21 +791,16 @@ class CodexSdkAdapter:
         state: _CodexSessionState,
         params: Mapping[str, object],
         method: str,
-        native: FrozenJsonDict,
     ) -> AgentEvent | None:
         item = self._mapping(params.get("item"), "item/completed item")
         item_type = item.get("type")
         if item_type == "commandExecution":
-            return self._event(
-                state,
-                "tool_completed",
-                ToolCompletedData(
-                    tool_call_id=self._string(item, "id", method),
-                    output=freeze_json_value(item.get("aggregatedOutput")),
-                    succeeded=item.get("status") == "completed",
-                ),
-                native_type=method,
-                native_payload=native,
+            return AgentToolUse(
+                tool_call_id=self._string(item, "id", method),
+                name="commandExecution",
+                phase="completed",
+                payload=freeze_native_json_value(item.get("aggregatedOutput")),
+                succeeded=item.get("status") == "completed",
             )
         if item_type == "mcpToolCall":
             item_id = self._string(item, "id", method)
@@ -1020,148 +815,134 @@ class CodexSdkAdapter:
             status = item.get("status")
             if status not in ("completed", "failed"):
                 raise ProtocolDefect("completed MCP tool call had an impossible status")
-            return self._event(
-                state,
-                "tool_completed",
-                ToolCompletedData(
-                    tool_call_id=item_id,
-                    output=freeze_json_value(
-                        item.get("result") if status == "completed" else item.get("error")
-                    ),
-                    succeeded=status == "completed",
+            server, tool = identity
+            return AgentToolUse(
+                tool_call_id=item_id,
+                name=f"{server}/{tool}",
+                phase="completed",
+                payload=freeze_native_json_value(
+                    item.get("result") if status == "completed" else item.get("error")
                 ),
-                native_type=method,
-                native_payload=native,
+                succeeded=status == "completed",
             )
-        if item_type in ("reasoning", "agentMessage", "fileChange"):
+        if item_type == "fileChange":
+            # A declined or failed patch is a completed tool action that did not apply.
+            status = self._patch_status(item.get("status"), method)
+            return AgentToolUse(
+                tool_call_id=self._string(item, "id", method),
+                name="fileChange",
+                phase="completed",
+                payload=freeze_native_json_object({"changes": item.get("changes")}),
+                succeeded=status == "applied",
+            )
+        if item_type in ("reasoning", "agentMessage"):
             return None
-        return self._event(
-            state,
-            "unknown",
-            UnknownData(),
+        return AgentNative(
             native_type=f"{method}:unknownItem",
-            native_payload=native,
+            payload=redact_native_payload(params),
         )
 
-    def _turn_completed(
+    def _turn_terminal(
         self,
         state: _CodexSessionState,
         params: Mapping[str, object],
-        method: str,
-        native: FrozenJsonDict,
-    ) -> AgentEvent:
+    ) -> AgentTerminal:
         if state.active_mcp_calls:
             raise ProtocolDefect("turn completed with active MCP tool calls")
         turn = self._mapping(params.get("turn"), "turn/completed turn")
         status = turn.get("status")
+        usage = self._terminal_usage(state)
+        diagnostics = tuple(state.diagnostics)
         if status == "completed":
-            if isinstance(state.current_output, JsonSchemaAgentOutput):
+            structured = None
+            if isinstance(state.request.output, JsonSchemaAgentOutput):
                 try:
-                    structured = parse_structured_output(
-                        state.final_text, state.current_output.schema
-                    )
+                    # Strict parse and freeze only; the backend enforced the schema natively.
+                    structured = parse_structured_output(state.final_text)
                 except OutputSchemaMismatch:
-                    return self._event(
-                        state,
-                        "turn_failed",
-                        TurnFailedData(
-                            failure="output_schema_violation",
-                            final_text=state.final_text,
-                            usage=state.usage,
-                            diagnostics=tuple(state.diagnostics),
-                        ),
-                        native_type=method,
-                        native_payload=native,
+                    return AgentTerminal(
+                        status="failed",
+                        failure=AgentFailure("output_schema_violation"),
+                        final_text=state.final_text,
+                        session_ref=state.ref,
+                        usage=usage,
+                        diagnostics=diagnostics,
                     )
-            else:
-                structured = None
-            return self._event(
-                state,
-                "turn_completed",
-                TurnCompletedData(
-                    final_text=state.final_text,
-                    structured_output=structured,
-                    usage=state.usage,
-                    diagnostics=tuple(state.diagnostics),
-                ),
-                native_type=method,
-                native_payload=native,
+            return AgentTerminal(
+                status="succeeded",
+                failure=None,
+                final_text=state.final_text,
+                session_ref=state.ref,
+                structured_output=structured,
+                usage=usage,
+                diagnostics=diagnostics,
             )
         if status == "interrupted":
-            return self._event(
-                state,
-                "turn_cancelled",
-                TurnCancelledData(
-                    final_text=state.final_text,
-                    usage=state.usage,
-                    diagnostics=tuple(state.diagnostics),
-                ),
-                native_type=method,
-                native_payload=native,
+            return AgentTerminal(
+                status="cancelled",
+                failure=None,
+                final_text=state.final_text,
+                session_ref=state.ref,
+                usage=usage,
+                diagnostics=diagnostics,
             )
         if status == "failed":
-            error = turn.get("error")
-            failure = (
-                "quota_exhausted"
-                if state.quota_exhausted or self._is_quota_error(error)
-                else "backend_failed"
+            failure: AgentTerminalFailure = (
+                AgentQuotaExhausted()
+                if state.quota_exhausted or self._is_quota_error(turn.get("error"))
+                else AgentFailure("backend_failed")
             )
-            return self._event(
-                state,
-                "turn_failed",
-                TurnFailedData(
-                    failure=failure,
-                    final_text=state.final_text,
-                    usage=state.usage,
-                    diagnostics=tuple(state.diagnostics),
-                ),
-                native_type=method,
-                native_payload=native,
+            return AgentTerminal(
+                status="failed",
+                failure=failure,
+                final_text=state.final_text,
+                session_ref=state.ref,
+                usage=usage,
+                diagnostics=diagnostics,
             )
         raise ProtocolDefect("turn/completed carried an impossible status")
 
-    def _file_change_events(
-        self,
-        state: _CodexSessionState,
-        raw_changes: object,
-        status: FileChangeStatus,
-        method: str,
-        native: FrozenJsonDict,
-    ) -> tuple[AgentEvent, ...]:
-        if not isinstance(raw_changes, list):
-            raise ProtocolDefect(f"{method} changes were malformed")
-        events: list[AgentEvent] = []
-        for raw_change in raw_changes:
-            change = self._mapping(raw_change, f"{method} change")
-            kind = self._mapping(change.get("kind"), f"{method} change kind")
-            kind_value = kind.get("type")
-            mapped: Literal["created", "modified", "deleted"]
-            if kind_value == "add":
-                mapped = "created"
-            elif kind_value == "delete":
-                mapped = "deleted"
-            elif kind_value == "update":
-                mapped = "modified"
-            else:
-                raise ProtocolDefect(f"{method} change kind was malformed")
-            diff = change.get("diff")
-            if not isinstance(diff, str):
-                raise ProtocolDefect(f"{method} change diff was malformed")
-            events.append(
-                self._event(
-                    state,
-                    "file_change",
-                    FileChangeData(
-                        path=self._string(change, "path", method),
-                        change=mapped,
-                        status=status,
-                        diff=diff,
-                    ),
-                    native_type=method,
-                    native_payload=native,
-                )
+    def _token_usage(self, params: Mapping[str, object]) -> TokenUsage:
+        """Normalize the ``tokenUsage.total`` member into the provider lane's noun.
+
+        ``inputTokens`` is already cache-inclusive (OpenAI wire semantics), so it maps
+        straight onto ``TokenUsage.input_tokens`` without re-adding cache components.
+        """
+        token_usage = self._mapping(params.get("tokenUsage"), "token usage")
+        total = self._mapping(token_usage.get("total"), "token usage total")
+        try:
+            return TokenUsage.from_components(
+                input_tokens=self._usage_count(total, "inputTokens"),
+                output_tokens=self._usage_count(total, "outputTokens"),
+                total_tokens=self._usage_presence(total, "totalTokens"),
+                reasoning_tokens=self._usage_presence(total, "reasoningOutputTokens"),
+                cache_read_input_tokens=self._usage_presence(total, "cachedInputTokens"),
+                cache_write_input_tokens=self._usage_presence(total, "cacheWriteInputTokens"),
             )
-        return tuple(events)
+        except ValueError:
+            raise ProtocolDefect("thread/tokenUsage/updated carried negative counts") from None
+
+    @staticmethod
+    def _usage_count(member: Mapping[str, object], key: str) -> int:
+        value = member.get(key)
+        if value is None:
+            return 0
+        if type(value) is not int:
+            raise ProtocolDefect(f"tokenUsage.total.{key} was not an integer")
+        return value
+
+    @staticmethod
+    def _usage_presence(member: Mapping[str, object], key: str) -> Presence[int]:
+        value = member.get(key)
+        if value is None:
+            return Absent()
+        if type(value) is not int:
+            raise ProtocolDefect(f"tokenUsage.total.{key} was not an integer")
+        return Present(value)
+
+    @staticmethod
+    def _terminal_usage(state: _CodexSessionState) -> Presence[TokenUsage]:
+        return Absent() if state.usage is None else Present(state.usage)
 
     def _validate_notification_identity(
         self, state: _CodexSessionState, method: str, params: Mapping[str, object]
@@ -1179,34 +960,6 @@ class CodexSdkAdapter:
             if turn_id != state.turn_id:
                 raise ProtocolDefect("Codex event changed or omitted its turn identity")
 
-    def _event(
-        self,
-        state: _CodexSessionState,
-        kind: AgentEventKind,
-        data: AgentEventData,
-        *,
-        native_type: str | None = None,
-        native_payload: JsonObject | None = None,
-    ) -> AgentEvent:
-        if state.turn_id is None:
-            raise ProtocolDefect("Codex event arrived before a turn id")
-        terminal = kind in ("turn_completed", "turn_failed", "turn_cancelled")
-        if state.seq >= _MAX_EVENT_COUNT or (not terminal and state.seq == _MAX_EVENT_COUNT - 1):
-            raise OutputLimitExceeded(_MAX_EVENT_COUNT)
-        state.seq += 1
-        return AgentEvent(
-            schema_version="agent-event.v1",
-            seq=state.seq,
-            backend="codex",
-            transport="sdk",
-            session_ref=state.ref,
-            turn_id=state.turn_id,
-            kind=kind,
-            data=data,
-            native_type=native_type,
-            native_payload=native_payload,
-        )
-
     def _state(self, session: AgentSession) -> _CodexSessionState:
         if session in self._dead_sessions:
             raise SessionUnavailable("Codex SDK session is no longer live")
@@ -1223,12 +976,14 @@ class CodexSdkAdapter:
     ) -> None:
         validate_session_ref(
             ref,
-            AgentCapabilityScope(backend="codex", transport="sdk", auth=request.auth),
+            backend=self.backend,
+            transport=self.transport,
+            profile_key=request.auth.profile_key,
             state_root_fingerprint=fingerprint_path(
                 state_root_from_environment("codex", environment)
             ),
             cwd=request.cwd,
-            cwd_scopes_sessions=False,
+            cwd_scopes_sessions=self.cwd_scopes_sessions,
         )
 
     def _session_summary(
@@ -1240,17 +995,17 @@ class CodexSdkAdapter:
     ) -> SessionSummary:
         return SessionSummary(
             ref=self._make_ref(
-                self._string(thread, "id", "thread_list"),
-                profile_key,
-                state_root,
-                self._string(thread, "cwd", "thread_list"),
+                native_session_id=self._string(thread, "id", "thread_list"),
+                profile_key=profile_key,
+                state_root=state_root,
+                cwd=self._string(thread, "cwd", "thread_list"),
             ),
             metadata=SessionMetadata(name=self._optional_string(thread.get("name"))),
         )
 
     @staticmethod
     def _make_ref(
-        native_session_id: str, profile_key: str, state_root: Path, cwd: str
+        *, native_session_id: str, profile_key: str, state_root: Path, cwd: str
     ) -> AgentSessionRef:
         return AgentSessionRef(
             schema_version="agent-session-ref.v1",
@@ -1330,11 +1085,6 @@ class CodexSdkAdapter:
         if match is None:
             raise ProtocolDefect("Codex SDK server metadata had an invalid version")
         return match.group("version")
-
-    @staticmethod
-    def _require_scope(scope: AgentCapabilityScope) -> None:
-        if scope.backend != "codex" or scope.transport != "sdk":
-            raise InvalidAgentRequest("Codex SDK received a different capability scope")
 
     @staticmethod
     def _require_local_auth(kind: str) -> None:
@@ -1469,37 +1219,6 @@ class CodexSdkAdapter:
             )
             config["shell_environment_policy"] = {"inherit": "core", "exclude": excluded}
         return config
-
-    @classmethod
-    def _decode_models(
-        cls, response: object
-    ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[tuple[str, tuple[str, ...]], ...]]:
-        payload = cls._mapping(response, "Codex SDK model response")
-        data = payload.get("data")
-        if not isinstance(data, list):
-            raise ProtocolDefect("Codex SDK model response data was not an array")
-        models: list[str] = []
-        mapped: list[tuple[str, tuple[str, ...]]] = []
-        all_efforts: list[str] = []
-        for raw in data:
-            model = cls._mapping(raw, "Codex SDK model")
-            name = model.get("model")
-            efforts = model.get("supportedReasoningEfforts")
-            if not isinstance(name, str) or not name or not isinstance(efforts, list):
-                raise ProtocolDefect("Codex SDK model was malformed")
-            if name in models:
-                raise ProtocolDefect("Codex SDK repeated a model identity")
-            model_efforts: list[str] = []
-            for raw_effort in efforts:
-                effort = cls._mapping(raw_effort, "Codex SDK model effort").get("reasoningEffort")
-                if not isinstance(effort, str) or not effort or effort in model_efforts:
-                    raise ProtocolDefect("Codex SDK model effort was malformed")
-                model_efforts.append(effort)
-                if effort not in all_efforts:
-                    all_efforts.append(effort)
-            models.append(name)
-            mapped.append((name, tuple(model_efforts)))
-        return tuple(models), tuple(all_efforts), tuple(mapped)
 
     @staticmethod
     def _append_final_text(state: _CodexSessionState, text: str) -> None:

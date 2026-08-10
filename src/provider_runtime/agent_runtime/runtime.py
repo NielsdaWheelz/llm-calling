@@ -8,13 +8,14 @@ import os
 import shutil
 import stat
 import weakref
-from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, Protocol, assert_never
 
-from provider_runtime.agent_runtime.auth import (
+from provider_runtime.types import Absent, CancelSignal, Presence, Present, TokenUsage
+
+from .auth import (
     AuthEnvironmentRequest,
     build_child_environment,
     child_home_directory,
@@ -22,19 +23,8 @@ from provider_runtime.agent_runtime.auth import (
     is_runtime_owned_environment_name,
     mcp_header_environment_name,
     resolve_state_root,
-    secret_environment_name,
 )
-from provider_runtime.agent_runtime.capabilities import (
-    AgentCapabilities,
-    AgentCapabilityScope,
-    require_discovery_operation,
-    validate_auth_capability,
-    validate_mcp_network_policy,
-    validate_session_capabilities,
-    validate_turn_capabilities,
-    validate_turn_policy,
-)
-from provider_runtime.agent_runtime.errors import (
+from .errors import (
     CredentialUnavailable,
     ExecutableUnavailable,
     InvalidAgentRequest,
@@ -46,21 +36,16 @@ from provider_runtime.agent_runtime.errors import (
     TurnNotStarted,
     UnsupportedCapability,
 )
-from provider_runtime.agent_runtime.events import (
-    TERMINAL_EVENT_KINDS,
+from .events import (
     AgentEvent,
-    DiagnosticData,
-    SessionStartedData,
-    TerminalEventKind,
-    TextDeltaData,
-    TurnCancelledData,
-    TurnFailedData,
-    UsageData,
-    terminal_event_to_result,
+    AgentFailure,
+    AgentTerminal,
+    AgentText,
+    AgentUsage,
     validate_event_stream,
 )
-from provider_runtime.agent_runtime.policy import PermissionPolicy
-from provider_runtime.agent_runtime.sessions import (
+from .policy import PermissionPolicy, narrow_policy
+from .sessions import (
     AgentSession,
     SessionPage,
     SessionQuery,
@@ -70,9 +55,8 @@ from provider_runtime.agent_runtime.sessions import (
     validate_read_session_auth,
     validate_session_ref,
 )
-from provider_runtime.agent_runtime.types import (
+from .types import (
     AGENT_ROUTES,
-    AgentResult,
     AgentSessionRef,
     AgentSessionRequest,
     AgentTransport,
@@ -83,13 +67,12 @@ from provider_runtime.agent_runtime.types import (
     FileContent,
     ForkSession,
     ImageContent,
-    JsonObject,
     McpServerSpec,
     ResumeSession,
     TextContent,
     TurnRequest,
+    validate_mcp_network_policy,
 )
-from provider_runtime.types import CancelSignal
 
 type SecretResolver = Callable[[str], Awaitable[str]]
 type Route = tuple[Backend, AgentTransport]
@@ -101,7 +84,6 @@ _TURN_CLEANUP_TIMEOUT_SECONDS = 2.0
 _CLOSE_DRAIN_TIMEOUT_SECONDS = 10.0
 _CLOSE_SETTLE_TIMEOUT_SECONDS = 2.0
 _STATE_ROOT_MODE = 0o700
-_RETIRED_TURN_MEMORY = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,11 +125,12 @@ class AgentAdapter(Protocol):
     @property
     def transport(self) -> AgentTransport: ...
 
-    def validate_auth(self, credential: CredentialRef) -> None: ...
+    @property
+    def cwd_scopes_sessions(self) -> bool:
+        """Whether this backend's native sessions are directory-scoped (a backend fact)."""
+        ...
 
-    async def capabilities(
-        self, scope: AgentCapabilityScope, *, environment: Mapping[str, str]
-    ) -> AgentCapabilities: ...
+    def validate_auth(self, credential: CredentialRef) -> None: ...
 
     async def list_sessions(
         self, query: SessionQuery, *, environment: Mapping[str, str]
@@ -165,16 +148,14 @@ class AgentAdapter(Protocol):
         self,
         request: AgentSessionRequest,
         *,
-        capabilities: AgentCapabilities,
         environment: Mapping[str, str],
     ) -> AgentSession:
-        """Open one native session.
+        """Open one native session, validating the request behaviorally.
 
-        `capabilities` is the table the runtime already discovered for this scope and has
-        already validated the request against; an adapter must not rediscover it. An adapter
-        that did would spawn its `--version` and authentication probes a second time, so
-        opening one session would cost twice the child processes it needs. An adapter still
-        enforces the backend facts a capability table cannot express.
+        There is no capability table: the adapter enforces the backend facts it
+        owns (policy mapping, content kinds, native options) and fails closed
+        before any billable work when the request asks for something the
+        transport cannot enforce.
         """
         ...
 
@@ -186,19 +167,14 @@ class AgentAdapter(Protocol):
         approvals: ApprovalHandler | None,
     ) -> AsyncGenerator[AgentEvent, None]: ...
 
-    async def interrupt(self, session: AgentSession, turn_id: str | None) -> None:
-        """Interrupt the identified turn natively and leave the session fit for the next turn.
+    async def interrupt(self, session: AgentSession) -> None:
+        """Interrupt the session's active turn natively and keep it fit for the next turn.
 
-        The runtime abandons this turn's event stream as soon as this returns, so an adapter
-        whose native transport outlives a single turn — a shared JSON-RPC connection, a live
-        SDK client — owns the interrupted turn's leftover frames: it must either drain them
-        here or discard them on arrival. The runtime enforces the obligation rather than
-        trusting it (see `_SessionBinding.retired_turn_ids`), and it cannot discharge it
-        itself: a lane whose interrupt kills the child process answers a drain with
-        EOF-without-terminal, which is a defect, not a cancellation.
-
-        `turn_id is None` means the turn never reached native identity, so there is no turn to
-        name and the whole session must be released.
+        The runtime abandons the turn's event stream as soon as this returns, so
+        an adapter whose native transport outlives a single turn owns the
+        interrupted turn's leftover frames: it must drain or discard them before
+        the next turn reads the stream. An adapter whose turn never became
+        identifiable releases the whole session instead.
         """
         ...
 
@@ -211,20 +187,10 @@ class AgentAdapter(Protocol):
 class _SessionBinding:
     adapter: AgentAdapter
     request: AgentSessionRequest
-    capabilities: AgentCapabilities
     state_root_fingerprint: str
-    # Turns whose stream the runtime abandoned mid-flight. A later stream that replays one of
-    # their native frames means the adapter did not honour the drain obligation on
-    # `AgentAdapter.interrupt`, and the frame would otherwise be silently misattributed to the
-    # new turn. Bounded because a long-lived session may be interrupted many times.
-    retired_turn_ids: deque[str] = field(
-        default_factory=lambda: deque(maxlen=_RETIRED_TURN_MEMORY), repr=False
-    )
-    session_started_emitted: bool = False
+    ref_validated: bool = False
     turn_active: bool = False
-    active_turn_id: str | None = None
     turn_driver: asyncio.Task[None] | None = field(default=None, repr=False)
-    turn_queue: asyncio.Queue[AgentEvent] | None = field(default=None, repr=False)
     consumer_terminal_received: asyncio.Event | None = field(default=None, repr=False)
     turn_error: BaseException | None = field(default=None, repr=False)
     forced_terminal: AgentEvent | None = field(default=None, repr=False)
@@ -272,29 +238,14 @@ class AgentRuntime:
     async def __aexit__(self, *_exc: object) -> None:
         await self.close()
 
-    async def capabilities(self, scope: AgentCapabilityScope) -> AgentCapabilities:
-        return await self._run_owned_operation(lambda: self._capabilities_owned(scope))
-
-    async def _capabilities_owned(self, scope: AgentCapabilityScope) -> AgentCapabilities:
-        self._require_open()
-        adapter = self._adapter(scope.backend, scope.transport)
-        adapter.validate_auth(scope.auth)
-        environment, _ = await self._environment(scope.backend, scope.auth, ())
-        capabilities = await adapter.capabilities(scope, environment=environment)
-        validate_auth_capability(scope.auth, capabilities)
-        return capabilities
-
     async def list_sessions(self, query: SessionQuery) -> SessionPage:
         return await self._run_owned_operation(lambda: self._list_sessions_owned(query))
 
     async def _list_sessions_owned(self, query: SessionQuery) -> SessionPage:
         self._require_open()
-        adapter = self._adapter(query.scope.backend, query.scope.transport)
-        adapter.validate_auth(query.scope.auth)
-        environment, _ = await self._environment(query.scope.backend, query.scope.auth, ())
-        capabilities = await adapter.capabilities(query.scope, environment=environment)
-        validate_auth_capability(query.scope.auth, capabilities)
-        require_discovery_operation(capabilities, "list")
+        adapter = self._adapter(query.backend, query.transport)
+        adapter.validate_auth(query.auth)
+        environment, _ = await self._environment(query.backend, query.auth, ())
         return await adapter.list_sessions(query, environment=environment)
 
     async def read_session(
@@ -307,24 +258,18 @@ class AgentRuntime:
     ) -> SessionSnapshot:
         self._require_open()
         validate_read_session_auth(ref, options)
-        scope = AgentCapabilityScope(
-            backend=ref.backend,
-            transport=ref.transport,
-            auth=options.auth,
-        )
         adapter = self._adapter(ref.backend, ref.transport)
         adapter.validate_auth(options.auth)
         environment, state_root = await self._environment(ref.backend, options.auth, ())
         validate_session_ref(
             ref,
-            scope,
+            backend=ref.backend,
+            transport=ref.transport,
+            profile_key=options.auth.profile_key,
             state_root_fingerprint=fingerprint_path(state_root),
             cwd="/",
             cwd_scopes_sessions=False,
         )
-        capabilities = await adapter.capabilities(scope, environment=environment)
-        validate_auth_capability(options.auth, capabilities)
-        require_discovery_operation(capabilities, "read")
         return await adapter.read_session(ref, options, environment=environment)
 
     async def open_session(self, request: AgentSessionRequest) -> AgentSession:
@@ -352,11 +297,7 @@ class AgentRuntime:
             request,
             request.policy,
         )
-        scope = AgentCapabilityScope(
-            backend=request.backend,
-            transport=request.transport,
-            auth=request.auth,
-        )
+        validate_mcp_network_policy(request.mcp_servers, request.policy)
         adapter = self._adapter(request.backend, request.transport)
         adapter.validate_auth(request.auth)
         environment, state_root = await self._environment(
@@ -366,20 +307,12 @@ class AgentRuntime:
         if isinstance(request.open, ResumeSession | ForkSession):
             validate_session_ref(
                 request.open.ref,
-                scope,
+                backend=request.backend,
+                transport=request.transport,
+                profile_key=request.auth.profile_key,
                 state_root_fingerprint=state_root_fingerprint,
                 cwd=request.cwd,
-                cwd_scopes_sessions=False,
-            )
-        capabilities = await adapter.capabilities(scope, environment=environment)
-        validate_session_capabilities(request, capabilities)
-        if isinstance(request.open, ResumeSession | ForkSession):
-            validate_session_ref(
-                request.open.ref,
-                scope,
-                state_root_fingerprint=state_root_fingerprint,
-                cwd=request.cwd,
-                cwd_scopes_sessions=capabilities.cwd_scopes_sessions,
+                cwd_scopes_sessions=adapter.cwd_scopes_sessions,
             )
         environment.update(
             await self._mcp_environment(
@@ -389,28 +322,22 @@ class AgentRuntime:
             )
         )
         request = self._resolve_mcp_commands(request)
-        session = await adapter.open_session(
-            request, capabilities=capabilities, environment=environment
-        )
+        session = await adapter.open_session(request, environment=environment)
         self._require_open()
         if not isinstance(session, AgentSession) or session in self._sessions:
             raise ProtocolDefect(
                 "adapter returned an invalid or reused AgentSession",
                 code="invalid_adapter_session",
             )
-        if session.ref_is_complete:
-            self._validate_adapter_ref(
-                session.ref,
-                request,
-                state_root_fingerprint,
-                capabilities.cwd_scopes_sessions,
-            )
-        self._sessions[session] = _SessionBinding(
+        binding = _SessionBinding(
             adapter=adapter,
             request=request,
-            capabilities=capabilities,
             state_root_fingerprint=state_root_fingerprint,
         )
+        if session.ref_is_complete:
+            self._validate_adapter_ref(session.ref, binding, adapter.cwd_scopes_sessions)
+            binding.ref_validated = True
+        self._sessions[session] = binding
         return session
 
     async def run_turn(
@@ -420,16 +347,16 @@ class AgentRuntime:
         *,
         approvals: ApprovalHandler | None = None,
         cancel: CancelSignal | None = None,
-    ) -> AgentResult:
+    ) -> AgentTerminal:
         terminal: AgentEvent | None = None
         async for event in self.stream_turn(session, request, approvals=approvals, cancel=cancel):
             terminal = event
-        if terminal is None:
+        if not isinstance(terminal, AgentTerminal):
             raise ProtocolDefect(
                 "validated stream returned no terminal",
                 code="missing_terminal_projection",
             )
-        return terminal_event_to_result(terminal)
+        return terminal
 
     async def close_session(self, session: AgentSession) -> None:
         """Release one owned native session without affecting sibling sessions.
@@ -483,7 +410,7 @@ class AgentRuntime:
         cleanup_errors: list[BaseException] = []
         if binding.turn_active:
             result = await self._bounded_cleanup_call(
-                self._interrupt_once(binding, session, binding.active_turn_id),
+                self._interrupt_once(binding, session),
                 "agent session interruption exceeded its cleanup bound",
                 cancel_when_late=True,
             )
@@ -511,7 +438,6 @@ class AgentRuntime:
             cleanup_errors.append(result)
         if binding.turn_active:
             binding.turn_active = False
-            binding.active_turn_id = None
             session.end_turn()
         async with self._lifecycle_lock:
             if self._sessions.get(session) is binding:
@@ -536,31 +462,27 @@ class AgentRuntime:
                 raise SessionMismatch("AgentSession does not belong to this AgentRuntime")
             if binding.invalidated:
                 raise SessionUnavailable("AgentSession native client is no longer live")
-            validate_turn_capabilities(
-                request, binding.capabilities, session_model=binding.request.model
-            )
             policy = binding.request.policy
             if request.policy is not None:
-                policy = validate_turn_policy(policy, request.policy, binding.capabilities)
+                # Narrowing-only: a per-turn patch may only ever reduce what the session's
+                # policy already allows. The adapter still decides whether it can apply the
+                # narrowed policy at all.
+                policy = narrow_policy(policy, request.policy)
             if request.mcp_servers is not None:
                 validate_mcp_network_policy(request.mcp_servers, policy)
             if policy.approval == "ask" and approvals is None:
                 raise InvalidAgentRequest("approval ask policy requires an approval handler")
-            if cancel is not None and not binding.capabilities.cancellation:
-                raise UnsupportedCapability("selected adapter does not support cancellation")
             if cancel is not None and cancel.is_set():
                 raise TurnNotStarted("cancelled")
             self._validate_content_files(request.input, binding.request, policy)
 
             session.begin_turn()
             binding.turn_active = True
-            binding.active_turn_id = None
             binding.interrupt_requested = False
             binding.turn_error = None
             binding.forced_terminal = None
             queue: asyncio.Queue[AgentEvent] = asyncio.Queue(maxsize=256)
             terminal_received = asyncio.Event()
-            binding.turn_queue = queue
             binding.consumer_terminal_received = terminal_received
             driver = asyncio.create_task(
                 self._drive_turn(
@@ -569,7 +491,6 @@ class AgentRuntime:
                     request,
                     approvals=approvals,
                     cancel=cancel,
-                    policy=policy,
                     queue=queue,
                     terminal_received=terminal_received,
                 )
@@ -594,7 +515,7 @@ class AgentRuntime:
                     await asyncio.gather(next_event, return_exceptions=True)
                     continue
                 event = next_event.result()
-                if event.kind in ("turn_completed", "turn_failed", "turn_cancelled"):
+                if isinstance(event, AgentTerminal):
                     terminal_received.set()
                 yield event
         finally:
@@ -646,19 +567,15 @@ class AgentRuntime:
         *,
         approvals: ApprovalHandler | None,
         cancel: CancelSignal | None,
-        policy: PermissionPolicy,
         queue: asyncio.Queue[AgentEvent],
         terminal_received: asyncio.Event,
     ) -> None:
         source = binding.adapter.stream_turn(session, request, approvals=approvals)
         interrupted: AsyncGenerator[AgentEvent, None] | None = None
         primary_error: BaseException | None = None
-        # Only an event the consumer actually received may anchor a forced terminal's seq;
-        # anchoring on a consumed-but-unqueued event would leave a hole in the sequence.
         last_enqueued: AgentEvent | None = None
         text_parts: list[str] = []
-        usage = None
-        diagnostics: list[str] = []
+        usage: Presence[TokenUsage] = Absent()
         terminal_enqueued = False
         hard_teardown = False
         try:
@@ -673,20 +590,14 @@ class AgentRuntime:
                 timeout_seconds=timeout_seconds,
             )
             async for event in validate_event_stream(interrupted):
-                binding.active_turn_id = event.turn_id
                 self._observe_session_event(binding, session, event)
-                if event.kind == "turn_started":
-                    self._persist_overrides(binding, request, policy)
-                if isinstance(event.data, TextDeltaData):
-                    text_parts.append(event.data.text)
-                elif isinstance(event.data, UsageData):
-                    usage = event.data.usage
-                elif isinstance(event.data, DiagnosticData):
-                    if len(diagnostics) < 64 and event.data.message not in diagnostics:
-                        diagnostics.append(event.data.message)
+                if isinstance(event, AgentText):
+                    text_parts.append(event.text)
+                elif isinstance(event, AgentUsage):
+                    usage = Present(event.usage)
                 await queue.put(event)
                 last_enqueued = event
-                if event.kind in TERMINAL_EVENT_KINDS:
+                if isinstance(event, AgentTerminal):
                     terminal_enqueued = True
                     await terminal_received.wait()
         except BaseException as error:
@@ -697,11 +608,10 @@ class AgentRuntime:
                     binding.turn_error = TurnNotStarted("cancelled")
                 elif not terminal_enqueued:
                     binding.forced_terminal = self._synthetic_terminal(
-                        last_enqueued,
+                        session,
                         "cancelled",
                         final_text="".join(text_parts),
                         usage=usage,
-                        diagnostics=tuple(diagnostics),
                     )
             else:
                 binding.turn_error = error
@@ -717,13 +627,7 @@ class AgentRuntime:
             except BaseException as error:
                 cleanup_errors.append(error)
             was_active = binding.turn_active
-            # An interrupt was issued, so the adapter's stream was abandoned wherever it had
-            # reached. Remember the native turn so a later stream on this session cannot pass
-            # off its leftovers as new work.
-            if binding.interrupt_requested and binding.active_turn_id is not None:
-                binding.retired_turn_ids.append(binding.active_turn_id)
             binding.turn_active = False
-            binding.active_turn_id = None
             if was_active:
                 session.end_turn()
             if cleanup_errors or hard_teardown:
@@ -807,7 +711,7 @@ class AgentRuntime:
                 binding.consumer_terminal_received.set()
         active = [
             self._bounded_cleanup_call(
-                self._interrupt_once(binding, session, binding.active_turn_id),
+                self._interrupt_once(binding, session),
                 "agent interruption exceeded its cleanup bound",
                 cancel_when_late=True,
             )
@@ -841,7 +745,6 @@ class AgentRuntime:
                     )
         for session, binding in self._sessions.items():
             binding.turn_driver = None
-            binding.active_turn_id = None
             if binding.turn_active:
                 cleanup_errors.append(
                     ProtocolDefect(
@@ -939,26 +842,6 @@ class AgentRuntime:
             )
         except OSError:
             raise CredentialUnavailable("profile state root could not be resolved") from None
-        resolved_secret: str | None = None
-        target: str | None = None
-        if credential.kind == "secret_reference":
-            resolver = self._config.secret_resolver
-            if resolver is None:
-                raise UnsupportedCapability(
-                    "secret_reference requires an AgentRuntimeConfig.secret_resolver"
-                )
-            name = credential.name
-            if name is None:
-                raise ProtocolDefect("validated secret_reference has no reference name")
-            try:
-                resolved_secret = await resolver(name)
-            except asyncio.CancelledError:
-                raise
-            except CredentialUnavailable:
-                raise
-            except Exception:
-                raise CredentialUnavailable("secret_reference resolution failed") from None
-            target = secret_environment_name(backend)
         environment = build_child_environment(
             AuthEnvironmentRequest(
                 backend=backend,
@@ -966,8 +849,6 @@ class AgentRuntime:
                 inherited_environment=dict(os.environ),
                 allowed_environment=allowed_environment,
                 state_root=state_root,
-                resolved_secret=resolved_secret,
-                secret_environment_name=target,
             )
         )
         self._secure_state_root(state_root)
@@ -1119,10 +1000,9 @@ class AgentRuntime:
     ) -> AsyncGenerator[AgentEvent, None]:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_seconds
-        last: AgentEvent | None = None
+        started = False
         text_parts: list[str] = []
-        usage = None
-        diagnostics: list[str] = []
+        usage: Presence[TokenUsage] = Absent()
         next_task: asyncio.Future[AgentEvent] | None = None
         stop_task = asyncio.create_task(
             self._watch_turn_stop(
@@ -1144,15 +1024,12 @@ class AgentRuntime:
                         event = next_task.result()
                     except StopAsyncIteration:
                         return
-                    last = event
-                    if isinstance(event.data, TextDeltaData):
-                        text_parts.append(event.data.text)
-                    elif isinstance(event.data, UsageData):
-                        usage = event.data.usage
-                    elif isinstance(event.data, DiagnosticData):
-                        if len(diagnostics) < 64 and event.data.message not in diagnostics:
-                            diagnostics.append(event.data.message)
-                    terminal_seen = event.kind in TERMINAL_EVENT_KINDS
+                    started = True
+                    if isinstance(event, AgentText):
+                        text_parts.append(event.text)
+                    elif isinstance(event, AgentUsage):
+                        usage = Present(event.usage)
+                    terminal_seen = isinstance(event, AgentTerminal)
                     if terminal_seen:
                         await self._settle({stop_task})
                     yield event
@@ -1162,25 +1039,22 @@ class AgentRuntime:
                 cause = stop_task.result()
                 next_task.cancel()
                 await self._settle({next_task})
-                if last is None:
+                if not started:
                     await source.aclose()
                     raise TurnNotStarted("turn_timeout" if cause == "timed_out" else "cancelled")
                 await source.aclose()
                 yield self._synthetic_terminal(
-                    last,
+                    session,
                     cause,
                     final_text="".join(text_parts),
                     usage=usage,
-                    diagnostics=tuple(diagnostics),
                 )
                 return
         finally:
             cleanup_errors: list[BaseException] = []
             try:
                 if not terminal_seen:
-                    await self._interrupt_once(
-                        binding, session, last.turn_id if last is not None else None
-                    )
+                    await self._interrupt_once(binding, session)
             except BaseException as error:
                 cleanup_errors.append(error)
             try:
@@ -1217,136 +1091,80 @@ class AgentRuntime:
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             cause: StopCause = "cancelled" if cancel_task in done else "timed_out"
-            await self._interrupt_once(binding, session, binding.active_turn_id)
+            await self._interrupt_once(binding, session)
             return cause
         finally:
             await self._settle(tasks)
 
     @staticmethod
-    async def _interrupt_once(
-        binding: _SessionBinding,
-        session: AgentSession,
-        turn_id: str | None,
-    ) -> None:
+    async def _interrupt_once(binding: _SessionBinding, session: AgentSession) -> None:
         if binding.interrupt_requested:
             return
         binding.interrupt_requested = True
         try:
-            await binding.adapter.interrupt(session, turn_id)
+            await binding.adapter.interrupt(session)
         except BaseException:
             binding.interrupt_requested = False
             raise
 
     @staticmethod
     def _synthetic_terminal(
-        last: AgentEvent,
+        session: AgentSession,
         cause: StopCause,
         *,
         final_text: str,
-        usage: JsonObject | None,
-        diagnostics: tuple[str, ...],
-    ) -> AgentEvent:
-        kind: TerminalEventKind
-        data: TurnCancelledData | TurnFailedData
+        usage: Presence[TokenUsage],
+    ) -> AgentTerminal:
         match cause:
             case "cancelled":
-                kind = "turn_cancelled"
-                data = TurnCancelledData(
-                    final_text=final_text, usage=usage, diagnostics=diagnostics
+                return AgentTerminal(
+                    status="cancelled",
+                    failure=None,
+                    final_text=final_text,
+                    session_ref=session.ref,
+                    usage=usage,
                 )
             case "timed_out":
-                kind = "turn_failed"
-                data = TurnFailedData(
-                    failure="turn_timeout",
+                return AgentTerminal(
+                    status="failed",
+                    failure=AgentFailure("turn_timeout"),
                     final_text=final_text,
+                    session_ref=session.ref,
                     usage=usage,
-                    diagnostics=diagnostics,
                 )
             case _:
                 assert_never(cause)
-        return AgentEvent(
-            schema_version="agent-event.v1",
-            seq=last.seq + 1,
-            backend=last.backend,
-            transport=last.transport,
-            session_ref=last.session_ref,
-            turn_id=last.turn_id,
-            kind=kind,
-            data=data,
-        )
 
-    @staticmethod
     def _observe_session_event(
-        binding: _SessionBinding, session: AgentSession, event: AgentEvent
+        self, binding: _SessionBinding, session: AgentSession, event: AgentEvent
     ) -> None:
-        if event.turn_id in binding.retired_turn_ids:
-            raise ProtocolDefect(
-                "agent stream replayed an interrupted turn's native frames",
-                code="retired_turn_replayed",
-            )
-        if not binding.session_started_emitted and event.kind != "session_started":
-            raise ProtocolDefect(
-                "first session stream did not begin with session_started",
-                code="missing_session_started",
-            )
-        if event.kind == "session_started":
-            if binding.session_started_emitted or not isinstance(event.data, SessionStartedData):
-                raise ProtocolDefect(
-                    "session_started was emitted more than once",
-                    code="duplicate_session_started",
-                )
-            if not session.ref_is_complete:
-                AgentRuntime._validate_adapter_ref(
-                    event.session_ref,
-                    binding.request,
-                    binding.state_root_fingerprint,
-                    binding.capabilities.cwd_scopes_sessions,
-                )
-                session.complete_ref(event.session_ref)
-            elif session.ref != event.session_ref:
-                raise ProtocolDefect(
-                    "session_started ref does not match AgentSession.ref",
-                    code="session_ref_changed",
-                )
-            binding.session_started_emitted = True
-            return
+        """An adapter must complete and keep one consistent session ref before it streams."""
         if not session.ref_is_complete:
             raise ProtocolDefect(
-                "first session event did not complete the session ref",
-                code="missing_session_started",
+                "adapter streamed an event before completing the session ref",
+                code="incomplete_session_ref",
             )
-        if session.ref != event.session_ref:
+        if not binding.ref_validated:
+            self._validate_adapter_ref(session.ref, binding, binding.adapter.cwd_scopes_sessions)
+            binding.ref_validated = True
+        if isinstance(event, AgentTerminal) and event.session_ref != session.ref:
             raise ProtocolDefect(
-                "event ref does not match AgentSession.ref",
+                "terminal session ref does not match AgentSession.ref",
                 code="session_ref_changed",
             )
 
     @staticmethod
-    def _persist_overrides(
-        binding: _SessionBinding,
-        request: TurnRequest,
-        policy: PermissionPolicy,
-    ) -> None:
-        updates: dict[str, object] = {}
-        for name in binding.capabilities.persistent_turn_overrides:
-            value = getattr(request, name)
-            if value is not None:
-                updates[name] = policy if name == "policy" else value
-        if updates:
-            binding.request = replace(binding.request, **updates)
-
-    @staticmethod
     def _validate_adapter_ref(
         ref: AgentSessionRef,
-        request: AgentSessionRequest,
-        state_root_fingerprint: str,
+        binding: _SessionBinding,
         cwd_scopes_sessions: bool,
     ) -> None:
+        request = binding.request
         if (
             ref.backend != request.backend
             or ref.transport != request.transport
             or ref.profile_key != request.auth.profile_key
-            or ref.state_root_fingerprint != state_root_fingerprint
+            or ref.state_root_fingerprint != binding.state_root_fingerprint
             or (cwd_scopes_sessions and ref.cwd_fingerprint != fingerprint_path(request.cwd))
         ):
             raise ProtocolDefect(
@@ -1427,8 +1245,8 @@ class AgentRuntime:
 
 
 def _default_adapters(config: AgentRuntimeConfig) -> tuple[AgentAdapter, ...]:
-    from provider_runtime.agent_runtime.claude_sdk import ClaudeSdkAdapter
-    from provider_runtime.agent_runtime.codex_sdk import CodexSdkAdapter
+    from .claude_sdk import ClaudeSdkAdapter
+    from .codex_sdk import CodexSdkAdapter
 
     return (
         CodexSdkAdapter(),

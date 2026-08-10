@@ -8,12 +8,10 @@ from typing import cast, get_args
 import pytest
 
 from provider_runtime.agent_runtime.errors import InvalidAgentRequest
+from provider_runtime.agent_runtime.events import AGENT_FAILURE_CAUSES, AgentFailureCause
 from provider_runtime.agent_runtime.policy import PermissionPolicy
 from provider_runtime.agent_runtime.types import (
-    AGENT_FAILURE_CAUSES,
     AGENT_ROUTES,
-    AgentFailureCause,
-    AgentResult,
     AgentSessionRef,
     AgentSessionRequest,
     AgentTarget,
@@ -30,6 +28,7 @@ from provider_runtime.agent_runtime.types import (
     FrozenJsonDict,
     HeaderReference,
     ImageContent,
+    JsonSchemaAgentOutput,
     McpServerSpec,
     NewSession,
     ResumeSession,
@@ -37,7 +36,6 @@ from provider_runtime.agent_runtime.types import (
     TurnRequest,
     agent_target_to_session_request,
     api_target_to_provider_target,
-    freeze_json_object,
     freeze_json_value,
     ref_from_json,
     ref_to_json,
@@ -373,67 +371,6 @@ def test_direct_frozen_json_construction_cannot_smuggle_mutable_or_nonfinite_val
     assert approval.native_payload == frozen
 
 
-def test_result_status_and_failure_are_a_closed_bijection() -> None:
-    result = AgentResult(
-        status="succeeded",
-        failure=None,
-        final_text="done",
-        structured_output=None,
-        session_ref=_ref(),
-        turn_id="turn-1",
-    )
-    assert result.failure is None
-    with pytest.raises(InvalidAgentRequest, match="failed results require"):
-        AgentResult(
-            status="failed",
-            failure=None,
-            final_text="",
-            structured_output=None,
-            session_ref=_ref(),
-            turn_id="turn-1",
-        )
-
-
-def test_result_rejects_mutable_json_at_every_owned_field() -> None:
-    values = {
-        "status": "succeeded",
-        "failure": None,
-        "final_text": "done",
-        "structured_output": None,
-        "session_ref": _ref(),
-        "turn_id": "turn-1",
-    }
-    with pytest.raises(InvalidAgentRequest, match="structured_output"):
-        AgentResult(**{**values, "structured_output": {"answer": "mutable"}})
-    with pytest.raises(InvalidAgentRequest, match="usage"):
-        AgentResult(**{**values, "usage": {"input_tokens": 1}})
-    with pytest.raises(InvalidAgentRequest, match="terminal_native_payload"):
-        AgentResult(**{**values, "terminal_native_payload": {"type": "mutable"}})
-
-    frozen_empty = FrozenJsonDict()
-    with pytest.raises(TypeError):
-        dict.__setitem__(frozen_empty, "self", frozen_empty)  # type: ignore[arg-type]
-    assert frozen_empty == {}
-    with pytest.raises(InvalidAgentRequest, match="only failed results"):
-        AgentResult(
-            status="cancelled",
-            failure="backend_failed",
-            final_text="",
-            structured_output=None,
-            session_ref=_ref(),
-            turn_id="turn-1",
-        )
-
-    source = {"items": ["one"]}
-    frozen = freeze_json_object(source)
-    result = AgentResult(**{**values, "usage": frozen})
-    source["items"].append("two")
-    assert result.usage == {"items": ("one",)}
-    assert result.usage is not None
-    with pytest.raises(TypeError):
-        result.usage["items"] = ()  # pyright: ignore[reportIndexIssue]
-
-
 def test_session_open_variants_keep_the_complete_ref() -> None:
     ref = _ref()
     assert ResumeSession(ref).ref is ref
@@ -447,29 +384,6 @@ def test_equal_frozen_json_objects_hash_equal_regardless_of_key_order() -> None:
     assert first == second
     assert hash(first) == hash(second)
     assert second in {first}
-    assert len({first, second}) == 1
-
-
-def test_equal_agent_results_hash_equal_regardless_of_native_key_order() -> None:
-    values: dict[str, object] = {
-        "status": "succeeded",
-        "failure": None,
-        "final_text": "done",
-        "structured_output": None,
-        "session_ref": _ref(),
-        "turn_id": "turn-1",
-    }
-    first = AgentResult(
-        **values,  # pyright: ignore[reportArgumentType]
-        terminal_native_payload=freeze_json_object({"a": 1, "b": 2}),
-    )
-    second = AgentResult(
-        **values,  # pyright: ignore[reportArgumentType]
-        terminal_native_payload=freeze_json_object({"b": 2, "a": 1}),
-    )
-
-    assert first == second
-    assert hash(first) == hash(second)
     assert len({first, second}) == 1
 
 
@@ -514,3 +428,28 @@ def test_closed_route_and_failure_vocabularies_have_exactly_one_owner() -> None:
         get_args(AgentTransport.__value__)
     )
     assert {backend for backend, _transport in AGENT_ROUTES} == set(get_args(Backend.__value__))
+
+
+def test_json_schema_output_freezes_a_plain_json_schema_mapping() -> None:
+    source: dict[str, object] = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+    output = JsonSchemaAgentOutput(name="Answer", schema=source)
+    source["properties"] = {}
+
+    assert isinstance(output.schema, FrozenJsonDict), (
+        "the schema must be frozen at construction so events stay immutable"
+    )
+    assert thaw_json_value(output.schema) == {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+    with pytest.raises(InvalidAgentRequest, match="JSON object"):
+        JsonSchemaAgentOutput(name="Answer", schema="not a schema")  # type: ignore[arg-type]
+    with pytest.raises(InvalidAgentRequest, match="non-empty"):
+        JsonSchemaAgentOutput(name="", schema={})

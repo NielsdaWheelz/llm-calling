@@ -12,7 +12,7 @@ AgentRuntime:    one local SDK session -> streamed turns and durable session ref
 The agent runtime does not pretend a stateful coding agent is a stateless model
 call. Callers own prompts, durable chat history, budgets, orchestration, and
 product policy. The runtime owns route selection, isolated local-account state,
-capability validation, SDK lifecycle, normalized events, cancellation, and one
+the authorization model, SDK lifecycle, normalized events, cancellation, and one
 terminal outcome per started turn.
 
 ## Shipped routes
@@ -44,20 +44,22 @@ uv sync --extra claude-sdk
 uv sync --extra agent-sdks
 ```
 
-The current exact pins are:
+The extras carry bounded constraints (`openai-codex>=0.144.4,<1`,
+`openai-codex-cli-bin>=0.144.4,<1`, `claude-agent-sdk>=0.2.130,<1`); the
+lockfile pins the exact resolution. The vetted versions the adapters were
+written against are openai-codex 0.144.4 with its matched runtime, and
+claude-agent-sdk 0.2.130 with Claude Code 2.1.220.
 
-- `openai-codex==0.144.4`;
-- `openai-codex-cli-bin==0.144.4` (the SDK's matched runtime package);
-- `claude-agent-sdk==0.2.130`;
-- Claude Code `2.1.220`.
+A version that drifts from the vetted one is met with **one warning plus a
+behavioral capability probe**, never a hard fail: the adapters verify what the
+backend actually does (account type, effective configuration, sandbox
+capability) instead of trusting a version-keyed table. A missing SDK, missing
+bundled runtime, or unresponsive executable remains a typed availability
+failure (`SdkUnavailable` / `ExecutableUnavailable`).
 
 `openai-codex` ships a matched Codex runtime, so `AgentRuntimeConfig` has no
 Codex executable setting. Claude Code is still a local executable and may be
 selected with `AgentRuntimeConfig.claude_executable`.
-
-An SDK or executable version mismatch is a typed availability failure. Upgrades
-therefore require a pin change, deterministic adapter tests, the clean-wheel
-checks, and a new unnarrowed live certification run.
 
 ## Minimal use
 
@@ -65,7 +67,6 @@ checks, and a new unnarrowed live certification run.
 from pathlib import Path
 
 from provider_runtime.agent_runtime import (
-    AgentCapabilityScope,
     AgentRuntime,
     AgentRuntimeConfig,
     AgentSessionRequest,
@@ -89,31 +90,26 @@ request = AgentSessionRequest(
 )
 
 async with AgentRuntime(config) as runtime:
-    capabilities = await runtime.capabilities(
-        AgentCapabilityScope(backend="codex", transport="sdk", auth=auth)
-    )
     session = await runtime.open_session(request)
-    result = await runtime.run_turn(
+    terminal = await runtime.run_turn(
         session,
         TurnRequest(input=(TextContent("Summarize this repository."),)),
     )
     await runtime.close_session(session)
 ```
 
-`open_session` always performs its own scoped
-capability discovery and validation, so callers cannot bypass it with a stale
-table.
-
-Capability discovery is host-sensitive where the native executable depends on an OS
-sandbox. On Linux, restricted Codex workspace writes and Claude network allowlists are
-advertised only when `bubblewrap` can actually create its network namespace (and Claude's
-allowlist additionally requires `socat`). Containers that deny that namespace therefore fail
-closed during request validation instead of accepting a mode that will fail midway through a
-turn. Codex `full_access` remains a distinct, explicitly requested unsandboxed mode.
-
 For streamed UI or telemetry, iterate `runtime.stream_turn(...)` instead of
 calling `run_turn(...)`. `run_turn` is the terminal projection of that same
-stream.
+stream and returns the stream's `AgentTerminal`.
+
+Validation is behavioral, not table-driven: `open_session` fails closed before
+any billable work when the request asks for something the transport cannot
+enforce (an unenforceable tool filter, a sandbox mode the host cannot provide,
+an approval mode the backend does not have). On Linux, restricted Codex
+workspace writes and Claude network allowlists require `bubblewrap` to create
+its network namespace (Claude's allowlist additionally requires `socat`); hosts
+that cannot are refused during `open_session` instead of failing midway through
+a turn.
 
 ## Ownership boundary
 
@@ -125,17 +121,19 @@ The official SDKs own:
 - subscription authentication already enrolled by the user;
 - provider-defined approval behavior exposed by the SDK.
 
-This package owns:
+This package owns the retained security kernel and the lifecycle around it:
 
 - one closed `(backend, transport)` selection;
 - an isolated state root and child environment;
-- exact SDK/executable compatibility checks;
-- request validation against discovered capabilities;
-- normalized immutable events and strict terminal grammar;
+- restrictive permission defaults and narrowing-only policy changes;
+- unsafe-action confirmation for model-initiated shell/filesystem/network/MCP
+  actions;
+- bounded, recursively redacted native event representation;
+- normalized immutable events and the strict terminal grammar;
 - timeout, cancellation, output bounds, and cleanup;
 - transparent environment-replacing/process-group launchers where the public
   SDK lacks those process controls;
-- redaction and typed public errors;
+- typed public errors;
 - SDK-neutral session references and test doubles.
 
 The adapters use public SDK surface only. Directly consuming a vendor's internal
@@ -153,7 +151,12 @@ CredentialRef(kind="local_account", profile_key="...")
 The user must enroll the native tool before using the package. The runtime does
 not implement login, token brokering, hosted subscription proxying, or API-key
 fallback. `api_key_environment` and `secret_reference` session credentials are
-rejected before secret resolution.
+rejected at every route and refused structurally by the child-environment
+builder; those kinds exist only as *sources* for MCP credential references.
+
+Subscription pool exhaustion ends the turn with an `AgentTerminal` whose
+failure is the `AgentQuotaExhausted` value. Block-and-stop only: the lane never
+overflows onto API-rate credentials.
 
 `state_root_base` must be an existing normalized absolute directory that is not
 group- or world-writable. A profile lives at:
@@ -183,40 +186,8 @@ Claude Code and descendants can be terminated as one process group. Both
 launchers live in runtime-owned backend parent directories outside the child
 profile, contain no credentials, and do not reconstruct SDK arguments.
 
-`CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK` must be unset. A non-empty value would
-disable the exact-version contract and therefore fails closed.
-
-## Capabilities first
-
-Every request is validated against `AgentCapabilities` scoped to the exact
-backend, transport, and credential. Capabilities report SDK/runtime versions,
-session and discovery operations, models, reasoning, content, structured
-output, tools, MCP, sandbox/network/approval modes, overrides, and observable
-native facts.
-
-The current material differences are:
-
-| Contract | Codex SDK | Claude Agent SDK |
-| --- | --- | --- |
-| Auth | local ChatGPT account | local Claude account |
-| Sessions | new, resume, fork | new, resume, fork |
-| Discovery | list, metadata-only read | none |
-| Models | enumerated by SDK | open/unknown (`None`) |
-| Input | text, local images | text |
-| Structured output | native JSON Schema | native JSON Schema |
-| Filesystem | read-only, workspace-write, full-access | read-only, workspace-write |
-| Network | disabled, unrestricted | disabled, exact-host allowlist |
-| Approval | deny, provider-review | deny, caller ask, allow |
-| MCP | stdio and streamable HTTP; reference auth | streamable HTTP; no reference auth |
-| Native tool filters | not exposed | exact accepted Claude tool names |
-| Session cwd scope | no | yes |
-
-`models=None` means the transport cannot enumerate models; it does not mean every
-string is known-good. The backend may reject a misspelled Claude model.
-
-Neither route reports the reasoning effort it actually used, so
-`reports_effective_effort=False`. A requested effort can be validated against the
-published vocabulary, but silent provider-side clamping remains unobservable.
+`CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK` must be unset. It is an ambient control
+over the SDK's own compatibility behavior and therefore fails closed.
 
 ## Sessions and references
 
@@ -238,9 +209,9 @@ Claude additionally requires the same cwd because its native sessions are
 directory-scoped. Codex refs retain the cwd fingerprint as provenance but may be
 resumed from another directory.
 
-Codex implements `list_sessions` and metadata-only `read_session`. Turn/item
-history flags and cursors are rejected until a native paginated history contract
-is bound. Claude advertises no discovery operation.
+Codex implements `list_sessions` and metadata-only `read_session` (name
+metadata only; no history contract is bound). Claude has no discovery
+operation and answers both with `UnsupportedCapability`.
 
 One session permits one active turn. A concurrent turn is `ConcurrentTurn`.
 `close_session(session)` idempotently interrupts any active turn, releases only
@@ -276,16 +247,20 @@ Approval modes have distinct ownership:
 swap who reviews a request. Either may narrow to `deny`; `allow` may narrow to
 either reviewer.
 
-Per-turn `PermissionPolicyPatch` can only narrow. Filesystem/network modes move
-toward less authority, allowed tools must be an exact subset, denied tools an
-exact superset, copied environment names an exact subset, and network allowlist
-entries an exact subset where the base policy already had an allowlist.
+Per-turn `PermissionPolicyPatch` can only narrow — a session may only ever
+reduce what is allowed, never widen it. Filesystem/network modes move toward
+less authority, allowed tools must be an exact subset, denied tools an exact
+superset, copied environment names an exact subset, and network allowlist
+entries an exact subset where the base policy already had an allowlist. The
+shipped SDK routes cannot reconfigure a live client's policy, so they reject
+per-turn patches; the narrowing algebra still gates the request before the
+adapter sees it.
 
-Codex's public SDK does not expose exact built-in allow/deny filtering, so the
-route reports `tool_controls=False`. It accepts only the sentinel
-`allowed_tools=("*",)` when built-ins are intentionally enabled; specific names
-would claim a control the SDK cannot enforce. Claude publishes and enforces its
-exact accepted native names.
+Codex's public SDK does not expose exact built-in allow/deny filtering. It
+accepts only the sentinel `allowed_tools=("*",)` when built-ins are
+intentionally enabled; specific names would claim a control the SDK cannot
+enforce. Claude validates policies against its exact accepted native tool names
+and verifies the effective tool set the backend reports at session start.
 
 ## MCP
 
@@ -306,10 +281,11 @@ or container for credentialed stdio servers.
 
 ## Structured output and native options
 
-`JsonSchemaAgentOutput` accepts the package's canonical JSON Schema subset. The
-adapter passes the schema through the SDK's public native output-schema option,
-then validates the final value again before returning it. No JSON repair or
-best-effort parsing occurs.
+`JsonSchemaAgentOutput` carries a plain JSON Schema mapping (pass
+`model_json_schema()` where a pydantic model exists). The adapter passes the
+schema through the SDK's public native output-schema option; the backend
+enforces it. The final value is strict-parsed and frozen — no JSON repair, no
+coercion — and a miss is the `output_schema_violation` terminal failure.
 
 Native extension objects are versioned, backend-specific escape hatches:
 
@@ -321,43 +297,46 @@ Unknown or wrong-backend native options fail before SDK startup.
 
 ## Event and terminal grammar
 
-The normalized stream kinds are:
+The normalized stream is exactly six kinds:
 
 ```text
-session_started | turn_started | text_delta | reasoning |
-tool_started | tool_updated | tool_completed |
-approval_requested | approval_answered | file_change |
-usage | diagnostic | unknown | native_retry_observed |
-turn_completed | turn_failed | turn_cancelled
+AgentText              one chunk of assistant output text
+AgentToolUse           tool_call_id, name, phase started|updated|completed,
+                       owned payload; completed carries succeeded
+AgentUsage             TokenUsage, normalized to the provider lane's noun
+AgentPermissionRequest one answered unsafe-action confirmation (request + decision)
+AgentNative            any native frame without a first-class kind, as a
+                       bounded, recursively redacted payload
+AgentTerminal          exactly-once terminal: status, typed failure value,
+                       final text, structured output, usage, session ref
 ```
 
-`diagnostic` and `unknown` are the only session-scoped kinds allowed before
-`turn_started`. After a turn starts, events must preserve native order and one of
-the three terminal kinds must appear exactly once and last. Missing, duplicate,
-misidentified, post-terminal, or cross-turn events are `ProtocolDefect`.
+`AgentTerminal.failure` is `None`, `AgentQuotaExhausted()`, or
+`AgentFailure(cause)` with causes `backend_failed`, `turn_timeout`,
+`output_limit_exceeded`, `approval_unanswered`, `output_schema_violation`.
+Model/backend failures are terminal values; broken runtime invariants raise
+(`ProtocolDefect`, `MissingTerminalEvent`). Exactly one `AgentTerminal` ends
+every started turn, last; post-terminal frames are defects.
 
-`native_payload` is a recursively frozen, redacted, field-allowlisted diagnostic
-view. Unknown additive SDK notifications become `unknown`; malformed known
-notifications remain defects.
-
-`run_turn` returns `AgentResult(status="succeeded" | "failed" | "cancelled")`
-from the terminal event. Model/backend failures are terminal values; broken
-runtime invariants raise.
+Native detail that used to have first-class kinds — reasoning deltas, file
+changes as separate events, diagnostics, retry observations, system frames —
+travels as `AgentNative` with the redacted native payload.
 
 ## Cancellation, limits, and retries
 
 The runtime bounds turn duration, event count, individual message size, final
 text, diagnostics, and cleanup. A caller cancellation signal or timeout invokes
-the SDK's native interrupt operation. Cancellation before native turn identity
-raises `TurnNotStarted`; after identity it yields `turn_cancelled`.
+the SDK's native interrupt operation. Cancellation before the first stream
+event raises `TurnNotStarted`; after it, the stream ends with a cancelled (or
+`turn_timeout`-failed) `AgentTerminal` that preserves the text and usage the
+consumer already received.
 
 If a stream transport fails or violates its grammar, the Codex SDK client is
 discarded rather than reused with uncertain native state. Claude drains an
 interrupted turn or invalidates the session before another turn can begin.
 
-The runtime never retries a turn. Provider-native retry observations may be
-reported as `native_retry_observed`, but replaying a stateful agent turn at this
-layer would risk duplicate side effects.
+The runtime never retries a turn. Replaying a stateful agent turn at this layer
+would risk duplicate side effects.
 
 ## Error model
 
@@ -396,21 +375,16 @@ The paid local-account matrix is opt-in:
 LLM_RUNTIME_LIVE=1 \
 LLM_RUNTIME_LIVE_AGENT_STATE_ROOT_BASE=/absolute/existing/private/root \
 LLM_RUNTIME_LIVE_AGENT_PROFILE=live-local \
-LLM_RUNTIME_LIVE_CLAUDE_SDK_MODELS=<model-a>,<model-b> \
 uv run pytest -m live_provider tests/live/test_agent_matrix.py
 ```
 
 An omitted route selector is the release run and covers both shipped routes.
 `LLM_RUNTIME_LIVE_AGENT_ROUTES=codex:sdk` or `claude:sdk` narrows a debugging run
 and certifies nothing. The matrix never enrolls an account or prints tokens.
-Codex's no-quota preflight initializes the public SDK and checks the exact
-SDK/bundled-runtime pair; Claude's preflight resolves and version-checks the real
-executable in the runtime-owned child environment.
-Codex certifies every discovered `(model, model-supported effort)` pair. Claude
-requires the complete native model list in
-`LLM_RUNTIME_LIVE_CLAUDE_SDK_MODELS` and certifies its cross-product with every
-reported effort. Empty entries, whitespace, and duplicate Claude models fail
-before a paid turn starts. Route-wide feature probes still run once per route.
+Per route it certifies: one full streamed turn under the default restrictive
+policy, a resumed second turn on the same native session, and a structured
+output turn — asserting the six-kind grammar, the terminal shape, and
+normalized `TokenUsage` on the way through.
 
 ## References
 

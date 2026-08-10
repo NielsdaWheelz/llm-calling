@@ -8,15 +8,16 @@ import os
 import re
 import shutil
 import sys
+import warnings
 import weakref
-from collections.abc import AsyncGenerator, AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, Iterator, Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal, cast
 
 from provider_runtime.errors import sanitize_provider_text
-from provider_runtime.schema import to_json_schema
+from provider_runtime.types import Absent, Presence, Present, TokenUsage
 
 from ._claude_launcher import OwnedProcessGroup, ensure_claude_launcher
 from ._limits import OutputLimitExceeded, bounded_payload_size
@@ -24,8 +25,8 @@ from ._process import ProcessLimits, capture_process_output
 from ._sandbox import bubblewrap_network_namespace_available, environment_executable
 from ._structured_output import (
     OutputSchemaMismatch,
+    freeze_structured_output,
     parse_structured_output,
-    validate_structured_output,
 )
 from .auth import (
     credential_environment_names,
@@ -37,12 +38,6 @@ from .auth import (
 )
 from .auth import (
     freeze_native_json_value as freeze_json_value,
-)
-from .capabilities import (
-    AgentCapabilities,
-    AgentCapabilityScope,
-    BuiltinToolFamily,
-    validate_mcp_network_policy,
 )
 from .errors import (
     AgentRuntimeDefect,
@@ -59,23 +54,15 @@ from .errors import (
 )
 from .events import (
     AgentEvent,
-    AgentEventData,
-    AgentEventKind,
-    ApprovalAnsweredData,
-    ApprovalRequestedData,
-    DiagnosticData,
-    FileChangeData,
-    ReasoningData,
-    SessionStartedData,
-    TextDeltaData,
-    ToolCompletedData,
-    ToolStartedData,
-    TurnCancelledData,
-    TurnCompletedData,
-    TurnFailedData,
-    TurnStartedData,
-    UnknownData,
-    UsageData,
+    AgentFailure,
+    AgentNative,
+    AgentPermissionRequest,
+    AgentQuotaExhausted,
+    AgentTerminal,
+    AgentTerminalFailure,
+    AgentText,
+    AgentToolUse,
+    AgentUsage,
 )
 from .policy import PermissionPolicy, tool_is_allowed
 from .sessions import (
@@ -89,7 +76,6 @@ from .sessions import (
     validate_session_ref,
 )
 from .types import (
-    AgentOutputSpec,
     AgentSessionRef,
     AgentSessionRequest,
     ApprovalDecision,
@@ -99,74 +85,23 @@ from .types import (
     CredentialRef,
     ForkSession,
     FrozenJsonDict,
-    JsonObject,
     JsonSchemaAgentOutput,
     NewSession,
     ResumeSession,
     TextContent,
     TurnRequest,
+    thaw_json_value,
+    validate_mcp_network_policy,
 )
 
-_KNOWN_FIELDS: dict[str, tuple[str, ...]] = {
-    "SystemMessage": ("subtype", "data"),
-    "StreamEvent": ("uuid", "session_id", "parent_tool_use_id", "event"),
-    "AssistantMessage": (
-        "model",
-        "session_id",
-        "message_id",
-        "uuid",
-        "stop_reason",
-        "error",
-        "usage",
-        "content",
-    ),
-    "UserMessage": ("uuid", "parent_tool_use_id", "tool_use_result", "content"),
-    "RateLimitEvent": ("uuid", "session_id", "rate_limit_info"),
-    # Every field `parse_message` populates on a 0.2.130 `ResultMessage`. The allowlist is
-    # exhaustive on purpose: it is an allowlist, so a field left out here is a field the
-    # terminal event silently drops, and the spec's "retaining native event data" is exactly
-    # what a caller needs the terminal payload for. `permission_denials` and `model_usage`
-    # carry no auth material — the sensitive-key scrub in `redact_native_payload` still runs
-    # over both — and `total_cost_usd` is the backend's own number, never a runtime-derived
-    # one, so reporting it does not put this lane into costing.
-    "ResultMessage": (
-        "subtype",
-        "duration_ms",
-        "duration_api_ms",
-        "is_error",
-        "num_turns",
-        "session_id",
-        "stop_reason",
-        "total_cost_usd",
-        "usage",
-        "result",
-        "structured_output",
-        "model_usage",
-        "permission_denials",
-        "deferred_tool_use",
-        "terminal_reason",
-        "errors",
-        "api_error_status",
-        "uuid",
-    ),
-    "permission/request": (
-        "tool_name",
-        "input",
-        "tool_use_id",
-        "title",
-        "display_name",
-        "description",
-        "blocked_path",
-    ),
-}
 # Claude Code 2.1.220 builds `system/init` in `tAr()` as `tools: e.tools.map(o => q_n(o.name))`
 # with `q_n(e) { return e === "Agent" ? "Task" : e }`, so the one internal tool named `Agent`
 # is reported under its user-facing name. Every other tool is reported verbatim.
 _INIT_TOOL_ALIASES: dict[str, str] = {"Agent": "Task"}
 # The exact native tool names this lane accepts in `PermissionPolicy.allowed_tools`, per
-# built-in family, pinned to `_SUPPORTED_CLAUDE_VERSION` for the same reason
-# `_INIT_TOOL_ALIASES` is: the Agent SDK ships no tool-name constant and `system/init` only
-# echoes back the tools the session already asked for, so nothing discovers these at runtime.
+# built-in family, pinned to `_SUPPORTED_CLAUDE_VERSION`: the Agent SDK ships no tool-name
+# constant and `system/init` only echoes back the tools the session already asked for, so
+# nothing discovers these at runtime.
 #
 # Read out of the installed 2.1.220 binary rather than written from memory. Each name is a
 # tool-name constant carried by a tool object the default pool builder `R6()` registers:
@@ -178,18 +113,19 @@ _INIT_TOOL_ALIASES: dict[str, str] = {"Agent": "Task"}
 # and `KillShell`, the last two aliased to `TaskOutput`/`TaskStop` — register no tool and are
 # deliberately absent, as is `PowerShell`, which 2.1.220 registers on Windows only.
 #
-# This table is the single source of both the advertised families and the approval-operation
-# classification below, so a name can never be advertised as a file write while the approval
-# path treats it as an ordinary tool use.
-_BUILTIN_TOOL_NAMES: tuple[tuple[BuiltinToolFamily, tuple[str, ...]], ...] = (
+# This table is behavioral policy enforcement, not a capability advertisement: it is the
+# single source of both the accepted-name set and the approval-operation classification, so
+# a name can never be treated as a file write on one path and an ordinary tool use on the
+# other.
+_BUILTIN_TOOL_NAMES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("file_read", ("Read", "Glob", "Grep")),
     ("file_write", ("Write", "Edit", "NotebookEdit")),
     ("command", ("Bash",)),
 )
-# Built-in tools 2.1.220 ships that this lane refuses outright, so no capability of it may
-# advertise them. Both reach the network through Claude Code's own client rather than through
-# the sandbox this adapter always engages, so a policy naming either would get network access
-# that `PermissionPolicy.network` never granted.
+# Built-in tools 2.1.220 ships that this lane refuses outright. Both reach the network
+# through Claude Code's own client rather than through the sandbox this adapter always
+# engages, so a policy naming either would get network access that
+# `PermissionPolicy.network` never granted.
 _REFUSED_TOOL_NAMES: tuple[str, ...] = ("WebFetch", "WebSearch")
 _FILE_CHANGE_TOOL_NAMES = frozenset(dict(_BUILTIN_TOOL_NAMES)["file_write"])
 _COMMAND_TOOL_NAMES = frozenset(dict(_BUILTIN_TOOL_NAMES)["command"])
@@ -199,7 +135,6 @@ _COMMAND_TOOL_NAMES = frozenset(dict(_BUILTIN_TOOL_NAMES)["command"])
 _MCP_TOOL_PREFIX = "mcp__"
 _MCP_CONNECTED_STATUS = "connected"
 _SDK_PERMISSION_MODE = "default"
-_DIAGNOSTIC_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _INTERRUPT_TIMEOUT_SECONDS = 2.0
 # How long an interrupted turn's tail may take to arrive before the session is declared
 # unusable. It is the interrupt bound plus room for one in-flight tool result to land.
@@ -215,11 +150,12 @@ _GROUP_ADOPTION_TIMEOUT_SECONDS = 2.0
 # executable is as much a version surface as the SDK package is. The probe runs before any
 # session exists and gets its own short bound.
 _VERSION_TIMEOUT_SECONDS = 10.0
-# Pinned against the installed Claude Code build; discovery never assumes a version.
+# The vetted versions are a warning threshold, not a gate: a drifted install gets exactly one
+# RuntimeWarning and then answers to the behavioral `system/init` verification, which is the
+# check that actually protects the policy contract.
 _SUPPORTED_CLAUDE_VERSION = "2.1.220"
 _CLAUDE_VERSION = re.compile(r"([0-9]+(?:\.[0-9]+){2}(?:[-+][0-9A-Za-z.-]+)?) \(Claude Code\)\Z")
 _VERSION_STDOUT_LIMIT = 16 * 1024
-_CLAUDE_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 # Claude Code 2.1.220 reports a rate/usage-limit refusal three ways and none of them is an
 # `error_code` field: a `rate_limit_event` whose `rate_limit_info.status` is "rejected", an
 # assistant frame whose top-level `error` is "rate_limit" (the binary maps HTTP 429 to exactly
@@ -248,7 +184,12 @@ async def _read_claude_code_version(
     cwd: Path,
     environment: Mapping[str, str],
 ) -> str:
-    """Return the installed Claude Code version, refusing anything but the vetted build."""
+    """Probe the installed Claude Code build; drift warns, only silence fails.
+
+    An executable that cannot be run or does not answer stays `ExecutableUnavailable` —
+    there is nothing behavioral left to verify against. A build that answers with an
+    unexpected version keeps running behind the `system/init` verification instead.
+    """
     text = await capture_process_output(
         (executable, "--version"),
         cwd=cwd,
@@ -261,10 +202,23 @@ async def _read_claude_code_version(
     )
     match = _CLAUDE_VERSION.fullmatch(text)
     if match is None:
-        raise ExecutableUnavailable("Claude CLI returned an unrecognized version string")
+        warnings.warn(
+            f"Claude CLI answered an unrecognized version string "
+            f"{sanitize_provider_text(text, limit=64)!r}; expected "
+            f"{_SUPPORTED_CLAUDE_VERSION!r} — continuing behind the behavioral "
+            "system/init verification",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return text
     version = match.group(1)
     if version != _SUPPORTED_CLAUDE_VERSION:
-        raise ExecutableUnavailable("Claude CLI version is not vetted")
+        warnings.warn(
+            f"Claude Code {version} is not the vetted {_SUPPORTED_CLAUDE_VERSION} — "
+            "continuing behind the behavioral system/init verification",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return version
 
 
@@ -299,22 +253,6 @@ class _ClaudeQuotaSignal:
         return self.observed or api_error_status == _QUOTA_HTTP_STATUS
 
 
-@dataclass(frozen=True, slots=True)
-class _PendingEvent:
-    """One described-but-unnumbered event.
-
-    Sequence numbers belong to the turn generator alone (see `ClaudeSdkAdapter._event`), so any
-    code that runs off that task — notably the permission callback, which the SDK dispatches from
-    a task it spawns itself — describes its events with this type and lets the generator number
-    them in stream order.
-    """
-
-    kind: AgentEventKind
-    data: AgentEventData
-    native_type: str | None = None
-    native_payload: JsonObject | None = None
-
-
 @dataclass(slots=True)
 class _ClaudeSessionState:
     sdk: Any
@@ -328,28 +266,29 @@ class _ClaudeSessionState:
     # An interrupted turn's tail is still queued on the client's shared message stream and
     # must be discarded before the next turn reads it.
     drain_pending: bool = False
-    session_started_emitted: bool = False
-    seq: int = 0
     message_count: int = 0
     output_bytes: int = 0
-    turn_number: int = 0
     turn_id: str | None = None
     final_text: str = ""
     final_text_bytes: int = 0
-    usage: FrozenJsonDict | None = None
-    current_output: AgentOutputSpec | None = None
+    usage: TokenUsage | None = None
     diagnostics: list[str] = field(default_factory=list)
-    # What `open_session` observed about this session before any turn existed. `open_session`
-    # returns a session rather than a stream, so there is no earlier event this could be:
-    # `stream_turn` emits it in the session-scope window right after `session_started`, which
-    # is where the SDK reported it. It is emptied there, so only the first stream carries it.
+    # What `open_session` observed about this session before any turn existed.
+    # `open_session` returns a session rather than a stream, so there is no earlier event
+    # this could be: the first stream emits it at its head and empties the list, so only
+    # that stream carries it.
     pending_startup_diagnostics: list[str] = field(default_factory=list)
     quota: _ClaudeQuotaSignal = field(default_factory=_ClaudeQuotaSignal)
     approval_failure: bool = False
     approval_abort: bool = False
     current_policy: PermissionPolicy | None = None
     current_approvals: ApprovalHandler | None = None
-    pending_events: list[_PendingEvent] = field(default_factory=list)
+    # `ToolResultBlock` carries only the call id, so the started block's name is remembered
+    # here for the completion event; the map is one turn's, cleared at every turn start.
+    tool_names: dict[str, str] = field(default_factory=dict)
+    # Events described off the turn generator's task — the permission callback runs on a
+    # task the SDK spawns itself — queued here and emitted by the generator in stream order.
+    pending_events: list[AgentEvent] = field(default_factory=list)
     approval_defect: AgentRuntimeDefect | None = None
 
 
@@ -358,6 +297,9 @@ class ClaudeSdkAdapter:
 
     backend: Literal["claude"] = "claude"
     transport: Literal["sdk"] = "sdk"
+    # Claude Code scopes its native session store by working directory, so a resumed ref
+    # must match the requesting cwd. A backend fact, spelled once for the runtime.
+    cwd_scopes_sessions: Literal[True] = True
 
     def __init__(self, *, executable: str = "claude") -> None:
         if type(executable) is not str or not executable or "\0" in executable:
@@ -371,79 +313,15 @@ class ClaudeSdkAdapter:
     def validate_auth(self, credential: CredentialRef) -> None:
         self._require_local_auth(credential.kind)
 
-    async def capabilities(
-        self,
-        scope: AgentCapabilityScope,
-        *,
-        environment: Mapping[str, str],
-    ) -> AgentCapabilities:
-        self._require_scope(scope)
-        self._require_local_auth(scope.auth.kind)
-        sdk = self._load_sdk()
-        sdk_version = self._sdk_version(sdk)
-        if sdk_version != _SUPPORTED_SDK_VERSION:
-            raise SdkUnavailable("claude-agent-sdk version is not vetted")
-        state_root = state_root_from_environment("claude", environment)
-        executable_version = await _read_claude_code_version(
-            self._require_executable(),
-            cwd=state_root,
-            environment=environment,
-        )
-        network_sandbox = await _network_sandbox_available(cwd=state_root, environment=environment)
-        return AgentCapabilities(
-            scope=scope,
-            executable_version=executable_version,
-            sdk_version=sdk_version,
-            session_operations=("new", "resume", "fork"),
-            discovery_operations=(),
-            models=None,
-            reasoning_efforts=_CLAUDE_REASONING_EFFORTS,
-            reasoning_summaries=(),
-            thinking_budget=True,
-            content_kinds=("text",),
-            attachment_kinds=(),
-            session_instruction_roles=("system",),
-            turn_instruction_roles=(),
-            streaming=True,
-            cancellation=True,
-            structured_output=True,
-            native_output_schema=True,
-            # Reported from the one accepted-name table, so the families a caller is told
-            # about are exactly the families it can name a tool from. `web_fetch`/`web_search`
-            # are absent even though 2.1.220 ships both: `_validate_policy_mapping` refuses
-            # their tools, and the session's tool set *is* `policy.allowed_tools`, so no
-            # request this adapter accepts can ever reach them.
-            builtin_tool_families=tuple(family for family, _names in _BUILTIN_TOOL_NAMES),
-            builtin_tool_names=_BUILTIN_TOOL_NAMES,
-            tool_controls=True,
-            mcp_transports=("streamable_http",),
-            mcp_auth_forms=(),
-            filesystem_modes=("read_only", "workspace_write"),
-            network_modes=("disabled", "allowlist") if network_sandbox else ("disabled",),
-            network_allowlist=network_sandbox,
-            approval_modes=("deny", "ask", "allow"),
-            additional_dirs=True,
-            max_turns=False,
-            timeouts=True,
-            turn_overrides=(),
-            persistent_turn_overrides=(),
-            native_extension_version="claude-agent-sdk.python",
-            native_option_names=("include_partial_messages",),
-            cwd_scopes_sessions=True,
-            reports_auth_identity=False,
-            # Claude Code's `system/init` carries no effort member, so the clamp the
-            # adapter applies stays unobservable to the caller.
-            reports_effective_effort=False,
-        )
-
     async def list_sessions(
         self,
         query: SessionQuery,
         *,
         environment: Mapping[str, str],
     ) -> SessionPage:
-        self._require_scope(query.scope)
-        self._require_local_auth(query.scope.auth.kind)
+        if query.backend != self.backend or query.transport != self.transport:
+            raise InvalidAgentRequest("ClaudeSdkAdapter received a different route")
+        self._require_local_auth(query.auth.kind)
         del environment
         raise UnsupportedCapability(
             "Claude SDK discovery cannot be scoped to the selected isolated state root"
@@ -472,12 +350,10 @@ class ClaudeSdkAdapter:
         self,
         request: AgentSessionRequest,
         *,
-        capabilities: AgentCapabilities,
         environment: Mapping[str, str],
     ) -> AgentSession:
         if request.backend != self.backend or request.transport != self.transport:
             raise InvalidAgentRequest("ClaudeSdkAdapter received a different route")
-        self._require_scope(capabilities.scope)
         self._require_local_auth(request.auth.kind)
         self._validate_policy_mapping(request.policy)
         validate_mcp_network_policy(request.mcp_servers, request.policy)
@@ -489,7 +365,9 @@ class ClaudeSdkAdapter:
         if isinstance(request.open, ResumeSession | ForkSession):
             validate_session_ref(
                 request.open.ref,
-                AgentCapabilityScope(backend="claude", transport="sdk", auth=request.auth),
+                backend="claude",
+                transport="sdk",
+                profile_key=request.auth.profile_key,
                 state_root_fingerprint=fingerprint_path(state_root),
                 cwd=request.cwd,
                 cwd_scopes_sessions=True,
@@ -499,6 +377,19 @@ class ClaudeSdkAdapter:
             ref = None if fork else request.open.ref
         elif not isinstance(request.open, NewSession):
             raise InvalidAgentRequest("unknown Claude SDK session operation")
+
+        executable = self._require_executable()
+        # There is no capability table. The version gates are one warning each plus the
+        # behavioral `system/init` verification below, and the only hard host requirement —
+        # the bubblewrap/socat proxy behind `network: allowlist` — fails closed here,
+        # before any SDK startup.
+        await _read_claude_code_version(executable, cwd=state_root, environment=environment)
+        if request.policy.network == "allowlist" and not await _network_sandbox_available(
+            cwd=state_root, environment=environment
+        ):
+            raise UnsupportedCapability(
+                "Claude network allowlist requires the bubblewrap/socat sandbox on this host"
+            )
 
         holder: list[_ClaudeSessionState] = []
 
@@ -513,7 +404,6 @@ class ClaudeSdkAdapter:
         mcp_servers = self._mcp_servers(request)
         output_format = self._output_format(request.output)
         thinking = self._thinking(request)
-        executable = self._require_executable()
         launcher = ensure_claude_launcher(state_root, executable, interpreter=sys.executable)
         accepted_tools = tuple(name for _family, names in _BUILTIN_TOOL_NAMES for name in names)
         denied_tools = tuple(
@@ -634,21 +524,19 @@ class ClaudeSdkAdapter:
                 "Claude SDK model changes persist and are not per-turn overrides"
             )
 
-        state.turn_number += 1
-        state.seq = 0
         state.message_count = 0
         state.output_bytes = 0
         state.turn_id = None
         state.final_text = ""
         state.final_text_bytes = 0
         state.usage = None
-        state.current_output = state.request.output
         state.diagnostics[:] = state.pending_startup_diagnostics
         state.quota = _ClaudeQuotaSignal()
         state.approval_failure = False
         state.approval_abort = False
         state.current_policy = policy
         state.current_approvals = approvals
+        state.tool_names.clear()
         state.pending_events.clear()
         state.approval_defect = None
         if state.drain_pending:
@@ -661,7 +549,7 @@ class ClaudeSdkAdapter:
             )
         except state.sdk.ClaudeSDKError:
             # No turn identity exists yet, so there is no stream to terminate with a value:
-            # the caller never saw `turn_started` and the turn is not in flight.
+            # the caller never saw an event and the turn is not in flight.
             await self._stop_client(state)
             raise SdkUnavailable("Claude SDK could not start the turn") from None
         state.turn_in_flight = True
@@ -696,69 +584,53 @@ class ClaudeSdkAdapter:
             # reaches this point means the stream never became usable at all.
             await self._stop_client(state, force_disconnect=True)
             raise
-        if state.ref is None or state.turn_id is None:
+        ref = state.ref
+        if ref is None or state.turn_id is None:
             raise ProtocolDefect("Claude SDK did not establish stream identity")
+        # The runtime defects on any event from a session whose ref is incomplete, so the
+        # learned identity is published before the first yield.
+        if not session.ref_is_complete:
+            session.complete_ref(ref)
 
-        if not state.session_started_emitted:
-            state.session_started_emitted = True
-            yield self._event(state, _PendingEvent("session_started", SessionStartedData()))
-        # Session-scope, and reported by the SDK at session startup: `open_session` observed
-        # them from `mcp_status` before any turn existed, so they are emitted at the first
-        # point in the session's first stream that can carry an event — after
-        # `session_started`, ahead of `turn_started`. `events.SESSION_SCOPE_EVENT_KINDS`
-        # makes that window legal for exactly this reason, and holding them back until the
-        # turn had opened would be this lane reordering the backend's own frames — the thing
-        # the Codex lane was refused permission to do.
+        # Session-scope MCP startup facts, observed by `open_session` before any turn
+        # existed: they ride at the head of the first stream as native frames and were
+        # already seeded into this turn's terminal diagnostics above.
         for diagnostic in state.pending_startup_diagnostics:
-            yield self._event(
-                state,
-                _PendingEvent(
-                    "diagnostic",
-                    DiagnosticData(code="optional_mcp_unavailable", message=diagnostic),
-                ),
+            yield AgentNative(
+                native_type="mcp_status",
+                payload=redact_native_payload({"diagnostic": diagnostic}),
             )
         state.pending_startup_diagnostics.clear()
-        yield self._event(
-            state, _PendingEvent("turn_started", TurnStartedData(), native_type="sdk/query")
-        )
 
         terminal_seen = False
         try:
             for message in buffered:
-                async for event in self._message_events(state, message):
+                for event in self._message_events(state, message):
                     yield event
-                    terminal_seen = event.kind in (
-                        "turn_completed",
-                        "turn_failed",
-                        "turn_cancelled",
-                    )
+                    if isinstance(event, AgentTerminal):
+                        terminal_seen = True
+                        break
                 if terminal_seen:
                     return
             async for message in source:
                 self._account_message(state, message)
                 self._learn_identity(state, message)
-                async for event in self._message_events(state, message):
+                for event in self._message_events(state, message):
                     yield event
-                    terminal_seen = event.kind in (
-                        "turn_completed",
-                        "turn_failed",
-                        "turn_cancelled",
-                    )
+                    if isinstance(event, AgentTerminal):
+                        terminal_seen = True
+                        break
                 if terminal_seen:
                     return
         except OutputLimitExceeded:
             await self._stop_client(state, force_disconnect=True)
-            yield self._event(
-                state,
-                _PendingEvent(
-                    "turn_failed",
-                    TurnFailedData(
-                        failure="output_limit_exceeded",
-                        final_text=state.final_text,
-                        usage=state.usage,
-                        diagnostics=tuple(dict.fromkeys(state.diagnostics)),
-                    ),
-                ),
+            yield AgentTerminal(
+                status="failed",
+                failure=AgentFailure("output_limit_exceeded"),
+                final_text=state.final_text,
+                session_ref=ref,
+                usage=self._usage_presence(state),
+                diagnostics=tuple(dict.fromkeys(state.diagnostics)),
             )
             return
         except asyncio.CancelledError:
@@ -778,17 +650,13 @@ class ClaudeSdkAdapter:
             # Only the SDK's own error hierarchy is a backend failure. Anything else reaching
             # here is our defect and must keep propagating rather than becoming a product state.
             await self._stop_client(state, force_disconnect=True)
-            yield self._event(
-                state,
-                _PendingEvent(
-                    "turn_failed",
-                    TurnFailedData(
-                        failure="backend_failed",
-                        final_text=state.final_text,
-                        usage=state.usage,
-                        diagnostics=("Claude SDK stream failed",),
-                    ),
-                ),
+            yield AgentTerminal(
+                status="failed",
+                failure=AgentFailure("backend_failed"),
+                final_text=state.final_text,
+                session_ref=ref,
+                usage=self._usage_presence(state),
+                diagnostics=("Claude SDK stream failed",),
             )
             return
         except Exception:
@@ -799,17 +667,15 @@ class ClaudeSdkAdapter:
             await self._stop_client(state, force_disconnect=True)
             raise MissingTerminalEvent()
 
-    async def interrupt(self, session: AgentSession, turn_id: str | None) -> None:
+    async def interrupt(self, session: AgentSession) -> None:
         if session in self._dead_sessions:
             return
         state = self._state(session)
-        if turn_id is None:
+        if state.turn_id is None:
             # No native turn was ever named, so nothing identifies the frames still coming
             # and no later turn could tell them apart: the whole session is released.
             await self._stop_client(state, force_disconnect=True)
             return
-        if state.turn_id != turn_id:
-            raise InvalidAgentRequest("interrupt turn id does not match the active Claude turn")
         await self._stop_client(state)
 
     async def close_session(self, session: AgentSession) -> None:
@@ -846,11 +712,12 @@ class ClaudeSdkAdapter:
         `receive_response()` reads, and the next turn would terminate on the previous turn's
         result.
 
-        The drain cannot run inside `interrupt()`, where the port documents the obligation:
-        the runtime issues that interrupt from `_watch_turn_stop` while the abandoned turn's
-        `anext` is still pending, and a second consumer of the same memory stream would race
-        it for messages. Here the abandoned generator is closed and nothing else is reading,
-        which is the port's other sanctioned option — discarding the frames on arrival.
+        The drain cannot run inside `interrupt()`, where the protocol documents the
+        obligation: the runtime issues that interrupt from `_watch_turn_stop` while the
+        abandoned turn's `anext` is still pending, and a second consumer of the same memory
+        stream would race it for messages. Here the abandoned generator is closed and
+        nothing else is reading, which is the protocol's other sanctioned option —
+        discarding the frames on arrival.
         """
         source = state.client.receive_response()
         try:
@@ -870,45 +737,41 @@ class ClaudeSdkAdapter:
         await self._stop_client(state, force_disconnect=True)
         raise SessionUnavailable("the interrupted Claude turn did not release its message stream")
 
-    async def _message_events(
-        self, state: _ClaudeSessionState, message: object
-    ) -> AsyncIterator[AgentEvent]:
-        """Number one native message's events, plus anything the permission callback queued.
+    def _message_events(self, state: _ClaudeSessionState, message: object) -> Iterator[AgentEvent]:
+        """Emit one native message's events, plus anything the permission callback queued.
 
-        This generator is the single serialization point for `state.seq`: `_decode_message`
-        only *describes* events and the permission callback — which the SDK dispatches from a
-        task it spawns itself (`Query._spawn_control_request_handler`) while this generator is
-        suspended — only queues descriptions. Draining the queue at every yield boundary keeps
-        the emitted sequence gap-free and keeps an approval pair ahead of the event it gated.
+        The permission callback runs on a task the SDK spawns itself
+        (`Query._spawn_control_request_handler`) while this generator's consumer is
+        suspended at a yield, so the callback only queues descriptions. Draining the queue
+        at every yield boundary keeps an approval event ahead of the tool event it gated.
         """
-        for pending in self._drain_pending(state):
-            yield pending
-        async for described in self._decode_message(state, message):
-            for pending in self._drain_pending(state):
-                yield pending
-            yield self._event(state, described)
-        for pending in self._drain_pending(state):
-            yield pending
+        yield from self._drain_pending(state)
+        for event in self._decode_message(state, message):
+            yield from self._drain_pending(state)
+            yield event
+        yield from self._drain_pending(state)
 
     def _drain_pending(self, state: _ClaudeSessionState) -> list[AgentEvent]:
-        """Number everything the permission callback queued, and surface any defect it hit."""
+        """Release everything the permission callback queued, and surface any defect it hit."""
         defect = state.approval_defect
         if defect is not None:
             state.approval_defect = None
             raise defect
-        queued = tuple(state.pending_events)
+        queued = list(state.pending_events)
         state.pending_events.clear()
-        return [self._event(state, pending) for pending in queued]
+        return queued
 
-    async def _decode_message(
-        self, state: _ClaudeSessionState, message: object
-    ) -> AsyncIterator[_PendingEvent]:
+    def _decode_message(self, state: _ClaudeSessionState, message: object) -> Iterator[AgentEvent]:
         sdk = state.sdk
-        native_type = type(message).__name__
-        native_payload = self._native_payload(native_type, message)
         if isinstance(message, sdk.SystemMessage):
-            for pending in self._system_events(state, message, native_type, native_payload):
-                yield pending
+            subtype = getattr(message, "subtype", None)
+            if not isinstance(subtype, str) or not subtype:
+                raise ProtocolDefect("Claude SystemMessage carried no subtype")
+            if subtype == "init":
+                # The behavioral capability probe: `system/init` is the only frame that
+                # reports the backend's *effective* configuration.
+                self._verify_initialization(state, message)
+            yield self._native(f"SystemMessage:{subtype}", message)
             return
         if isinstance(message, sdk.StreamEvent):
             event = getattr(message, "event", None)
@@ -921,44 +784,25 @@ class ClaudeSdkAdapter:
                     if not isinstance(text, str):
                         raise ProtocolDefect("Claude text delta was malformed")
                     self._append_final_text(state, text)
-                    yield _PendingEvent(
-                        "text_delta",
-                        TextDeltaData(text),
-                        native_type=native_type,
-                        native_payload=native_payload,
-                    )
+                    yield AgentText(text)
                     return
                 if delta.get("type") == "thinking_delta":
                     thinking = delta.get("thinking")
                     if not isinstance(thinking, str):
                         raise ProtocolDefect("Claude thinking delta was malformed")
+                    # Thinking has no first-class kind; it travels as a bounded native
+                    # frame, but the byte bound still applies before anything is retained.
                     self._check_event_text(thinking)
-                    yield _PendingEvent(
-                        "reasoning",
-                        ReasoningData(thinking, visibility="full"),
-                        native_type=native_type,
-                        native_payload=native_payload,
-                    )
+                    yield self._native("StreamEvent:thinking_delta", message)
                     return
-            yield _PendingEvent(
-                "unknown",
-                UnknownData(),
-                native_type=native_type,
-                native_payload=native_payload,
-            )
+            yield self._native("StreamEvent", message)
             return
         if isinstance(message, sdk.AssistantMessage):
             state.quota.observe_assistant_error(getattr(message, "error", None))
             usage = getattr(message, "usage", None)
             if isinstance(usage, dict):
-                frozen_usage = freeze_json_object(usage)
-                state.usage = frozen_usage
-                yield _PendingEvent(
-                    "usage",
-                    UsageData(frozen_usage),
-                    native_type=native_type,
-                    native_payload=native_payload,
-                )
+                state.usage = self._token_usage(usage)
+                yield AgentUsage(state.usage)
             partial = self._include_partial(state.request.native)
             content = getattr(message, "content", None)
             if not isinstance(content, (tuple, list)):
@@ -968,47 +812,31 @@ class ClaudeSdkAdapter:
                     arguments = getattr(block, "input", None)
                     if not isinstance(arguments, dict):
                         raise ProtocolDefect("Claude tool input was malformed")
-                    yield _PendingEvent(
-                        "tool_started",
-                        ToolStartedData(
-                            tool_call_id=self._required_attr(block, "id"),
-                            name=self._required_attr(block, "name"),
-                            arguments=freeze_json_object(arguments),
-                        ),
-                        native_type=native_type,
-                        native_payload=native_payload,
+                    tool_call_id = self._required_attr(block, "id")
+                    name = self._required_attr(block, "name")
+                    state.tool_names[tool_call_id] = name
+                    yield AgentToolUse(
+                        tool_call_id=tool_call_id,
+                        name=name,
+                        phase="started",
+                        payload=freeze_json_object(arguments),
                     )
                 elif isinstance(block, sdk.TextBlock) and not partial:
+                    # With partial messages on (the default), the final blocks duplicate
+                    # the deltas already streamed, so they are only decoded when off.
                     text = getattr(block, "text", None)
                     if not isinstance(text, str):
                         raise ProtocolDefect("Claude text block was malformed")
                     self._append_final_text(state, text)
-                    yield _PendingEvent(
-                        "text_delta",
-                        TextDeltaData(text),
-                        native_type=native_type,
-                        native_payload=native_payload,
-                    )
+                    yield AgentText(text)
                 elif isinstance(block, sdk.ThinkingBlock) and not partial:
                     thinking = getattr(block, "thinking", None)
                     if not isinstance(thinking, str):
                         raise ProtocolDefect("Claude thinking block was malformed")
                     self._check_event_text(thinking)
-                    yield _PendingEvent(
-                        "reasoning",
-                        ReasoningData(thinking, visibility="full"),
-                        native_type=native_type,
-                        native_payload=native_payload,
-                    )
+                    yield self._native("AssistantMessage:ThinkingBlock", block)
                 elif not isinstance(block, (sdk.TextBlock, sdk.ThinkingBlock)):
-                    yield _PendingEvent(
-                        "unknown",
-                        UnknownData(),
-                        native_type=f"AssistantMessage:{type(block).__name__}",
-                        native_payload=redact_native_payload(
-                            self._object_payload(block), allowed_fields=None
-                        ),
-                    )
+                    yield self._native(f"AssistantMessage:{type(block).__name__}", block)
             return
         if isinstance(message, sdk.UserMessage):
             content = getattr(message, "content", ())
@@ -1017,119 +845,49 @@ class ClaudeSdkAdapter:
             blocks = content if isinstance(content, (tuple, list)) else ()
             for block in blocks:
                 if isinstance(block, sdk.ToolResultBlock):
-                    output = freeze_json_value(getattr(block, "content", None))
-                    yield _PendingEvent(
-                        "tool_completed",
-                        ToolCompletedData(
-                            tool_call_id=self._required_attr(block, "tool_use_id"),
-                            output=output,
-                            succeeded=getattr(block, "is_error", None) is not True,
-                        ),
-                        native_type=native_type,
-                        native_payload=native_payload,
+                    tool_call_id = self._required_attr(block, "tool_use_id")
+                    name = state.tool_names.get(tool_call_id)
+                    if name is None:
+                        raise ProtocolDefect("Claude tool result arrived before its tool use")
+                    yield AgentToolUse(
+                        tool_call_id=tool_call_id,
+                        name=name,
+                        phase="completed",
+                        payload=freeze_json_value(getattr(block, "content", None)),
+                        succeeded=getattr(block, "is_error", None) is not True,
                     )
                 else:
-                    yield _PendingEvent(
-                        "unknown",
-                        UnknownData(),
-                        native_type=f"UserMessage:{type(block).__name__}",
-                        native_payload=redact_native_payload(
-                            self._object_payload(block), allowed_fields=None
-                        ),
-                    )
-            file_event = self._file_result_event(message, native_type, native_payload)
-            if file_event is not None:
-                yield file_event
+                    yield self._native(f"UserMessage:{type(block).__name__}", block)
             return
         if isinstance(message, sdk.RateLimitEvent):
             info = getattr(message, "rate_limit_info", None)
-            status = getattr(info, "status", None)
-            state.quota.observe_rate_limit_status(status)
-            status_message = (
-                sanitize_provider_text(status) if isinstance(status, str) else "unknown"
-            )
-            yield _PendingEvent(
-                "diagnostic",
-                DiagnosticData(
-                    code="claude_rate_limit",
-                    message=f"Claude rate limit status: {status_message}",
-                    detail=native_payload,
-                ),
-                native_type=native_type,
-                native_payload=native_payload,
-            )
+            state.quota.observe_rate_limit_status(getattr(info, "status", None))
+            yield self._native("RateLimitEvent", message)
             return
         if isinstance(message, sdk.ResultMessage):
-            yield self._result_event(state, message, native_type, native_payload)
+            # The terminal is the owned summary; the frame itself still travels so the
+            # backend-reported facts (cost, per-model usage, denials) are not lost.
+            yield self._native("ResultMessage", message)
+            yield self._terminal(state, message)
             return
         # claude-agent-sdk 0.2.130 closes `Message` over six classes and drops every
         # unrecognized wire type inside `parse_message`, so nothing reaches this arm today.
         # It is kept as the fail-open landing site for a future SDK that widens that union.
-        yield _PendingEvent(
-            "unknown",
-            UnknownData(),
-            native_type=native_type,
-            native_payload=redact_native_payload(
-                self._object_payload(message), allowed_fields=None
-            ),
-        )
+        yield self._native(type(message).__name__, message)
 
-    def _system_events(
-        self,
-        state: _ClaudeSessionState,
-        message: object,
-        native_type: str,
-        native_payload: FrozenJsonDict,
-    ) -> list[_PendingEvent]:
-        """Route every `system` frame, including the typed subclasses and `init`."""
-        subtype = getattr(message, "subtype", None)
-        if not isinstance(subtype, str) or not subtype:
-            raise ProtocolDefect("Claude SystemMessage carried no subtype")
-        if subtype == "init":
-            return self._initialization_events(state, message, native_payload)
-        if type(message) is not state.sdk.SystemMessage:
-            # A typed `SystemMessage` subclass (0.2.130 ships TaskStarted/TaskProgress/
-            # TaskNotification/TaskUpdated/MirrorError/HookEvent). These report work the turn
-            # performed or failed to perform, so they are diagnostics, not unknown frames.
-            code = subtype if _DIAGNOSTIC_CODE.fullmatch(subtype) else "system_event"
-            return [
-                _PendingEvent(
-                    "diagnostic",
-                    DiagnosticData(
-                        code=f"claude_{code}",
-                        message=f"Claude reported a {sanitize_provider_text(subtype, limit=64)} "
-                        "system message",
-                        detail=native_payload,
-                    ),
-                    native_type=f"SystemMessage:{subtype}",
-                    native_payload=native_payload,
-                )
-            ]
-        return [
-            _PendingEvent(
-                "unknown",
-                UnknownData(),
-                native_type=f"SystemMessage:{subtype}",
-                native_payload=native_payload,
-            )
-        ]
-
-    def _initialization_events(
-        self,
-        state: _ClaudeSessionState,
-        message: object,
-        native_payload: FrozenJsonDict,
-    ) -> list[_PendingEvent]:
+    def _verify_initialization(self, state: _ClaudeSessionState, message: object) -> None:
         """Check the backend's *effective* configuration against the one that was requested.
 
         `system/init` is the only frame that reports it. Claude Code 2.1.220 builds it in
-        `tAr()` as `{cwd, session_id, tools, mcp_servers, model, permissionMode, ...}`.
+        `tAr()` as `{cwd, session_id, tools, mcp_servers, model, permissionMode, ...}`. A
+        widened directory, permission mode, or tool set is a security fact and defects; a
+        substituted model is the backend's own prerogative and becomes a terminal
+        diagnostic beside the init frame's native payload.
         """
         data = getattr(message, "data", None)
         if not isinstance(data, Mapping):
             raise ProtocolDefect("Claude system/init carried no object payload")
-        reported_cwd = data.get("cwd")
-        if reported_cwd != state.request.cwd:
+        if data.get("cwd") != state.request.cwd:
             raise ProtocolDefect(
                 "Claude SDK reported a different effective working directory",
                 code="effective_cwd_mismatch",
@@ -1145,20 +903,8 @@ class ClaudeSdkAdapter:
         if not isinstance(reported_model, str) or not reported_model:
             raise ProtocolDefect("Claude SDK reported a malformed effective model")
         requested_model = state.request.model
-        if requested_model is None or reported_model == requested_model:
-            return []
-        self._record_diagnostic(state, "effective_model_changed")
-        return [
-            _PendingEvent(
-                "diagnostic",
-                DiagnosticData(
-                    code="effective_model_changed",
-                    message="Claude SDK reported a different effective model",
-                ),
-                native_type="SystemMessage:init",
-                native_payload=native_payload,
-            )
-        ]
+        if requested_model is not None and reported_model != requested_model:
+            self._record_diagnostic(state, "effective_model_changed")
 
     @staticmethod
     def _require_effective_tools(state: _ClaudeSessionState, data: Mapping[str, object]) -> None:
@@ -1184,109 +930,132 @@ class ClaudeSdkAdapter:
                 code="effective_policy_mismatch",
             )
 
-    def _result_event(
-        self,
-        state: _ClaudeSessionState,
-        message: object,
-        native_type: str,
-        native_payload: FrozenJsonDict,
-    ) -> _PendingEvent:
+    def _terminal(self, state: _ClaudeSessionState, message: object) -> AgentTerminal:
         # The native turn is over the moment its result is consumed, so nothing is left on
         # the shared stream for a later turn to inherit.
         state.turn_in_flight = False
-        usage_value = getattr(message, "usage", None)
-        usage = freeze_json_object(usage_value) if isinstance(usage_value, dict) else state.usage
+        ref = state.ref
+        if ref is None:
+            raise ProtocolDefect("Claude terminal arrived before stream identity")
+        result_usage = getattr(message, "usage", None)
+        if isinstance(result_usage, dict):
+            state.usage = self._token_usage(result_usage)
+        usage = self._usage_presence(state)
         result = getattr(message, "result", None)
         final_text = result if isinstance(result, str) else state.final_text
         self._check_final_text(final_text)
         diagnostics = tuple(dict.fromkeys(state.diagnostics))
         terminal_reason = getattr(message, "terminal_reason", None)
-        data: AgentEventData
         if state.approval_failure:
-            data = TurnFailedData(
-                failure="approval_unanswered",
+            return AgentTerminal(
+                status="failed",
+                failure=AgentFailure("approval_unanswered"),
                 final_text=final_text,
+                session_ref=ref,
                 usage=usage,
                 diagnostics=("approval handler failed",),
             )
-            kind: AgentEventKind = "turn_failed"
-        elif state.approval_abort or terminal_reason in ("aborted_streaming", "aborted_tools"):
-            data = TurnCancelledData(
+        if state.approval_abort or terminal_reason in ("aborted_streaming", "aborted_tools"):
+            return AgentTerminal(
+                status="cancelled",
+                failure=None,
                 final_text=final_text,
+                session_ref=ref,
                 usage=usage,
                 diagnostics=diagnostics,
             )
-            kind = "turn_cancelled"
-        elif getattr(message, "is_error", False):
-            subtype = getattr(message, "subtype", None)
+        if getattr(message, "is_error", False):
+            failure: AgentTerminalFailure
             if state.quota.is_exhausted(getattr(message, "api_error_status", None)):
-                failure = "quota_exhausted"
-            elif subtype == "error_max_structured_output_retries":
-                failure = "output_schema_violation"
+                failure = AgentQuotaExhausted()
+            elif getattr(message, "subtype", None) == "error_max_structured_output_retries":
+                failure = AgentFailure("output_schema_violation")
             else:
-                failure = "backend_failed"
+                failure = AgentFailure("backend_failed")
             errors = getattr(message, "errors", None)
             if isinstance(errors, list):
                 if len(errors) > _MAX_DIAGNOSTICS:
                     raise OutputLimitExceeded(_MAX_DIAGNOSTICS)
+                sanitized = (
+                    sanitize_provider_text(item) for item in errors if isinstance(item, str)
+                )
                 diagnostics = tuple(
-                    dict.fromkeys(
-                        [
-                            *diagnostics,
-                            *(
-                                sanitize_provider_text(item)
-                                for item in errors
-                                if isinstance(item, str) and item
-                            ),
-                        ]
-                    )
+                    dict.fromkeys([*diagnostics, *(text for text in sanitized if text)])
                 )
                 if len(diagnostics) > _MAX_DIAGNOSTICS:
                     raise OutputLimitExceeded(_MAX_DIAGNOSTICS)
-            data = TurnFailedData(
+            return AgentTerminal(
+                status="failed",
                 failure=failure,
                 final_text=final_text,
+                session_ref=ref,
                 usage=usage,
                 diagnostics=diagnostics,
             )
-            kind = "turn_failed"
-        elif isinstance(state.current_output, JsonSchemaAgentOutput):
-            raw_structured = getattr(message, "structured_output", None)
+        structured: FrozenJsonDict | None = None
+        if isinstance(state.request.output, JsonSchemaAgentOutput):
+            # The backend enforces the schema natively; this boundary only strict-parses
+            # and freezes the answer, and a miss is an expected model-output failure.
+            raw = getattr(message, "structured_output", None)
             try:
                 structured = (
-                    validate_structured_output(raw_structured, state.current_output.schema)
-                    if raw_structured is not None
-                    else parse_structured_output(final_text, state.current_output.schema)
+                    freeze_structured_output(raw)
+                    if raw is not None
+                    else parse_structured_output(final_text)
                 )
             except OutputSchemaMismatch:
-                data = TurnFailedData(
-                    failure="output_schema_violation",
+                return AgentTerminal(
+                    status="failed",
+                    failure=AgentFailure("output_schema_violation"),
                     final_text=final_text,
+                    session_ref=ref,
                     usage=usage,
                     diagnostics=diagnostics,
                 )
-                kind = "turn_failed"
-            else:
-                data = TurnCompletedData(
-                    final_text=final_text,
-                    structured_output=structured,
-                    usage=usage,
-                    diagnostics=diagnostics,
-                )
-                kind = "turn_completed"
-        else:
-            data = TurnCompletedData(
-                final_text=final_text,
-                usage=usage,
-                diagnostics=diagnostics,
-            )
-            kind = "turn_completed"
-        return _PendingEvent(
-            kind,
-            data,
-            native_type=native_type,
-            native_payload=native_payload,
+        return AgentTerminal(
+            status="succeeded",
+            failure=None,
+            final_text=final_text,
+            session_ref=ref,
+            usage=usage,
+            structured_output=structured,
+            diagnostics=diagnostics,
         )
+
+    @staticmethod
+    def _usage_presence(state: _ClaudeSessionState) -> Presence[TokenUsage]:
+        return Absent() if state.usage is None else Present(state.usage)
+
+    @classmethod
+    def _token_usage(cls, usage: Mapping[str, object]) -> TokenUsage:
+        """Normalize one native usage dict into the provider lane's noun.
+
+        Claude's wire `input_tokens` EXCLUDES the cache components it reports beside it;
+        the lane invariant is the cache-INCLUSIVE prompt total (see
+        `TokenUsage.from_components`), so both components are folded in at ingress. The
+        total is derived, and Claude reports no reasoning count.
+        """
+        input_tokens = cls._usage_count(usage, "input_tokens") or 0
+        output_tokens = cls._usage_count(usage, "output_tokens") or 0
+        cache_read = cls._usage_count(usage, "cache_read_input_tokens")
+        cache_write = cls._usage_count(usage, "cache_creation_input_tokens")
+        return TokenUsage.from_components(
+            input_tokens=input_tokens + (cache_read or 0) + (cache_write or 0),
+            output_tokens=output_tokens,
+            total_tokens=Absent(),
+            reasoning_tokens=Absent(),
+            cache_read_input_tokens=Absent() if cache_read is None else Present(cache_read),
+            cache_write_input_tokens=Absent() if cache_write is None else Present(cache_write),
+        )
+
+    @staticmethod
+    def _usage_count(usage: Mapping[str, object], key: str) -> int | None:
+        value = usage.get(key)
+        if value is None:
+            return None
+        if type(value) is not int or value < 0:
+            raise ProtocolDefect(f"Claude usage {key} was not a non-negative integer count")
+        return value
 
     @staticmethod
     def _record_diagnostic(state: _ClaudeSessionState, message: str) -> None:
@@ -1300,10 +1069,10 @@ class ClaudeSdkAdapter:
     ) -> Any:
         """Answer one native permission request from the task the SDK dispatches it on.
 
-        `Query._spawn_control_request_handler` runs this concurrently with the turn generator,
-        so it must not touch `state.seq`: it queues unnumbered descriptions and lets
-        `_message_events` number them. A defect detected here would otherwise be swallowed by
-        the SDK's control-request error response, so it is handed to the generator too.
+        `Query._spawn_control_request_handler` runs this concurrently with the turn
+        generator, so it only queues its event and lets `_message_events` emit it. A defect
+        detected here would otherwise be swallowed by the SDK's control-request error
+        response, so it is handed to the generator too.
         """
         try:
             return await self._decide_permission(state, name, tool_input, context)
@@ -1345,8 +1114,7 @@ class ClaudeSdkAdapter:
                 "display_name": getattr(context, "display_name", None),
                 "description": getattr(context, "description", None),
                 "blocked_path": blocked_path,
-            },
-            allowed_fields=_KNOWN_FIELDS["permission/request"],
+            }
         )
         summary = next(
             value
@@ -1357,21 +1125,11 @@ class ClaudeSdkAdapter:
             )
             if isinstance(value, str) and value
         )
-        summary = sanitize_provider_text(summary, limit=2_000)
         request = ApprovalRequest(
             operation=operation,
-            summary=summary,
+            summary=sanitize_provider_text(summary, limit=2_000),
             tool_name=name if operation == "tool_use" else None,
             native_payload=native,
-        )
-        self._queue_pending(
-            state,
-            _PendingEvent(
-                "approval_requested",
-                ApprovalRequestedData(request),
-                native_type="permission/request",
-                native_payload=native,
-            ),
         )
         handler_failed = False
         if policy.filesystem == "read_only" and operation in ("command", "file_change"):
@@ -1403,15 +1161,8 @@ class ClaudeSdkAdapter:
             if decision not in ("allow", "deny", "abort"):
                 decision = "deny"
                 handler_failed = True
-        self._queue_pending(
-            state,
-            _PendingEvent(
-                "approval_answered",
-                ApprovalAnsweredData(decision),
-                native_type="permission/response",
-                native_payload=freeze_json_object({"decision": decision}),
-            ),
-        )
+        # One auditable event per native request, carrying the decision that was made.
+        self._queue_pending(state, AgentPermissionRequest(request=request, decision=decision))
         if handler_failed:
             state.approval_failure = True
         elif decision == "abort":
@@ -1424,13 +1175,13 @@ class ClaudeSdkAdapter:
         )
 
     @staticmethod
-    def _queue_pending(state: _ClaudeSessionState, pending: _PendingEvent) -> None:
+    def _queue_pending(state: _ClaudeSessionState, event: AgentEvent) -> None:
         if len(state.pending_events) >= _MAX_EVENT_COUNT:
             raise ProtocolDefect(
                 "Claude queued more approval events than one turn may emit",
                 code="output_limit_before_delivery",
             )
-        state.pending_events.append(pending)
+        state.pending_events.append(event)
 
     def _learn_identity(self, state: _ClaudeSessionState, message: object) -> None:
         session_id: object | None = getattr(message, "session_id", None)
@@ -1452,6 +1203,9 @@ class ClaudeSdkAdapter:
             and session_id != state.ref.native_session_id
         ):
             raise ProtocolDefect("Claude SDK stream changed session identity")
+        # The native message uuid names the turn internally only: it gates the permission
+        # callback's active-turn check and interrupt's soft/hard choice. No public turn id
+        # exists.
         uuid = getattr(message, "uuid", None)
         if state.turn_id is None and isinstance(uuid, str) and uuid:
             state.turn_id = uuid
@@ -1588,31 +1342,6 @@ class ClaudeSdkAdapter:
                 code="process_cleanup_failed",
             ) from None
 
-    def _event(self, state: _ClaudeSessionState, pending: _PendingEvent) -> AgentEvent:
-        """Assign one stream sequence number.
-
-        The only caller is the turn generator (`stream_turn` and `_message_events`), which is
-        what keeps `seq` gap-free while the SDK dispatches permission callbacks concurrently.
-        """
-        if state.ref is None or state.turn_id is None:
-            raise ProtocolDefect("Claude event arrived before stream identity")
-        terminal = pending.kind in ("turn_completed", "turn_failed", "turn_cancelled")
-        if state.seq >= _MAX_EVENT_COUNT or (not terminal and state.seq == _MAX_EVENT_COUNT - 1):
-            raise OutputLimitExceeded(_MAX_EVENT_COUNT)
-        state.seq += 1
-        return AgentEvent(
-            schema_version="agent-event.v1",
-            seq=state.seq,
-            backend="claude",
-            transport="sdk",
-            session_ref=state.ref,
-            turn_id=state.turn_id,
-            kind=pending.kind,
-            data=pending.data,
-            native_type=pending.native_type,
-            native_payload=pending.native_payload,
-        )
-
     def _state(self, session: AgentSession) -> _ClaudeSessionState:
         if session in self._dead_sessions:
             raise SessionUnavailable("Claude SDK session is no longer live")
@@ -1621,16 +1350,25 @@ class ClaudeSdkAdapter:
         except KeyError as error:
             raise InvalidAgentRequest("session is not owned by this Claude adapter") from error
 
-    @staticmethod
-    def _load_sdk() -> ModuleType:
+    @classmethod
+    def _load_sdk(cls) -> ModuleType:
         if os.environ.get("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK"):
             raise UnsupportedCapability("ambient Claude SDK version-check bypass is forbidden")
         try:
-            return importlib.import_module("claude_agent_sdk")
+            sdk = importlib.import_module("claude_agent_sdk")
         except ModuleNotFoundError as error:
             raise SdkUnavailable(
                 "claude-agent-sdk is unavailable; install the 'claude-sdk' extra"
             ) from error
+        version = cls._sdk_version(sdk)
+        if version != _SUPPORTED_SDK_VERSION:
+            warnings.warn(
+                f"claude-agent-sdk {version} is not the vetted {_SUPPORTED_SDK_VERSION} — "
+                "continuing behind the behavioral system/init verification",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return sdk
 
     def _require_executable(self) -> str:
         if self._executable is None:
@@ -1652,12 +1390,8 @@ class ClaudeSdkAdapter:
             return "unknown"
 
     @staticmethod
-    def _require_scope(scope: AgentCapabilityScope) -> None:
-        if scope.backend != "claude" or scope.transport != "sdk":
-            raise InvalidAgentRequest("Claude SDK received a different capability scope")
-
-    @staticmethod
     def _require_local_auth(kind: str) -> None:
+        # Retained security kernel: this lane forwards no API-key credential on any path.
         if kind != "local_account":
             raise UnsupportedCapability(
                 "Claude Agent SDK cannot report its effective authentication identity"
@@ -1701,6 +1435,7 @@ class ClaudeSdkAdapter:
 
     @staticmethod
     def _validate_policy_mapping(policy: PermissionPolicy) -> None:
+        """Enforce the backend facts this transport owns, failing closed before any work."""
         if policy.filesystem == "full_access":
             raise UnsupportedCapability("Claude SDK full filesystem access is not fail-closed")
         if policy.network == "unrestricted":
@@ -1739,9 +1474,11 @@ class ClaudeSdkAdapter:
         result: dict[str, object] = {}
         for server in request.mcp_servers:
             if server.transport != "streamable_http":
-                # `capabilities()` advertises `streamable_http` only, so this is unreachable
-                # through the runtime. It fails loudly rather than silently emitting a config
-                # shape nobody checked, should that advertisement ever widen.
+                # `validate_mcp_network_policy` only admits a stdio server under full
+                # filesystem and unrestricted network policy, both of which
+                # `_validate_policy_mapping` refuses for this lane, so this is unreachable
+                # through the runtime. It fails loudly rather than silently emitting a
+                # config shape nobody checked, should either gate ever move.
                 raise UnsupportedCapability(
                     "Claude SDK MCP configuration supports streamable HTTP servers only"
                 )
@@ -1807,10 +1544,9 @@ class ClaudeSdkAdapter:
     def _output_format(output: object) -> dict[str, object] | None:
         if not isinstance(output, JsonSchemaAgentOutput):
             return None
-        return {
-            "type": "json_schema",
-            "schema": to_json_schema(output.schema, inline_defs=False, include_annotations=True),
-        }
+        # The caller's plain JSON Schema passes through to the SDK's native option; the
+        # backend enforces it, this lane never interprets it.
+        return {"type": "json_schema", "schema": thaw_json_value(output.schema)}
 
     @staticmethod
     def _thinking(request: AgentSessionRequest) -> dict[str, object] | None:
@@ -1825,11 +1561,11 @@ class ClaudeSdkAdapter:
     def _operation(name: str) -> Literal["command", "file_change", "tool_use"]:
         """Classify one tool for the approval summary and the read-only refusal.
 
-        Read from the same table `capabilities()` publishes, because the two classifications
-        are the same classification: `_decide_permission` denies `command`/`file_change`
-        outright under `filesystem: read_only`, so a name advertised as a file write that
-        this method called an ordinary tool use would be a write allowed under a read-only
-        policy.
+        Read from `_BUILTIN_TOOL_NAMES`, because the accepted-name set and this
+        classification are the same fact: `_decide_permission` denies
+        `command`/`file_change` outright under `filesystem: read_only`, so a file-write
+        name this method called an ordinary tool use would be a write allowed under a
+        read-only policy.
         """
         if name in _COMMAND_TOOL_NAMES:
             return "command"
@@ -1837,41 +1573,13 @@ class ClaudeSdkAdapter:
             return "file_change"
         return "tool_use"
 
-    @staticmethod
-    def _file_result_event(
-        message: object,
-        native_type: str,
-        native_payload: FrozenJsonDict,
-    ) -> _PendingEvent | None:
-        result = getattr(message, "tool_use_result", None)
-        if not isinstance(result, Mapping):
-            return None
-        change_type = result.get("type")
-        mapped: Literal["created", "modified", "deleted"] | None
-        if change_type == "create":
-            mapped = "created"
-        elif change_type == "update":
-            mapped = "modified"
-        elif change_type == "delete":
-            mapped = "deleted"
-        else:
-            mapped = None
-        path = result.get("filePath")
-        if mapped is None or not isinstance(path, str):
-            return None
-        return _PendingEvent(
-            "file_change",
-            # The SDK surfaces a file change through the tool *result*, so the write has
-            # already happened by the time this message arrives.
-            FileChangeData(path=path, change=mapped, status="applied"),
+    @classmethod
+    def _native(cls, native_type: str, value: object) -> AgentNative:
+        """One native frame with no first-class kind, recursively redacted and bounded."""
+        return AgentNative(
             native_type=native_type,
-            native_payload=native_payload,
+            payload=redact_native_payload(cls._object_payload(value)),
         )
-
-    @staticmethod
-    def _native_payload(native_type: str, message: object) -> FrozenJsonDict:
-        payload = ClaudeSdkAdapter._object_payload(message)
-        return redact_native_payload(payload, allowed_fields=_KNOWN_FIELDS.get(native_type))
 
     @staticmethod
     def _object_payload(value: object) -> dict[str, object]:

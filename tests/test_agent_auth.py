@@ -14,7 +14,6 @@ from provider_runtime.agent_runtime.auth import (
     mcp_header_environment_name,
     redact_native_payload,
     resolve_state_root,
-    secret_environment_name,
     state_root_from_environment,
     validate_policy_environment,
 )
@@ -131,83 +130,24 @@ def test_policy_environment_rejects_alternate_auth_and_provider_selection(
         )
 
 
-def test_api_key_environment_selects_one_named_source_and_scrubs_the_rest(tmp_path: Path) -> None:
-    child = build_child_environment(
-        AuthEnvironmentRequest(
-            backend="claude",
-            credential=CredentialRef(
-                kind="api_key_environment", profile_key="api", name="ANTHROPIC_API_KEY"
-            ),
-            inherited_environment={
-                "TERM": "dumb",
-                "ANTHROPIC_API_KEY": "selected-secret",
-                "ANTHROPIC_AUTH_TOKEN": "wrong-secret",
-            },
-            allowed_environment=("TERM",),
-            state_root=tmp_path / "claude" / "api",
-        )
-    )
-
-    assert child["ANTHROPIC_API_KEY"] == "selected-secret"
-    assert "ANTHROPIC_AUTH_TOKEN" not in child
-    assert child["CLAUDE_CONFIG_DIR"].endswith("/claude/api")
-    with pytest.raises(CredentialUnavailable, match="ANTHROPIC_API_KEY"):
-        build_child_environment(
-            AuthEnvironmentRequest(
-                backend="claude",
-                credential=CredentialRef(
-                    kind="api_key_environment", profile_key="api", name="ANTHROPIC_API_KEY"
-                ),
-                inherited_environment={},
-                allowed_environment=(),
-                state_root=tmp_path / "claude" / "api",
+def test_named_session_credentials_are_rejected_before_any_forwarding(tmp_path: Path) -> None:
+    """Subscription auth only: no path exists that forwards an API key into a session child."""
+    for credential in (
+        CredentialRef(kind="api_key_environment", profile_key="api", name="ANTHROPIC_API_KEY"),
+        CredentialRef(
+            kind="secret_reference", profile_key="vault", name="providers/openai/personal"
+        ),
+    ):
+        with pytest.raises(InvalidAgentRequest, match="local_account"):
+            build_child_environment(
+                AuthEnvironmentRequest(
+                    backend="claude",
+                    credential=credential,
+                    inherited_environment={"ANTHROPIC_API_KEY": "must-never-cross"},
+                    allowed_environment=(),
+                    state_root=tmp_path / "claude" / "api",
+                )
             )
-        )
-
-    with pytest.raises(InvalidAgentRequest, match="recognized"):
-        build_child_environment(
-            AuthEnvironmentRequest(
-                backend="claude",
-                credential=CredentialRef(
-                    kind="api_key_environment", profile_key="api", name="ARBITRARY_KEY"
-                ),
-                inherited_environment={"ARBITRARY_KEY": "secret"},
-                allowed_environment=(),
-                state_root=tmp_path / "claude" / "api",
-            )
-        )
-
-
-def test_secret_reference_uses_only_explicit_resolution_and_backend_target(tmp_path: Path) -> None:
-    assert secret_environment_name("codex") == "OPENAI_API_KEY"
-    assert secret_environment_name("claude") == "ANTHROPIC_API_KEY"
-    child = build_child_environment(
-        AuthEnvironmentRequest(
-            backend="codex",
-            credential=CredentialRef(
-                kind="secret_reference", profile_key="vault", name="providers/openai/personal"
-            ),
-            inherited_environment={"providers/openai/personal": "wrong", "TERM": "dumb"},
-            allowed_environment=("TERM",),
-            state_root=tmp_path / "codex" / "vault",
-            resolved_secret="resolved-value",
-            secret_environment_name="OPENAI_API_KEY",
-        )
-    )
-
-    assert child["OPENAI_API_KEY"] == "resolved-value"
-    assert "providers/openai/personal" not in child
-    with pytest.raises(CredentialUnavailable, match="could not be resolved"):
-        AuthEnvironmentRequest(
-            backend="codex",
-            credential=CredentialRef(
-                kind="secret_reference", profile_key="vault", name="providers/openai/personal"
-            ),
-            inherited_environment={},
-            allowed_environment=(),
-            state_root=tmp_path / "codex" / "vault",
-            secret_environment_name="OPENAI_API_KEY",
-        )
 
 
 def test_mcp_header_environment_alias_is_stable_and_opaque() -> None:
@@ -240,20 +180,21 @@ def test_policy_can_never_allow_credential_class_environment_names() -> None:
         validate_policy_environment("codex", PermissionPolicy(environment=("ANTHROPIC_API_KEY",)))
 
 
-def test_known_native_payloads_are_allowlisted_and_secret_fields_are_denied() -> None:
+def test_native_payloads_are_recursively_scrubbed_without_field_allowlists() -> None:
     payload = redact_native_payload(
         {
             "message": "safe",
             "authorization": "Bearer definitely-secret-token",
             "nested": {"token": "sk-secret-secret-secret"},
-            "ignored": "not contract data",
-        },
-        allowed_fields=("message", "nested", "authorization"),
+            "extra": "kept because redaction owns keys, not schemas",
+        }
     )
 
     assert payload == {
         "message": "safe",
+        "authorization": "...redacted",
         "nested": {"token": "...redacted"},
+        "extra": "kept because redaction owns keys, not schemas",
     }
     assert "definitely-secret-token" not in json.dumps(thaw_json_value(payload))
 
@@ -321,24 +262,20 @@ USAGE_COUNTER_KEYS = (
 
 
 @pytest.mark.parametrize("key", CREDENTIAL_KEYS)
-def test_every_credential_key_shape_is_redacted_on_both_payload_paths(key: str) -> None:
+def test_every_credential_key_shape_is_redacted(key: str) -> None:
     """A false negative here leaks a secret, so the vocabulary is asserted key by key."""
     secret = "sk-live-definitely-secret-value"
 
-    allowlisted = redact_native_payload({key: secret, "message": "safe"}, allowed_fields=(key,))
-    assert allowlisted == {}, f"{key!r} must not survive the allowlist filter"
-
-    passthrough = redact_native_payload({"outer": {key: secret}}, allowed_fields=None)
-    assert passthrough == {"outer": {key: "...redacted"}}
+    passthrough = redact_native_payload({"outer": {key: secret}})
+    assert passthrough == {"outer": {key: "...redacted"}}, (
+        f"{key!r} must be redacted wherever it appears"
+    )
     assert secret not in json.dumps(thaw_json_value(passthrough))
 
 
 @pytest.mark.parametrize("key", USAGE_COUNTER_KEYS)
 def test_backend_reported_usage_counter_names_are_not_treated_as_credentials(key: str) -> None:
-    assert redact_native_payload({key: 140}, allowed_fields=(key,)) == {key: 140}
-    assert redact_native_payload({"usage": {key: 140}}, allowed_fields=None) == {
-        "usage": {key: 140}
-    }
+    assert redact_native_payload({"usage": {key: 140}}) == {"usage": {key: 140}}
 
 
 def test_captured_backend_usage_payloads_survive_redaction_intact() -> None:
@@ -364,10 +301,7 @@ def test_captured_backend_usage_payloads_survive_redaction_intact() -> None:
             "modelContextWindow": 258400,
         },
     }
-    assert (
-        redact_native_payload(codex_params, allowed_fields=("threadId", "turnId", "tokenUsage"))
-        == codex_params
-    )
+    assert redact_native_payload(codex_params) == codex_params
 
     claude_result: dict[str, object] = {
         "usage": {
@@ -378,22 +312,17 @@ def test_captured_backend_usage_payloads_survive_redaction_intact() -> None:
         },
         "model_usage": {"native-model": {"input_tokens": 140, "output_tokens": 32}},
     }
-    assert (
-        redact_native_payload(claude_result, allowed_fields=("usage", "model_usage"))
-        == claude_result
-    )
+    assert redact_native_payload(claude_result) == claude_result
 
 
 def test_unknown_payloads_are_bounded_scrubbed_or_dropped_to_a_stub() -> None:
-    scrubbed = redact_native_payload(
-        {"detail": "Bearer abcdefghijklmnopqrstuvwxyz"}, allowed_fields=None
-    )
+    scrubbed = redact_native_payload({"detail": "Bearer abcdefghijklmnopqrstuvwxyz"})
     assert scrubbed == {"detail": "Bearer ...redacted"}
 
-    dropped = redact_native_payload({"detail": "x" * 100}, allowed_fields=None, max_bytes=20)
+    dropped = redact_native_payload({"detail": "x" * 100}, max_bytes=20)
     assert dropped == {"redaction": "payload_dropped", "reason": "size_limit"}
 
-    huge_integer = redact_native_payload({"detail": 10**10000}, allowed_fields=None)
+    huge_integer = redact_native_payload({"detail": 10**10000})
     assert huge_integer == {"redaction": "payload_dropped", "reason": "shape_limit"}
 
 
@@ -441,7 +370,7 @@ def test_ordinary_environment_names_stay_forwardable(name: str) -> None:
 
 def test_a_non_finite_native_number_is_a_protocol_defect_not_a_silent_stub() -> None:
     with pytest.raises(ProtocolDefect, match="malformed JSON"):
-        redact_native_payload({"score": float("nan")}, allowed_fields=None)
+        redact_native_payload({"score": float("nan")})
 
 
 def test_state_root_read_back_is_strict_and_identical_for_every_transport(

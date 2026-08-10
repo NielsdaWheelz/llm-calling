@@ -12,8 +12,13 @@ official SDK. It is not a hosted subscription proxy, multi-tenant sandbox, login
 service, or token broker.
 
 The only shipped routes are `codex:sdk` and `claude:sdk`. There is no raw CLI or
-direct protocol fallback. Each route rejects named API-key and secret-reference
-session credentials before resolving a secret.
+direct protocol fallback. Session authentication is subscription-only: each
+route rejects named API-key and secret-reference session credentials before any
+secret could be resolved, and the child-environment builder refuses to forward
+them structurally, so no code path exists that places an API key in an agent
+child. Subscription pool exhaustion terminates the turn with the
+`AgentQuotaExhausted` failure value — the lane never overflows onto API-rate
+credentials.
 
 Report any raw credential in an event, diagnostic, exception, persisted session
 reference, generated file, or child command line as a vulnerability.
@@ -42,9 +47,13 @@ ChatGPT subscription auth; ambient API keys do not reach the runtime.
 
 For Claude, a shell router or version-manager shim can overwrite
 `CLAUDE_CONFIG_DIR` and defeat isolation. Point
-`AgentRuntimeConfig.claude_executable` at the real executable. The live matrix
-resolves the path, refuses POSIX-shell wrappers, and version-checks the exact file
-in the runtime-owned child environment.
+`AgentRuntimeConfig.claude_executable` at the real executable. The runtime
+resolves the path and probes the executable in the runtime-owned child
+environment before any session starts. Version drift against the vetted build
+is reported as one warning and met with behavioral probes (effective
+configuration verification on the wire), never silently trusted; an executable
+or SDK that is missing or does not answer remains a typed availability
+failure.
 
 ## SDK process-group launchers
 
@@ -83,9 +92,11 @@ treat provider review as permission for the provider's maintained policy to
 approve actions within the separately selected filesystem/network sandbox.
 
 Codex does not expose exact built-in tool filters through its public SDK. The
-route reports that limitation and rejects specific allow/deny patterns rather
-than pretending they were enforced. Claude publishes and validates its exact
-accepted native tool names.
+route rejects specific allow/deny patterns rather than pretending they were
+enforced; only the explicit `allowed_tools=("*",)` sentinel is accepted when
+built-ins are intentionally enabled. Claude validates policies against its
+exact accepted native tool names and verifies the effective tool set the
+backend reports at session start.
 
 ## MCP and credentials
 
@@ -108,21 +119,28 @@ Safer supported shapes are:
   workspace-write filesystem, and unrestricted network. Codex cannot enforce an
   exact hostname allowlist, so this confines filesystem access, not egress.
 
-## Bounds, cancellation, and cleanup
+## Bounds, redaction, cancellation, and cleanup
 
 SDK messages, event count, text, final output, diagnostics, turn duration, and
 cleanup are bounded. Output-limit failures terminate the turn and discard
 uncertain native session state. The runtime never retries a stateful turn.
+
+Native frames cross the public boundary only as `AgentNative` events whose
+payload passed the bounded, recursive redaction: credential-shaped keys are
+dropped wherever they appear, every retained string is sanitized and
+length-bounded, and a payload exceeding its depth/item/byte bounds is dropped
+whole. There are no per-version field allowlists; redaction is by key shape,
+not by schema table.
 
 Cancellation uses the SDK's native interrupt operation. Claude drains the
 interrupted tail or invalidates the client before reuse. Codex discards the SDK
 client after protocol/transport uncertainty. Runtime close terminates active
 work and closes all clients.
 
-The public event grammar requires exactly one terminal event after a started
-turn. Identity mismatches, events from retired turns, malformed known SDK
-notifications, and post-terminal frames are defects rather than tolerated
-input.
+The public event grammar is six kinds and requires exactly one `AgentTerminal`
+after a started turn. Identity mismatches, events from retired turns, malformed
+known SDK notifications, and post-terminal frames are defects rather than
+tolerated input.
 
 ## Optional dependency boundary
 
