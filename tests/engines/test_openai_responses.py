@@ -1,0 +1,1367 @@
+"""OpenAI Responses engine conformance + fault injection (HTTP boundary via respx).
+
+Request tests assert EXACT body dicts as the SDK puts them on the wire; decode
+tests feed canned envelopes; stream tests feed raw SSE bytes. No internal
+mocking anywhere — respx intercepts the SDK's own httpx transport.
+"""
+
+import json
+from base64 import b64encode
+from collections.abc import Mapping
+from dataclasses import replace
+
+import httpx
+import pytest
+import respx
+
+from provider_runtime.engines import TransientAttempt
+from provider_runtime.engines.openai_responses import OpenAIResponsesEngine
+from provider_runtime.errors import CredentialRejected, InvalidRequest, ProtocolDefect
+from provider_runtime.registry import REGISTRY_REVISION, ModelRow
+from provider_runtime.types import (
+    Absent,
+    AssistantMessage,
+    CanonicalTool,
+    CodecStreamEvent,
+    ContinuationArtifact,
+    ContinuationDelta,
+    Failed,
+    FinalAttempt,
+    GenerateIntent,
+    ImageBlock,
+    Incomplete,
+    InvalidToolArguments,
+    NotDispatched,
+    OutputSpec,
+    PossiblyBillable,
+    Present,
+    PromptBlock,
+    PromptMessage,
+    ProviderContextTooLarge,
+    ProviderCredential,
+    ProviderHttpUnavailable,
+    ProviderRateLimit,
+    ProviderStreamInterrupted,
+    ProviderTarget,
+    ProviderTimeout,
+    ReasoningLevel,
+    Refused,
+    StreamStart,
+    StrictJsonOutput,
+    StructuredContent,
+    Succeeded,
+    SystemMessage,
+    TerminalEvent,
+    TextContent,
+    TextDelta,
+    TextOutput,
+    TokenUsage,
+    ToolCall,
+    ToolCallDelta,
+    ToolCallDone,
+    ToolCallStart,
+    ToolChoice,
+    ToolResultMessage,
+    TransportUnavailable,
+    UserMessage,
+)
+
+RESPONSES_URL = "https://api.openai.com/v1/responses"
+
+REASONING_LEVELS: Mapping[ReasoningLevel, object] = {"none": "none", "low": "low", "high": "high"}
+
+ROW = ModelRow(
+    ref="openai:gpt-test",
+    provider="openai",
+    model_id="gpt-test-1",
+    engine="openai_responses",
+    base_url=Present("https://api.openai.com/v1"),
+    context_window=400_000,
+    max_output_tokens=64_000,
+    modalities=frozenset({"text", "image"}),
+    tools=True,
+    streaming=True,
+    structured="native",
+    reasoning=Present(REASONING_LEVELS),
+    continuation_codec="openai.v1",
+    correlation="header",
+    routing=Absent(),
+)
+
+TARGET = ProviderTarget(provider="openai", model="gpt-test-1")
+CREDENTIAL = ProviderCredential(provider="openai", key="sk-test-not-a-real-key-1234567890")
+
+SYSTEM = SystemMessage(blocks=(PromptBlock(text="You are terse."),))
+USER = UserMessage(blocks=(PromptBlock(text="hi"),))
+
+SEARCH_TOOL = CanonicalTool(
+    name="search_library",
+    description="Search the library",
+    parameters={
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+    },
+)
+
+TEXT_OUTPUT = TextOutput()
+
+VERDICT_OUTPUT = StrictJsonOutput(
+    name="verdict",
+    schema={
+        "type": "object",
+        "properties": {"verdict": {"type": "string"}},
+        "required": ["verdict"],
+        "additionalProperties": False,
+    },
+)
+
+
+def make_intent(
+    *,
+    messages: tuple[PromptMessage, ...] = (SYSTEM, USER),
+    max_output_tokens: int = 128,
+    reasoning: ReasoningLevel = "high",
+    tools: tuple[CanonicalTool, ...] = (),
+    tool_choice: ToolChoice = "auto",
+    output: OutputSpec = TEXT_OUTPUT,
+    provider_options: Mapping[str, object] | None = None,
+    target: ProviderTarget = TARGET,
+) -> GenerateIntent:
+    return GenerateIntent(
+        target=target,
+        messages=messages,
+        max_output_tokens=max_output_tokens,
+        reasoning=reasoning,
+        tools=tools,
+        tool_choice=tool_choice,
+        output=output,
+        provider_options={} if provider_options is None else provider_options,
+    )
+
+
+def usage_body() -> dict[str, object]:
+    return {
+        "input_tokens": 120,
+        "input_tokens_details": {"cached_tokens": 100, "cache_write_tokens": 8},
+        "output_tokens": 30,
+        "output_tokens_details": {"reasoning_tokens": 12},
+        "total_tokens": 150,
+    }
+
+
+EXPECTED_USAGE = TokenUsage(
+    input_tokens=120,
+    output_tokens=30,
+    total_tokens=150,
+    reasoning_tokens=Present(12),
+    cache_read_input_tokens=Present(100),
+    cache_write_input_tokens=Present(8),
+)
+
+TEXT_ITEM: dict[str, object] = {
+    "id": "msg_1",
+    "type": "message",
+    "role": "assistant",
+    "status": "completed",
+    "content": [{"type": "output_text", "text": "hello", "annotations": []}],
+}
+
+REASONING_ITEM: dict[str, object] = {
+    "id": "rs_1",
+    "type": "reasoning",
+    "summary": [],
+    "encrypted_content": "gAAAAB-enc-1",
+}
+
+FUNCTION_CALL_ITEM: dict[str, object] = {
+    "id": "fc_1",
+    "type": "function_call",
+    "call_id": "call_1",
+    "name": "search_library",
+    "arguments": '{"query": "cats"}',
+    "status": "completed",
+}
+
+
+def envelope(
+    *,
+    output: list[dict[str, object]],
+    status: str = "completed",
+    usage: dict[str, object] | None = None,
+    incomplete_details: dict[str, object] | None = None,
+    model: str | None = "gpt-test-1",
+    response_id: str = "resp_123",
+) -> dict[str, object]:
+    body: dict[str, object] = {
+        "id": response_id,
+        "object": "response",
+        "created_at": 1,
+        "status": status,
+        "output": output,
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
+    }
+    if model is not None:
+        body["model"] = model
+    if usage is not None:
+        body["usage"] = usage
+    if incomplete_details is not None:
+        body["incomplete_details"] = incomplete_details
+    return body
+
+
+def mock_response(body: dict[str, object], *, request_id: str | None = "req_abc") -> httpx.Response:
+    headers = {"content-type": "application/json"}
+    if request_id is not None:
+        headers["x-request-id"] = request_id
+    return httpx.Response(200, headers=headers, json=body)
+
+
+def request_body(route: respx.Route) -> dict[str, object]:
+    request = route.calls.last.request
+    parsed = json.loads(request.content)
+    assert isinstance(parsed, dict), f"request body is not a JSON object: {request.content!r}"
+    return parsed
+
+
+def sse_bytes(frames: list[dict[str, object]]) -> bytes:
+    chunks = [f"event: {frame['type']}\ndata: {json.dumps(frame)}\n\n".encode() for frame in frames]
+    return b"".join(chunks)
+
+
+def mock_stream(frames: list[dict[str, object]], *, request_id: str = "req_s1") -> httpx.Response:
+    return httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream", "x-request-id": request_id},
+        content=sse_bytes(frames),
+    )
+
+
+def created_frame(response_id: str = "resp_s1") -> dict[str, object]:
+    return {
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": {"id": response_id, "status": "in_progress", "model": "gpt-test-1"},
+    }
+
+
+def completed_frame(
+    *,
+    output: list[dict[str, object]],
+    usage: dict[str, object] | None = None,
+    model: str = "gpt-test-1",
+    response_id: str = "resp_s1",
+) -> dict[str, object]:
+    return {
+        "type": "response.completed",
+        "sequence_number": 99,
+        "response": envelope(
+            output=output, usage=usage, model=model, response_id=response_id, status="completed"
+        ),
+    }
+
+
+async def collect_stream(
+    engine: OpenAIResponsesEngine, intent: GenerateIntent, *, row: ModelRow = ROW
+) -> list[CodecStreamEvent]:
+    return [event async for event in engine.stream(row, intent, CREDENTIAL)]
+
+
+def assert_meta(
+    outcome: Succeeded | Refused | Incomplete | Failed,
+    *,
+    request_id: str = "req_abc",
+    usage: TokenUsage | None = EXPECTED_USAGE,
+    native_reasoning: str | None = "high",
+    status_code: int = 200,
+    model: str = "gpt-test-1",
+) -> None:
+    meta = outcome.meta
+    assert meta.provider == "openai", f"meta.provider: {meta.provider!r}"
+    assert meta.model == model, f"meta.model: {meta.model!r}"
+    assert meta.provider_request_id == Present(request_id), (
+        f"meta.provider_request_id: {meta.provider_request_id!r}"
+    )
+    assert meta.upstream_provider == Absent(), f"meta.upstream_provider: {meta.upstream_provider!r}"
+    expected_usage = Absent() if usage is None else Present(usage)
+    assert meta.usage == expected_usage, f"meta.usage: {meta.usage!r} != {expected_usage!r}"
+    expected_native = Absent() if native_reasoning is None else Present(native_reasoning)
+    assert meta.native_reasoning == expected_native, (
+        f"meta.native_reasoning: {meta.native_reasoning!r} != {expected_native!r}"
+    )
+    assert meta.registry_revision == REGISTRY_REVISION, (
+        f"meta.registry_revision: {meta.registry_revision!r}"
+    )
+    assert meta.billability == PossiblyBillable(), f"meta.billability: {meta.billability!r}"
+    assert len(meta.attempt_trace) == 1, f"attempt_trace: {meta.attempt_trace!r}"
+    record = meta.attempt_trace[0]
+    assert record.attempt == 1, f"attempt: {record.attempt}"
+    assert record.signal == FinalAttempt(), f"signal: {record.signal!r}"
+    assert record.status_code == Present(status_code), f"status_code: {record.status_code!r}"
+    assert record.ended_at_ms >= record.started_at_ms, f"attempt record times: {record!r}"
+
+
+# ---------------------------------------------------------------------------
+# Request conformance
+
+
+@respx.mock
+async def test_generate_sends_exact_request_body_headers_and_url() -> None:
+    route = respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
+    )
+    outcome = await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    assert route.call_count == 1, f"expected exactly one dispatch; got {route.call_count}"
+    request = route.calls.last.request
+    assert request.headers["authorization"] == f"Bearer {CREDENTIAL.key}", (
+        f"authorization header: {request.headers.get('authorization')!r}"
+    )
+    body = request_body(route)
+    assert body == {
+        "model": "gpt-test-1",
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": "You are terse."}]},
+            {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        ],
+        "max_output_tokens": 128,
+        "store": False,
+        "include": ["reasoning.encrypted_content"],
+        "reasoning": {"effort": "high"},
+    }, f"request body: {body!r}"
+
+
+@respx.mock
+async def test_generate_omits_reasoning_when_row_has_no_reasoning_knob() -> None:
+    route = respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
+    )
+    row = replace(ROW, reasoning=Absent())
+    outcome = await OpenAIResponsesEngine().generate(row, make_intent(reasoning="none"), CREDENTIAL)
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    body = request_body(route)
+    assert "reasoning" not in body, f"reasoning key must be omitted; body: {body!r}"
+    assert outcome.meta.native_reasoning == Absent(), (
+        f"native_reasoning: {outcome.meta.native_reasoning!r}"
+    )
+
+
+async def test_generate_rejects_undeclared_reasoning_level() -> None:
+    with pytest.raises(InvalidRequest, match="reasoning level 'max'"):
+        await OpenAIResponsesEngine().generate(ROW, make_intent(reasoning="max"), CREDENTIAL)
+
+
+@respx.mock
+async def test_generate_encodes_tools_strict_with_closed_schema() -> None:
+    route = respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
+    )
+    intent = make_intent(tools=(SEARCH_TOOL,), tool_choice="none")
+    outcome = await OpenAIResponsesEngine().generate(ROW, intent, CREDENTIAL)
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    body = request_body(route)
+    assert body["tools"] == [
+        {
+            "type": "function",
+            "name": "search_library",
+            "description": "Search the library",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        }
+    ], f"tools: {body.get('tools')!r}"
+    assert body["tool_choice"] == "none", f"tool_choice: {body.get('tool_choice')!r}"
+
+
+@respx.mock
+async def test_generate_without_tools_omits_tool_choice() -> None:
+    route = respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
+    )
+    outcome = await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    body = request_body(route)
+    assert "tools" not in body and "tool_choice" not in body, (
+        f"tools/tool_choice must be omitted; body: {body!r}"
+    )
+
+
+@respx.mock
+async def test_generate_encodes_strict_json_output_as_native_text_format() -> None:
+    structured_item: dict[str, object] = {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": '{"verdict": "yes"}', "annotations": []}],
+    }
+    route = respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[structured_item], usage=usage_body()))
+    )
+    outcome = await OpenAIResponsesEngine().generate(
+        ROW, make_intent(output=VERDICT_OUTPUT), CREDENTIAL
+    )
+    body = request_body(route)
+    assert body["text"] == {
+        "format": {
+            "type": "json_schema",
+            "name": "verdict",
+            "schema": {
+                "type": "object",
+                "properties": {"verdict": {"type": "string"}},
+                "required": ["verdict"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        }
+    }, f"text.format: {body.get('text')!r}"
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    assert outcome.response.content == StructuredContent(
+        payload={"verdict": "yes"}, text='{"verdict": "yes"}'
+    ), f"content: {outcome.response.content!r}"
+
+
+@respx.mock
+async def test_generate_json_mode_row_sends_json_object_format() -> None:
+    structured_item: dict[str, object] = {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": '{"verdict": "no"}', "annotations": []}],
+    }
+    route = respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[structured_item], usage=usage_body()))
+    )
+    row = replace(ROW, structured="json_mode")
+    outcome = await OpenAIResponsesEngine().generate(
+        row, make_intent(output=VERDICT_OUTPUT), CREDENTIAL
+    )
+    body = request_body(route)
+    assert body["text"] == {"format": {"type": "json_object"}}, f"text: {body.get('text')!r}"
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    assert outcome.response.content == StructuredContent(
+        payload={"verdict": "no"}, text='{"verdict": "no"}'
+    ), f"content: {outcome.response.content!r}"
+
+
+@respx.mock
+async def test_generate_encodes_image_block_as_data_url() -> None:
+    route = respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
+    )
+    image = ImageBlock(media_type="image/png", data=b"\x89PNG-fake")
+    intent = make_intent(
+        messages=(SYSTEM, UserMessage(blocks=(PromptBlock(text="what is this?"), image)))
+    )
+    outcome = await OpenAIResponsesEngine().generate(ROW, intent, CREDENTIAL)
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    body = request_body(route)
+    expected_url = f"data:image/png;base64,{b64encode(b'\x89PNG-fake').decode('ascii')}"
+    assert body["input"] == [
+        {"role": "system", "content": [{"type": "input_text", "text": "You are terse."}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "what is this?"},
+                {"type": "input_image", "image_url": expected_url, "detail": "auto"},
+            ],
+        },
+    ], f"input: {body.get('input')!r}"
+
+
+@respx.mock
+async def test_generate_replays_continuation_payload_verbatim() -> None:
+    route = respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
+    )
+    artifact = ContinuationArtifact(
+        target=TARGET,
+        codec_id="openai.v1",
+        opaque_payload={"output": (REASONING_ITEM, FUNCTION_CALL_ITEM)},
+    )
+    intent = make_intent(
+        messages=(
+            SYSTEM,
+            USER,
+            AssistantMessage(
+                text="prior",
+                tool_calls=(
+                    ToolCall(id="call_1", name="search_library", arguments={"query": "cats"}),
+                ),
+                continuation=Present(artifact),
+            ),
+            ToolResultMessage(call_id="call_1", output="42", is_error=False),
+        )
+    )
+    outcome = await OpenAIResponsesEngine().generate(ROW, intent, CREDENTIAL)
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    body = request_body(route)
+    assert body["input"] == [
+        {"role": "system", "content": [{"type": "input_text", "text": "You are terse."}]},
+        {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        REASONING_ITEM,
+        FUNCTION_CALL_ITEM,
+        {"type": "function_call_output", "call_id": "call_1", "output": "42"},
+    ], f"input must splice payload items verbatim; got: {body.get('input')!r}"
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    [
+        ContinuationArtifact(
+            target=ProviderTarget(provider="openai", model="gpt-other"),
+            codec_id="openai.v1",
+            opaque_payload={"output": (REASONING_ITEM,)},
+        ),
+        ContinuationArtifact(
+            target=TARGET,
+            codec_id="anthropic.v1",
+            opaque_payload={"output": (REASONING_ITEM,)},
+        ),
+    ],
+    ids=["target-mismatch", "codec-mismatch"],
+)
+async def test_generate_rejects_continuation_bound_elsewhere(
+    artifact: ContinuationArtifact,
+) -> None:
+    intent = make_intent(
+        messages=(
+            SYSTEM,
+            USER,
+            AssistantMessage(text="prior", tool_calls=(), continuation=Present(artifact)),
+        )
+    )
+    with pytest.raises(InvalidRequest, match="cannot replay"):
+        await OpenAIResponsesEngine().generate(ROW, intent, CREDENTIAL)
+
+
+async def test_generate_rejects_continuation_without_output_items() -> None:
+    artifact = ContinuationArtifact(target=TARGET, codec_id="openai.v1", opaque_payload={})
+    intent = make_intent(
+        messages=(
+            SYSTEM,
+            USER,
+            AssistantMessage(text="prior", tool_calls=(), continuation=Present(artifact)),
+        )
+    )
+    with pytest.raises(InvalidRequest, match="output"):
+        await OpenAIResponsesEngine().generate(ROW, intent, CREDENTIAL)
+
+
+async def test_generate_rejects_assistant_tool_calls_without_continuation() -> None:
+    intent = make_intent(
+        messages=(
+            SYSTEM,
+            USER,
+            AssistantMessage(
+                text="",
+                tool_calls=(ToolCall(id="call_1", name="search_library", arguments={}),),
+                continuation=Absent(),
+            ),
+            ToolResultMessage(call_id="call_1", output="42", is_error=False),
+        )
+    )
+    with pytest.raises(InvalidRequest, match="continuation"):
+        await OpenAIResponsesEngine().generate(ROW, intent, CREDENTIAL)
+
+
+@respx.mock
+async def test_generate_forwards_provider_options_into_request_body() -> None:
+    route = respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
+    )
+    intent = make_intent(provider_options={"parallel_tool_calls": False, "prompt_cache_key": "k1"})
+    outcome = await OpenAIResponsesEngine().generate(ROW, intent, CREDENTIAL)
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    body = request_body(route)
+    assert body["parallel_tool_calls"] is False, f"body: {body!r}"
+    assert body["prompt_cache_key"] == "k1", f"body: {body!r}"
+
+
+async def test_generate_rejects_provider_options_colliding_with_owned_keys() -> None:
+    intent = make_intent(provider_options={"store": True})
+    with pytest.raises(InvalidRequest, match="store"):
+        await OpenAIResponsesEngine().generate(ROW, intent, CREDENTIAL)
+
+
+@respx.mock
+async def test_generate_uses_sdk_default_base_url_when_row_base_url_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    route = respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
+    )
+    row = replace(ROW, base_url=Absent())
+    outcome = await OpenAIResponsesEngine().generate(row, make_intent(), CREDENTIAL)
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    assert route.call_count == 1, "request must hit the SDK default base URL"
+
+
+# ---------------------------------------------------------------------------
+# Response decode
+
+
+@respx.mock
+async def test_generate_decodes_success_usage_meta_and_continuation() -> None:
+    output = [REASONING_ITEM, TEXT_ITEM]
+    respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=output, usage=usage_body()))
+    )
+    outcome = await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    assert_meta(outcome)
+    assert outcome.response.content == TextContent(text="hello", tool_calls=()), (
+        f"content: {outcome.response.content!r}"
+    )
+    continuation = outcome.response.continuation
+    assert isinstance(continuation, Present), f"continuation: {continuation!r}"
+    artifact = continuation.value
+    assert artifact.target == TARGET, f"artifact.target: {artifact.target!r}"
+    assert artifact.codec_id == "openai.v1", f"artifact.codec_id: {artifact.codec_id!r}"
+    assert list(artifact.opaque_payload["output"]) == output, (  # type: ignore[arg-type]
+        f"payload items must be the verbatim wire output: {artifact.opaque_payload!r}"
+    )
+
+
+@respx.mock
+async def test_generate_falls_back_to_envelope_id_when_header_missing() -> None:
+    respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(
+            envelope(output=[TEXT_ITEM], usage=usage_body()), request_id=None
+        )
+    )
+    outcome = await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    assert outcome.meta.provider_request_id == Present("resp_123"), (
+        f"provider_request_id: {outcome.meta.provider_request_id!r}"
+    )
+
+
+@respx.mock
+async def test_generate_parses_tool_calls_strictly() -> None:
+    respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(
+            envelope(output=[FUNCTION_CALL_ITEM, TEXT_ITEM], usage=usage_body())
+        )
+    )
+    outcome = await OpenAIResponsesEngine().generate(
+        ROW, make_intent(tools=(SEARCH_TOOL,)), CREDENTIAL
+    )
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    assert outcome.response.content == TextContent(
+        text="hello",
+        tool_calls=(ToolCall(id="call_1", name="search_library", arguments={"query": "cats"}),),
+    ), f"content: {outcome.response.content!r}"
+
+
+@respx.mock
+async def test_generate_invalid_tool_arguments_returns_failed_value() -> None:
+    broken = dict(FUNCTION_CALL_ITEM, arguments='{"query": ')
+    respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[broken], usage=usage_body()))
+    )
+    outcome = await OpenAIResponsesEngine().generate(
+        ROW, make_intent(tools=(SEARCH_TOOL,)), CREDENTIAL
+    )
+    assert isinstance(outcome, Failed), f"outcome: {outcome!r}"
+    assert isinstance(outcome.failure, InvalidToolArguments), f"failure: {outcome.failure!r}"
+    assert "search_library" in outcome.failure.safe_detail, (
+        f"safe_detail: {outcome.failure.safe_detail!r}"
+    )
+    assert_meta(outcome)
+
+
+@respx.mock
+async def test_generate_maps_refusal_output_to_refused() -> None:
+    refusal_item: dict[str, object] = {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "refusal", "refusal": "I cannot help with that."}],
+    }
+    respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[refusal_item], usage=usage_body()))
+    )
+    outcome = await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert isinstance(outcome, Refused), f"outcome: {outcome!r}"
+    assert outcome.safe_detail == "I cannot help with that.", (
+        f"safe_detail: {outcome.safe_detail!r}"
+    )
+    assert_meta(outcome)
+
+
+@pytest.mark.parametrize(
+    ("native_reason", "expected_reason"),
+    [("max_output_tokens", "max_output_tokens"), ("content_filter", "content_filter_partial")],
+)
+@respx.mock
+async def test_generate_maps_incomplete_statuses(native_reason: str, expected_reason: str) -> None:
+    respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(
+            envelope(
+                output=[TEXT_ITEM],
+                status="incomplete",
+                usage=usage_body(),
+                incomplete_details={"reason": native_reason},
+            )
+        )
+    )
+    outcome = await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert isinstance(outcome, Incomplete), f"outcome: {outcome!r}"
+    assert outcome.reason == expected_reason, f"reason: {outcome.reason!r}"
+    assert outcome.status == "provider_incomplete", f"status: {outcome.status!r}"
+    assert outcome.safe_detail == Present(native_reason), f"safe_detail: {outcome.safe_detail!r}"
+    assert_meta(outcome)
+
+
+@respx.mock
+async def test_generate_unknown_incomplete_reason_is_protocol_defect() -> None:
+    respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(
+            envelope(
+                output=[TEXT_ITEM],
+                status="incomplete",
+                incomplete_details={"reason": "novel_reason"},
+            )
+        )
+    )
+    with pytest.raises(ProtocolDefect, match="novel_reason"):
+        await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+
+
+@respx.mock
+async def test_generate_unknown_terminal_status_is_protocol_defect() -> None:
+    respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[TEXT_ITEM], status="queued"))
+    )
+    with pytest.raises(ProtocolDefect, match="queued"):
+        await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+
+
+@respx.mock
+async def test_generate_strict_json_non_json_text_is_protocol_defect() -> None:
+    respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
+    )
+    with pytest.raises(ProtocolDefect, match="not valid JSON"):
+        await OpenAIResponsesEngine().generate(ROW, make_intent(output=VERDICT_OUTPUT), CREDENTIAL)
+
+
+@respx.mock
+async def test_generate_malformed_json_envelope_is_protocol_defect() -> None:
+    respx.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(
+            200, headers={"content-type": "application/json"}, content=b"{not json"
+        )
+    )
+    with pytest.raises(ProtocolDefect, match="not valid JSON"):
+        await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+
+
+@respx.mock
+async def test_generate_missing_model_is_protocol_defect() -> None:
+    respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[TEXT_ITEM], model=None))
+    )
+    with pytest.raises(ProtocolDefect, match="model"):
+        await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+
+
+@respx.mock
+async def test_generate_missing_output_is_protocol_defect() -> None:
+    body = envelope(output=[])
+    del body["output"]
+    respx.post(RESPONSES_URL).mock(return_value=mock_response(body))
+    with pytest.raises(ProtocolDefect, match="output"):
+        await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+
+
+# ---------------------------------------------------------------------------
+# Fault injection — generate
+
+
+@respx.mock
+async def test_generate_rate_limit_with_retry_after_raises_transient() -> None:
+    respx.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(
+            429,
+            headers={"retry-after": "7", "x-request-id": "req_429"},
+            json={"error": {"message": "slow down", "type": "rate_limit_error"}},
+        )
+    )
+    with pytest.raises(TransientAttempt) as exc_info:
+        await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    attempt = exc_info.value
+    assert attempt.cause == ProviderRateLimit(retry_after=Present(7.0)), f"cause: {attempt.cause!r}"
+    assert attempt.status_code == Present(429), f"status_code: {attempt.status_code!r}"
+    assert attempt.provider_request_id == Present("req_429"), (
+        f"provider_request_id: {attempt.provider_request_id!r}"
+    )
+    assert attempt.billability == PossiblyBillable(), f"billability: {attempt.billability!r}"
+
+
+@respx.mock
+async def test_generate_rate_limit_without_retry_after_raises_transient() -> None:
+    respx.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(429, json={"error": {"message": "slow down"}})
+    )
+    with pytest.raises(TransientAttempt) as exc_info:
+        await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert exc_info.value.cause == ProviderRateLimit(retry_after=Absent()), (
+        f"cause: {exc_info.value.cause!r}"
+    )
+
+
+@respx.mock
+async def test_generate_5xx_raises_transient_unavailable() -> None:
+    respx.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(503, json={"error": {"message": "overloaded"}})
+    )
+    with pytest.raises(TransientAttempt) as exc_info:
+        await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert exc_info.value.cause == ProviderHttpUnavailable(), f"cause: {exc_info.value.cause!r}"
+    assert exc_info.value.status_code == Present(503), (
+        f"status_code: {exc_info.value.status_code!r}"
+    )
+
+
+@respx.mock
+async def test_generate_timeout_raises_transient_timeout() -> None:
+    respx.post(RESPONSES_URL).mock(side_effect=httpx.ReadTimeout("read timed out"))
+    with pytest.raises(TransientAttempt) as exc_info:
+        await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert exc_info.value.cause == ProviderTimeout(), f"cause: {exc_info.value.cause!r}"
+    assert exc_info.value.billability == PossiblyBillable(), (
+        f"billability: {exc_info.value.billability!r}"
+    )
+
+
+@respx.mock
+async def test_generate_connect_error_raises_transport_unavailable_not_dispatched() -> None:
+    respx.post(RESPONSES_URL).mock(side_effect=httpx.ConnectError("no route to host"))
+    with pytest.raises(TransientAttempt) as exc_info:
+        await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert exc_info.value.cause == TransportUnavailable(), f"cause: {exc_info.value.cause!r}"
+    assert exc_info.value.billability == NotDispatched(), (
+        f"billability: {exc_info.value.billability!r}"
+    )
+
+
+@respx.mock
+async def test_generate_context_overflow_returns_failed_value() -> None:
+    respx.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(
+            400,
+            headers={"x-request-id": "req_400"},
+            json={
+                "error": {
+                    "message": "This model's maximum context length is 400000 tokens.",
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                }
+            },
+        )
+    )
+    outcome = await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert isinstance(outcome, Failed), f"outcome: {outcome!r}"
+    assert outcome.failure == ProviderContextTooLarge(), f"failure: {outcome.failure!r}"
+    assert_meta(outcome, request_id="req_400", usage=None, status_code=400)
+
+
+@respx.mock
+async def test_generate_credential_rejection_raises() -> None:
+    respx.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(
+            401,
+            json={"error": {"message": "Incorrect API key provided", "code": "invalid_api_key"}},
+        )
+    )
+    with pytest.raises(CredentialRejected, match="401"):
+        await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+
+
+# ---------------------------------------------------------------------------
+# Streaming
+
+
+@respx.mock
+async def test_stream_decodes_deltas_tool_calls_continuation_and_terminal() -> None:
+    done_fc: dict[str, object] = {
+        "id": "fc_item_1",
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "search_library",
+        "arguments": '{"query": "cats"}',
+        "status": "completed",
+    }
+    done_reasoning = dict(REASONING_ITEM)
+    done_message: dict[str, object] = {
+        "id": "msg_s1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "Hi there", "annotations": []}],
+    }
+    frames: list[dict[str, object]] = [
+        created_frame(),
+        {
+            "type": "response.output_item.added",
+            "sequence_number": 1,
+            "output_index": 0,
+            "item": {
+                "id": "fc_item_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "search_library",
+                "arguments": "",
+            },
+        },
+        {
+            "type": "response.function_call_arguments.delta",
+            "sequence_number": 2,
+            "output_index": 0,
+            "item_id": "fc_item_1",
+            "delta": '{"query":',
+        },
+        {
+            "type": "response.function_call_arguments.delta",
+            "sequence_number": 3,
+            "output_index": 0,
+            "item_id": "fc_item_1",
+            "delta": ' "cats"}',
+        },
+        {
+            "type": "response.output_item.done",
+            "sequence_number": 4,
+            "output_index": 0,
+            "item": done_fc,
+        },
+        {
+            "type": "response.output_item.done",
+            "sequence_number": 5,
+            "output_index": 1,
+            "item": done_reasoning,
+        },
+        {
+            "type": "response.output_text.delta",
+            "sequence_number": 6,
+            "output_index": 2,
+            "item_id": "msg_s1",
+            "content_index": 0,
+            "logprobs": [],
+            "delta": "Hi",
+        },
+        {
+            "type": "response.output_text.delta",
+            "sequence_number": 7,
+            "output_index": 2,
+            "item_id": "msg_s1",
+            "content_index": 0,
+            "logprobs": [],
+            "delta": " there",
+        },
+        {
+            "type": "response.output_item.done",
+            "sequence_number": 8,
+            "output_index": 2,
+            "item": done_message,
+        },
+        completed_frame(output=[done_fc, done_reasoning, done_message], usage=usage_body()),
+    ]
+    route = respx.post(RESPONSES_URL).mock(return_value=mock_stream(frames))
+    intent = make_intent(tools=(SEARCH_TOOL,))
+    events = await collect_stream(OpenAIResponsesEngine(), intent)
+
+    body = request_body(route)
+    assert body["stream"] is True, f"stream flag missing from request body: {body!r}"
+
+    expected_tool_call = ToolCall(id="call_1", name="search_library", arguments={"query": "cats"})
+    assert events[0] == StreamStart(), f"first event: {events[0]!r}"
+    assert events[1] == ToolCallStart(call_id="call_1", name="search_library"), f"{events[1]!r}"
+    assert events[2] == ToolCallDelta(call_id="call_1", arguments_delta='{"query":'), (
+        f"{events[2]!r}"
+    )
+    assert events[3] == ToolCallDelta(call_id="call_1", arguments_delta=' "cats"}'), (
+        f"{events[3]!r}"
+    )
+    assert events[4] == ToolCallDone(tool_call=expected_tool_call), f"{events[4]!r}"
+    assert events[5] == TextDelta(text="Hi"), f"{events[5]!r}"
+    assert events[6] == TextDelta(text=" there"), f"{events[6]!r}"
+
+    continuation_delta = events[7]
+    assert isinstance(continuation_delta, ContinuationDelta), f"{continuation_delta!r}"
+    artifact = continuation_delta.artifact
+    assert artifact.target == TARGET and artifact.codec_id == "openai.v1", f"{artifact!r}"
+    assert list(artifact.opaque_payload["output"]) == [done_fc, done_reasoning, done_message], (  # type: ignore[arg-type]
+        f"payload items must be the verbatim done items in order: {artifact.opaque_payload!r}"
+    )
+
+    terminal = events[8]
+    assert isinstance(terminal, TerminalEvent), f"{terminal!r}"
+    outcome = terminal.outcome
+    assert isinstance(outcome, Succeeded), f"terminal outcome: {outcome!r}"
+    assert outcome.response.content == TextContent(
+        text="Hi there", tool_calls=(expected_tool_call,)
+    ), f"content: {outcome.response.content!r}"
+    assert outcome.response.continuation == Present(artifact), (
+        f"terminal continuation: {outcome.response.continuation!r}"
+    )
+    assert_meta(outcome, request_id="req_s1")
+    assert len(events) == 9, f"unexpected extra events: {events!r}"
+
+
+@respx.mock
+async def test_stream_midcut_after_semantic_output_raises_partial_interrupt() -> None:
+    frames = [
+        created_frame(),
+        {
+            "type": "response.output_text.delta",
+            "sequence_number": 1,
+            "output_index": 0,
+            "item_id": "msg_s1",
+            "content_index": 0,
+            "logprobs": [],
+            "delta": "partial",
+        },
+    ]
+    respx.post(RESPONSES_URL).mock(return_value=mock_stream(frames))
+    events: list[CodecStreamEvent] = []
+    with pytest.raises(TransientAttempt) as exc_info:
+        async for event in OpenAIResponsesEngine().stream(ROW, make_intent(), CREDENTIAL):
+            events.append(event)
+    assert events == [StreamStart(), TextDelta(text="partial")], f"events: {events!r}"
+    assert exc_info.value.cause == ProviderStreamInterrupted(partial_output=True), (
+        f"cause: {exc_info.value.cause!r}"
+    )
+    assert exc_info.value.billability == PossiblyBillable(), (
+        f"billability: {exc_info.value.billability!r}"
+    )
+
+
+@respx.mock
+async def test_stream_midcut_before_semantic_output_raises_clean_interrupt() -> None:
+    respx.post(RESPONSES_URL).mock(return_value=mock_stream([created_frame()]))
+    events: list[CodecStreamEvent] = []
+    with pytest.raises(TransientAttempt) as exc_info:
+        async for event in OpenAIResponsesEngine().stream(ROW, make_intent(), CREDENTIAL):
+            events.append(event)
+    assert events == [StreamStart()], f"events: {events!r}"
+    assert exc_info.value.cause == ProviderStreamInterrupted(partial_output=False), (
+        f"cause: {exc_info.value.cause!r}"
+    )
+
+
+@respx.mock
+async def test_stream_inband_error_event_rate_limit_raises_transient() -> None:
+    frames: list[dict[str, object]] = [
+        created_frame(),
+        {
+            "type": "error",
+            "sequence_number": 1,
+            "code": "rate_limit_exceeded",
+            "message": "Too many tokens",
+            "param": None,
+        },
+    ]
+    respx.post(RESPONSES_URL).mock(return_value=mock_stream(frames))
+    with pytest.raises(TransientAttempt) as exc_info:
+        async for _ in OpenAIResponsesEngine().stream(ROW, make_intent(), CREDENTIAL):
+            pass
+    assert exc_info.value.cause == ProviderRateLimit(retry_after=Absent()), (
+        f"cause: {exc_info.value.cause!r}"
+    )
+
+
+@respx.mock
+async def test_stream_failed_frame_server_error_raises_transient() -> None:
+    frames: list[dict[str, object]] = [
+        created_frame(),
+        {
+            "type": "response.failed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_s1",
+                "status": "failed",
+                "model": "gpt-test-1",
+                "error": {"code": "server_error", "message": "The model had an error"},
+            },
+        },
+    ]
+    respx.post(RESPONSES_URL).mock(return_value=mock_stream(frames))
+    with pytest.raises(TransientAttempt) as exc_info:
+        async for _ in OpenAIResponsesEngine().stream(ROW, make_intent(), CREDENTIAL):
+            pass
+    assert exc_info.value.cause == ProviderHttpUnavailable(), f"cause: {exc_info.value.cause!r}"
+
+
+@respx.mock
+async def test_stream_unknown_inband_error_is_protocol_defect() -> None:
+    frames: list[dict[str, object]] = [
+        created_frame(),
+        {"type": "error", "sequence_number": 1, "code": "invalid_prompt", "message": "bad prompt"},
+    ]
+    respx.post(RESPONSES_URL).mock(return_value=mock_stream(frames))
+    with pytest.raises(ProtocolDefect, match="invalid_prompt"):
+        async for _ in OpenAIResponsesEngine().stream(ROW, make_intent(), CREDENTIAL):
+            pass
+
+
+@respx.mock
+async def test_stream_refusal_folds_into_incomplete_refused_terminal() -> None:
+    frames: list[dict[str, object]] = [
+        created_frame(),
+        {
+            "type": "response.refusal.delta",
+            "sequence_number": 1,
+            "output_index": 0,
+            "item_id": "msg_s1",
+            "content_index": 0,
+            "delta": "I cannot ",
+        },
+        {
+            "type": "response.refusal.delta",
+            "sequence_number": 2,
+            "output_index": 0,
+            "item_id": "msg_s1",
+            "content_index": 0,
+            "delta": "help with that.",
+        },
+        completed_frame(output=[], usage=usage_body()),
+    ]
+    respx.post(RESPONSES_URL).mock(return_value=mock_stream(frames))
+    events = await collect_stream(OpenAIResponsesEngine(), make_intent())
+    assert events[0] == StreamStart(), f"events: {events!r}"
+    terminal = events[1]
+    assert isinstance(terminal, TerminalEvent), f"events: {events!r}"
+    outcome = terminal.outcome
+    assert isinstance(outcome, Incomplete), f"terminal outcome: {outcome!r}"
+    assert outcome.status == "refused", f"status: {outcome.status!r}"
+    assert outcome.reason == "content_filter_partial", f"reason: {outcome.reason!r}"
+    assert outcome.safe_detail == Present("I cannot help with that."), (
+        f"safe_detail: {outcome.safe_detail!r}"
+    )
+    assert len(events) == 2, f"no ContinuationDelta on refusal: {events!r}"
+
+
+@respx.mock
+async def test_stream_incomplete_terminal() -> None:
+    frames: list[dict[str, object]] = [
+        created_frame(),
+        {
+            "type": "response.output_text.delta",
+            "sequence_number": 1,
+            "output_index": 0,
+            "item_id": "msg_s1",
+            "content_index": 0,
+            "logprobs": [],
+            "delta": "truncat",
+        },
+        {
+            "type": "response.incomplete",
+            "sequence_number": 2,
+            "response": envelope(
+                output=[],
+                status="incomplete",
+                usage=usage_body(),
+                incomplete_details={"reason": "max_output_tokens"},
+                response_id="resp_s1",
+            ),
+        },
+    ]
+    respx.post(RESPONSES_URL).mock(return_value=mock_stream(frames))
+    events = await collect_stream(OpenAIResponsesEngine(), make_intent())
+    terminal = events[-1]
+    assert isinstance(terminal, TerminalEvent), f"events: {events!r}"
+    outcome = terminal.outcome
+    assert isinstance(outcome, Incomplete), f"terminal outcome: {outcome!r}"
+    assert outcome.reason == "max_output_tokens", f"reason: {outcome.reason!r}"
+    assert outcome.status == "provider_incomplete", f"status: {outcome.status!r}"
+    assert_meta(outcome, request_id="req_s1")
+
+
+@respx.mock
+async def test_stream_tool_argument_parse_failure_yields_failed_terminal() -> None:
+    frames: list[dict[str, object]] = [
+        created_frame(),
+        {
+            "type": "response.output_item.added",
+            "sequence_number": 1,
+            "output_index": 0,
+            "item": {
+                "id": "fc_item_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "search_library",
+                "arguments": "",
+            },
+        },
+        {
+            "type": "response.output_item.done",
+            "sequence_number": 2,
+            "output_index": 0,
+            "item": {
+                "id": "fc_item_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "search_library",
+                "arguments": '{"query": ',
+                "status": "completed",
+            },
+        },
+    ]
+    respx.post(RESPONSES_URL).mock(return_value=mock_stream(frames))
+    events = await collect_stream(OpenAIResponsesEngine(), make_intent(tools=(SEARCH_TOOL,)))
+    assert events[0] == StreamStart(), f"events: {events!r}"
+    assert events[1] == ToolCallStart(call_id="call_1", name="search_library"), f"{events[1]!r}"
+    terminal = events[2]
+    assert isinstance(terminal, TerminalEvent), f"events: {events!r}"
+    outcome = terminal.outcome
+    assert isinstance(outcome, Failed), f"terminal outcome: {outcome!r}"
+    assert isinstance(outcome.failure, InvalidToolArguments), f"failure: {outcome.failure!r}"
+    assert len(events) == 3, f"stream must end at the failed terminal: {events!r}"
+
+
+@respx.mock
+async def test_stream_context_overflow_yields_failed_terminal_without_stream_start() -> None:
+    respx.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(
+            400,
+            headers={"x-request-id": "req_400"},
+            json={"error": {"message": "too long", "code": "context_length_exceeded"}},
+        )
+    )
+    events = await collect_stream(OpenAIResponsesEngine(), make_intent())
+    assert len(events) == 1, f"expected a single terminal event: {events!r}"
+    terminal = events[0]
+    assert isinstance(terminal, TerminalEvent), f"{terminal!r}"
+    outcome = terminal.outcome
+    assert isinstance(outcome, Failed), f"terminal outcome: {outcome!r}"
+    assert outcome.failure == ProviderContextTooLarge(), f"failure: {outcome.failure!r}"
+    assert_meta(outcome, request_id="req_400", usage=None, status_code=400)
+
+
+@respx.mock
+async def test_stream_credential_rejection_raises_before_any_event() -> None:
+    respx.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(403, json={"error": {"message": "forbidden"}})
+    )
+    events: list[CodecStreamEvent] = []
+    with pytest.raises(CredentialRejected, match="403"):
+        async for event in OpenAIResponsesEngine().stream(ROW, make_intent(), CREDENTIAL):
+            events.append(event)
+    assert events == [], f"no events may precede credential rejection: {events!r}"
+
+
+@respx.mock
+async def test_stream_rate_limit_at_accept_raises_transient() -> None:
+    respx.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(
+            429, headers={"retry-after": "3"}, json={"error": {"message": "slow down"}}
+        )
+    )
+    with pytest.raises(TransientAttempt) as exc_info:
+        async for _ in OpenAIResponsesEngine().stream(ROW, make_intent(), CREDENTIAL):
+            pass
+    assert exc_info.value.cause == ProviderRateLimit(retry_after=Present(3.0)), (
+        f"cause: {exc_info.value.cause!r}"
+    )
+
+
+@respx.mock
+async def test_stream_malformed_frame_is_protocol_defect() -> None:
+    content = sse_bytes([created_frame()]) + b"event: response.completed\ndata: {broken\n\n"
+    respx.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=content
+        )
+    )
+    with pytest.raises(ProtocolDefect, match="stream frame"):
+        async for _ in OpenAIResponsesEngine().stream(ROW, make_intent(), CREDENTIAL):
+            pass
+
+
+@respx.mock
+async def test_stream_strict_json_terminal_promotes_structured_content() -> None:
+    done_message: dict[str, object] = {
+        "id": "msg_s1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": '{"verdict": "yes"}', "annotations": []}],
+    }
+    frames: list[dict[str, object]] = [
+        created_frame(),
+        {
+            "type": "response.output_text.delta",
+            "sequence_number": 1,
+            "output_index": 0,
+            "item_id": "msg_s1",
+            "content_index": 0,
+            "logprobs": [],
+            "delta": '{"verdict": "yes"}',
+        },
+        {
+            "type": "response.output_item.done",
+            "sequence_number": 2,
+            "output_index": 0,
+            "item": done_message,
+        },
+        completed_frame(output=[done_message], usage=usage_body()),
+    ]
+    respx.post(RESPONSES_URL).mock(return_value=mock_stream(frames))
+    events = await collect_stream(OpenAIResponsesEngine(), make_intent(output=VERDICT_OUTPUT))
+    terminal = events[-1]
+    assert isinstance(terminal, TerminalEvent), f"events: {events!r}"
+    outcome = terminal.outcome
+    assert isinstance(outcome, Succeeded), f"terminal outcome: {outcome!r}"
+    assert outcome.response.content == StructuredContent(
+        payload={"verdict": "yes"}, text='{"verdict": "yes"}'
+    ), f"content: {outcome.response.content!r}"
+
+
+# ---------------------------------------------------------------------------
+# Continuation round-trip: decode → replay encodes verbatim
+
+
+@respx.mock
+async def test_continuation_round_trip_replays_decoded_items_verbatim() -> None:
+    first_output = [REASONING_ITEM, FUNCTION_CALL_ITEM]
+    route = respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=first_output, usage=usage_body()))
+    )
+    engine = OpenAIResponsesEngine()
+    first = await engine.generate(ROW, make_intent(tools=(SEARCH_TOOL,)), CREDENTIAL)
+    assert isinstance(first, Succeeded), f"first outcome: {first!r}"
+    continuation = first.response.continuation
+    assert isinstance(continuation, Present), f"continuation: {continuation!r}"
+    content = first.response.content
+    assert isinstance(content, TextContent), f"content: {content!r}"
+
+    follow_up = make_intent(
+        messages=(
+            SYSTEM,
+            USER,
+            AssistantMessage(text="", tool_calls=content.tool_calls, continuation=continuation),
+            ToolResultMessage(call_id="call_1", output="42", is_error=False),
+        ),
+        tools=(SEARCH_TOOL,),
+    )
+    second = await engine.generate(ROW, follow_up, CREDENTIAL)
+    assert isinstance(second, Succeeded), f"second outcome: {second!r}"
+    body = request_body(route)
+    assert body["input"] == [
+        {"role": "system", "content": [{"type": "input_text", "text": "You are terse."}]},
+        {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        REASONING_ITEM,
+        FUNCTION_CALL_ITEM,
+        {"type": "function_call_output", "call_id": "call_1", "output": "42"},
+    ], f"replayed input must carry the decoded items verbatim: {body.get('input')!r}"
