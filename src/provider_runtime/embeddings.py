@@ -1,92 +1,182 @@
-"""OpenAI embeddings port: request building and strict response validation.
+"""OpenAI embeddings port — one SDK attempt per call; the runtime owns retries.
 
-The embedding port is openai-only (catalog `EmbeddingContract` rows). The
-runtime dispatches `build_embedding_request` through the shared `Transport`
-(Bearer auth injected there) with the central `EXTERNAL_LLM_RETRY` policy,
-classifies non-2xx through the openai codec's `classify_error`, and hands 2xx
-bodies to `parse_embedding_response`.
+The port is openai-only and Nexus-live (spec §13): ``ProviderRuntime.embed``
+drives `embed_once` through the shared retry owner (`retry.attempts`), so this
+module makes exactly ONE attempt: retryable trouble raises `TransientAttempt`,
+context overflow — the one expected terminal failure — returns as a value the
+runtime wraps in `NonGenerationCallFailed`, and defects raise their own types.
 
-The strict response validation is preserved verbatim-in-behavior from the
-pre-cutover `EmbeddingsClient`: missing/invalid data rows, invalid, duplicate,
-or uncovered indexes, non-list vectors, non-numeric or non-finite values are
-all rejected — now as `ProtocolDefect` (they were
-`ModelCallError(PROVIDER_DOWN)` before the defect/expected-failure split).
+Wire: the SDK's own embeddings lane (``AsyncOpenAI.embeddings.create``,
+``max_retries=0``, explicit timeout, injectable http_client, default base
+URL — the rows are openai-proper only). ``encoding_format`` is deliberately
+omitted so the SDK default applies: it requests base64 on the wire and decodes
+the packed float32 payload back to plain floats itself; a provider answering
+JSON float lists passes through that decode untouched.
+
+Decode validation is preserved verbatim-in-behavior from the pre-cutover port:
+missing, invalid, duplicate, or uncovered indexes, non-list vectors, and
+non-numeric or non-finite values are all `ProtocolDefect` — one vector per
+input, returned in input order.
 """
 
 from __future__ import annotations
 
-import json
 import math
 from collections.abc import Mapping
+from typing import Final
 
-from provider_runtime.errors import ProtocolDefect
+import httpx
+import openai
+from openai.types import CreateEmbeddingResponse
+from openai.types.create_embedding_response import Usage
+from openai.types.embedding import Embedding
+
+from provider_runtime.engines import TransientAttempt
+from provider_runtime.errors import (
+    CredentialRejected,
+    ProtocolDefect,
+    RuntimeDefect,
+    safe_provider_error_body_snippet,
+)
 from provider_runtime.types import (
     Absent,
+    Billability,
     EmbeddingCall,
     EmbeddingResponse,
-    FinalizedProviderRequest,
+    NotDispatched,
+    PossiblyBillable,
     Presence,
     Present,
-    ProviderTarget,
+    ProviderContextTooLarge,
+    ProviderCredential,
+    ProviderHttpUnavailable,
+    ProviderRateLimit,
+    ProviderTimeout,
     TokenUsage,
+    TransportUnavailable,
     presence_of,
 )
 
-_EMBEDDINGS_URL = "https://api.openai.com/v1/embeddings"
-
-
-def _dump_bytes(value: object) -> bytes:
-    return json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-
-
-def build_embedding_request(call: EmbeddingCall) -> FinalizedProviderRequest:
-    """The plain JSON POST for the openai embeddings endpoint.
-
-    Reuses `FinalizedProviderRequest` so the shared Transport (auth injection,
-    timeouts, verbatim passthrough) carries it; the protocol tag is the openai
-    codec's — only its `classify_error` ever sees this request's errors."""
-    body: dict[str, object] = {"model": call.model, "input": list(call.inputs)}
-    if isinstance(call.dimensions, Present):
-        body["dimensions"] = call.dimensions.value
-    return FinalizedProviderRequest(
-        target=ProviderTarget(provider="openai", model=call.model),
-        protocol="openai_responses",
-        url=_EMBEDDINGS_URL,
-        method="POST",
-        safe_headers={},
-        body=_dump_bytes(body),
-    )
+# Prior-art non-generation request timeout (old runtime's _REQUEST_TIMEOUT_S);
+# embeddings never stream, so the generation engines' long budget is wrong here.
+_TIMEOUT_S: Final[float] = 45.0
 
 
 def _defect(message: str) -> ProtocolDefect:
     return ProtocolDefect(code="invalid_embedding_response", message=message)
 
 
-def parse_embedding_response(
-    status: int,
-    headers: Mapping[str, str],
-    body: bytes,
-    *,
-    expected_count: int,
-) -> EmbeddingResponse:
-    """Decode a 2xx embeddings response; non-2xx goes through classify_error."""
-    del status, headers  # 2xx only; no header-borne facts consumed
-    try:
-        data = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        raise _defect("openai embeddings response is not valid JSON") from None
-    if not isinstance(data, dict):
-        raise _defect("openai embeddings response is not a JSON object")
+def _int_or_none(value: object) -> int | None:
+    # bool is an int subclass; token counts are never booleans.
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
-    rows = data.get("data")
+
+# ---------------------------------------------------------------------------
+# Error classification (port of the old openai codec's classify_error; mirrors
+# the openai engines' module-local classifiers)
+
+
+def _terminal_http_failure(error: openai.APIStatusError) -> ProviderContextTooLarge:
+    """Classify a non-2xx response.
+
+    Returns the ONE expected terminal failure (context overflow); raises
+    CredentialRejected / RuntimeDefect for terminal operator conditions and
+    TransientAttempt for retryable ones.
+    """
+    status = error.status_code
+    # The SDK unwraps body["error"] before attaching it, so error.body is the
+    # inner error object for openai-shaped error envelopes.
+    inner = dict(error.body) if isinstance(error.body, Mapping) else None
+    code = inner.get("code") if inner else None
+    error_type = inner.get("type") if inner else None
+    message = inner.get("message") if inner else None
+    snippet = (
+        safe_provider_error_body_snippet({"error": inner} if inner else None) or f"HTTP {status}"
+    )
+
+    if status in (401, 403):
+        raise CredentialRejected(
+            message=f"openai rejected the platform credential (HTTP {status}): {snippet}"
+        )
+    if status == 402 or "insufficient_quota" in (code, error_type):
+        raise RuntimeDefect(
+            origin="provider_http",
+            code="quota_exhausted",
+            message=f"openai quota/billing exhausted (HTTP {status}): {snippet}",
+        )
+    if code == "context_length_exceeded" or (
+        isinstance(message, str) and "maximum context length" in message.lower()
+    ):
+        return ProviderContextTooLarge()
+    if status == 429:
+        raise TransientAttempt(
+            cause=ProviderRateLimit(retry_after=_retry_after_seconds(error.response.headers)),
+            status_code=Present(status),
+            provider_request_id=presence_of(error.request_id),
+            billability=PossiblyBillable(),
+        )
+    if status in (500, 502, 503, 504):
+        raise TransientAttempt(
+            cause=ProviderHttpUnavailable(),
+            status_code=Present(status),
+            provider_request_id=presence_of(error.request_id),
+            billability=PossiblyBillable(),
+        )
+    raise RuntimeDefect(
+        origin="provider_http",
+        code="unclassified_provider_error",
+        message=f"openai returned an unclassified error (HTTP {status}): {snippet}",
+    )
+
+
+def _transient_connection(error: openai.APIConnectionError) -> TransientAttempt:
+    if isinstance(error, openai.APITimeoutError):
+        return TransientAttempt(
+            cause=ProviderTimeout(),
+            status_code=Absent(),
+            provider_request_id=Absent(),
+            billability=PossiblyBillable(),
+        )
+    # A pure pre-connect failure means no bytes reached the provider; every
+    # other transport error implies the connection was at least opened.
+    billability: Billability = (
+        NotDispatched() if isinstance(error.__cause__, httpx.ConnectError) else PossiblyBillable()
+    )
+    return TransientAttempt(
+        cause=TransportUnavailable(),
+        status_code=Absent(),
+        provider_request_id=Absent(),
+        billability=billability,
+    )
+
+
+def _retry_after_seconds(headers: httpx.Headers) -> Presence[float]:
+    raw = headers.get("retry-after")
+    if raw is None:
+        return Absent()
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return Absent()
+    return Present(seconds) if seconds >= 0 else Absent()
+
+
+# ---------------------------------------------------------------------------
+# Decode — the SDK constructs response models leniently (no validation), so
+# every field is untrusted at this boundary.
+
+
+def _decode_response(
+    response: CreateEmbeddingResponse, *, expected_count: int
+) -> EmbeddingResponse:
+    rows = response.data
     if not isinstance(rows, list):
         raise _defect("openai embeddings response missing data")
-
     embeddings_by_index: dict[int, tuple[float, ...]] = {}
     for row in rows:
-        if not isinstance(row, dict):
+        if not isinstance(row, Embedding):
             raise _defect("openai embeddings response contains invalid row")
-        index = row.get("index")
+        index = row.index
         if (
             not isinstance(index, int)
             or isinstance(index, bool)
@@ -95,38 +185,76 @@ def parse_embedding_response(
             or index in embeddings_by_index
         ):
             raise _defect("openai embeddings response contains invalid index")
-        embedding = row.get("embedding")
-        if not isinstance(embedding, list):
+        if not isinstance(row.embedding, list):
             raise _defect("openai embeddings response contains invalid vector")
         try:
-            vector = tuple(float(value) for value in embedding)
+            vector = tuple(float(value) for value in row.embedding)
         except (TypeError, ValueError):
             raise _defect("openai embeddings response contains non-numeric vector value") from None
         if not all(math.isfinite(value) for value in vector):
             raise _defect("openai embeddings response contains non-finite vector value")
         embeddings_by_index[index] = vector
-
     if set(embeddings_by_index) != set(range(expected_count)):
         raise _defect("openai embeddings response has incomplete indexes")
     embeddings = tuple(embeddings_by_index[index] for index in range(expected_count))
+    return EmbeddingResponse(embeddings=embeddings, usage=_decode_usage(response.usage))
 
-    usage: Presence[TokenUsage] = Absent()
-    usage_data = data.get("usage")
-    if isinstance(usage_data, dict):
-        prompt_tokens = usage_data.get("prompt_tokens")
-        total_tokens = usage_data.get("total_tokens")
-        usage = Present(
-            TokenUsage.from_components(
-                input_tokens=prompt_tokens if isinstance(prompt_tokens, int) else 0,
-                output_tokens=0,
-                total_tokens=presence_of(total_tokens if isinstance(total_tokens, int) else None),
-                reasoning_tokens=Absent(),
-                cache_read_input_tokens=Absent(),
-                cache_write_input_tokens=Absent(),
-            )
+
+def _decode_usage(raw: object) -> Presence[TokenUsage]:
+    if not isinstance(raw, Usage):
+        return Absent()
+    return Present(
+        TokenUsage.from_components(
+            input_tokens=_int_or_none(raw.prompt_tokens) or 0,
+            output_tokens=0,
+            total_tokens=presence_of(_int_or_none(raw.total_tokens)),
+            reasoning_tokens=Absent(),
+            cache_read_input_tokens=Absent(),
+            cache_write_input_tokens=Absent(),
         )
+    )
 
-    return EmbeddingResponse(embeddings=embeddings, usage=usage)
+
+# ---------------------------------------------------------------------------
+# The runtime's single-attempt seam
 
 
-__all__ = ["build_embedding_request", "parse_embedding_response"]
+async def embed_once(
+    call: EmbeddingCall,
+    credential: ProviderCredential,
+    *,
+    http_client: httpx.AsyncClient | None,
+) -> EmbeddingResponse | ProviderContextTooLarge:
+    """One openai-SDK embeddings attempt; `ProviderRuntime.embed` owns the loop."""
+    client = openai.AsyncOpenAI(
+        api_key=credential.key,
+        timeout=_TIMEOUT_S,
+        max_retries=0,
+        http_client=http_client,
+    )
+    try:
+        try:
+            response = await client.embeddings.create(
+                model=call.model,
+                input=list(call.inputs),
+                dimensions=(
+                    call.dimensions.value if isinstance(call.dimensions, Present) else openai.omit
+                ),
+            )
+        except openai.APIStatusError as error:
+            return _terminal_http_failure(error)
+        except openai.APIConnectionError as error:
+            raise _transient_connection(error) from error
+        except (ValueError, AttributeError) as error:
+            # The SDK's own 2xx parse trips on malformed envelopes before this
+            # module's decode sees them: invalid JSON (JSONDecodeError), empty
+            # data or bad base64/length (ValueError), non-object rows in its
+            # base64 post-parse (AttributeError).
+            raise _defect(f"openai embeddings response failed SDK decode: {error}") from error
+    finally:
+        if http_client is None:
+            await client.close()
+    return _decode_response(response, expected_count=len(call.inputs))
+
+
+__all__ = ["embed_once"]

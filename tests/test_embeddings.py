@@ -1,25 +1,38 @@
-"""OpenAI embeddings port: request golden, strict validation, runtime retries."""
+"""OpenAI embeddings port conformance + fault injection (HTTP boundary via respx).
+
+Every test drives the Nexus-facing seam — ``ProviderRuntime.embed`` — with
+respx intercepting the openai SDK's own httpx transport; no internal mocking.
+Request tests assert the EXACT body the SDK puts on the wire (the SDK default
+requests ``encoding_format=base64`` and decodes the packed float32 payload
+itself, so wire vectors here are base64 strings and expected values are
+float32-exact).
+"""
 
 from __future__ import annotations
 
 import json
+from array import array
+from base64 import b64encode
 
 import httpx
 import pytest
 import respx
 
-import provider_runtime.runtime as runtime_module
-from provider_runtime.embeddings import build_embedding_request, parse_embedding_response
-from provider_runtime.errors import CredentialRejected, ProtocolDefect
-from provider_runtime.runtime import NonGenerationCallFailed, ProviderRuntime
+from provider_runtime.errors import CredentialRejected, ProtocolDefect, RuntimeDefect
+from provider_runtime.runtime import Credentials, NonGenerationCallFailed, ProviderRuntime
 from provider_runtime.types import (
     Absent,
     EmbeddingCall,
     Presence,
     Present,
+    ProviderContextTooLarge,
     ProviderCredential,
     ProviderHttpUnavailable,
+    ProviderRateLimit,
+    ProviderTimeout,
     RetryPolicy,
+    TokenUsage,
+    TransientCause,
     TransientExhausted,
 )
 
@@ -27,9 +40,18 @@ ABSENT: Absent = Absent()
 EMBEDDINGS_URL = "https://api.openai.com/v1/embeddings"
 CREDENTIAL = ProviderCredential(provider="openai", key="sk-test-not-a-real-key-1234567890")
 
+# Tests are the one sanctioned RetryPolicy( construction site outside retry.py.
 FAST_RETRY = RetryPolicy(
     max_attempts=3, initial_delay_s=0.0, max_delay_s=0.0, jitter_s=0.0, deadline_s=Absent()
 )
+
+# Exactly representable in float32, so base64 round-trips compare equal.
+VECTOR_0 = (0.5, -1.25)
+VECTOR_1 = (2.0, 0.75)
+
+
+def runtime() -> ProviderRuntime:
+    return ProviderRuntime(Credentials(), retry=FAST_RETRY)
 
 
 def call(
@@ -38,10 +60,15 @@ def call(
     return EmbeddingCall(model="text-embedding-3-small", inputs=inputs, dimensions=dimensions)
 
 
+def b64_floats(*values: float) -> str:
+    """The wire form the SDK's default encoding_format=base64 asks for: packed float32."""
+    return b64encode(array("f", values).tobytes()).decode("ascii")
+
+
 def success_body(*, out_of_order: bool = False) -> dict[str, object]:
-    rows = [
-        {"index": 0, "embedding": [0.1, 0.2]},
-        {"index": 1, "embedding": [0.3, 0.4]},
+    rows: list[object] = [
+        {"object": "embedding", "index": 0, "embedding": b64_floats(*VECTOR_0)},
+        {"object": "embedding", "index": 1, "embedding": b64_floats(*VECTOR_1)},
     ]
     if out_of_order:
         rows.reverse()
@@ -53,176 +80,359 @@ def success_body(*, out_of_order: bool = False) -> dict[str, object]:
     }
 
 
-def parse(body: object, *, expected_count: int = 2):
-    return parse_embedding_response(
-        200, {}, json.dumps(body).encode(), expected_count=expected_count
-    )
+def data_body(rows: list[object]) -> dict[str, object]:
+    body = success_body()
+    body["data"] = rows
+    return body
+
+
+def error_response(
+    status: int, message: str, *, code: str | None = None, headers: dict[str, str] | None = None
+) -> httpx.Response:
+    error: dict[str, object] = {"message": message, "type": "invalid_request_error"}
+    if code is not None:
+        error["code"] = code
+    return httpx.Response(status, headers=headers or {}, json={"error": error})
 
 
 # ---------------------------------------------------------------------------
-# build_embedding_request
+# Request conformance
 
 
-def test_build_request_golden() -> None:
-    request = build_embedding_request(call())
-    assert request.url == EMBEDDINGS_URL
-    assert request.method == "POST"
-    assert request.target.provider == "openai"
-    assert request.safe_headers == {}
-    assert json.loads(request.body) == {
+@respx.mock
+async def test_embed_sends_exact_request_body_and_bearer_auth() -> None:
+    route = respx.post(EMBEDDINGS_URL).mock(return_value=httpx.Response(200, json=success_body()))
+    response = await runtime().embed(call(), credential=CREDENTIAL)
+    assert route.call_count == 1, f"expected exactly one dispatch; got {route.call_count}"
+    request = route.calls.last.request
+    assert request.headers["authorization"] == f"Bearer {CREDENTIAL.key}", (
+        f"authorization header: {request.headers.get('authorization')!r}"
+    )
+    body = json.loads(request.content)
+    assert body == {
         "model": "text-embedding-3-small",
         "input": ["alpha", "beta"],
-    }
+        "encoding_format": "base64",  # SDK default: packed float32 on the wire
+    }, f"request body: {body!r}"
+    assert response.embeddings == (VECTOR_0, VECTOR_1), f"embeddings: {response.embeddings!r}"
 
 
-def test_build_request_includes_present_dimensions() -> None:
-    request = build_embedding_request(call(dimensions=Present(256)))
-    assert json.loads(request.body) == {
+@respx.mock
+async def test_embed_sends_dimensions_when_present() -> None:
+    route = respx.post(EMBEDDINGS_URL).mock(return_value=httpx.Response(200, json=success_body()))
+    await runtime().embed(call(dimensions=Present(256)), credential=CREDENTIAL)
+    body = json.loads(route.calls.last.request.content)
+    assert body == {
         "model": "text-embedding-3-small",
         "input": ["alpha", "beta"],
         "dimensions": 256,
-    }
+        "encoding_format": "base64",
+    }, f"request body: {body!r}"
 
 
 # ---------------------------------------------------------------------------
-# parse_embedding_response — strict validation preserved from the old client
+# Decode — order, vector forms, usage
 
 
-def test_parse_success_reorders_by_index_and_folds_usage() -> None:
-    response = parse(success_body(out_of_order=True))
-    assert response.embeddings == ((0.1, 0.2), (0.3, 0.4))
-    assert isinstance(response.usage, Present)
-    assert response.usage.value.input_tokens == 7
-    assert response.usage.value.total_tokens == 7
-    assert response.usage.value.output_tokens == 0
+@respx.mock
+async def test_embed_reorders_vectors_by_index_into_input_order() -> None:
+    respx.post(EMBEDDINGS_URL).mock(
+        return_value=httpx.Response(200, json=success_body(out_of_order=True))
+    )
+    response = await runtime().embed(call(), credential=CREDENTIAL)
+    assert response.embeddings == (VECTOR_0, VECTOR_1), f"embeddings: {response.embeddings!r}"
 
 
-def test_parse_without_usage_is_absent() -> None:
+@respx.mock
+async def test_embed_accepts_plain_float_list_vectors() -> None:
+    # A provider answering JSON float lists (despite the base64 request) passes
+    # through the SDK's decode untouched and must still validate and order.
+    respx.post(EMBEDDINGS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json=data_body(
+                [
+                    {"object": "embedding", "index": 1, "embedding": list(VECTOR_1)},
+                    {"object": "embedding", "index": 0, "embedding": list(VECTOR_0)},
+                ]
+            ),
+        )
+    )
+    response = await runtime().embed(call(), credential=CREDENTIAL)
+    assert response.embeddings == (VECTOR_0, VECTOR_1), f"embeddings: {response.embeddings!r}"
+
+
+@respx.mock
+async def test_embed_maps_usage_tokens() -> None:
+    respx.post(EMBEDDINGS_URL).mock(return_value=httpx.Response(200, json=success_body()))
+    response = await runtime().embed(call(), credential=CREDENTIAL)
+    assert response.usage == Present(
+        TokenUsage(
+            input_tokens=7,
+            output_tokens=0,
+            total_tokens=7,
+            reasoning_tokens=Absent(),
+            cache_read_input_tokens=Absent(),
+            cache_write_input_tokens=Absent(),
+        )
+    ), f"usage: {response.usage!r}"
+
+
+@respx.mock
+async def test_embed_without_usage_is_absent() -> None:
     body = success_body()
     del body["usage"]
-    assert parse(body).usage == Absent()
+    respx.post(EMBEDDINGS_URL).mock(return_value=httpx.Response(200, json=body))
+    response = await runtime().embed(call(), credential=CREDENTIAL)
+    assert response.usage == Absent(), f"usage: {response.usage!r}"
 
 
-def test_parse_rejects_non_json_and_non_object() -> None:
-    with pytest.raises(ProtocolDefect):
-        parse_embedding_response(200, {}, b"not json", expected_count=1)
-    with pytest.raises(ProtocolDefect):
-        parse([1, 2, 3])
-
-
-def test_parse_rejects_missing_data() -> None:
-    with pytest.raises(ProtocolDefect, match="missing data"):
-        parse({"object": "list"})
-
-
-def test_parse_rejects_invalid_row() -> None:
-    with pytest.raises(ProtocolDefect, match="invalid row"):
-        parse({"data": ["nope", "nope"]})
+# ---------------------------------------------------------------------------
+# Decode — strict index/vector validation (malformed envelope ⇒ ProtocolDefect)
 
 
 @pytest.mark.parametrize(
-    "index",
-    [None, "0", True, -1, 2],
-    ids=["missing", "string", "bool", "negative", "out-of-range"],
+    "row",
+    [
+        pytest.param({"object": "embedding", "embedding": b64_floats(0.5)}, id="missing"),
+        pytest.param(
+            {"object": "embedding", "index": "0", "embedding": b64_floats(0.5)}, id="string"
+        ),
+        pytest.param(
+            {"object": "embedding", "index": True, "embedding": b64_floats(0.5)}, id="bool"
+        ),
+        pytest.param(
+            {"object": "embedding", "index": -1, "embedding": b64_floats(0.5)}, id="negative"
+        ),
+        pytest.param(
+            {"object": "embedding", "index": 2, "embedding": b64_floats(0.5)}, id="out-of-range"
+        ),
+    ],
 )
-def test_parse_rejects_invalid_indexes(index: object) -> None:
-    with pytest.raises(ProtocolDefect, match="invalid index"):
-        parse({"data": [{"index": index, "embedding": [0.1]}]})
-
-
-def test_parse_rejects_duplicate_index() -> None:
-    with pytest.raises(ProtocolDefect, match="invalid index"):
-        parse(
-            {
-                "data": [
-                    {"index": 0, "embedding": [0.1]},
-                    {"index": 0, "embedding": [0.2]},
-                ]
-            }
+@respx.mock
+async def test_embed_rejects_invalid_indexes(row: dict[str, object]) -> None:
+    respx.post(EMBEDDINGS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json=data_body(
+                [row, {"object": "embedding", "index": 1, "embedding": b64_floats(0.5)}]
+            ),
         )
+    )
+    with pytest.raises(ProtocolDefect, match="invalid index"):
+        await runtime().embed(call(), credential=CREDENTIAL)
 
 
-def test_parse_rejects_invalid_vector() -> None:
-    with pytest.raises(ProtocolDefect, match="invalid vector"):
-        parse({"data": [{"index": 0, "embedding": "zap"}, {"index": 1, "embedding": [0.1]}]})
+@respx.mock
+async def test_embed_rejects_duplicate_index() -> None:
+    respx.post(EMBEDDINGS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json=data_body(
+                [
+                    {"object": "embedding", "index": 0, "embedding": b64_floats(0.5)},
+                    {"object": "embedding", "index": 0, "embedding": b64_floats(0.25)},
+                ]
+            ),
+        )
+    )
+    with pytest.raises(ProtocolDefect, match="invalid index"):
+        await runtime().embed(call(), credential=CREDENTIAL)
 
 
-def test_parse_rejects_non_numeric_vector_value() -> None:
-    with pytest.raises(ProtocolDefect, match="non-numeric vector value"):
-        parse({"data": [{"index": 0, "embedding": [{}]}, {"index": 1, "embedding": [0.1]}]})
-
-
-def test_parse_rejects_non_finite_vector_value() -> None:
-    body = json.dumps(
-        {"data": [{"index": 0, "embedding": [float("nan")]}]},
-    ).encode()
-    with pytest.raises(ProtocolDefect, match="non-finite"):
-        parse_embedding_response(200, {}, body, expected_count=1)
-
-
-def test_parse_rejects_incomplete_index_coverage() -> None:
+@respx.mock
+async def test_embed_rejects_incomplete_index_coverage() -> None:
+    route = respx.post(EMBEDDINGS_URL).mock(
+        return_value=httpx.Response(
+            200, json=data_body([{"object": "embedding", "index": 0, "embedding": b64_floats(0.5)}])
+        )
+    )
     with pytest.raises(ProtocolDefect, match="incomplete indexes"):
-        parse({"data": [{"index": 0, "embedding": [0.1]}]})
+        await runtime().embed(call(), credential=CREDENTIAL)
+    assert route.call_count == 1, f"defects must not retry; got {route.call_count} dispatches"
+
+
+@respx.mock
+async def test_embed_rejects_non_list_vector() -> None:
+    respx.post(EMBEDDINGS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json=data_body(
+                [
+                    {"object": "embedding", "index": 0, "embedding": {"x": 1}},
+                    {"object": "embedding", "index": 1, "embedding": b64_floats(0.5)},
+                ]
+            ),
+        )
+    )
+    with pytest.raises(ProtocolDefect, match="invalid vector"):
+        await runtime().embed(call(), credential=CREDENTIAL)
+
+
+@respx.mock
+async def test_embed_rejects_non_numeric_vector_value() -> None:
+    respx.post(EMBEDDINGS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json=data_body(
+                [
+                    {"object": "embedding", "index": 0, "embedding": [{}]},
+                    {"object": "embedding", "index": 1, "embedding": b64_floats(0.5)},
+                ]
+            ),
+        )
+    )
+    with pytest.raises(ProtocolDefect, match="non-numeric vector value"):
+        await runtime().embed(call(), credential=CREDENTIAL)
+
+
+@respx.mock
+async def test_embed_rejects_non_finite_vector_value() -> None:
+    respx.post(EMBEDDINGS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json=data_body(
+                [
+                    {"object": "embedding", "index": 0, "embedding": b64_floats(float("nan"))},
+                    {"object": "embedding", "index": 1, "embedding": b64_floats(0.5)},
+                ]
+            ),
+        )
+    )
+    with pytest.raises(ProtocolDefect, match="non-finite vector value"):
+        await runtime().embed(call(), credential=CREDENTIAL)
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        pytest.param([], id="empty-data"),
+        pytest.param(["nope", "nope"], id="non-object-row"),
+        pytest.param(
+            [
+                {"object": "embedding", "index": 0, "embedding": "zap"},
+                {"object": "embedding", "index": 1, "embedding": b64_floats(0.5)},
+            ],
+            id="malformed-base64",
+        ),
+    ],
+)
+@respx.mock
+async def test_embed_sdk_decode_breakage_is_a_protocol_defect(rows: list[object]) -> None:
+    # These envelopes trip the SDK's own base64 post-parse before our decode
+    # ever sees them; the breakage must still surface as a ProtocolDefect.
+    route = respx.post(EMBEDDINGS_URL).mock(return_value=httpx.Response(200, json=data_body(rows)))
+    with pytest.raises(ProtocolDefect, match="failed SDK decode"):
+        await runtime().embed(call(), credential=CREDENTIAL)
+    assert route.call_count == 1, f"defects must not retry; got {route.call_count} dispatches"
 
 
 # ---------------------------------------------------------------------------
-# End-to-end through ProviderRuntime.embed (openai classify_error + retries)
+# Fault injection — retries through the real runtime loop
 
 
-@pytest.fixture
-def fast_retry(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(runtime_module, "EXTERNAL_LLM_RETRY", FAST_RETRY)
-
-
+@pytest.mark.parametrize(
+    "first_response",
+    [
+        pytest.param(
+            error_response(429, "slow down", headers={"retry-after": "0"}), id="rate-limit"
+        ),
+        pytest.param(error_response(503, "overloaded"), id="unavailable"),
+    ],
+)
 @respx.mock
-async def test_embed_end_to_end_success(fast_retry: None) -> None:
-    route = respx.post(EMBEDDINGS_URL).mock(return_value=httpx.Response(200, json=success_body()))
-    async with httpx.AsyncClient() as http:
-        response = await ProviderRuntime(http).embed(call(), credential=CREDENTIAL)
-    assert response.embeddings == ((0.1, 0.2), (0.3, 0.4))
-    assert route.call_count == 1
-    sent = json.loads(route.calls[0].request.content)
-    assert sent == {"model": "text-embedding-3-small", "input": ["alpha", "beta"]}
-    assert route.calls[0].request.headers["authorization"] == f"Bearer {CREDENTIAL.key}"
-
-
-@respx.mock
-async def test_embed_retries_transient_then_succeeds(fast_retry: None) -> None:
+async def test_embed_retries_transient_then_succeeds(first_response: httpx.Response) -> None:
     route = respx.post(EMBEDDINGS_URL).mock(
-        side_effect=[
-            httpx.Response(500, json={"error": {"message": "boom", "type": "server_error"}}),
-            httpx.Response(200, json=success_body()),
-        ]
+        side_effect=[first_response, httpx.Response(200, json=success_body())]
     )
-    async with httpx.AsyncClient() as http:
-        response = await ProviderRuntime(http).embed(call(), credential=CREDENTIAL)
-    assert route.call_count == 2
-    assert len(response.embeddings) == 2
+    response = await runtime().embed(call(), credential=CREDENTIAL)
+    assert route.call_count == 2, f"expected one retry; got {route.call_count} dispatches"
+    assert response.embeddings == (VECTOR_0, VECTOR_1), f"embeddings: {response.embeddings!r}"
 
 
+@pytest.mark.parametrize(
+    ("fault", "expected_cause"),
+    [
+        pytest.param(
+            error_response(429, "slow down"),
+            ProviderRateLimit(retry_after=Absent()),
+            id="rate-limit",
+        ),
+        pytest.param(
+            error_response(500, "boom"),
+            ProviderHttpUnavailable(),
+            id="unavailable",
+        ),
+        pytest.param(
+            httpx.ReadTimeout("read timed out"),
+            ProviderTimeout(),
+            id="timeout",
+        ),
+    ],
+)
 @respx.mock
-async def test_embed_exhaustion_raises_expected_port_failure(fast_retry: None) -> None:
-    route = respx.post(EMBEDDINGS_URL).mock(
-        return_value=httpx.Response(
-            500, json={"error": {"message": "boom", "type": "server_error"}}
-        )
+async def test_embed_exhaustion_raises_expected_port_failure(
+    fault: httpx.Response | Exception, expected_cause: TransientCause
+) -> None:
+    route = respx.post(EMBEDDINGS_URL)
+    if isinstance(fault, httpx.Response):
+        route.mock(return_value=fault)
+    else:
+        route.mock(side_effect=fault)
+    with pytest.raises(NonGenerationCallFailed) as exc_info:
+        await runtime().embed(call(), credential=CREDENTIAL)
+    assert route.call_count == FAST_RETRY.max_attempts, (
+        f"expected {FAST_RETRY.max_attempts} attempts; got {route.call_count}"
     )
-    async with httpx.AsyncClient() as http:
-        with pytest.raises(NonGenerationCallFailed) as exc_info:
-            await ProviderRuntime(http).embed(call(), credential=CREDENTIAL)
-    assert route.call_count == FAST_RETRY.max_attempts
     assert exc_info.value.failure == TransientExhausted(
-        attempts=FAST_RETRY.max_attempts, cause=ProviderHttpUnavailable()
+        attempts=FAST_RETRY.max_attempts, cause=expected_cause
+    ), f"failure: {exc_info.value.failure!r}"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        pytest.param(
+            error_response(
+                400,
+                "This model's maximum context length is 8192 tokens.",
+                code="context_length_exceeded",
+            ),
+            id="by-code",
+        ),
+        pytest.param(
+            error_response(400, "Maximum context length exceeded for this request."),
+            id="by-message",
+        ),
+    ],
+)
+@respx.mock
+async def test_embed_context_overflow_raises_expected_port_failure(
+    response: httpx.Response,
+) -> None:
+    route = respx.post(EMBEDDINGS_URL).mock(return_value=response)
+    with pytest.raises(NonGenerationCallFailed) as exc_info:
+        await runtime().embed(call(), credential=CREDENTIAL)
+    assert exc_info.value.failure == ProviderContextTooLarge(), (
+        f"failure: {exc_info.value.failure!r}"
     )
+    assert route.call_count == 1, f"expected values must not retry; got {route.call_count}"
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@respx.mock
+async def test_embed_credential_rejection_is_a_defect(status: int) -> None:
+    route = respx.post(EMBEDDINGS_URL).mock(return_value=error_response(status, "bad key"))
+    with pytest.raises(CredentialRejected, match=str(status)):
+        await runtime().embed(call(), credential=CREDENTIAL)
+    assert route.call_count == 1, f"defects must not retry; got {route.call_count} dispatches"
 
 
 @respx.mock
-async def test_embed_credential_rejection_is_a_defect(fast_retry: None) -> None:
+async def test_embed_unclassified_error_is_a_defect() -> None:
     respx.post(EMBEDDINGS_URL).mock(
-        return_value=httpx.Response(
-            401, json={"error": {"message": "bad key", "type": "invalid_request_error"}}
-        )
+        return_value=error_response(400, "unknown parameter: 'frobnicate'")
     )
-    async with httpx.AsyncClient() as http:
-        with pytest.raises(CredentialRejected):
-            await ProviderRuntime(http).embed(call(), credential=CREDENTIAL)
+    with pytest.raises(RuntimeDefect) as exc_info:
+        await runtime().embed(call(), credential=CREDENTIAL)
+    assert exc_info.value.code == "unclassified_provider_error", f"code: {exc_info.value.code!r}"
