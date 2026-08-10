@@ -1,16 +1,18 @@
-"""Provider runtime: the sole same-target retry owner over transport + codecs.
+"""Provider runtime facade: registry-resolved dispatch over the engines.
 
-`ProviderRuntime` dispatches finalized provider calls through `Transport`,
-routes bodies through the protocol's codec, and owns everything the codecs do
-not: the retry boundary, the attempt trace, stream envelope sequencing,
-cancellation, runtime-owned `Failed`/`Cancelled` terminals, and structured
-promotion (codecs decode `TextContent` only; the plan-owning layer promotes to
-`StructuredContent` when the plan's output arm is `strict_json`).
+`ProviderRuntime` owns everything the engines do not: registry resolution and
+intent gates, credential lookup, the retry loop (`retry.attempts`) with
+attempt-trace accumulation and billability folding, stream envelope
+sequencing, cancellation, one OTel span per facade call, and the `json_out` /
+`chat` sugar. Engines make exactly ONE attempt and construct single-attempt
+`CallMeta`; the runtime rewrites every terminal meta with the accumulated
+trace via `dataclasses.replace`.
 
-Retry rules (§9): retry only exactly classified `TransientCause` signals, only
-before any semantic provider event, per `call.retry_policy`. Exhaustion folds
-into `Failed(TransientExhausted)` preserving the normalized final signal and
-the full attempt trace on meta. Defects raise. No fallback of any kind.
+Retry rules (spec §8): retry only exact `TransientCause` signals
+(`TransientAttempt`), only before any semantic provider event reached the
+consumer. Exhaustion folds into `Failed(TransientExhausted)` preserving the
+final cause and the full attempt trace on meta. Defects raise. No fallback of
+any kind.
 
 Attempt-trace timestamps are monotonic milliseconds (`time.monotonic`-derived)
 suitable for durations only — they are not wall-clock times.
@@ -19,99 +21,87 @@ suitable for durations only — they are not wall-clock times.
 from __future__ import annotations
 
 import asyncio
-import json
-import random
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import dataclass, replace
-from typing import Any, Final, Protocol, assert_never
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from typing import Any, assert_never
 
 import httpx
+import pydantic
 
-from provider_runtime import anthropic, embeddings, gemini, moonshot, openai, openrouter
-from provider_runtime._signals import (
-    ClassifiedError,
-    ExpectedFailureSignal,
-    TransientStreamError,
+from provider_runtime import embeddings
+from provider_runtime.engines import Engine, TransientAttempt
+from provider_runtime.engines.anthropic_messages import AnthropicMessagesEngine
+from provider_runtime.engines.gemini_generate import GeminiGenerateEngine
+from provider_runtime.engines.openai_chat import OpenAIChatEngine
+from provider_runtime.engines.openai_responses import OpenAIResponsesEngine
+from provider_runtime.errors import CredentialMissing, InvalidRequest, ProtocolDefect
+from provider_runtime.otel import call_span, record_outcome
+from provider_runtime.registry import (
+    REGISTRY_REVISION,
+    EngineId,
+    ModelRow,
+    resolve,
+    resolve_target,
 )
-from provider_runtime.catalog import CATALOG, Catalog
-from provider_runtime.errors import ProtocolDefect
-from provider_runtime.planning import EXTERNAL_LLM_RETRY
-from provider_runtime.transport import (
-    SseEvent,
-    Transport,
-    TransportResponse,
-    _auth_header,
-    _lowered,
-)
+from provider_runtime.retry import DEFAULT_RETRY, attempts
 from provider_runtime.types import (
     Absent,
     AttemptRecord,
+    AttemptSignal,
+    Billability,
     CallMeta,
     CallOutcome,
     Cancelled,
     CancelSignal,
     CodecStreamEvent,
-    ContinuationDelta,
+    ConfirmedNonBillable,
     EmbeddingCall,
     EmbeddingResponse,
     Failed,
     FinalAttempt,
-    FinalizedProviderCall,
-    FinalizedProviderRequest,
+    GenerateIntent,
+    ImageBlock,
+    Incomplete,
+    InvalidStructuredOutput,
     NotDispatched,
     PossiblyBillable,
     Presence,
     Present,
+    PromptBlock,
+    PromptMessage,
     ProviderContextTooLarge,
     ProviderCredential,
-    ProviderProtocol,
-    ProviderRateLimit,
+    ProviderName,
     ProviderStreamInterrupted,
     ProviderTarget,
-    ProviderTimeout,
+    ReasoningLevel,
+    Refused,
     RetryPolicy,
     RuntimeStreamEvent,
     StreamOutcome,
+    StreamStart,
+    StrictJsonOutput,
     StructuredContent,
+    StructuredReply,
     Succeeded,
+    SystemMessage,
     TerminalEvent,
-    TextDelta,
-    ToolCallDelta,
-    ToolCallDone,
-    ToolCallStart,
-    TranscriptionCall,
-    TranscriptionResponse,
+    TextOutput,
     TransientCause,
     TransientExhausted,
-    TransportUnavailable,
-    UsageEvent,
-)
-
-# Per-request transport timeout (httpx phase timeout: connect/read gaps, not
-# total stream duration). Prior-art DEFAULT_TIMEOUT_S preserved.
-_REQUEST_TIMEOUT_S: Final[float] = 45.0
-
-# Semantic provider events (§9): once one has been yielded to the caller,
-# internal retry is unsafe. StreamStart and TerminalEvent are not semantic.
-_SEMANTIC_EVENTS: Final = (
-    TextDelta,
-    ToolCallStart,
-    ToolCallDelta,
-    ToolCallDone,
-    ContinuationDelta,
-    UsageEvent,
+    UserMessage,
 )
 
 
 class NonGenerationCallFailed(Exception):
-    """Expected-failure channel for the non-generation ports (embed/transcribe).
+    """Expected-failure channel for the embed port.
 
-    Those ports return plain responses rather than `CallOutcome`, so retry
-    exhaustion and provider context overflow surface as this exception carrying
-    the same closed `ExpectedModelFailure` leaves `generate()` folds into
-    `Failed`. Defects (credential rejection, quota exhaustion, protocol
-    breakage) raise their own types as everywhere else.
+    The port returns a plain `EmbeddingResponse` rather than `CallOutcome`, so
+    retry exhaustion and provider context overflow surface as this exception
+    carrying the same closed `ExpectedModelFailure` leaves `generate()` folds
+    into `Failed`. Defects (credential rejection, protocol breakage) raise
+    their own types as everywhere else.
     """
 
     def __init__(self, failure: TransientExhausted | ProviderContextTooLarge) -> None:
@@ -119,187 +109,172 @@ class NonGenerationCallFailed(Exception):
         self.failure = failure
 
 
-# ---------------------------------------------------------------------------
-# Codec dispatch
+@dataclass(frozen=True, slots=True)
+class Credentials:
+    """Provider API keys by provider name; the lane reads zero env vars.
 
+    Every key is repr-suppressed; `None` means the provider is not configured
+    and dispatching to it raises `CredentialMissing`.
+    """
 
-class _Codec(Protocol):
-    decode_response: Callable[[int, Mapping[str, str], bytes], CallOutcome]
-    decode_stream: Callable[
-        [Mapping[str, str], AsyncIterator[SseEvent]], AsyncIterator[CodecStreamEvent]
-    ]
-    classify_error: Callable[[int, Mapping[str, str], bytes], ClassifiedError]
-    stream_request: Callable[[FinalizedProviderRequest], FinalizedProviderRequest]
-
-
-def _codec_for(protocol: ProviderProtocol) -> _Codec:
-    match protocol:
-        case "openai_responses":
-            return openai
-        case "anthropic_messages":
-            return anthropic
-        case "gemini_generate_content":
-            return gemini
-        case "moonshot_chat":
-            return moonshot
-        case "openrouter_chat":
-            return openrouter
-        case _:
-            assert_never(protocol)
+    openai: str | None = field(default=None, repr=False)
+    anthropic: str | None = field(default=None, repr=False)
+    gemini: str | None = field(default=None, repr=False)
+    moonshot: str | None = field(default=None, repr=False)
+    openrouter: str | None = field(default=None, repr=False)
+    deepseek: str | None = field(default=None, repr=False)
+    xai: str | None = field(default=None, repr=False)
 
 
 # ---------------------------------------------------------------------------
-# Retry mechanics (shared by every non-stream port; the stream has its own
-# attempt loop with identical delay/deadline rules)
+# Attempt bookkeeping (trace, billability fold, runtime-owned meta)
 
 
 def _monotonic_ms() -> int:
     return int(time.monotonic() * 1000)
 
 
-def _retry_delay_s(*, attempt: int, signal: TransientCause, policy: RetryPolicy) -> float:
-    """Exponential `initial * 2^(attempt-1)` plus jitter, capped at max_delay.
+def _record(
+    attempt: int, signal: AttemptSignal, status_code: Presence[int], started_ms: int
+) -> AttemptRecord:
+    return AttemptRecord(
+        attempt=attempt,
+        signal=signal,
+        status_code=status_code,
+        started_at_ms=started_ms,
+        ended_at_ms=_monotonic_ms(),
+    )
 
-    A Present `ProviderRateLimit.retry_after` is honored verbatim (no jitter)
-    but still capped at max_delay."""
-    if isinstance(signal, ProviderRateLimit) and isinstance(signal.retry_after, Present):
-        return min(signal.retry_after.value, policy.max_delay_s)
-    delay = policy.initial_delay_s * (2 ** (attempt - 1))
-    if policy.jitter_s > 0:
-        delay += random.uniform(0, policy.jitter_s)
-    return min(delay, policy.max_delay_s)
 
-
-def _deadline_exhausted(loop_started: float, policy: RetryPolicy, delay_s: float) -> bool:
-    """Absent deadline means no wall-clock deadline at all."""
-    match policy.deadline_s:
-        case Present(value=deadline):
-            return time.monotonic() - loop_started + delay_s > deadline
-        case Absent():
-            return False
+def _billability_rank(billability: Billability) -> int:
+    match billability:
+        case NotDispatched():
+            return 0
+        case ConfirmedNonBillable():
+            return 1
+        case PossiblyBillable():
+            return 2
         case _:
-            assert_never(policy.deadline_s)
+            assert_never(billability)
 
 
-@dataclass(frozen=True, slots=True)
-class _SendSucceeded:
-    response: TransportResponse
-    trace: tuple[AttemptRecord, ...]
+def _fold_billability(folded: Billability, observed: Billability) -> Billability:
+    """NotDispatched < ConfirmedNonBillable < PossiblyBillable — keep the max."""
+    return observed if _billability_rank(observed) > _billability_rank(folded) else folded
 
 
-@dataclass(frozen=True, slots=True)
-class _SendFailed:
-    failure: TransientExhausted | ProviderContextTooLarge
-    trace: tuple[AttemptRecord, ...]
-    # True once any attempt reached the provider (a response of any status,
-    # or a transport error other than a pure pre-connect failure). Threads
-    # into generate()'s Failed billability: NotDispatched when no attempt
-    # ever got past connect.
-    dispatched: bool
+def _absorbed[Outcome: Succeeded | Refused | Incomplete | Cancelled | Failed](
+    outcome: Outcome, prior: Sequence[AttemptRecord], billability: Billability
+) -> Outcome:
+    """Rebuild an engine outcome with the runtime-owned accumulated trace.
+
+    Engines construct single-attempt meta (attempt=1); their records are
+    renumbered onto the accumulated trace and their billability folds in.
+    """
+    renumbered = tuple(
+        replace(record, attempt=len(prior) + offset)
+        for offset, record in enumerate(outcome.meta.attempt_trace, start=1)
+    )
+    meta = replace(
+        outcome.meta,
+        attempt_trace=(*prior, *renumbered),
+        billability=_fold_billability(billability, outcome.meta.billability),
+    )
+    return replace(outcome, meta=meta)
 
 
 def _runtime_meta(
-    target: ProviderTarget,
+    row: ModelRow,
     trace: tuple[AttemptRecord, ...],
-    billability: NotDispatched | PossiblyBillable,
+    billability: Billability,
+    request_id: Presence[str],
 ) -> CallMeta:
-    """Meta for runtime-constructed terminals (Failed/Cancelled).
+    """Meta for runtime-constructed terminals (exhaustion, cancellation).
 
-    Request id and usage are deliberately Absent: a runtime terminal means no
-    codec decoded an authoritative provider envelope for this call."""
+    Usage is deliberately Absent — a runtime terminal means no engine decoded
+    an authoritative provider envelope. The request id is the last transient
+    attempt's, when the provider issued one.
+    """
     return CallMeta(
-        provider=target.provider,
-        model=target.model,
-        provider_request_id=Absent(),
+        provider=row.provider,
+        model=row.model_id,
+        provider_request_id=request_id,
         upstream_provider=Absent(),
         usage=Absent(),
         attempt_trace=trace,
         billability=billability,
+        native_reasoning=Absent(),
+        registry_revision=REGISTRY_REVISION,
     )
 
 
-def _with_trace(outcome: CallOutcome, trace: tuple[AttemptRecord, ...]) -> CallOutcome:
-    """Rebuild a codec-decoded outcome with the runtime-owned attempt trace.
-
-    Codecs always construct meta with attempt_trace=(); CallMeta and the
-    outcome types are plain values (the no-replace negative gate covers stream
-    EVENT types only)."""
-    return replace(outcome, meta=replace(outcome.meta, attempt_trace=trace))
+# ---------------------------------------------------------------------------
+# Intent gates — runtime-owned validation against the resolved row
 
 
-def _promote_succeeded(outcome: Succeeded, call: FinalizedProviderCall) -> Succeeded:
-    """Structured promotion: the plan-owning layer's half of StrictJsonOutput.
-
-    Codecs decode TextContent only (their decode signatures carry no plan). On
-    a Succeeded outcome for a strict_json plan, the terminal text must strictly
-    parse to a JSON object; anything else is a ProtocolDefect."""
-    if call.output_kind != "strict_json":
-        return outcome
-    content = outcome.response.content
-    if isinstance(content, StructuredContent):
-        return outcome
-    try:
-        payload = json.loads(content.text)
-    except json.JSONDecodeError:
-        raise ProtocolDefect(
-            code="invalid_structured_output",
-            message=(
-                f"{call.request.target.provider} strict_json output was not valid JSON "
-                f"({len(content.text)} chars)"
-            ),
-        ) from None
-    if not isinstance(payload, dict):
-        raise ProtocolDefect(
-            code="structured_output_not_object",
-            message=(
-                f"{call.request.target.provider} strict_json output parsed to "
-                f"{type(payload).__name__}, not a JSON object"
-            ),
-        )
-    return replace(
-        outcome,
-        response=replace(outcome.response, content=StructuredContent(payload, content.text)),
-    )
+def _validate_intent(row: ModelRow, intent: GenerateIntent, *, streaming: bool) -> None:
+    if streaming and not row.streaming:
+        raise InvalidRequest(message=f"registry row {row.ref!r} does not support streaming")
+    if intent.tools:
+        if not row.tools:
+            raise InvalidRequest(message=f"registry row {row.ref!r} does not support tools")
+        if isinstance(intent.output, StrictJsonOutput):
+            # types.py: tools+strict-output rejected here ⇒ no impossible
+            # ResponseContent state downstream.
+            raise InvalidRequest(
+                message="tools and StrictJsonOutput cannot be combined in one intent"
+            )
+    if "image" not in row.modalities:
+        for message in intent.messages:
+            if isinstance(message, UserMessage) and any(
+                isinstance(block, ImageBlock) for block in message.blocks
+            ):
+                raise InvalidRequest(
+                    message=f"registry row {row.ref!r} does not accept image input"
+                )
 
 
-async def _guarded_anext(source: AsyncIterator[CodecStreamEvent]) -> CodecStreamEvent:
+# ---------------------------------------------------------------------------
+# Cancellation race
+
+
+async def _guarded_next(source: AsyncIterator[CodecStreamEvent]) -> CodecStreamEvent:
     try:
         return await anext(source)
     except StopAsyncIteration:
-        # Codec contract breach: decode_stream must end with a TerminalEvent or
-        # raise TransientStreamError; bare exhaustion is a defect.
+        # Engine contract breach: a stream must end with a TerminalEvent or
+        # raise TransientAttempt; bare exhaustion is a defect.
         raise ProtocolDefect(
             code="missing_terminal_event",
-            message="codec stream ended without a terminal event or transient signal",
+            message="engine stream ended without a terminal event or transient signal",
         ) from None
 
 
-async def _next_or_cancel(
-    source: AsyncIterator[CodecStreamEvent], cancel: CancelSignal | None
-) -> CodecStreamEvent | None:
-    """Race the next codec event against cancellation; None means cancelled.
+async def _race_cancel[T](action: Awaitable[T], cancel: CancelSignal | None) -> T | None:
+    """Race one engine await against cancellation; None means cancelled.
 
     Cancellation-safe: if the CONSUMING task is itself cancelled while parked
     in the race, both tasks are cancelled and settled (via `asyncio.wait`,
     which never raises a task's own exception) before the external
-    CancelledError is re-raised. This guarantees the codec generator is no
-    longer running by the time stream()'s `finally: await source.aclose()`
+    CancelledError is re-raised. This guarantees the engine generator is no
+    longer running by the time the caller's `finally: await source.aclose()`
     runs — otherwise aclose() raises "already running", masking the
-    CancelledError."""
+    CancelledError.
+    """
     if cancel is None:
-        return await _guarded_anext(source)
-    next_task = asyncio.ensure_future(_guarded_anext(source))
+        return await action
+    next_task = asyncio.ensure_future(action)
     cancel_task = asyncio.ensure_future(cancel.wait())
     tasks: set[asyncio.Task[Any]] = {next_task, cancel_task}
     try:
         done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     except asyncio.CancelledError:
-        for t in tasks:
-            t.cancel()
+        for task in tasks:
+            task.cancel()
         await asyncio.wait(tasks)  # settle; wait() never raises task exceptions
-        for t in tasks:
-            if not t.cancelled():
-                t.exception()  # retrieve, so no 'Task exception was never retrieved'
+        for task in tasks:
+            if not task.cancelled():
+                task.exception()  # retrieve, so no 'Task exception was never retrieved'
         raise
     if next_task in done:
         cancel_task.cancel()
@@ -315,368 +290,398 @@ async def _next_or_cancel(
 
 
 # ---------------------------------------------------------------------------
+# json_out helpers
+
+
+def _invalid_structured_detail(
+    model: type[pydantic.BaseModel], error: pydantic.ValidationError
+) -> str:
+    """Class name + terse location/message summary — NEVER the payload."""
+    causes = "; ".join(
+        f"{'.'.join(str(part) for part in item['loc']) or '<root>'}: {item['msg']}"
+        for item in error.errors(include_url=False, include_input=False)[:3]
+    )
+    return f"{model.__name__} validation failed ({error.error_count()} errors): {causes}"
+
+
+# ---------------------------------------------------------------------------
 # Runtime
 
 
 class ProviderRuntime:
-    def __init__(self, http: httpx.AsyncClient, catalog: Catalog = CATALOG) -> None:
-        self._http = http
-        self._catalog = catalog
-        self._transport = Transport(http)
+    """Engines + credentials wired once; every call dispatches through a row."""
+
+    def __init__(
+        self,
+        credentials: Credentials,
+        *,
+        retry: RetryPolicy = DEFAULT_RETRY,
+        http_client: httpx.AsyncClient | None = None,
+        engines: Mapping[EngineId, Engine] | None = None,
+    ) -> None:
+        # `engines` is the deterministic-test seam (spec §11: facade tests run
+        # against FakeEngine); the production default wires the four adapters.
+        self._credentials = credentials
+        self._retry = retry
+        self._http_client = http_client
+        self._engines: Mapping[EngineId, Engine] = (
+            engines
+            if engines is not None
+            else {
+                "openai_responses": OpenAIResponsesEngine(http_client=http_client),
+                "openai_chat": OpenAIChatEngine(http_client=http_client),
+                "anthropic_messages": AnthropicMessagesEngine(http_client=http_client),
+                "gemini_generate": GeminiGenerateEngine(http_client=http_client),
+            }
+        )
+
+    def _credential(self, provider: ProviderName) -> ProviderCredential:
+        match provider:
+            case "openai":
+                key = self._credentials.openai
+            case "anthropic":
+                key = self._credentials.anthropic
+            case "gemini":
+                key = self._credentials.gemini
+            case "moonshot":
+                key = self._credentials.moonshot
+            case "openrouter":
+                key = self._credentials.openrouter
+            case "deepseek":
+                key = self._credentials.deepseek
+            case "xai":
+                key = self._credentials.xai
+            case _:
+                assert_never(provider)
+        if key is None:
+            raise CredentialMissing(message=f"no {provider} credential configured")
+        return ProviderCredential(provider=provider, key=key)
 
     # -- generate -----------------------------------------------------------
 
     async def generate(
-        self, call: FinalizedProviderCall, *, credential: ProviderCredential
+        self, intent: GenerateIntent, *, cancel: CancelSignal | None = None
     ) -> CallOutcome:
-        codec = _codec_for(call.request.protocol)
-        sent = await self._send_with_retry(
-            lambda: self._transport.send(call.request, credential, _REQUEST_TIMEOUT_S),
-            codec.classify_error,
-            call.retry_policy,
-        )
-        match sent:
-            case _SendFailed(failure=failure, trace=trace, dispatched=dispatched):
-                billability = PossiblyBillable() if dispatched else NotDispatched()
-                return Failed(
-                    meta=_runtime_meta(call.request.target, trace, billability),
-                    failure=failure,
-                )
-            case _SendSucceeded(response=response, trace=trace):
+        row = resolve_target(intent.target)
+        _validate_intent(row, intent, streaming=False)
+        credential = self._credential(row.provider)
+        engine = self._engines[row.engine]
+        with call_span("chat", provider=row.provider, model=row.model_id) as span:
+            outcome = await self._generate_outcome(row, intent, credential, engine, cancel)
+            record_outcome(span, outcome.meta)
+            return outcome
+
+    async def _generate_outcome(
+        self,
+        row: ModelRow,
+        intent: GenerateIntent,
+        credential: ProviderCredential,
+        engine: Engine,
+        cancel: CancelSignal | None,
+    ) -> CallOutcome:
+        trace: list[AttemptRecord] = []
+        billability: Billability = NotDispatched()
+        last_cause: TransientCause | None = None
+        last_request_id: Presence[str] = Absent()
+        tries = attempts(self._retry)
+        try:
+            async for handle in tries:
+                started_ms = _monotonic_ms()
+                if cancel is not None and cancel.is_set():
+                    trace.append(_record(handle.number, FinalAttempt(), Absent(), started_ms))
+                    return Cancelled(
+                        meta=_runtime_meta(row, tuple(trace), billability, last_request_id)
+                    )
                 try:
-                    outcome = codec.decode_response(
-                        response.status, response.headers, response.body
+                    outcome = await _race_cancel(engine.generate(row, intent, credential), cancel)
+                except TransientAttempt as failed:
+                    billability = _fold_billability(billability, failed.billability)
+                    last_request_id = failed.provider_request_id
+                    last_cause = failed.cause
+                    trace.append(
+                        _record(handle.number, failed.cause, failed.status_code, started_ms)
                     )
-                except ExpectedFailureSignal as signal:
-                    return Failed(
-                        meta=_runtime_meta(call.request.target, trace, PossiblyBillable()),
-                        failure=signal.failure,
+                    handle.mark_failed(failed.cause)
+                    continue
+                if outcome is None:
+                    # Cancelled mid-attempt: the request was already in flight,
+                    # so the conservative fold is PossiblyBillable.
+                    billability = _fold_billability(billability, PossiblyBillable())
+                    trace.append(_record(handle.number, FinalAttempt(), Absent(), started_ms))
+                    return Cancelled(
+                        meta=_runtime_meta(row, tuple(trace), billability, last_request_id)
                     )
-                outcome = _with_trace(outcome, trace)
-                if isinstance(outcome, Succeeded):
-                    outcome = _promote_succeeded(outcome, call)
-                return outcome
-            case _:
-                assert_never(sent)
+                return _absorbed(outcome, trace, billability)
+        finally:
+            # Deterministic close: abandoning the suspended attempt iterator
+            # would leave its finalization to the event loop's GC hook.
+            if isinstance(tries, AsyncGenerator):
+                await tries.aclose()
+        if last_cause is None:
+            raise AssertionError("attempt loop exhausted without a recorded transient cause")
+        # The exhausting attempt's record carries FinalAttempt; its transient
+        # cause lives in TransientExhausted.cause.
+        trace[-1] = replace(trace[-1], signal=FinalAttempt())
+        return Failed(
+            meta=_runtime_meta(row, tuple(trace), billability, last_request_id),
+            failure=TransientExhausted(attempts=len(trace), cause=last_cause),
+        )
 
     # -- stream -------------------------------------------------------------
 
-    async def stream(
-        self,
-        call: FinalizedProviderCall,
-        *,
-        credential: ProviderCredential,
-        cancel: CancelSignal | None = None,
+    def stream(
+        self, intent: GenerateIntent, *, cancel: CancelSignal | None = None
     ) -> AsyncIterator[RuntimeStreamEvent]:
-        codec = _codec_for(call.request.protocol)
-        streaming_request = codec.stream_request(call.request)
-        policy = call.retry_policy
-        target = call.request.target
+        row = resolve_target(intent.target)
+        _validate_intent(row, intent, streaming=True)
+        credential = self._credential(row.provider)
+        engine = self._engines[row.engine]
+        return self._stream_events(row, intent, credential, engine, cancel)
+
+    async def _stream_events(
+        self,
+        row: ModelRow,
+        intent: GenerateIntent,
+        credential: ProviderCredential,
+        engine: Engine,
+        cancel: CancelSignal | None,
+    ) -> AsyncIterator[RuntimeStreamEvent]:
         trace: list[AttemptRecord] = []
+        billability: Billability = NotDispatched()
+        last_cause: TransientCause | None = None
+        last_request_id: Presence[str] = Absent()
         seq = 0
-        dispatched = False
-        loop_started = time.monotonic()
+        start_forwarded = False
+        semantic_forwarded = False
 
-        def final_record(
-            attempt: int, status: Presence[int], started_ms: int
-        ) -> tuple[AttemptRecord, ...]:
-            trace.append(
-                AttemptRecord(
-                    attempt=attempt,
-                    signal=FinalAttempt(),
-                    status_code=status,
-                    started_at_ms=started_ms,
-                    ended_at_ms=_monotonic_ms(),
-                )
-            )
-            return tuple(trace)
+        with call_span("chat", provider=row.provider, model=row.model_id) as span:
 
-        def terminal(outcome: StreamOutcome) -> RuntimeStreamEvent:
-            nonlocal seq
-            seq += 1
-            return RuntimeStreamEvent(seq=seq, event=TerminalEvent(outcome=outcome))
+            def envelope(event: CodecStreamEvent) -> RuntimeStreamEvent:
+                nonlocal seq
+                seq += 1
+                return RuntimeStreamEvent(seq=seq, event=event)
 
-        for attempt in range(1, policy.max_attempts + 1):
-            started_ms = _monotonic_ms()
-            if cancel is not None and cancel.is_set():
-                billability = PossiblyBillable() if dispatched else NotDispatched()
-                yield terminal(
-                    Cancelled(
-                        meta=_runtime_meta(
-                            target, final_record(attempt, Absent(), started_ms), billability
-                        )
-                    )
-                )
-                return
-            semantic_emitted = False
-            status: Presence[int] = Absent()
-            signal: TransientCause | None = None
+            def terminal(outcome: StreamOutcome) -> RuntimeStreamEvent:
+                record_outcome(span, outcome.meta)
+                return envelope(TerminalEvent(outcome=outcome))
+
+            def cancelled_meta(attempt: int, started_ms: int) -> CallMeta:
+                trace.append(_record(attempt, FinalAttempt(), Absent(), started_ms))
+                return _runtime_meta(row, tuple(trace), billability, last_request_id)
+
+            tries = attempts(self._retry)
             try:
-                async with self._transport.stream(
-                    streaming_request, credential, _REQUEST_TIMEOUT_S
-                ) as response:
-                    dispatched = True
-                    status = Present(response.status)
-                    if not 200 <= response.status < 300:
-                        body = await response.read_error_body()
-                        classified = codec.classify_error(response.status, response.headers, body)
-                        if isinstance(classified, ProviderContextTooLarge):
+                async for handle in tries:
+                    started_ms = _monotonic_ms()
+                    if cancel is not None and cancel.is_set():
+                        yield terminal(Cancelled(meta=cancelled_meta(handle.number, started_ms)))
+                        return
+                    source = engine.stream(row, intent, credential)
+                    try:
+                        while True:
+                            event = await _race_cancel(_guarded_next(source), cancel)
+                            if event is None:
+                                # Cancelled mid-attempt: the request was
+                                # already in flight — fold PossiblyBillable.
+                                billability = _fold_billability(billability, PossiblyBillable())
+                                yield terminal(
+                                    Cancelled(meta=cancelled_meta(handle.number, started_ms))
+                                )
+                                return
+                            match event:
+                                case StreamStart():
+                                    # At most ONE StreamStart crosses the
+                                    # envelope, even across retried attempts.
+                                    if not start_forwarded:
+                                        start_forwarded = True
+                                        yield envelope(event)
+                                case TerminalEvent(outcome=outcome):
+                                    yield terminal(_absorbed(outcome, trace, billability))
+                                    return
+                                case _:
+                                    semantic_forwarded = True
+                                    yield envelope(event)
+                    except TransientAttempt as failed:
+                        billability = _fold_billability(billability, failed.billability)
+                        last_request_id = failed.provider_request_id
+                        if semantic_forwarded:
+                            # Post-semantic-output, ANY transient is terminal
+                            # with the stream-interruption leaf rebuilt to
+                            # carry the true flag.
+                            trace.append(
+                                _record(
+                                    handle.number, FinalAttempt(), failed.status_code, started_ms
+                                )
+                            )
                             yield terminal(
                                 Failed(
                                     meta=_runtime_meta(
-                                        target,
-                                        final_record(attempt, status, started_ms),
-                                        PossiblyBillable(),
+                                        row, tuple(trace), billability, last_request_id
                                     ),
-                                    failure=classified,
+                                    failure=TransientExhausted(
+                                        attempts=len(trace),
+                                        cause=ProviderStreamInterrupted(partial_output=True),
+                                    ),
                                 )
                             )
                             return
-                        signal = classified
-                    else:
-                        source = codec.decode_stream(response.headers, response.events)
-                        try:
-                            while True:
-                                event = await _next_or_cancel(source, cancel)
-                                if event is None:
-                                    yield terminal(
-                                        Cancelled(
-                                            meta=_runtime_meta(
-                                                target,
-                                                final_record(attempt, status, started_ms),
-                                                PossiblyBillable(),
-                                            )
-                                        )
-                                    )
-                                    return
-                                if isinstance(event, TerminalEvent):
-                                    stream_trace = final_record(attempt, status, started_ms)
-                                    outcome: StreamOutcome = replace(
-                                        event.outcome,
-                                        meta=replace(
-                                            event.outcome.meta, attempt_trace=stream_trace
-                                        ),
-                                    )
-                                    if isinstance(outcome, Succeeded):
-                                        outcome = _promote_succeeded(outcome, call)
-                                    yield terminal(outcome)
-                                    return
-                                seq += 1
-                                yield RuntimeStreamEvent(seq=seq, event=event)
-                                if isinstance(event, _SEMANTIC_EVENTS):
-                                    semantic_emitted = True
-                        finally:
-                            if isinstance(source, AsyncGenerator):
-                                await source.aclose()
-            except ExpectedFailureSignal as expected:
-                # Always terminal: tool-argument parse failure follows tool
-                # deltas, so semantic content was involved; no retry.
-                yield terminal(
-                    Failed(
-                        meta=_runtime_meta(
-                            target, final_record(attempt, status, started_ms), PossiblyBillable()
-                        ),
-                        failure=expected.failure,
-                    )
-                )
-                return
-            except TransientStreamError as stream_error:
-                signal = stream_error.cause
-            except httpx.TimeoutException:
-                signal = ProviderTimeout()
-            except httpx.TransportError:
-                signal = TransportUnavailable()
-            if signal is None:
-                raise AssertionError("stream attempt ended without terminal or signal")
-            if semantic_emitted:
-                # Post-semantic-output, ANY transient is terminal with the
-                # stream-interruption leaf rebuilt to carry the true flag.
-                failure_trace = final_record(attempt, status, started_ms)
-                yield terminal(
-                    Failed(
-                        meta=_runtime_meta(target, failure_trace, PossiblyBillable()),
-                        failure=TransientExhausted(
-                            attempts=len(failure_trace),
-                            cause=ProviderStreamInterrupted(partial_output=True),
-                        ),
-                    )
-                )
-                return
-            delay_s = _retry_delay_s(attempt=attempt, signal=signal, policy=policy)
-            if attempt >= policy.max_attempts or _deadline_exhausted(loop_started, policy, delay_s):
-                failure_trace = final_record(attempt, status, started_ms)
-                billability = PossiblyBillable() if dispatched else NotDispatched()
-                yield terminal(
-                    Failed(
-                        meta=_runtime_meta(target, failure_trace, billability),
-                        failure=TransientExhausted(attempts=len(failure_trace), cause=signal),
-                    )
-                )
-                return
-            trace.append(
-                AttemptRecord(
-                    attempt=attempt,
-                    signal=signal,
-                    status_code=status,
-                    started_at_ms=started_ms,
-                    ended_at_ms=_monotonic_ms(),
+                        last_cause = failed.cause
+                        trace.append(
+                            _record(handle.number, failed.cause, failed.status_code, started_ms)
+                        )
+                        handle.mark_failed(failed.cause)
+                    finally:
+                        if isinstance(source, AsyncGenerator):
+                            await source.aclose()
+            finally:
+                # Deterministic close: abandoning the suspended attempt
+                # iterator would leave its finalization to the GC hook.
+                if isinstance(tries, AsyncGenerator):
+                    await tries.aclose()
+            if last_cause is None:
+                raise AssertionError("stream attempt loop exhausted without a transient cause")
+            trace[-1] = replace(trace[-1], signal=FinalAttempt())
+            yield terminal(
+                Failed(
+                    meta=_runtime_meta(row, tuple(trace), billability, last_request_id),
+                    failure=TransientExhausted(attempts=len(trace), cause=last_cause),
                 )
             )
-            await asyncio.sleep(delay_s)
-        raise AssertionError("unreachable stream retry loop exit")
 
-    # -- non-generation ports (openai-only; central EXTERNAL_LLM_RETRY) ------
+    # -- json_out -----------------------------------------------------------
+
+    async def json_out[T: pydantic.BaseModel](
+        self,
+        model: type[T],
+        intent: GenerateIntent,
+        *,
+        cancel: CancelSignal | None = None,
+    ) -> StructuredReply[T] | Refused | Incomplete | Cancelled | Failed:
+        """Typed structured output: strict schema derived from the model.
+
+        Validation miss → `Failed(InvalidStructuredOutput)` carrying the same
+        terminal meta. No repair, no retry.
+        """
+        if not isinstance(intent.output, TextOutput):
+            raise InvalidRequest(
+                message="json_out requires an intent with TextOutput; "
+                "the strict schema is derived from the pydantic model"
+            )
+        strict_intent = replace(
+            intent,
+            output=StrictJsonOutput(name=model.__name__, schema=model.model_json_schema()),
+        )
+        outcome = await self.generate(strict_intent, cancel=cancel)
+        match outcome:
+            case Succeeded(response=response):
+                content = response.content
+                if not isinstance(content, StructuredContent):
+                    # Engine contract: a strict-JSON intent decodes to
+                    # StructuredContent on every Succeeded path.
+                    raise ProtocolDefect(
+                        code="invalid_structured_output",
+                        message="strict-JSON success decoded without structured content",
+                    )
+                try:
+                    value = model.model_validate(content.payload)
+                except pydantic.ValidationError as error:
+                    return Failed(
+                        meta=outcome.meta,
+                        failure=InvalidStructuredOutput(
+                            safe_detail=_invalid_structured_detail(model, error)
+                        ),
+                    )
+                return StructuredReply(value=value, outcome=outcome)
+            case Refused() | Incomplete() | Cancelled() | Failed():
+                return outcome
+            case _:
+                assert_never(outcome)
+
+    # -- chat sugar ---------------------------------------------------------
+
+    async def chat(
+        self,
+        ref: str,
+        *,
+        system: str = "",
+        user: str,
+        reasoning: ReasoningLevel = "none",
+        max_output_tokens: int | None = None,
+    ) -> CallOutcome:
+        """The 95% call site: one system/user turn against a registry ref."""
+        row = resolve(ref)
+        user_message = UserMessage(blocks=(PromptBlock(text=user),))
+        messages: tuple[PromptMessage, ...] = (
+            (SystemMessage(blocks=(PromptBlock(text=system),)), user_message)
+            if system
+            else (user_message,)
+        )
+        intent = GenerateIntent(
+            target=ProviderTarget(provider=row.provider, model=row.model_id),
+            messages=messages,
+            max_output_tokens=(
+                row.max_output_tokens if max_output_tokens is None else max_output_tokens
+            ),
+            reasoning=reasoning,
+            tools=(),
+            tool_choice="auto",
+            output=TextOutput(),
+        )
+        return await self.generate(intent)
+
+    # -- embed (openai-only non-generation port) -----------------------------
 
     async def embed(
         self, call: EmbeddingCall, *, credential: ProviderCredential
     ) -> EmbeddingResponse:
-        request = embeddings.build_embedding_request(call)
-        sent = await self._send_with_retry(
-            lambda: self._transport.send(request, credential, _REQUEST_TIMEOUT_S),
-            openai.classify_error,
-            EXTERNAL_LLM_RETRY,
-        )
-        match sent:
-            case _SendFailed(failure=failure):
-                raise NonGenerationCallFailed(failure)
-            case _SendSucceeded(response=response):
-                return embeddings.parse_embedding_response(
-                    response.status,
-                    response.headers,
-                    response.body,
-                    expected_count=len(call.inputs),
-                )
-            case _:
-                assert_never(sent)
+        """OpenAI-only embeddings port (live Nexus consumer), same retry owner.
 
-    async def transcribe(
-        self, call: TranscriptionCall, *, credential: ProviderCredential
-    ) -> TranscriptionResponse:
-        request = openai.build_transcription_request(
-            model=call.model,
-            filename=call.filename,
-            audio=call.content,
-            media_type=call.media_type,
-        )
+        Delegates single attempts to the embeddings module's seam::
 
-        async def send() -> TransportResponse:
-            # Multipart is a transport-special port (TranscriptionHttpRequest);
-            # auth header naming stays owned by transport._auth_header.
-            name, value = _auth_header(credential)
-            response = await self._http.post(
-                request.url,
-                data=dict(request.form_fields),
-                files={"file": (request.filename, request.content, request.media_type)},
-                headers={name: value},
-                timeout=httpx.Timeout(_REQUEST_TIMEOUT_S),
-            )
-            return TransportResponse(
-                status=response.status_code,
-                headers=_lowered(response.headers),
-                body=response.content,
-            )
+            async def embed_once(
+                call: EmbeddingCall,
+                credential: ProviderCredential,
+                *,
+                http_client: httpx.AsyncClient | None,
+            ) -> EmbeddingResponse | ProviderContextTooLarge
 
-        sent = await self._send_with_retry(send, openai.classify_error, EXTERNAL_LLM_RETRY)
-        match sent:
-            case _SendFailed(failure=failure):
-                raise NonGenerationCallFailed(failure)
-            case _SendSucceeded(response=response):
-                result = openai.parse_transcription_response(
-                    response.status, response.headers, response.body
-                )
-                return TranscriptionResponse(text=result.text, usage=result.usage)
-            case _:
-                assert_never(sent)
-
-    # -- shared non-stream retry engine --------------------------------------
-
-    async def _send_with_retry(
-        self,
-        send: Callable[[], Awaitable[TransportResponse]],
-        classify: Callable[[int, Mapping[str, str], bytes], ClassifiedError],
-        policy: RetryPolicy,
-    ) -> _SendSucceeded | _SendFailed:
-        trace: list[AttemptRecord] = []
-        loop_started = time.monotonic()
-        # True once any attempt reaches the provider. httpx.ConnectError is a
-        # pure pre-connect failure (no bytes sent) and does NOT set it; every
-        # other transport error implies the connection was at least opened.
-        dispatched = False
-        for attempt in range(1, policy.max_attempts + 1):
-            started_ms = _monotonic_ms()
-            status: Presence[int] = Absent()
-            signal: TransientCause
+        — one openai-SDK attempt; context overflow is the one expected
+        terminal failure (returned as a value), retryable trouble raises
+        `TransientAttempt`, defects raise their own types. Retry exhaustion
+        and context overflow surface here as `NonGenerationCallFailed`.
+        """
+        last_cause: TransientCause | None = None
+        attempt_count = 0
+        tries = attempts(self._retry)
+        with call_span("embeddings", provider="openai", model=call.model) as span:
             try:
-                response = await send()
-            except httpx.ConnectError:
-                signal = TransportUnavailable()
-            except httpx.TimeoutException:
-                dispatched = True
-                signal = ProviderTimeout()
-            except httpx.TransportError:
-                dispatched = True
-                signal = TransportUnavailable()
-            else:
-                dispatched = True
-                status = Present(response.status)
-                if 200 <= response.status < 300:
-                    trace.append(
-                        AttemptRecord(
-                            attempt=attempt,
-                            signal=FinalAttempt(),
-                            status_code=status,
-                            started_at_ms=started_ms,
-                            ended_at_ms=_monotonic_ms(),
+                async for handle in tries:
+                    attempt_count = handle.number
+                    try:
+                        result = await embeddings.embed_once(
+                            call, credential, http_client=self._http_client
                         )
-                    )
-                    return _SendSucceeded(response=response, trace=tuple(trace))
-                # classify_error raises defects (credential/quota/protocol)
-                # which propagate; it returns only exact classified values.
-                classified = classify(response.status, response.headers, response.body)
-                if isinstance(classified, ProviderContextTooLarge):
-                    trace.append(
-                        AttemptRecord(
-                            attempt=attempt,
-                            signal=FinalAttempt(),
-                            status_code=status,
-                            started_at_ms=started_ms,
-                            ended_at_ms=_monotonic_ms(),
+                    except TransientAttempt as failed:
+                        last_cause = failed.cause
+                        handle.mark_failed(failed.cause)
+                        continue
+                    if isinstance(result, ProviderContextTooLarge):
+                        raise NonGenerationCallFailed(result)
+                    if span.is_recording() and isinstance(result.usage, Present):
+                        span.set_attribute(
+                            "gen_ai.usage.input_tokens", result.usage.value.input_tokens
                         )
-                    )
-                    return _SendFailed(
-                        failure=classified, trace=tuple(trace), dispatched=dispatched
-                    )
-                signal = classified
-            delay_s = _retry_delay_s(attempt=attempt, signal=signal, policy=policy)
-            if attempt >= policy.max_attempts or _deadline_exhausted(loop_started, policy, delay_s):
-                trace.append(
-                    AttemptRecord(
-                        attempt=attempt,
-                        signal=FinalAttempt(),
-                        status_code=status,
-                        started_at_ms=started_ms,
-                        ended_at_ms=_monotonic_ms(),
-                    )
-                )
-                return _SendFailed(
-                    failure=TransientExhausted(attempts=len(trace), cause=signal),
-                    trace=tuple(trace),
-                    dispatched=dispatched,
-                )
-            trace.append(
-                AttemptRecord(
-                    attempt=attempt,
-                    signal=signal,
-                    status_code=status,
-                    started_at_ms=started_ms,
-                    ended_at_ms=_monotonic_ms(),
-                )
-            )
-            await asyncio.sleep(delay_s)
-        raise AssertionError("unreachable retry loop exit")
+                    return result
+            finally:
+                if isinstance(tries, AsyncGenerator):
+                    await tries.aclose()
+        if last_cause is None:
+            raise AssertionError("embed attempt loop exhausted without a transient cause")
+        raise NonGenerationCallFailed(TransientExhausted(attempts=attempt_count, cause=last_cause))
 
 
 __all__ = [
+    "Credentials",
     "NonGenerationCallFailed",
     "ProviderRuntime",
 ]
