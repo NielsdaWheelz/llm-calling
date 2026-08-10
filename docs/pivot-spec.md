@@ -56,7 +56,7 @@ Design stance (binding):
 | `src/provider_runtime/registry.py` | `ModelRow` capability table + `resolve()` + `REGISTRY_REVISION` | ex-`catalog.py` contract-facts |
 | `src/provider_runtime/prices.py` | `estimate_cost(meta) -> Presence[CostEstimate]` over vendored snapshot | indicative, never authoritative |
 | `src/provider_runtime/prices_snapshot.json` | Vendored `pydantic/genai-prices` data | refreshed by script, manually |
-| `src/provider_runtime/retry.py` | Single retry owner (`stamina`-backed) | `RetryPolicy(` in one module |
+| `src/provider_runtime/retry.py` | Single retry owner (owned explicit loop) | `RetryPolicy(` in one module |
 | `src/provider_runtime/otel.py` | `gen_ai.*` via **`opentelemetry-api` only**, pinned semconv version | no-op without configured SDK |
 | `src/provider_runtime/runtime.py` | `ProviderRuntime`: engines + credentials, dispatch, retry, spans, stream envelope | rewritten |
 | `src/provider_runtime/engines/__init__.py` | `Engine` protocol | new |
@@ -175,9 +175,12 @@ the gateway layer.
 
 ## 8. Retry (single owner)
 
-Retryable: `TransientCause` leaves (`ProviderRateLimit` honoring retry-after ≤ 60s,
+Retryable: `TransientCause` leaves (`ProviderRateLimit` honoring retry-after ≤ 60s — a retry-after above 60s is not honored:
+the call exhausts rather than retrying before the provider's stated window —,
 `ProviderTimeout`, `ProviderHttpUnavailable`, `TransportUnavailable`). Not retryable:
-everything else. Max 3 attempts, jittered exponential backoff (`stamina`), one wall-clock
+everything else. Max 3 attempts, jittered exponential backoff (owned loop — `stamina` was
+evaluated and rejected: it cannot express retry-after-driven delays plus a wall-clock
+deadline without contortion), one wall-clock
 deadline. Exhaustion → `Failed(TransientExhausted)` with full attempt trace in `CallMeta`.
 Streams: no mid-stream resumption; interruption after any emitted event →
 `ProviderStreamInterrupted`, retried only when zero non-terminal events were emitted.
@@ -237,7 +240,7 @@ What Nexus consumes and what v2 guarantees:
 | `plan.native_reasoning`, `plan.catalog_revision` (`llm_ledger.py`) | `CallMeta.native_reasoning`, `CallMeta.registry_revision` |
 | `TokenUsage` incl. cache read/write (`llm_ledger.py`) | unchanged |
 | `Billability` / `PossiblyBillable` / `TransientExhausted` control flow (`chat_runs.py`) | unchanged semantics |
-| `RuntimeStreamEvent(seq, …)` envelopes + event kinds (`llm_execution.py`, `chat_runs.py`, artifacts engine) | unchanged |
+| `RuntimeStreamEvent(seq, …)` envelopes + event kinds (`llm_execution.py`, `chat_runs.py`, artifacts engine) | unchanged, except: at most ONE `StreamStart` crosses the envelope across retried attempts (old lane re-emitted per attempt); Nexus `isinstance`-checks it only — verified safe |
 | `AssistantMessage.continuation` replay (`chat_runs.py`) | unchanged; codec ids change once (registry `continuation_codec`) |
 | `GenerateIntent`, `CanonicalTool`, `Presence`, outcome unions | names kept; `plan_generate` call path becomes `rt.generate(intent)` |
 | `EmbeddingCall` → `runtime.embed` (`semantic_chunks.py`) | port kept, same shape |
@@ -288,7 +291,7 @@ only code edits.
 |---|---|---|
 | **WP-0 Hygiene + provenance** | Delete `docs/agent-runtime-hard-cutover.md`; fix dangling `.dossiers/provider-facts.md` reference; check in `docs/decisions/2026-08-09-pivot-council.md`; commit this spec | — |
 | **WP-A Agent kernel** | `agent_runtime/` only: security kernel extraction, event trim, `AgentQuotaExhausted`, lockfile/constraint pinning change, deletions, its tests + gates + doc updates. Self-contained: shares only stable nouns with `types.py` | WP-0 |
-| **WP-P Provider lane (atomic)** | One PR, internally ordered commits: (1) deps `openai`/`anthropic`/`google-genai`/`stamina`/`pydantic`/`opentelemetry-api` + `types.py` trim; (2) engines + conformance/fault tests; (3) `runtime.py`/`registry.py`/`retry.py`/`otel.py`/`prices.py` + facade; (4) `embeddings.py`/`testing.py` rewrites; (5) deletions; (6) gates + README. The contract change is cross-cutting — coexistence slices were rejected as dual-path legacy; atomicity is the honest shape (council review, finding 6) | WP-0 |
+| **WP-P Provider lane (atomic)** | One PR, internally ordered commits: (1) deps `openai`/`anthropic`/`google-genai`/`pydantic`/`opentelemetry-api` + `types.py` trim; (2) engines + conformance/fault tests; (3) `runtime.py`/`registry.py`/`retry.py`/`otel.py`/`prices.py` + facade; (4) `embeddings.py`/`testing.py` rewrites; (5) deletions; (6) gates + README. The contract change is cross-cutting — coexistence slices were rejected as dual-path legacy; atomicity is the honest shape (council review, finding 6) | WP-0 |
 | **WP-L Live evidence** | Run live matrix across full registry + both agent backends; check in evidence; start the six-month moratorium | WP-A, WP-P |
 
 WP-A and WP-P are parallel (disjoint trees, shared nouns frozen in WP-0 planning).
