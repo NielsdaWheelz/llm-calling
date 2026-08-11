@@ -813,8 +813,44 @@ async def test_json_out_round_trip_returns_structured_reply() -> None:
     assert reply.outcome.meta == engine_meta()
     (call,) = engine.generate_calls
     sent = call[1]
-    assert sent.output == StrictJsonOutput(name="Verdict", schema=Verdict.model_json_schema()), (
-        "json_out must derive the strict schema from the pydantic model"
+    expected = {**Verdict.model_json_schema(), "additionalProperties": False}
+    assert sent.output == StrictJsonOutput(name="Verdict", schema=expected), (
+        "json_out must derive the strict schema from the pydantic model, closed at the root"
+    )
+
+
+class Finding(pydantic.BaseModel):
+    title: str
+
+
+class Report(pydantic.BaseModel):
+    summary: str
+    findings: list[Finding]
+
+
+async def test_json_out_closes_every_object_node_for_native_strict_modes() -> None:
+    # Certified live: OpenAI Responses and Anthropic output_config.format both
+    # reject any object schema without an explicit additionalProperties: false,
+    # which pydantic's generator omits.
+    engine = FakeEngine(
+        generate_script=[structured_succeeded({"summary": "s", "findings": [{"title": "t"}]})]
+    )
+    reply = await make_runtime(engine).json_out(Report, make_intent())
+    assert isinstance(reply, StructuredReply)
+    (call,) = engine.generate_calls
+    sent = call[1]
+    assert isinstance(sent.output, StrictJsonOutput)
+    schema = sent.output.schema
+    assert schema["additionalProperties"] is False, "root object must be closed"
+    defs = schema["$defs"]
+    assert isinstance(defs, dict)
+    finding = defs["Finding"]
+    assert isinstance(finding, dict)
+    assert finding["additionalProperties"] is False, "nested object must be closed"
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    assert "additionalProperties" not in properties["summary"], (
+        "a non-object string node must pass through untouched"
     )
 
 

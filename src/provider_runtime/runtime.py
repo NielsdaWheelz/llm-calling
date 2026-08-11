@@ -559,6 +559,27 @@ class ProviderRuntime:
 
     # -- json_out -----------------------------------------------------------
 
+    @staticmethod
+    def _closed_schema(schema: Mapping[str, object]) -> dict[str, object]:
+        """Recursively close object nodes: native strict modes (OpenAI Responses,
+        Anthropic output_config.format) reject any object without an explicit
+        `additionalProperties: false`, and pydantic's generator omits it."""
+
+        def close(node: object) -> object:
+            if isinstance(node, Mapping):
+                return close_mapping(node)
+            if isinstance(node, list):
+                return [close(item) for item in node]
+            return node
+
+        def close_mapping(node: Mapping[str, object]) -> dict[str, object]:
+            closed = {key: close(value) for key, value in node.items()}
+            if "properties" in closed or closed.get("type") == "object":
+                closed.setdefault("additionalProperties", False)
+            return closed
+
+        return close_mapping(schema)
+
     async def json_out[T: pydantic.BaseModel](
         self,
         model: type[T],
@@ -576,9 +597,11 @@ class ProviderRuntime:
                 message="json_out requires an intent with TextOutput; "
                 "the strict schema is derived from the pydantic model"
             )
+        schema = self._closed_schema(model.model_json_schema())
+        assert isinstance(schema, Mapping)
         strict_intent = replace(
             intent,
-            output=StrictJsonOutput(name=model.__name__, schema=model.model_json_schema()),
+            output=StrictJsonOutput(name=model.__name__, schema=schema),
         )
         outcome = await self.generate(strict_intent, cancel=cancel)
         match outcome:

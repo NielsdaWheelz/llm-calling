@@ -1,0 +1,33 @@
+{
+  "auth": "local_account",
+  "cases": [
+    {
+      "model": "backend-default",
+      "resume_turn": {
+        "same_native_session": true,
+        "status": "succeeded"
+      },
+      "route": "claude:sdk",
+      "stream_turn": {
+        "event_count": 13,
+        "event_kinds": [
+          "AgentNative",
+          "AgentTerminal",
+          "AgentText",
+          "AgentUsage"
+        ],
+        "final_text_sha256": "f4e2f2b43402948f7cec1d2a5d2baef207530bc0f67d2a2df3d5f4cb3cf3d3fc",
+        "status": "succeeded",
+        "usage_reported": true
+      },
+      "structured_turn": {
+        "ok": true,
+        "status": "succeeded"
+      }
+    }
+  ],
+  "evidence_revision": "29c030e85e08",
+  "recorded_at": "2026-08-11T06:40:01Z",
+  "route": "claude:sdk",
+  "schema_version": "agent-runtime-live-evidence.v2"
+}

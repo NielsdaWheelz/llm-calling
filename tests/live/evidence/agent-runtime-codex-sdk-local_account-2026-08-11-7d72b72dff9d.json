@@ -1,0 +1,33 @@
+{
+  "auth": "local_account",
+  "cases": [
+    {
+      "model": "backend-default",
+      "resume_turn": {
+        "same_native_session": true,
+        "status": "succeeded"
+      },
+      "route": "codex:sdk",
+      "stream_turn": {
+        "event_count": 7,
+        "event_kinds": [
+          "AgentNative",
+          "AgentTerminal",
+          "AgentText",
+          "AgentUsage"
+        ],
+        "final_text_sha256": "9795c5ff8937f23526ccb207a5684c1fc94a7854e19c021b39d944e51f5baef2",
+        "status": "succeeded",
+        "usage_reported": true
+      },
+      "structured_turn": {
+        "ok": true,
+        "status": "succeeded"
+      }
+    }
+  ],
+  "evidence_revision": "7d72b72dff9d",
+  "recorded_at": "2026-08-11T06:40:23Z",
+  "route": "codex:sdk",
+  "schema_version": "agent-runtime-live-evidence.v2"
+}

@@ -1,0 +1,666 @@
+{
+  "evidence_revision": "2bf13e5df201",
+  "recorded_at": "2026-08-11T06:47:53Z",
+  "registry_revision": "2026-08-10.2",
+  "rows": {
+    "anthropic:claude-fable-5": {
+      "chat": {
+        "attempts": 1,
+        "provider_request_id": "req_011CdvWZbVoxUC5RkGw8KWfW",
+        "reasoning": "low",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 41,
+          "output_tokens": 4,
+          "total_tokens": 45
+        }
+      },
+      "continuation": {
+        "attempts": 1,
+        "provider_request_id": "req_011CdvWhb7xpMyYKAxjphjn4",
+        "replayed_level": "high",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 86,
+          "output_tokens": 14,
+          "total_tokens": 100
+        }
+      },
+      "json_out": {
+        "attempts": 1,
+        "provider_request_id": "req_011CdvWfYAZ998MZCAfeAPY5",
+        "status": "passed",
+        "structured": "native",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 315,
+          "output_tokens": 17,
+          "total_tokens": 332
+        }
+      },
+      "stream": {
+        "attempts": 1,
+        "event_count": 5,
+        "event_kinds": [
+          "StreamStart",
+          "TerminalEvent",
+          "TextDelta",
+          "UsageEvent"
+        ],
+        "provider_request_id": "req_011CdvWaukwdWdNp91kdWvVk",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 51,
+          "output_tokens": 11,
+          "total_tokens": 62
+        }
+      },
+      "tools": {
+        "attempts": 1,
+        "provider_request_id": "req_011CdvWdR7qXYuobagfE6Vup",
+        "status": "passed",
+        "tool_called": "lookup_temperature",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 505,
+          "output_tokens": 11,
+          "total_tokens": 516
+        }
+      }
+    },
+    "anthropic:claude-sonnet-5": {
+      "chat": {
+        "attempts": 1,
+        "provider_request_id": "req_011CdvWZTuuKrZutQmiwGPg8",
+        "reasoning": "low",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 41,
+          "output_tokens": 4,
+          "total_tokens": 45
+        }
+      },
+      "continuation": {
+        "attempts": 1,
+        "provider_request_id": "req_011CdvWhBKUxvnmgnySfT4Yr",
+        "replayed_level": "high",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 108,
+          "output_tokens": 3,
+          "total_tokens": 111
+        }
+      },
+      "json_out": {
+        "attempts": 1,
+        "provider_request_id": "req_011CdvWfQ2QvUimiSy7eWwUi",
+        "status": "passed",
+        "structured": "native",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 315,
+          "output_tokens": 17,
+          "total_tokens": 332
+        }
+      },
+      "stream": {
+        "attempts": 1,
+        "event_count": 5,
+        "event_kinds": [
+          "StreamStart",
+          "TerminalEvent",
+          "TextDelta",
+          "UsageEvent"
+        ],
+        "provider_request_id": "req_011CdvWajLskmfhS76Exkp3A",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 51,
+          "output_tokens": 11,
+          "total_tokens": 62
+        }
+      },
+      "tools": {
+        "attempts": 1,
+        "provider_request_id": "req_011CdvWd1wpQZkFVb91KxVwt",
+        "status": "passed",
+        "tool_called": "lookup_temperature",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 569,
+          "output_tokens": 16,
+          "total_tokens": 585
+        }
+      }
+    },
+    "deepseek:deepseek-v4-flash": {
+      "chat": {
+        "attempts": 1,
+        "provider_request_id": "8895ab6a-9dcf-4889-82ef-b6049daad724",
+        "reasoning": "none",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 27,
+          "output_tokens": 2,
+          "total_tokens": 29
+        }
+      },
+      "continuation": {
+        "attempts": 1,
+        "provider_request_id": "61bb69f4-c2ab-4205-972f-bf3bd0a3d3b4",
+        "replayed_level": "high",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 136,
+          "output_tokens": 30,
+          "total_tokens": 166
+        }
+      },
+      "json_out": {
+        "attempts": 1,
+        "provider_request_id": "11615c83-8d96-4076-88d5-92edbcbcf6b8",
+        "status": "passed",
+        "structured": "json_mode",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 68,
+          "output_tokens": 10,
+          "total_tokens": 78
+        }
+      },
+      "stream": {
+        "attempts": 1,
+        "event_count": 12,
+        "event_kinds": [
+          "StreamStart",
+          "TerminalEvent",
+          "TextDelta",
+          "UsageEvent"
+        ],
+        "provider_request_id": "3c30a52c-bcf8-4410-9593-86da7ce9ccc2",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 32,
+          "output_tokens": 9,
+          "total_tokens": 41
+        }
+      },
+      "tools": {
+        "attempts": 1,
+        "provider_request_id": "45856ac3-615b-46e7-b458-b7ccdc62ab36",
+        "status": "passed",
+        "tool_called": "lookup_temperature",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 375,
+          "output_tokens": 10,
+          "total_tokens": 385
+        }
+      }
+    },
+    "deepseek:deepseek-v4-pro": {
+      "chat": {
+        "attempts": 1,
+        "provider_request_id": "2a2cff88-6262-461f-a984-056965bcd653",
+        "reasoning": "none",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 27,
+          "output_tokens": 2,
+          "total_tokens": 29
+        }
+      },
+      "continuation": {
+        "attempts": 1,
+        "provider_request_id": "4d8f9ee1-8c6a-46e3-99a2-a5af67a48d57",
+        "replayed_level": "high",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 57,
+          "output_tokens": 43,
+          "total_tokens": 100
+        }
+      },
+      "json_out": {
+        "attempts": 1,
+        "provider_request_id": "e0b9a54a-dc05-4d71-be94-30627a746c57",
+        "status": "passed",
+        "structured": "json_mode",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 68,
+          "output_tokens": 12,
+          "total_tokens": 80
+        }
+      },
+      "stream": {
+        "attempts": 1,
+        "event_count": 12,
+        "event_kinds": [
+          "StreamStart",
+          "TerminalEvent",
+          "TextDelta",
+          "UsageEvent"
+        ],
+        "provider_request_id": "b87acdd2-1e3e-4c47-b408-d08ee3cf7de0",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 32,
+          "output_tokens": 9,
+          "total_tokens": 41
+        }
+      },
+      "tools": {
+        "attempts": 1,
+        "provider_request_id": "78350c56-8f01-4a46-8cb7-2b50dd0a869b",
+        "status": "passed",
+        "tool_called": "lookup_temperature",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 375,
+          "output_tokens": 11,
+          "total_tokens": 386
+        }
+      }
+    },
+    "gemini:gemini-3.5-flash": {
+      "chat": {
+        "reason": "no gemini credential: set GEMINI_API_KEY to probe row gemini:gemini-3.5-flash",
+        "status": "skipped"
+      },
+      "continuation": {
+        "reason": "no gemini credential: set GEMINI_API_KEY to probe row gemini:gemini-3.5-flash",
+        "status": "skipped"
+      },
+      "json_out": {
+        "reason": "no gemini credential: set GEMINI_API_KEY to probe row gemini:gemini-3.5-flash",
+        "status": "skipped"
+      },
+      "stream": {
+        "reason": "no gemini credential: set GEMINI_API_KEY to probe row gemini:gemini-3.5-flash",
+        "status": "skipped"
+      },
+      "tools": {
+        "reason": "no gemini credential: set GEMINI_API_KEY to probe row gemini:gemini-3.5-flash",
+        "status": "skipped"
+      }
+    },
+    "moonshot:kimi-k3": {
+      "chat": {
+        "attempts": 1,
+        "provider_request_id": "chatcmpl-6a7ac517c37a6f648178f465",
+        "reasoning": "low",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 117,
+          "output_tokens": 62,
+          "total_tokens": 179
+        }
+      },
+      "continuation": {
+        "attempts": 1,
+        "provider_request_id": "chatcmpl-6a7ac58911cb3e988c7b6cd4",
+        "replayed_level": "high",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 213,
+          "output_tokens": 33,
+          "total_tokens": 246
+        }
+      },
+      "json_out": {
+        "attempts": 1,
+        "provider_request_id": "chatcmpl-6a7ac56a78b6c7e1efd35d79",
+        "status": "passed",
+        "structured": "json_mode",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 186,
+          "output_tokens": 57,
+          "total_tokens": 243
+        }
+      },
+      "stream": {
+        "attempts": 1,
+        "event_count": 14,
+        "event_kinds": [
+          "ContinuationDelta",
+          "StreamStart",
+          "TerminalEvent",
+          "TextDelta",
+          "UsageEvent"
+        ],
+        "provider_request_id": "chatcmpl-6a7ac52ba64cc134363074b1",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 123,
+          "output_tokens": 58,
+          "total_tokens": 181
+        }
+      },
+      "tools": {
+        "attempts": 1,
+        "provider_request_id": "chatcmpl-6a7ac54edec9d2c4d1bae53e",
+        "status": "passed",
+        "tool_called": "lookup_temperature",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 308,
+          "output_tokens": 27,
+          "total_tokens": 335
+        }
+      }
+    },
+    "openai:gpt-5.6-luna": {
+      "chat": {
+        "attempts": 1,
+        "provider_request_id": "req_6420d0517181425d9e5e26da5d7618b3",
+        "reasoning": "none",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 31,
+          "output_tokens": 5,
+          "total_tokens": 36
+        }
+      },
+      "continuation": {
+        "attempts": 1,
+        "provider_request_id": "req_c2481929aec84ffd879286edbecf5039",
+        "replayed_level": "high",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 83,
+          "output_tokens": 18,
+          "total_tokens": 101
+        }
+      },
+      "json_out": {
+        "attempts": 1,
+        "provider_request_id": "req_d464072f50804ae19d7a144fdafb0c34",
+        "status": "passed",
+        "structured": "native",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 98,
+          "output_tokens": 19,
+          "total_tokens": 117
+        }
+      },
+      "stream": {
+        "attempts": 1,
+        "event_count": 12,
+        "event_kinds": [
+          "ContinuationDelta",
+          "StreamStart",
+          "TerminalEvent",
+          "TextDelta"
+        ],
+        "provider_request_id": "req_b9802ecac56a45f8a9d30a1320e818d4",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 37,
+          "output_tokens": 13,
+          "total_tokens": 50
+        }
+      },
+      "tools": {
+        "attempts": 1,
+        "provider_request_id": "req_d96a638485a544e8ae75851853ead4b0",
+        "status": "passed",
+        "tool_called": "lookup_temperature",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 115,
+          "output_tokens": 6,
+          "total_tokens": 121
+        }
+      }
+    },
+    "openai:gpt-5.6-sol": {
+      "chat": {
+        "attempts": 1,
+        "provider_request_id": "req_858559c125d347d68d970f2f14142df6",
+        "reasoning": "none",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 31,
+          "output_tokens": 5,
+          "total_tokens": 36
+        }
+      },
+      "continuation": {
+        "attempts": 1,
+        "provider_request_id": "req_ba77cb184aa24a29bf9c5c2560e37cef",
+        "replayed_level": "high",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 68,
+          "output_tokens": 5,
+          "total_tokens": 73
+        }
+      },
+      "json_out": {
+        "attempts": 1,
+        "provider_request_id": "req_46108d17744243218cd7e71174cf2186",
+        "status": "passed",
+        "structured": "native",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 98,
+          "output_tokens": 19,
+          "total_tokens": 117
+        }
+      },
+      "stream": {
+        "attempts": 1,
+        "event_count": 12,
+        "event_kinds": [
+          "ContinuationDelta",
+          "StreamStart",
+          "TerminalEvent",
+          "TextDelta"
+        ],
+        "provider_request_id": "req_6c612fe8889f4002b3b06615c1c2cc23",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 37,
+          "output_tokens": 13,
+          "total_tokens": 50
+        }
+      },
+      "tools": {
+        "attempts": 1,
+        "provider_request_id": "req_b7d58fba1c664e51b23a92c8fa23b54a",
+        "status": "passed",
+        "tool_called": "lookup_temperature",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 115,
+          "output_tokens": 10,
+          "total_tokens": 125
+        }
+      }
+    },
+    "openai:gpt-5.6-terra": {
+      "chat": {
+        "attempts": 1,
+        "provider_request_id": "req_c27538574e27482cb444e6b4f0ab9c07",
+        "reasoning": "none",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 31,
+          "output_tokens": 5,
+          "total_tokens": 36
+        }
+      },
+      "continuation": {
+        "attempts": 1,
+        "provider_request_id": "req_44cb4554cbc040b6b0b175f98c0f4039",
+        "replayed_level": "high",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 87,
+          "output_tokens": 17,
+          "total_tokens": 104
+        }
+      },
+      "json_out": {
+        "attempts": 1,
+        "provider_request_id": "req_da448cdff0f340068ffe5fd5675bd2aa",
+        "status": "passed",
+        "structured": "native",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 98,
+          "output_tokens": 19,
+          "total_tokens": 117
+        }
+      },
+      "stream": {
+        "attempts": 1,
+        "event_count": 12,
+        "event_kinds": [
+          "ContinuationDelta",
+          "StreamStart",
+          "TerminalEvent",
+          "TextDelta"
+        ],
+        "provider_request_id": "req_a5f3d5abb5be4718bf8d4353adc634e1",
+        "status": "passed",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 37,
+          "output_tokens": 13,
+          "total_tokens": 50
+        }
+      },
+      "tools": {
+        "attempts": 1,
+        "provider_request_id": "req_00ed4aa5fb4e415a91d11ec3a137eaf8",
+        "status": "passed",
+        "tool_called": "lookup_temperature",
+        "upstream_provider": null,
+        "usage": {
+          "input_tokens": 115,
+          "output_tokens": 6,
+          "total_tokens": 121
+        }
+      }
+    },
+    "openrouter:kimi-k3": {
+      "chat": {
+        "attempts": 1,
+        "provider_request_id": "gen-1786430746-Vk52KrszThSetegwMH8f",
+        "reasoning": "low",
+        "status": "passed",
+        "upstream_provider": "Moonshot AI",
+        "usage": {
+          "input_tokens": 117,
+          "output_tokens": 40,
+          "total_tokens": 157
+        }
+      },
+      "continuation": {
+        "attempts": 1,
+        "provider_request_id": "gen-1786430863-V1nDl0r85QNoY1VwiOs3",
+        "replayed_level": "high",
+        "status": "passed",
+        "upstream_provider": "Moonshot AI",
+        "usage": {
+          "input_tokens": 231,
+          "output_tokens": 39,
+          "total_tokens": 270
+        }
+      },
+      "json_out": {
+        "attempts": 1,
+        "provider_request_id": "gen-1786430828-qAVjciiQ5ZRoi609ZJZF",
+        "status": "passed",
+        "structured": "json_mode",
+        "upstream_provider": "Moonshot AI",
+        "usage": {
+          "input_tokens": 186,
+          "output_tokens": 57,
+          "total_tokens": 243
+        }
+      },
+      "stream": {
+        "attempts": 1,
+        "event_count": 13,
+        "event_kinds": [
+          "ContinuationDelta",
+          "StreamStart",
+          "TerminalEvent",
+          "TextDelta",
+          "UsageEvent"
+        ],
+        "provider_request_id": "gen-1786430765-DLfpIJi8AkpviPuKT0uN",
+        "status": "passed",
+        "upstream_provider": "Moonshot AI",
+        "usage": {
+          "input_tokens": 123,
+          "output_tokens": 67,
+          "total_tokens": 190
+        }
+      },
+      "tools": {
+        "attempts": 1,
+        "provider_request_id": "gen-1786430804-ygsqLm8NUrKQYHMCBV1e",
+        "status": "passed",
+        "tool_called": "lookup_temperature",
+        "upstream_provider": "Moonshot AI",
+        "usage": {
+          "input_tokens": 321,
+          "output_tokens": 39,
+          "total_tokens": 360
+        }
+      }
+    },
+    "xai:grok-4.5": {
+      "chat": {
+        "reason": "no xai credential: set XAI_API_KEY to probe row xai:grok-4.5",
+        "status": "skipped"
+      },
+      "continuation": {
+        "reason": "no xai credential: set XAI_API_KEY to probe row xai:grok-4.5",
+        "status": "skipped"
+      },
+      "json_out": {
+        "reason": "no xai credential: set XAI_API_KEY to probe row xai:grok-4.5",
+        "status": "skipped"
+      },
+      "stream": {
+        "reason": "no xai credential: set XAI_API_KEY to probe row xai:grok-4.5",
+        "status": "skipped"
+      },
+      "tools": {
+        "reason": "no xai credential: set XAI_API_KEY to probe row xai:grok-4.5",
+        "status": "skipped"
+      }
+    }
+  },
+  "schema_version": "provider-runtime-live-evidence.v1"
+}

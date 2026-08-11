@@ -153,11 +153,17 @@ def _chat_reasoning(row: ModelRow) -> ReasoningLevel:
 
 
 def _replay_reasoning(row: ModelRow) -> ReasoningLevel | None:
-    """The cheapest level that actually reasons; None when the row has none."""
-    for level in _declared_levels(row):
-        if level != "none":
-            return level
-    return None
+    """The declared level that reliably reasons; None when the row has none.
+
+    "high" over the cheapest declared level: certified live that claude-sonnet-5
+    at "low" effort completes without emitting a thinking signature, so a cheap
+    level can leave nothing for the continuation probe to replay."""
+    declared: tuple[ReasoningLevel, ...] = tuple(
+        level for level in _declared_levels(row) if level != "none"
+    )
+    if not declared:
+        return None
+    return "high" if "high" in declared else declared[-1]
 
 
 def _intent(
