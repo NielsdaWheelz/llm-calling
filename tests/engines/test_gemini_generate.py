@@ -1448,6 +1448,24 @@ async def test_429_with_retry_after_raises_transient_rate_limit(
 
 
 @respx.mock
+async def test_429_with_negative_retry_after_has_absent_delay(
+    engine: GeminiGenerateEngine,
+) -> None:
+    respx.post(generate_url(LEVEL_ROW)).mock(
+        return_value=httpx.Response(
+            429,
+            headers={"retry-after": "-5"},
+            json={"error": {"code": 429, "message": "slow down", "status": "RESOURCE_EXHAUSTED"}},
+        )
+    )
+    with pytest.raises(TransientAttempt) as excinfo:
+        await engine.generate(LEVEL_ROW, intent_for(LEVEL_ROW), CREDENTIAL)
+    assert excinfo.value.cause == ProviderRateLimit(retry_after=Absent()), (
+        f"got {excinfo.value.cause}"
+    )
+
+
+@respx.mock
 async def test_429_without_retry_after_has_absent_delay(engine: GeminiGenerateEngine) -> None:
     respx.post(generate_url(LEVEL_ROW)).mock(
         return_value=httpx.Response(

@@ -4,8 +4,8 @@ One span per facade call: `call_span` starts it with the `gen_ai.*` request
 attributes and ends it on exit, and the runtime records terminal facts from
 `CallMeta` via `record_outcome` — including the span-side mirror of
 `CallMeta.attempt_trace`, one bounded event per attempt. Attribute names are
-drawn from one pinned semconv release (`SEMCONV_VERSION`), recorded both as
-the tracer scope's schema URL and as a span attribute.
+drawn from one pinned semconv release (`SEMCONV_VERSION`), recorded once as the
+tracer scope's schema URL.
 
 The call span is deliberately NOT attached as the ambient current span for the
 whole call: the streaming port is an async generator that resumes inside its
@@ -107,7 +107,6 @@ def call_span(
             "gen_ai.operation.name": operation,
             "gen_ai.provider.name": _provider_name(provider),
             "gen_ai.request.model": model,
-            "provider_runtime.semconv_version": SEMCONV_VERSION,
         },
     )
     try:

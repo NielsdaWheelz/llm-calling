@@ -292,10 +292,12 @@ MCP configuration is session-scoped on both routes.
 - Streamable HTTP MCP requires HTTPS and must fit the network policy.
 - Claude can enforce an exact hostname allowlist but accepts no credential refs.
 - Codex accepts environment/header references, but its route cannot enforce an
-  exact hostname allowlist, so remote MCP requires unrestricted network — and
-  the SDK's sandbox presets only reach the network under `full_access`, so a
-  Codex remote-MCP session is `full_access` + `unrestricted` with both unsafe
-  dimensions acknowledged. It confines nothing; see SECURITY.md.
+  exact hostname allowlist, so remote MCP requires unrestricted network. Use
+  `workspace_write` + `unrestricted`, acknowledging `network_unrestricted`
+  only: the route writes `sandbox_workspace_write.network_access = true`, which
+  confines writes to `cwd`/`additional_dirs` while leaving reads and egress
+  open. `read_only` + network is refused — the Codex config has a network
+  toggle only under `sandbox_workspace_write`. See SECURITY.md.
 
 Secrets are resolved at the process boundary through `secret_resolver` or a
 named environment source, placed only in opaque child-environment aliases, and

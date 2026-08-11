@@ -123,12 +123,25 @@ The one confined remote-MCP shape is Claude streamable HTTP MCP under an exact
 hostname allowlist, with no credential references supplied by this package.
 
 Codex streamable HTTP MCP is the shape that carries reference
-headers/environment, and it is not a confinement boundary. Codex cannot enforce
-a hostname allowlist, so remote MCP needs unrestricted network; the SDK's
-sandbox presets only reach the network under `full_access`. A Codex remote-MCP
-session is therefore `full_access` + `unrestricted` with both unsafe dimensions
-acknowledged, which confines neither the filesystem nor egress. Run it as a
-dedicated OS user or in a container, or use the Claude shape instead.
+headers/environment. Codex cannot enforce a hostname allowlist, so remote MCP
+needs unrestricted network. The shape to use is `workspace_write` +
+`unrestricted`, acknowledging `network_unrestricted` only: the route writes
+`sandbox_workspace_write.network_access = true`, which is the one network toggle
+the Codex config carries. `full_access` + `unrestricted` remains accepted but
+acknowledges filesystem authority remote MCP does not need.
+
+`workspace_write` confines writes, not reads and not egress. Codex's
+workspace-write sandbox is read-only access plus write access to the session
+`cwd`, its `additional_dirs`, and by default `/tmp` and `$TMPDIR`; everything
+else on the host stays readable. With `network_access = true` there is no
+hostname allowlist and no port restriction, so anything the session can read it
+can also send. Treat a Codex remote-MCP session as exfiltration-capable: run it
+as a dedicated OS user or in a container, or use the Claude shape instead.
+
+`read_only` + network is refused rather than approximated. The Codex config
+exposes a network toggle only under `sandbox_workspace_write`, with no read-only
+counterpart, so the route will not claim a read-only sandbox can reach the
+network.
 
 ## Bounds, redaction, cancellation, and cleanup
 

@@ -250,19 +250,22 @@ async def test_retry_after_above_sixty_seconds_exhausts_without_retrying() -> No
     assert sleep.delays == [], f"an above-cap retry_after must never be slept, got {sleep.delays}"
 
 
-async def test_negative_retry_after_never_sleeps_negative() -> None:
-    # Speculative (a mis-parsed Retry-After header): retry_after has no
-    # non-negativity invariant at construction, so the loop must not turn a
-    # negative value into an instant zero-backoff retry via a bare sleep().
+async def test_a_negative_retry_after_never_reaches_the_loop() -> None:
+    # Why the loop carries no clamp: a mis-parsed Retry-After header cannot be
+    # represented, so it can never become an instant zero-backoff retry.
+    with pytest.raises(ValueError, match="retry_after must be >= 0"):
+        ProviderRateLimit(retry_after=Present(-5.0))
     clock = ManualClock()
     sleep = SleepRecorder(clock)
     await drive(
         policy(max_attempts=2),
-        fail_with=lambda _: ProviderRateLimit(retry_after=Present(-5.0)),
+        fail_with=lambda _: ProviderRateLimit(retry_after=Present(0.0)),
         clock=clock,
         sleep=sleep,
     )
-    assert sleep.delays == [0.0], f"a negative retry_after must clamp to 0, got {sleep.delays}"
+    assert sleep.delays == [0.0], (
+        f"the smallest legal retry_after is slept verbatim, got {sleep.delays}"
+    )
 
 
 async def test_rate_limit_without_retry_after_uses_backoff() -> None:

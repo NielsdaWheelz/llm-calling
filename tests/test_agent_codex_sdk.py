@@ -672,14 +672,26 @@ async def test_policy_mappings_outside_the_codex_sandbox_presets_are_rejected(
             await selected.open_session(
                 request(tmp_path, policy=PermissionPolicy(approval="ask", allowed_tools=("*",)))
             )
-        with pytest.raises(UnsupportedCapability, match="network"):
+        with pytest.raises(UnsupportedCapability, match="read_only sandbox has no network"):
             await selected.open_session(
                 request(
                     tmp_path,
                     policy=PermissionPolicy(
+                        filesystem="read_only",
                         network="unrestricted",
                         allowed_tools=("*",),
                         unsafe_confirmation=UnsafeConfirmation(("network_unrestricted",)),
+                    ),
+                )
+            )
+        with pytest.raises(UnsupportedCapability, match="full_access"):
+            await selected.open_session(
+                request(
+                    tmp_path,
+                    policy=PermissionPolicy(
+                        filesystem="full_access",
+                        allowed_tools=("*",),
+                        unsafe_confirmation=UnsafeConfirmation(("filesystem_full_access",)),
                     ),
                 )
             )
@@ -702,13 +714,29 @@ async def test_policy_mappings_outside_the_codex_sandbox_presets_are_rejected(
     )
 
 
-async def test_workspace_write_requires_the_bubblewrap_network_namespace_probe(
+@pytest.mark.parametrize(
+    ("policy", "network_access"),
+    [
+        (PermissionPolicy(filesystem="workspace_write", allowed_tools=("*",)), False),
+        (
+            PermissionPolicy(
+                filesystem="workspace_write",
+                network="unrestricted",
+                allowed_tools=("*",),
+                unsafe_confirmation=UnsafeConfirmation(("network_unrestricted",)),
+            ),
+            True,
+        ),
+    ],
+    ids=("network_disabled", "network_unrestricted"),
+)
+async def test_workspace_write_probes_bubblewrap_and_maps_the_sandbox_network_toggle(
     tmp_path: Path,
     installed_codex_sdk: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
+    policy: PermissionPolicy,
+    network_access: bool,
 ) -> None:
-    policy = PermissionPolicy(filesystem="workspace_write", allowed_tools=("*",))
-
     async def unavailable(*, cwd: Path, environment: Mapping[str, str]) -> bool:
         return False
 
@@ -733,7 +761,7 @@ async def test_workspace_write_requires_the_bubblewrap_network_namespace_probe(
     assert start["sandbox"] == "workspace-write"
     assert start["config"]["sandbox_workspace_write"] == {
         "writable_roots": [str(tmp_path.resolve())],
-        "network_access": False,
+        "network_access": network_access,
     }
 
 

@@ -349,6 +349,12 @@ class CostEstimate:
 class ProviderRateLimit:
     retry_after: Presence[float]
 
+    def __post_init__(self) -> None:
+        if isinstance(self.retry_after, Present) and self.retry_after.value < 0:
+            raise ValueError(
+                f"ProviderRateLimit.retry_after must be >= 0; got {self.retry_after.value}"
+            )
+
 
 @dataclass(frozen=True, slots=True)
 class ProviderTimeout:
@@ -729,8 +735,9 @@ class RetryPolicy:
 
 
 # ---------------------------------------------------------------------------
-# Non-generation port (openai-only embeddings; live Nexus consumer). A bare
-# model string suffices — the rows are openai-only.
+# Non-generation port (openai-only embeddings; live Nexus consumer). The call
+# names its model as a bare string: the port never resolves a registry row, so
+# there is nothing for a ProviderTarget to carry.
 
 
 @dataclass(frozen=True, slots=True)

@@ -605,9 +605,10 @@ def _retry_after(exc: genai_errors.APIError) -> Presence[float]:
     if value is None:
         return Absent()
     try:
-        return Present(float(value))
+        seconds = float(value)
     except ValueError:
         return Absent()
+    return Present(seconds) if seconds >= 0 else Absent()
 
 
 def _classify_api_error(exc: genai_errors.APIError) -> ProviderContextTooLarge:

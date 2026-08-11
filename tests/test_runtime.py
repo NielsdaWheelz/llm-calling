@@ -6,7 +6,10 @@ mocking. Assertions cover the runtime's own obligations: registry resolution
 and intent gates, credential lookup, the retry loop with attempt-trace
 accumulation and billability folding, the stream envelope (seq stamping,
 single-StreamStart grammar, mid-stream retry rules), cancellation, json_out,
-and the chat sugar.
+the chat sugar, and the facts the facade puts on its own call span.
+
+The embed port has no engine seam, so its span tests drive the openai SDK's
+transport with respx — the HTTP boundary, still no internal mocking.
 """
 
 from __future__ import annotations
@@ -16,11 +19,22 @@ import logging
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
+import httpx
 import pydantic
 import pytest
+import respx
 from opentelemetry import trace
 from opentelemetry.context import Context
-from opentelemetry.trace import Link, NoOpTracer, Span, SpanContext, SpanKind, Status, StatusCode
+from opentelemetry.trace import (
+    Link,
+    NoOpTracer,
+    Span,
+    SpanContext,
+    SpanKind,
+    Status,
+    StatusCode,
+    TracerProvider,
+)
 from opentelemetry.trace.span import INVALID_SPAN_CONTEXT
 from opentelemetry.util import types as otel_types
 
@@ -30,8 +44,10 @@ from provider_runtime.errors import (
     CredentialMissing,
     CredentialRejected,
     InvalidRequest,
+    NonGenerationCallFailed,
     ProtocolDefect,
 )
+from provider_runtime.prices import estimate_cost
 from provider_runtime.registry import REGISTRY_REVISION, ModelRow
 from provider_runtime.runtime import Credentials, ProviderRuntime
 from provider_runtime.types import (
@@ -47,6 +63,7 @@ from provider_runtime.types import (
     ConfirmedNonBillable,
     ContinuationArtifact,
     ContinuationDelta,
+    EmbeddingCall,
     Failed,
     FinalAttempt,
     GenerateIntent,
@@ -90,6 +107,7 @@ from provider_runtime.types import (
     UserMessage,
     presence_of,
 )
+from tests.test_otel import RecordingTracerProvider
 
 TARGET = ProviderTarget(provider="openai", model="gpt-5.6-sol")
 TEXT_ONLY_TARGET = ProviderTarget(provider="deepseek", model="deepseek-v4-pro")
@@ -178,7 +196,11 @@ class FakeEngine:
 
 
 def make_runtime(
-    engine: FakeEngine, *, max_attempts: int = 3, credentials: Credentials = CREDENTIALS
+    engine: FakeEngine,
+    *,
+    max_attempts: int = 3,
+    credentials: Credentials = CREDENTIALS,
+    tracer_provider: TracerProvider | None = None,
 ) -> ProviderRuntime:
     return ProviderRuntime(
         credentials,
@@ -197,6 +219,7 @@ def make_runtime(
             "anthropic_messages": engine,
             "gemini_generate": engine,
         },
+        tracer_provider=tracer_provider,
     )
 
 
@@ -970,3 +993,75 @@ async def test_abandoning_a_stream_ends_it_without_context_errors(
         await asyncio.ensure_future(stream.aclose())
     assert caplog.records == [], f"abandoning a stream logged: {caplog.text}"
     assert engine.streams_closed == 1
+
+
+# ---------------------------------------------------------------------------
+# spans: what the facade records on its own call span
+
+EMBEDDINGS_URL = "https://api.openai.com/v1/embeddings"
+EMBED_CALL = EmbeddingCall(model="text-embedding-3-small", inputs=("alpha",), dimensions=Absent())
+EMBED_CREDENTIAL = ProviderCredential(provider="openai", key="sk-openai-test-key-000")
+
+
+async def test_generate_records_the_cost_estimate_on_the_call_span() -> None:
+    tracer_provider = RecordingTracerProvider()
+    engine = FakeEngine(generate_script=[succeeded()])
+    outcome = await make_runtime(engine, tracer_provider=tracer_provider).generate(make_intent())
+    priced = estimate_cost(outcome.meta)
+    assert isinstance(priced, Present), "this test needs a model the price snapshot knows"
+    (span,) = tracer_provider.tracer.spans
+    assert span.attributes["provider_runtime.cost_estimate_usd_micros"] == (
+        priced.value.amount_usd_micros
+    )
+    assert span.attributes["provider_runtime.attempt_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("response", "failure", "attempt_count"),
+    [
+        pytest.param(
+            httpx.Response(500, json={"error": {"message": "boom", "type": "server_error"}}),
+            TransientExhausted(attempts=2, cause=ProviderHttpUnavailable()),
+            2,
+            id="retry-exhaustion",
+        ),
+        pytest.param(
+            httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": "This model's maximum context length is 8192 tokens.",
+                        "type": "invalid_request_error",
+                        "code": "context_length_exceeded",
+                    }
+                },
+            ),
+            ProviderContextTooLarge(),
+            1,
+            id="context-overflow",
+        ),
+    ],
+)
+@respx.mock
+async def test_embed_failure_arms_record_the_attempt_count_inside_an_errored_span(
+    response: httpx.Response,
+    failure: TransientExhausted | ProviderContextTooLarge,
+    attempt_count: int,
+) -> None:
+    # Both arms — exhaustion and the returned context-overflow value — raise
+    # INSIDE the span, so the attempt count lands on it either way and
+    # `call_span` marks the span ERROR either way.
+    respx.post(EMBEDDINGS_URL).mock(return_value=response)
+    tracer_provider = RecordingTracerProvider()
+    runtime = make_runtime(FakeEngine(), max_attempts=2, tracer_provider=tracer_provider)
+    with pytest.raises(NonGenerationCallFailed) as exc_info:
+        await runtime.embed(EMBED_CALL, credential=EMBED_CREDENTIAL)
+    assert exc_info.value.failure == failure
+    (span,) = tracer_provider.tracer.spans
+    assert span.name == "embeddings text-embedding-3-small"
+    assert span.attributes["provider_runtime.attempt_count"] == attempt_count
+    assert span.exceptions == [exc_info.value]
+    assert [status.status_code for status in span.statuses if isinstance(status, Status)] == [
+        StatusCode.ERROR
+    ]
+    assert span.ended

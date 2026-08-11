@@ -293,6 +293,14 @@ def test_transient_exhausted_rejects_attempts_below_one() -> None:
         TransientExhausted(attempts=0, cause=ProviderTimeout())
 
 
+def test_provider_rate_limit_rejects_a_negative_retry_after() -> None:
+    # A mis-parsed Retry-After header cannot reach the retry loop: the illegal
+    # state is unrepresentable, so no downstream clamp exists (or is needed).
+    assert ProviderRateLimit(retry_after=Present(0.0)).retry_after == Present(0.0)
+    with pytest.raises(ValueError, match="retry_after must be >= 0"):
+        ProviderRateLimit(retry_after=Present(-5.0))
+
+
 # ---------------------------------------------------------------------------
 # Frozen-ness
 

@@ -197,7 +197,6 @@ START_ATTRIBUTES = {
     "gen_ai.operation.name": "chat",
     "gen_ai.provider.name": "anthropic",
     "gen_ai.request.model": MODEL,
-    "provider_runtime.semconv_version": SEMCONV_VERSION,
 }
 
 TERMINAL_ATTRIBUTES = {
@@ -262,7 +261,9 @@ def test_every_provider_name_is_mapped() -> None:
     assert covered == set(get_args(ProviderName.__value__))
 
 
-def test_semconv_version_is_pinned_and_recorded() -> None:
+def test_semconv_version_is_pinned_and_recorded_only_on_the_tracer_scope() -> None:
+    # The scope's schema URL is the single record of the pinned release; a
+    # per-span copy would be a second source of truth for the same fact.
     assert re.fullmatch(r"\d+\.\d+\.\d+", SEMCONV_VERSION), (
         f"SEMCONV_VERSION must be a pinned release, got {SEMCONV_VERSION!r}"
     )
@@ -272,6 +273,8 @@ def test_semconv_version_is_pinned_and_recorded() -> None:
     assert provider.scopes == [
         ("provider_runtime", f"https://opentelemetry.io/schemas/{SEMCONV_VERSION}")
     ], f"tracer scope must pin the semconv schema, got {provider.scopes}"
+    (span,) = provider.tracer.spans
+    assert "provider_runtime.semconv_version" not in span.attributes
 
 
 def test_call_span_ends_the_span_on_exit() -> None:

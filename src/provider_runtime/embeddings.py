@@ -7,12 +7,14 @@ context overflow — the one expected terminal failure — returns as a value th
 runtime wraps in `NonGenerationCallFailed`, and defects raise their own types.
 
 Wire: the SDK's own embeddings lane (``AsyncOpenAI.embeddings.create``,
-``max_retries=0``, explicit timeout, injectable http_client, default base
-URL — this port is openai-only; there is no registry row to select
-otherwise). ``encoding_format`` is deliberately
-omitted so the SDK default applies: it requests base64 on the wire and decodes
-the packed float32 payload back to plain floats itself; a provider answering
-JSON float lists passes through that decode untouched.
+``max_retries=0``, explicit timeout, injectable http_client, and the canonical
+OpenAI host pinned explicitly — this port is openai-only, and the shared
+`zero_env_client` keeps every ambient SDK env read out of the request).
+``encoding_format`` is deliberately omitted so the SDK default applies: it
+requests base64 on the wire and decodes the packed float32 payload back to
+plain floats itself; a provider answering JSON float lists passes through that
+decode untouched. HTTP and transport classification are the shared openai ones;
+what is local here is the credential gate and the SDK-decode breakage arm.
 
 Decode validation is preserved verbatim-in-behavior from the pre-cutover port:
 missing, invalid, duplicate, or uncovered indexes, non-list vectors, and
@@ -23,7 +25,6 @@ input, returned in input order.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
 from typing import Final
 
 import httpx
@@ -32,30 +33,22 @@ from openai.types import CreateEmbeddingResponse
 from openai.types.create_embedding_response import Usage
 from openai.types.embedding import Embedding
 
-from provider_runtime.engines import TransientAttempt
-from provider_runtime.errors import (
-    CredentialRejected,
-    InvalidRequest,
-    ProtocolDefect,
-    RuntimeDefect,
-    safe_provider_error_body_snippet,
+from provider_runtime.engines._openai_common import (
+    CANONICAL_BASE_URL,
+    terminal_http_failure,
+    transient_connection,
+    zero_env_client,
 )
+from provider_runtime.errors import InvalidRequest, ProtocolDefect
 from provider_runtime.types import (
     Absent,
-    Billability,
     EmbeddingCall,
     EmbeddingResponse,
-    NotDispatched,
-    PossiblyBillable,
     Presence,
     Present,
     ProviderContextTooLarge,
     ProviderCredential,
-    ProviderHttpUnavailable,
-    ProviderRateLimit,
-    ProviderTimeout,
     TokenUsage,
-    TransportUnavailable,
     presence_of,
 )
 
@@ -71,96 +64,6 @@ def _defect(message: str) -> ProtocolDefect:
 def _int_or_none(value: object) -> int | None:
     # bool is an int subclass; token counts are never booleans.
     return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-# ---------------------------------------------------------------------------
-# Error classification (port of the old openai codec's classify_error; mirrors
-# the openai engines' module-local classifiers)
-
-
-def _terminal_http_failure(error: openai.APIStatusError) -> ProviderContextTooLarge:
-    """Classify a non-2xx response.
-
-    Returns the ONE expected terminal failure (context overflow); raises
-    CredentialRejected / RuntimeDefect for terminal operator conditions and
-    TransientAttempt for retryable ones.
-    """
-    status = error.status_code
-    # The SDK unwraps body["error"] before attaching it, so error.body is the
-    # inner error object for openai-shaped error envelopes.
-    inner = dict(error.body) if isinstance(error.body, Mapping) else None
-    code = inner.get("code") if inner else None
-    error_type = inner.get("type") if inner else None
-    message = inner.get("message") if inner else None
-    snippet = (
-        safe_provider_error_body_snippet({"error": inner} if inner else None) or f"HTTP {status}"
-    )
-
-    if status in (401, 403):
-        raise CredentialRejected(
-            message=f"openai rejected the platform credential (HTTP {status}): {snippet}"
-        )
-    if status == 402 or "insufficient_quota" in (code, error_type):
-        raise RuntimeDefect(
-            origin="provider_http",
-            code="quota_exhausted",
-            message=f"openai quota/billing exhausted (HTTP {status}): {snippet}",
-        )
-    if code == "context_length_exceeded" or (
-        isinstance(message, str) and "maximum context length" in message.lower()
-    ):
-        return ProviderContextTooLarge()
-    if status == 429:
-        raise TransientAttempt(
-            cause=ProviderRateLimit(retry_after=_retry_after_seconds(error.response.headers)),
-            status_code=Present(status),
-            provider_request_id=presence_of(error.request_id),
-            billability=PossiblyBillable(),
-        )
-    if status in (500, 502, 503, 504):
-        raise TransientAttempt(
-            cause=ProviderHttpUnavailable(),
-            status_code=Present(status),
-            provider_request_id=presence_of(error.request_id),
-            billability=PossiblyBillable(),
-        )
-    raise RuntimeDefect(
-        origin="provider_http",
-        code="unclassified_provider_error",
-        message=f"openai returned an unclassified error (HTTP {status}): {snippet}",
-    )
-
-
-def _transient_connection(error: openai.APIConnectionError) -> TransientAttempt:
-    if isinstance(error, openai.APITimeoutError):
-        return TransientAttempt(
-            cause=ProviderTimeout(),
-            status_code=Absent(),
-            provider_request_id=Absent(),
-            billability=PossiblyBillable(),
-        )
-    # A pure pre-connect failure means no bytes reached the provider; every
-    # other transport error implies the connection was at least opened.
-    billability: Billability = (
-        NotDispatched() if isinstance(error.__cause__, httpx.ConnectError) else PossiblyBillable()
-    )
-    return TransientAttempt(
-        cause=TransportUnavailable(),
-        status_code=Absent(),
-        provider_request_id=Absent(),
-        billability=billability,
-    )
-
-
-def _retry_after_seconds(headers: httpx.Headers) -> Presence[float]:
-    raw = headers.get("retry-after")
-    if raw is None:
-        return Absent()
-    try:
-        seconds = float(raw)
-    except ValueError:
-        return Absent()
-    return Present(seconds) if seconds >= 0 else Absent()
 
 
 # ---------------------------------------------------------------------------
@@ -236,10 +139,10 @@ async def embed_once(
         raise InvalidRequest(
             message=f"embeddings port is openai-only; got a {credential.provider!r} credential"
         )
-    client = openai.AsyncOpenAI(
+    client = zero_env_client(
         api_key=credential.key,
-        timeout=_TIMEOUT_S,
-        max_retries=0,
+        base_url=CANONICAL_BASE_URL,
+        timeout_s=_TIMEOUT_S,
         http_client=http_client,
     )
     try:
@@ -252,9 +155,9 @@ async def embed_once(
                 ),
             )
         except openai.APIStatusError as error:
-            return _terminal_http_failure(error)
+            return terminal_http_failure(error)
         except openai.APIConnectionError as error:
-            raise _transient_connection(error) from error
+            raise transient_connection(error) from error
         except (ValueError, AttributeError, TypeError) as error:
             # The SDK's own 2xx parse trips on malformed envelopes before this
             # module's decode sees them: invalid JSON (JSONDecodeError), empty

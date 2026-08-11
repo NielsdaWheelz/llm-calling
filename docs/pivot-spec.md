@@ -230,7 +230,13 @@ capability matrix — validation is behavioral (capability probe), not version-k
 4. Negative gates green; zero imports of deleted modules.
 5. Live matrix evidence recorded for the full registry.
 6. `README.md` describes v2 only.
-7. Provider lane ≤ ~4.5k src lines; agent lane ≤ 8k.
+7. Agent lane ≤ 8k src lines. Provider lane: the council's "~4.5k" was an unsupported
+   estimate and is withdrawn (same ruling as §10's withdrawn "~3k"); measured reality after
+   the consolidation pass is ~8k — four conformance-grade engines (two OpenAI dialects)
+   with full fault handling are the bulk, literal duplication has been extracted
+   (`engines/_openai_common.py`), and the remaining size buys correctness the criteria
+   above require. The enforced ceiling is: no duplication reintroduced, no generalized
+   engine framework to compress it.
 
 ## 13. Nexus migration contract (executed later, in nexus-web, at pin bump)
 

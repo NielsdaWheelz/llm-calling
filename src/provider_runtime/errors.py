@@ -7,7 +7,10 @@ values); defects raise.
 
 Retryable trouble is runtime-internal (`TransientAttempt` in
 `provider_runtime.engines`); it never crosses the facade — exhaustion surfaces
-as the `Failed(TransientExhausted)` value.
+as the `Failed(TransientExhausted)` value. The embed port is the exception: its
+return type has no failure variant, so it raises `NonGenerationCallFailed`
+carrying the same closed leaves — defined below, and the one class here that is
+not a defect.
 
 Every defect carries safe context only: no prompts, provider bodies,
 credentials, or hidden reasoning. Callers embed provider diagnostics only via
@@ -19,7 +22,11 @@ from __future__ import annotations
 import json
 import re
 
-from provider_runtime.types import FailureOrigin
+from provider_runtime.types import (
+    FailureOrigin,
+    ProviderContextTooLarge,
+    TransientExhausted,
+)
 
 
 class RuntimeDefect(Exception):
@@ -87,6 +94,21 @@ class CredentialMissing(RuntimeDefect):
 
     def __init__(self, *, message: str) -> None:
         super().__init__(origin="transport", code="credential_missing", message=message)
+
+
+class NonGenerationCallFailed(Exception):
+    """Expected-failure channel for the embed port.
+
+    The port returns a plain `EmbeddingResponse` rather than `CallOutcome`, so
+    retry exhaustion and provider context overflow surface as this exception
+    carrying the same closed `ExpectedModelFailure` leaves `generate()` folds
+    into `Failed`. Defects (credential rejection, protocol breakage) raise
+    their own types as everywhere else.
+    """
+
+    def __init__(self, failure: TransientExhausted | ProviderContextTooLarge) -> None:
+        super().__init__(type(failure).__name__)
+        self.failure = failure
 
 
 # ---------------------------------------------------------------------------

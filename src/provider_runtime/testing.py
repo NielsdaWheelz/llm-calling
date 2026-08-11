@@ -10,10 +10,10 @@ single-terminal grammar), so consumers assert on `RuntimeStreamEvent` exactly
 as against the real runtime.
 
 The dead wire layer has no double here by design: `NoNetworkRuntime` and SSE
-scripting died with it. Layering: imports from `types` and `registry` (plus
-`pydantic` for the json_out bound), plus the one facade type `runtime` itself
-does not re-export from `types` — `NonGenerationCallFailed`, embed's failure
-channel — never the engine modules or anything else from `runtime`.
+scripting died with it. Layering: imports from `types`, `registry` and `errors`
+(plus `pydantic` for the json_out bound) — the one name taken from `errors` is
+`NonGenerationCallFailed`, embed's failure channel — never `runtime` itself or
+the engine modules.
 
 `ScriptedRuntime`'s captured calls never store the credential key — only the
 provider name; `FakeEngine`'s capture the full `ProviderCredential` it was
@@ -29,8 +29,8 @@ from typing import Any, Literal
 
 import pydantic
 
+from provider_runtime.errors import NonGenerationCallFailed
 from provider_runtime.registry import ModelRow
-from provider_runtime.runtime import NonGenerationCallFailed
 from provider_runtime.types import (
     Absent,
     CallOutcome,

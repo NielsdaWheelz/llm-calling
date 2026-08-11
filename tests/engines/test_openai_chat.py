@@ -192,6 +192,15 @@ KNOBLESS_ROW = ModelRow(
     routing=Absent(),
 )
 
+# Every request-affecting environment variable the openai SDK reads on its own.
+POISON_ENV = {
+    "OPENAI_BASE_URL": "https://poisoned.invalid/v1",
+    "OPENAI_ORG_ID": "org-poison",
+    "OPENAI_PROJECT_ID": "proj-poison",
+    "OPENAI_WEBHOOK_SECRET": "whsec-poison",
+    "OPENAI_CUSTOM_HEADERS": "X-Poison: pwned",
+}
+
 EXPECTED_PINS = {
     "only": ["moonshotai"],
     "order": ["moonshotai"],
@@ -574,6 +583,27 @@ async def test_image_blocks_encode_as_data_url_content_parts(engine: OpenAIChatE
     ], f"body: {body}"
 
 
+@respx.mock
+async def test_ambient_openai_sdk_env_never_reaches_the_wire(
+    engine: OpenAIChatEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The openai SDK reads these at client construction whenever the matching
+    argument is omitted, and OPENAI_CUSTOM_HEADERS injects arbitrary headers
+    into every request — on a compat provider's host too."""
+    for name, value in POISON_ENV.items():
+        monkeypatch.setenv(name, value)
+    route = mock_completion(MOONSHOT_ROW, completion_body(model="kimi-k3"))
+    outcome = await engine.generate(
+        MOONSHOT_ROW, intent_for(MOONSHOT_ROW), credential_for(MOONSHOT_ROW)
+    )
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    assert route.call_count == 1, "request must hit the row's pinned host"
+    headers = route.calls.last.request.headers
+    assert "x-poison" not in headers, f"OPENAI_CUSTOM_HEADERS reached the wire: {headers!r}"
+    assert "openai-organization" not in headers, f"OPENAI_ORG_ID reached the wire: {headers!r}"
+    assert "openai-project" not in headers, f"OPENAI_PROJECT_ID reached the wire: {headers!r}"
+
+
 # ---------------------------------------------------------------------------
 # provider_options — extension passthrough, never overrides.
 
@@ -654,7 +684,7 @@ async def test_reasoning_level_outside_row_mapping_raises_invalid_request(
 
 async def test_reasoning_on_knobless_row_raises_invalid_request(engine: OpenAIChatEngine) -> None:
     row = KNOBLESS_ROW
-    with pytest.raises(InvalidRequest, match="reasoning"):
+    with pytest.raises(InvalidRequest, match="no reasoning knob"):
         await engine.generate(row, intent_for(row, reasoning="high"), credential_for(row))
 
 

@@ -28,6 +28,7 @@ from typing import Any, assert_never
 
 import httpx
 import pydantic
+from opentelemetry.trace import TracerProvider
 
 from provider_runtime import embeddings
 from provider_runtime.engines import Engine, TransientAttempt
@@ -35,7 +36,12 @@ from provider_runtime.engines.anthropic_messages import AnthropicMessagesEngine
 from provider_runtime.engines.gemini_generate import GeminiGenerateEngine
 from provider_runtime.engines.openai_chat import OpenAIChatEngine
 from provider_runtime.engines.openai_responses import OpenAIResponsesEngine
-from provider_runtime.errors import CredentialMissing, InvalidRequest, ProtocolDefect
+from provider_runtime.errors import (
+    CredentialMissing,
+    InvalidRequest,
+    NonGenerationCallFailed,
+    ProtocolDefect,
+)
 from provider_runtime.otel import as_current, call_span, record_outcome
 from provider_runtime.prices import estimate_cost
 from provider_runtime.registry import (
@@ -93,21 +99,6 @@ from provider_runtime.types import (
     TransientExhausted,
     UserMessage,
 )
-
-
-class NonGenerationCallFailed(Exception):
-    """Expected-failure channel for the embed port.
-
-    The port returns a plain `EmbeddingResponse` rather than `CallOutcome`, so
-    retry exhaustion and provider context overflow surface as this exception
-    carrying the same closed `ExpectedModelFailure` leaves `generate()` folds
-    into `Failed`. Defects (credential rejection, protocol breakage) raise
-    their own types as everywhere else.
-    """
-
-    def __init__(self, failure: TransientExhausted | ProviderContextTooLarge) -> None:
-        super().__init__(type(failure).__name__)
-        self.failure = failure
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,12 +310,16 @@ class ProviderRuntime:
         retry: RetryPolicy = DEFAULT_RETRY,
         http_client: httpx.AsyncClient | None = None,
         engines: Mapping[EngineId, Engine] | None = None,
+        tracer_provider: TracerProvider | None = None,
     ) -> None:
         # `engines` is the deterministic-test seam (spec §11: facade tests run
         # against FakeEngine); the production default wires the four adapters.
+        # `tracer_provider` is the standard OTel library seam: None means the
+        # process-global provider (no-op until an SDK configures one).
         self._credentials = credentials
         self._retry = retry
         self._http_client = http_client
+        self._tracer_provider = tracer_provider
         self._engines: Mapping[EngineId, Engine] = (
             engines
             if engines is not None
@@ -367,7 +362,12 @@ class ProviderRuntime:
         _validate_intent(row, intent, streaming=False)
         credential = self._credential(row.provider)
         engine = self._engines[row.engine]
-        with call_span("chat", provider=row.provider, model=row.model_id) as span:
+        with call_span(
+            "chat",
+            provider=row.provider,
+            model=row.model_id,
+            tracer_provider=self._tracer_provider,
+        ) as span:
             with as_current(span):
                 outcome = await self._generate_outcome(row, intent, credential, engine, cancel)
             record_outcome(span, outcome.meta, cost_estimate=estimate_cost(outcome.meta))
@@ -417,8 +417,7 @@ class ProviderRuntime:
         finally:
             # Deterministic close: abandoning the suspended attempt iterator
             # would leave its finalization to the event loop's GC hook.
-            if isinstance(tries, AsyncGenerator):
-                await tries.aclose()
+            await tries.aclose()
         if last_cause is None:
             raise AssertionError("attempt loop exhausted without a recorded transient cause")
         # The exhausting attempt's record carries FinalAttempt; its transient
@@ -456,7 +455,12 @@ class ProviderRuntime:
         start_forwarded = False
         semantic_forwarded = False
 
-        with call_span("chat", provider=row.provider, model=row.model_id) as span:
+        with call_span(
+            "chat",
+            provider=row.provider,
+            model=row.model_id,
+            tracer_provider=self._tracer_provider,
+        ) as span:
 
             def envelope(event: CodecStreamEvent) -> RuntimeStreamEvent:
                 nonlocal seq
@@ -539,8 +543,7 @@ class ProviderRuntime:
             finally:
                 # Deterministic close: abandoning the suspended attempt
                 # iterator would leave its finalization to the GC hook.
-                if isinstance(tries, AsyncGenerator):
-                    await tries.aclose()
+                await tries.aclose()
             if last_cause is None:
                 raise AssertionError("stream attempt loop exhausted without a transient cause")
             trace[-1] = replace(trace[-1], signal=FinalAttempt())
@@ -656,7 +659,12 @@ class ProviderRuntime:
         last_cause: TransientCause | None = None
         attempt_count = 0
         tries = attempts(self._retry)
-        with call_span("embeddings", provider="openai", model=call.model) as span:
+        with call_span(
+            "embeddings",
+            provider="openai",
+            model=call.model,
+            tracer_provider=self._tracer_provider,
+        ) as span:
             # Both failure arms raise INSIDE the span, so `call_span` marks it
             # ERROR either way; the finally puts the attempt count on all arms.
             try:
@@ -684,14 +692,12 @@ class ProviderRuntime:
                     TransientExhausted(attempts=attempt_count, cause=last_cause)
                 )
             finally:
-                if isinstance(tries, AsyncGenerator):
-                    await tries.aclose()
+                await tries.aclose()
                 if span.is_recording():
                     span.set_attribute("provider_runtime.attempt_count", attempt_count)
 
 
 __all__ = [
     "Credentials",
-    "NonGenerationCallFailed",
     "ProviderRuntime",
 ]

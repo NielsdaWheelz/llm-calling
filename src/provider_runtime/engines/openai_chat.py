@@ -51,6 +51,11 @@ from openai.types.chat.chat_completion_chunk import ChoiceDelta, ChoiceDeltaTool
 from openai.types.completion_usage import CompletionUsage
 
 from provider_runtime.engines import TransientAttempt
+from provider_runtime.engines._openai_common import (
+    retry_after_seconds,
+    transient_connection,
+    zero_env_client,
+)
 from provider_runtime.errors import (
     CredentialRejected,
     InvalidRequest,
@@ -76,7 +81,6 @@ from provider_runtime.types import (
     Incomplete,
     InvalidStructuredOutput,
     InvalidToolArguments,
-    NotDispatched,
     PossiblyBillable,
     Presence,
     Present,
@@ -707,17 +711,6 @@ def _stream_continuation(
 # Error classification — SDK exception → TransientAttempt / defect / value.
 
 
-def _retry_after_seconds(headers: httpx.Headers) -> Presence[float]:
-    """Numeric Retry-After seconds; the HTTP-date form has no consumer → Absent."""
-    value = headers.get("retry-after")
-    if value is None:
-        return Absent()
-    try:
-        return Present(float(value))
-    except ValueError:
-        return Absent()
-
-
 def _classify_status(provider: _Served, exc: openai.APIStatusError) -> ProviderContextTooLarge:
     """Classify a non-2xx response: raises for everything except the one
     non-retryable expected failure (context overflow), which returns."""
@@ -750,7 +743,7 @@ def _classify_status(provider: _Served, exc: openai.APIStatusError) -> ProviderC
         )
     if status == 429:
         raise TransientAttempt(
-            cause=ProviderRateLimit(retry_after=_retry_after_seconds(exc.response.headers)),
+            cause=ProviderRateLimit(retry_after=retry_after_seconds(exc.response.headers)),
             status_code=Present(status),
             provider_request_id=request_id,
             billability=PossiblyBillable(),
@@ -803,18 +796,6 @@ def _is_context_overflow(error: Mapping[str, object] | None) -> bool:
     return "context length" in message or "token limit" in message or "maximum context" in message
 
 
-def _transport_attempt(exc: openai.APIConnectionError) -> TransientAttempt:
-    # A pure pre-connect failure means no bytes reached the provider; every
-    # other transport error implies the connection was at least opened.
-    dispatched = not isinstance(exc.__cause__, httpx.ConnectError)
-    return TransientAttempt(
-        cause=TransportUnavailable(),
-        status_code=Absent(),
-        provider_request_id=Absent(),
-        billability=PossiblyBillable() if dispatched else NotDispatched(),
-    )
-
-
 def _classify_inband_error(provider: _Served, error: object) -> TransientCause:
     """Classify an in-band error object carried by an HTTP-200 body — the
     OpenRouter shape for an upstream that failed after the gateway accepted
@@ -859,11 +840,10 @@ class OpenAIChatEngine:
                 raise _registry_invalid(row, "openai_chat rows must carry a base_url")
             case _:
                 assert_never(row.base_url)
-        return openai.AsyncOpenAI(
+        return zero_env_client(
             api_key=credential.key,
             base_url=base_url,
-            max_retries=0,
-            timeout=self._timeout_s,
+            timeout_s=self._timeout_s,
             http_client=self._http_client,
         )
 
@@ -887,15 +867,8 @@ class OpenAIChatEngine:
                     meta=self._error_meta(row, exc, encoded.native_reasoning, started_ms),
                     failure=overflow,
                 )
-            except openai.APITimeoutError as exc:
-                raise TransientAttempt(
-                    cause=ProviderTimeout(),
-                    status_code=Absent(),
-                    provider_request_id=Absent(),
-                    billability=PossiblyBillable(),
-                ) from exc
             except openai.APIConnectionError as exc:
-                raise _transport_attempt(exc) from exc
+                raise transient_connection(exc) from exc
             except json.JSONDecodeError as exc:
                 raise ProtocolDefect(
                     code="malformed_json",
@@ -935,15 +908,8 @@ class OpenAIChatEngine:
                     )
                 )
                 return
-            except openai.APITimeoutError as exc:
-                raise TransientAttempt(
-                    cause=ProviderTimeout(),
-                    status_code=Absent(),
-                    provider_request_id=Absent(),
-                    billability=PossiblyBillable(),
-                ) from exc
             except openai.APIConnectionError as exc:
-                raise _transport_attempt(exc) from exc
+                raise transient_connection(exc) from exc
 
             # Provider accepted the request (headers + 2xx) — the envelope opens.
             yield StreamStart()

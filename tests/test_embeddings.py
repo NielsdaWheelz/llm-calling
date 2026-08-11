@@ -46,6 +46,15 @@ ABSENT: Absent = Absent()
 EMBEDDINGS_URL = "https://api.openai.com/v1/embeddings"
 CREDENTIAL = ProviderCredential(provider="openai", key="sk-test-not-a-real-key-1234567890")
 
+# Every request-affecting environment variable the openai SDK reads on its own.
+POISON_ENV = {
+    "OPENAI_BASE_URL": "https://poisoned.invalid/v1",
+    "OPENAI_ORG_ID": "org-poison",
+    "OPENAI_PROJECT_ID": "proj-poison",
+    "OPENAI_WEBHOOK_SECRET": "whsec-poison",
+    "OPENAI_CUSTOM_HEADERS": "X-Poison: pwned",
+}
+
 # Tests are the one sanctioned RetryPolicy( construction site outside retry.py.
 FAST_RETRY = RetryPolicy(
     max_attempts=3, initial_delay_s=0.0, max_delay_s=0.0, jitter_s=0.0, deadline_s=Absent()
@@ -134,6 +143,24 @@ async def test_embed_sends_dimensions_when_present() -> None:
         "dimensions": 256,
         "encoding_format": "base64",
     }, f"request body: {body!r}"
+
+
+@respx.mock
+async def test_embed_suppresses_every_ambient_sdk_env_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The openai SDK reads these at client construction whenever the matching
+    argument is omitted, and OPENAI_CUSTOM_HEADERS injects arbitrary headers
+    into every request. None of them may touch the wire."""
+    for name, value in POISON_ENV.items():
+        monkeypatch.setenv(name, value)
+    route = respx.post(EMBEDDINGS_URL).mock(return_value=httpx.Response(200, json=success_body()))
+    await runtime().embed(call(), credential=CREDENTIAL)
+    assert route.call_count == 1, "request must hit the canonical OpenAI host"
+    headers = route.calls.last.request.headers
+    assert "x-poison" not in headers, f"OPENAI_CUSTOM_HEADERS reached the wire: {headers!r}"
+    assert "openai-organization" not in headers, f"OPENAI_ORG_ID reached the wire: {headers!r}"
+    assert "openai-project" not in headers, f"OPENAI_PROJECT_ID reached the wire: {headers!r}"
 
 
 @respx.mock

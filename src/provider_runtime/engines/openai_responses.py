@@ -12,9 +12,10 @@ Wire obligations (spec §6, openai_responses row):
 - Reasoning: the row's reasoning map value is a self-describing wire fragment
   (openai rows: ``{"reasoning": {"effort": "<level>"}}``) merged verbatim into
   the request — the engine carries no per-provider shape knowledge.
-  ``native_reasoning`` records the fragment as compact sorted-keys JSON; a row
-  without a reasoning knob (or an empty fragment) sends nothing and records
-  ``Absent``.
+  ``native_reasoning`` records the fragment as compact sorted-keys JSON; an
+  empty fragment sends nothing and records ``Absent``. A row without a
+  reasoning knob expresses only ``none``: any other requested level raises
+  InvalidRequest rather than being silently dropped.
 - Tools: function tools with ``strict: true`` and a closed top-level schema
   (``additionalProperties: false``); ``tool_choice`` only alongside tools.
 - Output: ``text.format`` ``json_schema`` (strict) on ``structured="native"``
@@ -70,8 +71,13 @@ from openai.types.responses.response import IncompleteDetails
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
 
 from provider_runtime.engines import TransientAttempt
+from provider_runtime.engines._openai_common import (
+    CANONICAL_BASE_URL,
+    terminal_http_failure,
+    transient_connection,
+    zero_env_client,
+)
 from provider_runtime.errors import (
-    CredentialRejected,
     InvalidRequest,
     ProtocolDefect,
     RuntimeDefect,
@@ -83,7 +89,6 @@ from provider_runtime.types import (
     Absent,
     AssistantMessage,
     AttemptRecord,
-    Billability,
     CallMeta,
     CallOutcome,
     CodecStreamEvent,
@@ -95,12 +100,10 @@ from provider_runtime.types import (
     ImageBlock,
     Incomplete,
     InvalidToolArguments,
-    NotDispatched,
     PossiblyBillable,
     Presence,
     Present,
     PromptBlock,
-    ProviderContextTooLarge,
     ProviderCredential,
     ProviderHttpUnavailable,
     ProviderRateLimit,
@@ -145,10 +148,6 @@ _OWNED_OPTION_KEYS: Final[frozenset[str]] = frozenset(
         "stream",
     }
 )
-
-# The lane reads zero env vars: an Absent row base_url resolves here, never in
-# the SDK (which would consult OPENAI_BASE_URL).
-_DEFAULT_BASE_URL: Final[str] = "https://api.openai.com/v1"
 
 
 def _monotonic_ms() -> int:
@@ -199,6 +198,11 @@ def _reasoning_fragment(
                 return {}, Absent()
             return fragment, Present(json.dumps(fragment, sort_keys=True, separators=(",", ":")))
         case Absent():
+            if intent.reasoning != "none":
+                raise InvalidRequest(
+                    message=f"row {row.ref!r} has no reasoning knob; "
+                    f"level {intent.reasoning!r} is not expressible"
+                )
             return {}, Absent()
         case _:
             assert_never(row.reasoning)
@@ -385,93 +389,6 @@ def _meta(
         native_reasoning=native_reasoning,
         registry_revision=REGISTRY_REVISION,
     )
-
-
-# ---------------------------------------------------------------------------
-# SDK error classification
-
-
-def _terminal_http_failure(error: openai.APIStatusError) -> ProviderContextTooLarge:
-    """Classify a non-2xx response.
-
-    Returns the ONE expected terminal failure (context overflow); raises
-    CredentialRejected / RuntimeDefect for terminal operator conditions and
-    TransientAttempt for retryable ones.
-    """
-    status = error.status_code
-    inner = dict(error.body) if isinstance(error.body, Mapping) else None
-    code = _str_or_none(inner.get("code")) if inner else None
-    error_type = _str_or_none(inner.get("type")) if inner else None
-    message = _str_or_none(inner.get("message")) if inner else None
-    snippet = (
-        safe_provider_error_body_snippet({"error": inner} if inner else None) or f"HTTP {status}"
-    )
-
-    if status in (401, 403):
-        raise CredentialRejected(
-            message=f"openai rejected the platform credential (HTTP {status}): {snippet}"
-        )
-    if status == 402 or "insufficient_quota" in (code, error_type):
-        raise RuntimeDefect(
-            origin="provider_http",
-            code="quota_exhausted",
-            message=f"openai quota/billing exhausted (HTTP {status}): {snippet}",
-        )
-    if code == "context_length_exceeded" or (
-        message is not None and "maximum context length" in message.lower()
-    ):
-        return ProviderContextTooLarge()
-    if status == 429:
-        raise TransientAttempt(
-            cause=ProviderRateLimit(retry_after=_retry_after_seconds(error.response.headers)),
-            status_code=Present(status),
-            provider_request_id=presence_of(error.request_id),
-            billability=PossiblyBillable(),
-        )
-    if status in (500, 502, 503, 504):
-        raise TransientAttempt(
-            cause=ProviderHttpUnavailable(),
-            status_code=Present(status),
-            provider_request_id=presence_of(error.request_id),
-            billability=PossiblyBillable(),
-        )
-    raise RuntimeDefect(
-        origin="provider_http",
-        code="unclassified_provider_error",
-        message=f"openai returned an unclassified error (HTTP {status}): {snippet}",
-    )
-
-
-def _transient_connection(error: openai.APIConnectionError) -> TransientAttempt:
-    if isinstance(error, openai.APITimeoutError):
-        return TransientAttempt(
-            cause=ProviderTimeout(),
-            status_code=Absent(),
-            provider_request_id=Absent(),
-            billability=PossiblyBillable(),
-        )
-    # A pure pre-connect failure means no bytes reached the provider; every
-    # other transport error implies the connection was at least opened.
-    billability: Billability = (
-        NotDispatched() if isinstance(error.__cause__, httpx.ConnectError) else PossiblyBillable()
-    )
-    return TransientAttempt(
-        cause=TransportUnavailable(),
-        status_code=Absent(),
-        provider_request_id=Absent(),
-        billability=billability,
-    )
-
-
-def _retry_after_seconds(headers: httpx.Headers) -> Presence[float]:
-    raw = headers.get("retry-after")
-    if raw is None:
-        return Absent()
-    try:
-        seconds = float(raw)
-    except ValueError:
-        return Absent()
-    return Present(seconds) if seconds >= 0 else Absent()
 
 
 # ---------------------------------------------------------------------------
@@ -910,12 +827,13 @@ class OpenAIResponsesEngine:
         self._http_client = http_client
 
     def _client_for(self, row: ModelRow, credential: ProviderCredential) -> openai.AsyncOpenAI:
-        base_url = row.base_url.value if isinstance(row.base_url, Present) else _DEFAULT_BASE_URL
-        return openai.AsyncOpenAI(
+        # An Absent row base_url resolves here, never in the SDK (which would
+        # consult OPENAI_BASE_URL).
+        base_url = row.base_url.value if isinstance(row.base_url, Present) else CANONICAL_BASE_URL
+        return zero_env_client(
             api_key=credential.key,
             base_url=base_url,
-            timeout=self._timeout_s,
-            max_retries=0,
+            timeout_s=self._timeout_s,
             http_client=self._http_client,
         )
 
@@ -929,7 +847,7 @@ class OpenAIResponsesEngine:
             try:
                 response = await client.responses.create(**encoded.params)
             except openai.APIStatusError as error:
-                overflow = _terminal_http_failure(error)
+                overflow = terminal_http_failure(error)
                 return Failed(
                     meta=_meta(
                         model=row.model_id,
@@ -942,7 +860,7 @@ class OpenAIResponsesEngine:
                     failure=overflow,
                 )
             except openai.APIConnectionError as error:
-                raise _transient_connection(error) from error
+                raise transient_connection(error) from error
             except json.JSONDecodeError as error:
                 raise ProtocolDefect(
                     code="unparseable_response",
@@ -966,7 +884,7 @@ class OpenAIResponsesEngine:
             try:
                 events = await client.responses.create(stream=True, **encoded.params)
             except openai.APIStatusError as error:
-                overflow = _terminal_http_failure(error)
+                overflow = terminal_http_failure(error)
                 # Terminal without StreamStart: the provider never accepted.
                 yield TerminalEvent(
                     outcome=Failed(
@@ -983,7 +901,7 @@ class OpenAIResponsesEngine:
                 )
                 return
             except openai.APIConnectionError as error:
-                raise _transient_connection(error) from error
+                raise transient_connection(error) from error
 
             status_code = events.response.status_code
             state = _StreamState(request_id=events.response.headers.get("x-request-id"))

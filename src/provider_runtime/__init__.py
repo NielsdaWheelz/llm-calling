@@ -8,8 +8,9 @@ from ``provider_runtime.registry``; test doubles from
 ``provider_runtime.testing``.
 """
 
+from provider_runtime.errors import NonGenerationCallFailed
 from provider_runtime.prices import estimate_cost
-from provider_runtime.runtime import Credentials, NonGenerationCallFailed, ProviderRuntime
+from provider_runtime.runtime import Credentials, ProviderRuntime
 from provider_runtime.types import (
     Absent,
     AssistantMessage,

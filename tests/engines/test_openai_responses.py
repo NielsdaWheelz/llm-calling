@@ -101,6 +101,15 @@ ROW = ModelRow(
     routing=Absent(),
 )
 
+# Every request-affecting environment variable the openai SDK reads on its own.
+POISON_ENV = {
+    "OPENAI_BASE_URL": "https://poisoned.invalid/v1",
+    "OPENAI_ORG_ID": "org-poison",
+    "OPENAI_PROJECT_ID": "proj-poison",
+    "OPENAI_WEBHOOK_SECRET": "whsec-poison",
+    "OPENAI_CUSTOM_HEADERS": "X-Poison: pwned",
+}
+
 TARGET = ProviderTarget(provider="openai", model="gpt-test-1")
 CREDENTIAL = ProviderCredential(provider="openai", key="sk-test-not-a-real-key-1234567890")
 
@@ -380,6 +389,14 @@ async def test_generate_omits_reasoning_when_row_has_no_reasoning_knob() -> None
 async def test_generate_rejects_undeclared_reasoning_level() -> None:
     with pytest.raises(InvalidRequest, match="reasoning level 'max'"):
         await OpenAIResponsesEngine().generate(ROW, make_intent(reasoning="max"), CREDENTIAL)
+
+
+async def test_generate_rejects_a_reasoning_level_on_a_knobless_row() -> None:
+    """A knobless row expresses only 'none'; an explicit level the row cannot
+    put on the wire is refused, never silently dropped."""
+    row = replace(ROW, reasoning=Absent())
+    with pytest.raises(InvalidRequest, match="no reasoning knob"):
+        await OpenAIResponsesEngine().generate(row, make_intent(reasoning="high"), CREDENTIAL)
 
 
 @respx.mock
@@ -691,6 +708,27 @@ async def test_generate_ignores_openai_base_url_env_when_row_base_url_absent(
     assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
     assert route.call_count == 1, "request must hit the canonical OpenAI host"
     assert poisoned.call_count == 0, "OPENAI_BASE_URL must never reroute a call"
+
+
+@respx.mock
+async def test_generate_suppresses_every_ambient_sdk_env_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SDK reads these at client construction whenever the matching argument
+    is omitted, and OPENAI_CUSTOM_HEADERS injects arbitrary headers into every
+    request. None of them may touch the wire."""
+    for name, value in POISON_ENV.items():
+        monkeypatch.setenv(name, value)
+    route = respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
+    )
+    outcome = await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    assert route.call_count == 1, "request must hit the canonical OpenAI host"
+    headers = route.calls.last.request.headers
+    assert "x-poison" not in headers, f"OPENAI_CUSTOM_HEADERS reached the wire: {headers!r}"
+    assert "openai-organization" not in headers, f"OPENAI_ORG_ID reached the wire: {headers!r}"
+    assert "openai-project" not in headers, f"OPENAI_PROJECT_ID reached the wire: {headers!r}"
 
 
 # ---------------------------------------------------------------------------

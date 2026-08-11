@@ -1110,9 +1110,13 @@ class CodexSdkAdapter:
             raise UnsupportedCapability(
                 "Codex full_access cannot preserve restricted network policy"
             )
-        if policy.filesystem != "full_access" and policy.network != "disabled":
+        if policy.filesystem == "read_only" and policy.network != "disabled":
+            # `thread_start` selects the sandbox by mode name and carries the rest in `config`
+            # (0.144.4 api.py:372-384), and that config's only network toggle is
+            # `sandbox_workspace_write.network_access` (generated/v2_all.py:7877-7878, 3511-3518).
+            # There is no read-only counterpart section, so a read-only sandbox stays offline.
             raise UnsupportedCapability(
-                "Codex SDK sandbox presets cannot enable network without full_access"
+                "Codex read_only sandbox has no network toggle; use workspace_write"
             )
         if policy.approval not in ("deny", "provider_review"):
             raise UnsupportedCapability("Codex SDK approval mode is unsupported")
@@ -1159,7 +1163,7 @@ class CodexSdkAdapter:
         if request.policy.filesystem == "workspace_write":
             config["sandbox_workspace_write"] = {
                 "writable_roots": [request.cwd, *request.additional_dirs],
-                "network_access": False,
+                "network_access": request.policy.network == "unrestricted",
             }
         if request.mcp_servers:
             servers: dict[str, object] = {}

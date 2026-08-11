@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Final, assert_never
 
@@ -87,7 +87,7 @@ async def attempts(
     rng: random.Random | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-) -> AsyncIterator[Attempt]:
+) -> AsyncGenerator[Attempt, None]:
     """Yield 1-based attempt handles, sleeping the policy's backoff between them.
 
     The runtime's contract per yielded handle: return/break on a terminal
@@ -138,11 +138,10 @@ def _delay_s(
 
     A Present `ProviderRateLimit.retry_after` is honored verbatim (no jitter,
     no max_delay cap) — the caller must have already ruled out
-    `_exceeds_retry_after_cap`. Never negative: a mis-parsed Retry-After header
-    must not produce an instant zero-backoff retry.
+    `_exceeds_retry_after_cap`.
     """
     if isinstance(cause, ProviderRateLimit) and isinstance(cause.retry_after, Present):
-        return max(0.0, cause.retry_after.value)
+        return cause.retry_after.value
     delay = policy.initial_delay_s * (2 ** (attempt - 1))
     if policy.jitter_s > 0:
         delay += rng.uniform(0, policy.jitter_s)
