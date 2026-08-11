@@ -11,17 +11,15 @@ Wire obligations (spec §6, openai_responses row):
   re-synthesized alongside a continuation.
 - Reasoning: the row's reasoning map value is a self-describing wire fragment
   (openai rows: ``{"reasoning": {"effort": "<level>"}}``) merged verbatim into
-  the request — the engine carries no per-provider shape knowledge.
-  ``native_reasoning`` records the fragment as compact sorted-keys JSON; an
-  empty fragment sends nothing and records ``Absent``. A row without a
-  reasoning knob expresses only ``none``: any other requested level raises
-  InvalidRequest rather than being silently dropped.
+  the request — the engine carries no per-provider shape knowledge. The shared
+  ``row_reasoning`` owns which levels are expressible and what the row's knob
+  may write; this engine only merges the fragment and stamps the result.
 - Tools: function tools with ``strict: true`` and a closed top-level schema
   (``additionalProperties: false``); ``tool_choice`` only alongside tools.
 - Output: ``text.format`` ``json_schema`` (strict) on ``structured="native"``
   rows, ``json_object`` on ``json_mode`` rows. When the intent asked for strict
   JSON the terminal text must strictly parse to an object (StructuredContent);
-  anything else is a ProtocolDefect — no repair.
+  anything else is Failed(InvalidStructuredOutput) — no repair.
 - provider_options: forwarded verbatim via ``extra_body``; a key the engine
   itself maps from core intent fields raises InvalidRequest.
 - One attempt: retryable trouble raises TransientAttempt (429 → rate limit with
@@ -38,7 +36,6 @@ Wire obligations (spec §6, openai_responses row):
 from __future__ import annotations
 
 import json
-import time
 from base64 import b64encode
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -71,6 +68,15 @@ from openai.types.responses.response import IncompleteDetails
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
 
 from provider_runtime.engines import TransientAttempt
+from provider_runtime.engines._common import (
+    int_or_none,
+    monotonic_ms,
+    registry_invalid,
+    response_content,
+    row_reasoning,
+    str_or_none,
+    validate_continuation,
+)
 from provider_runtime.engines._openai_common import (
     CANONICAL_BASE_URL,
     terminal_http_failure,
@@ -80,7 +86,6 @@ from provider_runtime.engines._openai_common import (
 from provider_runtime.errors import (
     InvalidRequest,
     ProtocolDefect,
-    RuntimeDefect,
     safe_provider_error_body_snippet,
     sanitize_provider_text,
 )
@@ -99,6 +104,7 @@ from provider_runtime.types import (
     GenerateIntent,
     ImageBlock,
     Incomplete,
+    InvalidStructuredOutput,
     InvalidToolArguments,
     PossiblyBillable,
     Presence,
@@ -110,15 +116,12 @@ from provider_runtime.types import (
     ProviderStreamInterrupted,
     ProviderTimeout,
     Refused,
-    ResponseContent,
     ResponsePayload,
     StreamStart,
     StrictJsonOutput,
-    StructuredContent,
     Succeeded,
     SystemMessage,
     TerminalEvent,
-    TextContent,
     TextDelta,
     TextOutput,
     TokenUsage,
@@ -132,9 +135,9 @@ from provider_runtime.types import (
     presence_of,
 )
 
-# Request-body keys this engine maps from core intent fields. These plus the
-# row's reasoning-fragment top-level keys form the provider_options collision
-# set: naming one is an override, not an extension.
+# Request-body keys this engine maps from core intent fields. These plus every
+# top-level key the row's reasoning knob can write form the provider_options
+# collision set: naming one is an override, not an extension.
 _OWNED_OPTION_KEYS: Final[frozenset[str]] = frozenset(
     {
         "model",
@@ -149,18 +152,26 @@ _OWNED_OPTION_KEYS: Final[frozenset[str]] = frozenset(
     }
 )
 
-
-def _monotonic_ms() -> int:
-    return int(time.monotonic() * 1000)
-
-
-def _int_or_none(value: object) -> int | None:
-    # bool is an int subclass; token counts are never booleans.
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def _str_or_none(value: object) -> str | None:
-    return value if isinstance(value, str) else None
+# Every request key this engine writes itself — the params literal, the
+# conditional tools/text branches, and the kwargs added at the call sites.
+# The reasoning fragment is splatted into that literal, so a row naming one of
+# these AT ANY LEVEL either overwrites the engine's value or is silently
+# overwritten by it depending on ordering; both are a poisoned row, not a
+# request.
+_ENGINE_SET_REQUEST_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "model",
+        "input",
+        "max_output_tokens",
+        "store",
+        "include",
+        "tools",
+        "tool_choice",
+        "text",
+        "extra_body",
+        "stream",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -174,43 +185,16 @@ class _EncodedRequest:
     native_reasoning: Presence[str]
 
 
-def _reasoning_fragment(
-    row: ModelRow, intent: GenerateIntent
-) -> tuple[dict[str, Any], Presence[str]]:
-    """The row's self-describing reasoning wire fragment for the intent level,
-    plus its ``native_reasoning`` stamp (compact sorted-keys JSON; Absent when
-    nothing is sent)."""
-    match row.reasoning:
-        case Present(value=levels):
-            if intent.reasoning not in levels:
-                raise InvalidRequest(
-                    message=f"reasoning level {intent.reasoning!r} is not declared for {row.ref!r}"
-                )
-            value = levels[intent.reasoning]
-            if not isinstance(value, Mapping):
-                raise RuntimeDefect(
-                    origin="intent",
-                    code="registry_invalid",
-                    message=f"row {row.ref!r}: reasoning values must be request-fragment mappings",
-                )
-            fragment: dict[str, Any] = dict(value)
-            if not fragment:
-                return {}, Absent()
-            return fragment, Present(json.dumps(fragment, sort_keys=True, separators=(",", ":")))
-        case Absent():
-            if intent.reasoning != "none":
-                raise InvalidRequest(
-                    message=f"row {row.ref!r} has no reasoning knob; "
-                    f"level {intent.reasoning!r} is not expressible"
-                )
-            return {}, Absent()
-        case _:
-            assert_never(row.reasoning)
-
-
 def _encode_request(row: ModelRow, intent: GenerateIntent) -> _EncodedRequest:
-    fragment, native_reasoning = _reasoning_fragment(row, intent)
-    collisions = sorted((_OWNED_OPTION_KEYS | fragment.keys()) & set(intent.provider_options))
+    reasoning = row_reasoning(row, intent)
+    fragment_collisions = sorted(_ENGINE_SET_REQUEST_KEYS & reasoning.owned_keys)
+    if fragment_collisions:
+        raise registry_invalid(
+            row,
+            f"reasoning fragment keys {fragment_collisions!r} would rewrite request fields "
+            f"the engine sets itself",
+        )
+    collisions = sorted((_OWNED_OPTION_KEYS | reasoning.owned_keys) & set(intent.provider_options))
     if collisions:
         raise InvalidRequest(
             message=f"provider_options keys {collisions!r} collide with engine-mapped request fields"
@@ -223,7 +207,7 @@ def _encode_request(row: ModelRow, intent: GenerateIntent) -> _EncodedRequest:
         "include": ["reasoning.encrypted_content"],
         # The reasoning fragment merges verbatim — the engine never inspects
         # its shape; its keys collide with nothing this engine maps.
-        **fragment,
+        **reasoning.fragment,
     }
     if intent.tools:
         params["tools"] = [
@@ -259,7 +243,7 @@ def _encode_request(row: ModelRow, intent: GenerateIntent) -> _EncodedRequest:
             assert_never(intent.output)
     if intent.provider_options:
         params["extra_body"] = dict(intent.provider_options)
-    return _EncodedRequest(params=params, native_reasoning=native_reasoning)
+    return _EncodedRequest(params=params, native_reasoning=reasoning.native_reasoning)
 
 
 def _encode_input(row: ModelRow, intent: GenerateIntent) -> list[dict[str, object]]:
@@ -280,7 +264,7 @@ def _encode_input(row: ModelRow, intent: GenerateIntent) -> list[dict[str, objec
             case AssistantMessage(text=text, tool_calls=tool_calls, continuation=continuation):
                 match continuation:
                     case Present(value=artifact):
-                        _validate_continuation(artifact, row, intent)
+                        validate_continuation(artifact, row, intent)
                         items.extend(_artifact_input_items(artifact))
                     case Absent():
                         if tool_calls:
@@ -321,20 +305,6 @@ def _encode_user_block(block: PromptBlock | ImageBlock) -> dict[str, object]:
             }
         case _:
             assert_never(block)
-
-
-def _validate_continuation(
-    artifact: ContinuationArtifact, row: ModelRow, intent: GenerateIntent
-) -> None:
-    if artifact.target != intent.target or artifact.codec_id != row.continuation_codec:
-        raise InvalidRequest(
-            message=(
-                f"continuation artifact for {artifact.target.provider}/{artifact.target.model} "
-                f"(codec {artifact.codec_id!r}) cannot replay to "
-                f"{intent.target.provider}/{intent.target.model} "
-                f"(codec {row.continuation_codec!r})"
-            )
-        )
 
 
 def _artifact_input_items(artifact: ContinuationArtifact) -> list[dict[str, object]]:
@@ -382,7 +352,7 @@ def _meta(
                 signal=FinalAttempt(),
                 status_code=status_code,
                 started_at_ms=started_ms,
-                ended_at_ms=_monotonic_ms(),
+                ended_at_ms=monotonic_ms(),
             ),
         ),
         billability=PossiblyBillable(),
@@ -407,8 +377,8 @@ def _decode_usage(raw: object) -> Presence[TokenUsage]:
     reasoning = (
         output_details.reasoning_tokens if isinstance(output_details, OutputTokensDetails) else None
     )
-    input_tokens = _int_or_none(raw.input_tokens)
-    output_tokens = _int_or_none(raw.output_tokens)
+    input_tokens = int_or_none(raw.input_tokens)
+    output_tokens = int_or_none(raw.output_tokens)
     if input_tokens is None or output_tokens is None:
         # Usage the SDK surfaced without integer prompt/completion counts;
         # zeroing them would keep the cache components while dropping the
@@ -422,10 +392,10 @@ def _decode_usage(raw: object) -> Presence[TokenUsage]:
         usage = TokenUsage.from_components(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            total_tokens=presence_of(_int_or_none(raw.total_tokens)),
-            reasoning_tokens=presence_of(_int_or_none(reasoning)),
-            cache_read_input_tokens=presence_of(_int_or_none(cached)),
-            cache_write_input_tokens=presence_of(_int_or_none(cache_write)),
+            total_tokens=presence_of(int_or_none(raw.total_tokens)),
+            reasoning_tokens=presence_of(int_or_none(reasoning)),
+            cache_read_input_tokens=presence_of(int_or_none(cached)),
+            cache_write_input_tokens=presence_of(int_or_none(cache_write)),
         )
     except ValueError as error:
         raise ProtocolDefect(
@@ -464,9 +434,9 @@ def _parse_tool_call(
 ) -> ToolCall | InvalidToolArguments:
     """Strict JSON parse only; NO repair. Parse failure is an expected model
     failure value the caller folds into Failed."""
-    call_id = _str_or_none(item.call_id) or _str_or_none(item.id) or ""
-    name = _str_or_none(item.name) or ""
-    arguments_raw = _str_or_none(item.arguments)
+    call_id = str_or_none(item.call_id) or str_or_none(item.id) or ""
+    name = str_or_none(item.name) or ""
+    arguments_raw = str_or_none(item.arguments)
     if arguments_raw is None:
         arguments_raw = fallback_arguments
     try:
@@ -493,7 +463,7 @@ def _incomplete_reason(
 ) -> tuple[Literal["max_output_tokens", "content_filter_partial"], str]:
     """Map incomplete_details to (Incomplete.reason literal, native reason)."""
     reason = details.reason if isinstance(details, IncompleteDetails) else None
-    native = _str_or_none(reason) or ""
+    native = str_or_none(reason) or ""
     if native == "max_output_tokens":
         return "max_output_tokens", native
     if native == "content_filter":
@@ -502,36 +472,6 @@ def _incomplete_reason(
         code="unknown_incomplete_reason",
         message=f"openai incomplete response carries unknown reason {native!r}",
     )
-
-
-def _content_of(
-    intent: GenerateIntent, *, text: str, tool_calls: tuple[ToolCall, ...]
-) -> ResponseContent:
-    """The output arm is the intent's OutputSpec, never re-inferred. Under a
-    strict-JSON intent the provider guaranteed JSON output, so a non-object
-    terminal text is a protocol breach, not an expected failure."""
-    match intent.output:
-        case TextOutput():
-            return TextContent(text=text, tool_calls=tool_calls)
-        case StrictJsonOutput():
-            try:
-                payload = json.loads(text)
-            except json.JSONDecodeError:
-                raise ProtocolDefect(
-                    code="invalid_structured_output",
-                    message=f"openai strict JSON output was not valid JSON ({len(text)} chars)",
-                ) from None
-            if not isinstance(payload, dict):
-                raise ProtocolDefect(
-                    code="structured_output_not_object",
-                    message=(
-                        f"openai strict JSON output parsed to {type(payload).__name__}, "
-                        "not a JSON object"
-                    ),
-                )
-            return StructuredContent(payload=payload, text=text)
-        case _:
-            assert_never(intent.output)
 
 
 def _decode_response(
@@ -549,7 +489,7 @@ def _decode_response(
             code="unparseable_response",
             message="openai response body is not a JSON object envelope",
         )
-    model = _str_or_none(response.model)
+    model = str_or_none(response.model)
     if model is None:
         raise ProtocolDefect(
             code="missing_model", message="openai response envelope is missing 'model'"
@@ -559,7 +499,7 @@ def _decode_response(
             code="malformed_output", message="openai response 'output' is not a list of items"
         )
     dumped_items = _dump_items(response.output, code="malformed_output")
-    request_id = _str_or_none(response._request_id) or _str_or_none(response.id)
+    request_id = str_or_none(response._request_id) or str_or_none(response.id)
     meta = _meta(
         model=model,
         request_id=request_id,
@@ -591,19 +531,19 @@ def _decode_response(
         if isinstance(item, ResponseOutputMessage) and isinstance(item.content, list):
             for part in item.content:
                 if isinstance(part, ResponseOutputText):
-                    text_parts.append(_str_or_none(part.text) or "")
+                    text_parts.append(str_or_none(part.text) or "")
         elif isinstance(item, ResponseFunctionToolCall):
             parsed = _parse_tool_call(item)
             if isinstance(parsed, InvalidToolArguments):
                 return Failed(meta=meta, failure=parsed)
             tool_calls.append(parsed)
-    text = "".join(text_parts)
-
+    content = response_content(intent, text="".join(text_parts), tool_calls=tuple(tool_calls))
+    if isinstance(content, InvalidStructuredOutput):
+        return Failed(meta=meta, failure=content)
     return Succeeded(
         meta=meta,
         response=ResponsePayload(
-            content=_content_of(intent, text=text, tool_calls=tuple(tool_calls)),
-            continuation=_continuation_of(row, intent, dumped_items),
+            content=content, continuation=_continuation_of(row, intent, dumped_items)
         ),
     )
 
@@ -615,7 +555,7 @@ def _collect_refusal(output_items: Sequence[object]) -> str | None:
             continue
         for part in item.content:
             if isinstance(part, ResponseOutputRefusal):
-                parts.append(_str_or_none(part.refusal) or "")
+                parts.append(str_or_none(part.refusal) or "")
     return "".join(parts) if parts else None
 
 
@@ -644,9 +584,9 @@ class _StreamState:
 def _register_tool_call(state: _StreamState, item: object) -> ToolCallStart | None:
     if not isinstance(item, ResponseFunctionToolCall):
         return None
-    item_key = _str_or_none(item.id) or ""
-    call_id = _str_or_none(item.call_id) or item_key
-    name = _str_or_none(item.name) or ""
+    item_key = str_or_none(item.id) or ""
+    call_id = str_or_none(item.call_id) or item_key
+    name = str_or_none(item.name) or ""
     state.open_calls[item_key] = _OpenToolCall(call_id=call_id, name=name)
     return ToolCallStart(call_id=call_id, name=name)
 
@@ -654,11 +594,11 @@ def _register_tool_call(state: _StreamState, item: object) -> ToolCallStart | No
 def _accumulate_tool_arguments(
     state: _StreamState, frame: ResponseFunctionCallArgumentsDeltaEvent
 ) -> ToolCallDelta | None:
-    item_key = _str_or_none(frame.item_id) or ""
+    item_key = str_or_none(frame.item_id) or ""
     open_call = state.open_calls.get(item_key)
     if open_call is None:
         return None
-    delta = _str_or_none(frame.delta) or ""
+    delta = str_or_none(frame.delta) or ""
     if not delta:
         return None
     open_call.arguments += delta
@@ -676,7 +616,7 @@ def _finish_output_item(
         )
     state.completed_items.append(item.model_dump(mode="json", exclude_unset=True))
     if isinstance(item, ResponseFunctionToolCall):
-        item_key = _str_or_none(item.id) or ""
+        item_key = str_or_none(item.id) or ""
         open_call = state.open_calls.pop(item_key, None)
         parsed = _parse_tool_call(item, open_call.arguments if open_call else "")
         if isinstance(parsed, InvalidToolArguments):
@@ -688,7 +628,7 @@ def _finish_output_item(
         # refusal as a finished content part.
         for part in item.content or []:
             if isinstance(part, ResponseOutputRefusal):
-                state.refusal_parts.append(_str_or_none(part.refusal) or "")
+                state.refusal_parts.append(str_or_none(part.refusal) or "")
     return None
 
 
@@ -708,12 +648,12 @@ def _terminal_events(
             code="malformed_stream_frame",
             message=f"openai {frame.type} frame is missing 'response'",
         )
-    model = _str_or_none(envelope.model)
+    model = str_or_none(envelope.model)
     if model is None:
         raise ProtocolDefect(
             code="missing_model", message=f"openai {frame.type} envelope is missing 'model'"
         )
-    request_id = state.request_id or _str_or_none(envelope.id)
+    request_id = state.request_id or str_or_none(envelope.id)
     meta = _meta(
         model=model,
         request_id=request_id,
@@ -752,9 +692,11 @@ def _terminal_events(
             )
         ]
 
-    content = _content_of(
+    content = response_content(
         intent, text="".join(state.text_parts), tool_calls=tuple(state.tool_calls)
     )
+    if isinstance(content, InvalidStructuredOutput):
+        return [TerminalEvent(outcome=Failed(meta=meta, failure=content))]
     continuation = _continuation_of(row, intent, state.completed_items)
     events: list[CodecStreamEvent] = []
     match continuation:
@@ -806,8 +748,8 @@ def _raise_sdk_stream_error(
     our own frame dispatch sees it; classify it exactly like our frames."""
     body = error.body if isinstance(error.body, Mapping) else {}
     _raise_stream_error(
-        code=_str_or_none(body.get("code")),
-        message=_str_or_none(body.get("message")) or sanitize_provider_text(error.message),
+        code=str_or_none(body.get("code")),
+        message=str_or_none(body.get("message")) or sanitize_provider_text(error.message),
         state=state,
         status_code=status_code,
     )
@@ -841,7 +783,7 @@ class OpenAIResponsesEngine:
         self, row: ModelRow, intent: GenerateIntent, credential: ProviderCredential
     ) -> CallOutcome:
         encoded = _encode_request(row, intent)
-        started_ms = _monotonic_ms()
+        started_ms = monotonic_ms()
         client = self._client_for(row, credential)
         try:
             try:
@@ -877,7 +819,7 @@ class OpenAIResponsesEngine:
         self, row: ModelRow, intent: GenerateIntent, credential: ProviderCredential
     ) -> AsyncIterator[CodecStreamEvent]:
         encoded = _encode_request(row, intent)
-        started_ms = _monotonic_ms()
+        started_ms = monotonic_ms()
         client = self._client_for(row, credential)
         events: openai.AsyncStream[Any] | None = None
         try:
@@ -910,15 +852,15 @@ class OpenAIResponsesEngine:
                 async for raw in events:
                     if isinstance(raw, ResponseCreatedEvent | ResponseInProgressEvent):
                         if state.request_id is None and isinstance(raw.response, Response):
-                            state.request_id = _str_or_none(raw.response.id)
+                            state.request_id = str_or_none(raw.response.id)
                     elif isinstance(raw, ResponseTextDeltaEvent):
-                        delta = _str_or_none(raw.delta) or ""
+                        delta = str_or_none(raw.delta) or ""
                         if delta:
                             state.text_parts.append(delta)
                             state.semantic_emitted = True
                             yield TextDelta(text=delta)
                     elif isinstance(raw, ResponseRefusalDeltaEvent):
-                        state.refusal_parts.append(_str_or_none(raw.delta) or "")
+                        state.refusal_parts.append(str_or_none(raw.delta) or "")
                     elif isinstance(raw, ResponseOutputItemAddedEvent):
                         start = _register_tool_call(state, raw.item)
                         if start is not None:
@@ -973,8 +915,8 @@ class OpenAIResponsesEngine:
                         )
                     elif isinstance(raw, ResponseErrorEvent):
                         _raise_stream_error(
-                            code=_str_or_none(raw.code),
-                            message=_str_or_none(raw.message),
+                            code=str_or_none(raw.code),
+                            message=str_or_none(raw.message),
                             state=state,
                             status_code=status_code,
                         )

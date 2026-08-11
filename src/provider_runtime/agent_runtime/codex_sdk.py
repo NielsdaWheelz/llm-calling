@@ -28,7 +28,18 @@ from provider_runtime.errors import sanitize_provider_text
 from provider_runtime.types import Absent, Presence, Present, TokenUsage
 
 from ._codex_launcher import ensure_codex_launcher
-from ._limits import OutputLimitExceeded, bounded_payload_size
+from ._limits import (
+    _MAX_DIAGNOSTICS,
+    _MAX_EVENT_COUNT,
+    _MAX_EVENT_TEXT_BYTES,
+    _MAX_FINAL_TEXT_BYTES,
+    _MAX_MESSAGE_BYTES,
+    _MAX_MESSAGE_ITEMS,
+    _MAX_TURN_OUTPUT_BYTES,
+    _OPERATION_TIMEOUT_SECONDS,
+    OutputLimitExceeded,
+    bounded_payload_size,
+)
 from ._sandbox import bubblewrap_network_namespace_available
 from ._structured_output import OutputSchemaMismatch, parse_structured_output
 from .auth import (
@@ -99,14 +110,6 @@ _CERTIFIED_SDK_VERSION = "0.144.4"
 _RUNTIME_VERSION_PREFIX = re.compile(
     r"(?P<version>[0-9]+(?:\.[0-9]+){2}(?:[-+][0-9A-Za-z.-]+)?)(?:\s|$)"
 )
-_OPERATION_TIMEOUT_SECONDS = 30.0
-_MAX_EVENT_COUNT = 100_000
-_MAX_MESSAGE_BYTES = 4 * 1024 * 1024
-_MAX_MESSAGE_ITEMS = 100_000
-_MAX_TURN_OUTPUT_BYTES = 64 * 1024 * 1024
-_MAX_EVENT_TEXT_BYTES = 4 * 1024 * 1024
-_MAX_FINAL_TEXT_BYTES = 16 * 1024 * 1024
-_MAX_DIAGNOSTICS = 256
 _REQUIRED_MCP_STARTUP_FAILURE = "required MCP servers failed to initialize"
 
 _TURN_SCOPED_METHODS = frozenset(

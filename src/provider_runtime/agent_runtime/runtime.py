@@ -835,9 +835,7 @@ class AgentRuntime:
         allowed_environment: tuple[str, ...],
     ) -> tuple[dict[str, str], Path]:
         try:
-            state_root = resolve_state_root(
-                self._config.state_root_base, backend, credential.profile_key
-            )
+            state_root = resolve_state_root(self._config.state_root_base, backend, credential)
         except OSError:
             raise CredentialUnavailable("profile state root could not be resolved") from None
         environment = build_child_environment(

@@ -18,9 +18,9 @@ One engine, four provider quirk-sets, dispatched flat on `row.provider`:
 
 Reasoning is NOT a quirk-set: the engine carries zero per-provider reasoning
 shape knowledge. `row.reasoning[level]` is a self-describing request fragment
-merged verbatim into the body, its top-level keys join the `provider_options`
-collision set, and `CallMeta.native_reasoning` is that fragment as compact
-sorted-keys JSON (Absent when the row has no knob or the fragment is empty).
+merged verbatim into the body; the shared `row_reasoning` owns which levels are
+expressible, which keys join the `provider_options` collision set, and what
+`CallMeta.native_reasoning` records.
 
 The SDK owns the wire (serialization, transport, SSE, error envelopes); this
 module owns classification against the shared taxonomy and the IR mapping.
@@ -32,7 +32,6 @@ malformed envelopes raise `ProtocolDefect`; 401/403 raises `CredentialRejected`.
 from __future__ import annotations
 
 import json
-import time
 from base64 import b64encode
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -51,8 +50,18 @@ from openai.types.chat.chat_completion_chunk import ChoiceDelta, ChoiceDeltaTool
 from openai.types.completion_usage import CompletionUsage
 
 from provider_runtime.engines import TransientAttempt
-from provider_runtime.engines._openai_common import (
+from provider_runtime.engines._common import (
+    int_or_none,
+    mapping_or_none,
+    monotonic_ms,
+    registry_invalid,
+    response_content,
     retry_after_seconds,
+    row_reasoning,
+    str_or_none,
+    validate_continuation,
+)
+from provider_runtime.engines._openai_common import (
     transient_connection,
     zero_env_client,
 )
@@ -90,17 +99,13 @@ from provider_runtime.types import (
     ProviderHttpUnavailable,
     ProviderRateLimit,
     ProviderStreamInterrupted,
-    ProviderTarget,
     ProviderTimeout,
-    ResponseContent,
     ResponsePayload,
     StreamStart,
     StrictJsonOutput,
-    StructuredContent,
     Succeeded,
     SystemMessage,
     TerminalEvent,
-    TextContent,
     TextDelta,
     TextOutput,
     TokenUsage,
@@ -121,7 +126,8 @@ type _Served = Literal["deepseek", "moonshot", "xai", "openrouter"]
 
 # Keys this engine maps from core intent fields; a provider_options key in
 # this set is an override, not an extension → InvalidRequest. The reasoning
-# knob is row data, so its keys join the set per call (`_encode`).
+# knob is row data, so every key it can write joins the set per call
+# (`_encode`).
 _OWNED_KEYS: Final[frozenset[str]] = frozenset(
     {
         "model",
@@ -138,10 +144,6 @@ _OWNED_KEYS: Final[frozenset[str]] = frozenset(
 )
 
 
-def _monotonic_ms() -> int:
-    return int(time.monotonic() * 1000)
-
-
 def _served_provider(row: ModelRow) -> _Served:
     match row.provider:
         case "deepseek" | "moonshot" | "xai" | "openrouter" as provider:
@@ -154,28 +156,10 @@ def _served_provider(row: ModelRow) -> _Served:
             )
 
 
-# ---------------------------------------------------------------------------
-# Narrowing primitives (nullable/extra provider JSON stays private to ingress).
-
-
-def _mapping_or_none(value: object) -> Mapping[str, object] | None:
-    return value if isinstance(value, Mapping) else None
-
-
 def _sequence_or_none(value: object) -> Sequence[object] | None:
     if isinstance(value, Sequence) and not isinstance(value, str | bytes):
         return value
     return None
-
-
-def _str_or_none(value: object) -> str | None:
-    return value if isinstance(value, str) else None
-
-
-def _int_or_none(value: object) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return value
 
 
 # ---------------------------------------------------------------------------
@@ -192,8 +176,8 @@ class _Encoded:
 
 
 def _encode(provider: _Served, row: ModelRow, intent: GenerateIntent) -> _Encoded:
-    reasoning = _reasoning_fragment(row, intent)
-    body: dict[str, object] = dict(reasoning)
+    reasoning = row_reasoning(row, intent)
+    body: dict[str, object] = dict(reasoning.fragment)
     match provider:
         case "moonshot" | "xai":
             body["max_completion_tokens"] = intent.max_output_tokens
@@ -229,7 +213,7 @@ def _encode(provider: _Served, row: ModelRow, intent: GenerateIntent) -> _Encode
             assert_never(intent.output)
     if provider == "openrouter":
         body["provider"] = _routing_pins(row)
-    owned = _OWNED_KEYS | reasoning.keys()
+    owned = _OWNED_KEYS | reasoning.owned_keys
     for key in intent.provider_options:
         if key in owned:
             raise InvalidRequest(
@@ -240,48 +224,7 @@ def _encode(provider: _Served, row: ModelRow, intent: GenerateIntent) -> _Encode
     return _Encoded(
         messages=_encode_messages(provider, row, intent),
         body=body,
-        native_reasoning=_native_reasoning(reasoning),
-    )
-
-
-def _reasoning_fragment(row: ModelRow, intent: GenerateIntent) -> Mapping[str, object]:
-    """The row's self-describing request fragment for the requested level.
-
-    The engine knows no provider reasoning shapes: whatever mapping the row
-    supplies is merged verbatim into the request body.
-    """
-    match row.reasoning:
-        case Absent():
-            if intent.reasoning != "none":
-                raise InvalidRequest(
-                    message=f"row {row.ref!r} has no reasoning knob; "
-                    f"level {intent.reasoning!r} is not expressible"
-                )
-            return {}
-        case Present(value=levels):
-            if intent.reasoning not in levels:
-                raise InvalidRequest(
-                    message=f"reasoning level {intent.reasoning!r} is outside the levels "
-                    f"row {row.ref!r} supports"
-                )
-            fragment = _mapping_or_none(levels[intent.reasoning])
-            if fragment is None:
-                raise _registry_invalid(row, "reasoning values must be request-parameter mappings")
-            return fragment
-        case _:
-            assert_never(row.reasoning)
-
-
-def _native_reasoning(fragment: Mapping[str, object]) -> Presence[str]:
-    """Exactly what the reasoning knob put on the wire, compact and key-sorted."""
-    if not fragment:
-        return Absent()
-    return Present(json.dumps(dict(fragment), sort_keys=True, separators=(",", ":")))
-
-
-def _registry_invalid(row: ModelRow, detail: str) -> RuntimeDefect:
-    return RuntimeDefect(
-        origin="intent", code="registry_invalid", message=f"row {row.ref!r}: {detail}"
+        native_reasoning=reasoning.native_reasoning,
     )
 
 
@@ -298,7 +241,7 @@ def _routing_pins(row: ModelRow) -> dict[str, object]:
                 "quantizations": list(routing.quantizations),
             }
         case Absent():
-            raise _registry_invalid(row, "openrouter rows must pin routing")
+            raise registry_invalid(row, "openrouter rows must pin routing")
         case _:
             assert_never(row.routing)
 
@@ -325,7 +268,7 @@ def _encode_messages(
             case UserMessage(blocks=blocks):
                 encoded.append(_user_wire(blocks))
             case AssistantMessage() as assistant:
-                encoded.append(_assistant_wire(provider, row, assistant, intent.target))
+                encoded.append(_assistant_wire(provider, row, assistant, intent))
             case ToolResultMessage(call_id=call_id, output=output):
                 # is_error has no Chat Completions representation.
                 encoded.append({"role": "tool", "tool_call_id": call_id, "content": output})
@@ -352,18 +295,13 @@ def _user_wire(blocks: tuple[PromptBlock | ImageBlock, ...]) -> dict[str, object
 
 
 def _assistant_wire(
-    provider: _Served, row: ModelRow, message: AssistantMessage, target: ProviderTarget
+    provider: _Served, row: ModelRow, message: AssistantMessage, intent: GenerateIntent
 ) -> dict[str, object]:
     match message.continuation:
         case Absent():
             return _assistant_from_fields(message)
         case Present(value=artifact):
-            if artifact.target != target or artifact.codec_id != row.continuation_codec:
-                raise InvalidRequest(
-                    message=f"continuation artifact for {artifact.target.provider}/"
-                    f"{artifact.target.model} (codec {artifact.codec_id!r}) cannot replay to "
-                    f"{target.provider}/{target.model} (codec {row.continuation_codec!r})"
-                )
+            validate_continuation(artifact, row, intent)
             match provider:
                 case "moonshot":
                     # Complete-native-message replay, verbatim — including
@@ -416,7 +354,7 @@ def _payload_reasoning_details(artifact: ContinuationArtifact) -> list[dict[str,
         )
     entries: list[dict[str, object]] = []
     for detail in details:
-        entry = _mapping_or_none(detail)
+        entry = mapping_or_none(detail)
         if entry is None:
             raise InvalidRequest(
                 message="openrouter continuation reasoning_details entry is not an object"
@@ -449,25 +387,31 @@ def _fold_usage(
     return merged
 
 
-def _usage_from_raw(raw: Mapping[str, object]) -> TokenUsage:
-    prompt_details = _mapping_or_none(raw.get("prompt_tokens_details")) or {}
-    completion_details = _mapping_or_none(raw.get("completion_tokens_details")) or {}
+def _usage_from_raw(provider: _Served, raw: Mapping[str, object]) -> TokenUsage:
+    prompt_details = mapping_or_none(raw.get("prompt_tokens_details")) or {}
+    completion_details = mapping_or_none(raw.get("completion_tokens_details")) or {}
     # cached_tokens nests under prompt_tokens_details or sits flat on the usage
     # object (Moonshot's form) — both surfaced; prompt_tokens is cache-inclusive
     # on this wire, so no ingress normalization is needed.
-    cache_read = _int_or_none(prompt_details.get("cached_tokens"))
+    cache_read = int_or_none(prompt_details.get("cached_tokens"))
     if cache_read is None:
-        cache_read = _int_or_none(raw.get("cached_tokens"))
-    return TokenUsage.from_components(
-        input_tokens=_int_or_none(raw.get("prompt_tokens")) or 0,
-        output_tokens=_int_or_none(raw.get("completion_tokens")) or 0,
-        total_tokens=presence_of(_int_or_none(raw.get("total_tokens"))),
-        reasoning_tokens=presence_of(_int_or_none(completion_details.get("reasoning_tokens"))),
-        cache_read_input_tokens=presence_of(cache_read),
-        cache_write_input_tokens=presence_of(
-            _int_or_none(prompt_details.get("cache_write_tokens"))
-        ),
-    )
+        cache_read = int_or_none(raw.get("cached_tokens"))
+    try:
+        return TokenUsage.from_components(
+            input_tokens=int_or_none(raw.get("prompt_tokens")) or 0,
+            output_tokens=int_or_none(raw.get("completion_tokens")) or 0,
+            total_tokens=presence_of(int_or_none(raw.get("total_tokens"))),
+            reasoning_tokens=presence_of(int_or_none(completion_details.get("reasoning_tokens"))),
+            cache_read_input_tokens=presence_of(cache_read),
+            cache_write_input_tokens=presence_of(
+                int_or_none(prompt_details.get("cache_write_tokens"))
+            ),
+        )
+    except ValueError as error:
+        raise ProtocolDefect(
+            code="malformed_usage",
+            message=f"{provider} usage is not valid token accounting: {error}",
+        ) from error
 
 
 # ---------------------------------------------------------------------------
@@ -499,15 +443,15 @@ def _decode_tool_calls(
     calls: list[ToolCall] = []
     for entry in message.tool_calls or []:
         raw = entry.to_dict()
-        call_id = _str_or_none(raw.get("id")) or ""
-        function = _mapping_or_none(raw.get("function")) or {}
-        name = _str_or_none(function.get("name")) or ""
+        call_id = str_or_none(raw.get("id")) or ""
+        function = mapping_or_none(raw.get("function")) or {}
+        name = str_or_none(function.get("name")) or ""
         if not call_id or not name:
             raise ProtocolDefect(
                 code="malformed_tool_call", message="tool call is missing id or function.name"
             )
         arguments = _tool_arguments(
-            _str_or_none(function.get("arguments")) or "", tool_name=name, call_id=call_id
+            str_or_none(function.get("arguments")) or "", tool_name=name, call_id=call_id
         )
         if isinstance(arguments, InvalidToolArguments):
             return arguments
@@ -541,7 +485,7 @@ class _ToolCallAccumulator:
         self, entries: Sequence[ChoiceDeltaToolCall]
     ) -> Iterator[ToolCallStart | ToolCallDelta]:
         for entry in entries:
-            index = _int_or_none(entry.index) or 0
+            index = int_or_none(entry.index) or 0
             slot = self._slots.setdefault(index, _ToolCallSlot())
             if entry.id:
                 slot.call_id = entry.id
@@ -588,29 +532,6 @@ class _ToolCallAccumulator:
 # intent's OutputSpec, never re-inferred from the wire.
 
 
-def _response_content(
-    intent: GenerateIntent, text: str, tool_calls: tuple[ToolCall, ...]
-) -> ResponseContent | InvalidStructuredOutput:
-    match intent.output:
-        case TextOutput():
-            return TextContent(text=text, tool_calls=tool_calls)
-        case StrictJsonOutput():
-            try:
-                payload = json.loads(text)
-            except json.JSONDecodeError as exc:
-                return InvalidStructuredOutput(
-                    safe_detail=f"structured output is not valid JSON ({exc.msg} at char {exc.pos})"
-                )
-            if not isinstance(payload, dict):
-                return InvalidStructuredOutput(
-                    safe_detail=f"structured output parsed to {type(payload).__name__}, "
-                    f"not a JSON object"
-                )
-            return StructuredContent(payload=payload, text=text)
-        case _:
-            assert_never(intent.output)
-
-
 def _terminal_outcome(
     *,
     finish_reason: str | None,
@@ -622,7 +543,7 @@ def _terminal_outcome(
 ) -> Succeeded | Incomplete | Failed:
     match finish_reason:
         case "stop" | "tool_calls":
-            content = _response_content(intent, text, tool_calls)
+            content = response_content(intent, text=text, tool_calls=tool_calls)
             if isinstance(content, InvalidStructuredOutput):
                 return Failed(meta=meta, failure=content)
             return Succeeded(
@@ -661,7 +582,7 @@ def _continuation_from_message(
             # Verbatim preservation: entries stored exactly as received, in order.
             payload: Mapping[str, object] = {"reasoning_details": list(details)}
         case "deepseek" | "moonshot" | "xai":
-            if not _str_or_none(extra.get("reasoning_content")) and not message.tool_calls:
+            if not str_or_none(extra.get("reasoning_content")) and not message.tool_calls:
                 return Absent()
             # The payload is the complete native assistant message, verbatim.
             payload = message.to_dict()
@@ -718,8 +639,8 @@ def _classify_status(provider: _Served, exc: openai.APIStatusError) -> ProviderC
     # The SDK unwraps body["error"] before attaching it (`body.get("error",
     # body)`), so exc.body is usually the inner error object already; tolerate
     # both shapes.
-    body = _mapping_or_none(exc.body)
-    nested = _mapping_or_none(body.get("error")) if body is not None else None
+    body = mapping_or_none(exc.body)
+    nested = mapping_or_none(body.get("error")) if body is not None else None
     error = nested if nested is not None else body
     snippet = safe_provider_error_body_snippet(dict(body) if body is not None else None)
     detail = f": {snippet}" if snippet else ""
@@ -774,7 +695,7 @@ def _is_moderation_flagged(error: Mapping[str, object] | None) -> bool:
     not a rejected platform credential."""
     if error is None:
         return False
-    metadata = _mapping_or_none(error.get("metadata"))
+    metadata = mapping_or_none(error.get("metadata"))
     if metadata is None:
         return False
     return _sequence_or_none(metadata.get("reasons")) is not None or "flagged_input" in metadata
@@ -783,40 +704,42 @@ def _is_moderation_flagged(error: Mapping[str, object] | None) -> bool:
 def _mentions_quota(error: Mapping[str, object] | None) -> bool:
     if error is None:
         return False
-    kind = (_str_or_none(error.get("type")) or "") + (_str_or_none(error.get("code")) or "")
+    kind = (str_or_none(error.get("type")) or "") + (str_or_none(error.get("code")) or "")
     return "quota" in kind
 
 
 def _is_context_overflow(error: Mapping[str, object] | None) -> bool:
     if error is None:
         return False
-    if _str_or_none(error.get("code")) == "context_length_exceeded":
+    if str_or_none(error.get("code")) == "context_length_exceeded":
         return True
-    message = (_str_or_none(error.get("message")) or "").lower()
+    message = (str_or_none(error.get("message")) or "").lower()
     return "context length" in message or "token limit" in message or "maximum context" in message
 
 
 def _classify_inband_error(provider: _Served, error: object) -> TransientCause:
     """Classify an in-band error object carried by an HTTP-200 body — the
     OpenRouter shape for an upstream that failed after the gateway accepted
-    the request. 429-shaped → ProviderRateLimit; 5xx-shaped → transient;
-    anything else is no modeled failure of ours and raises."""
-    parsed = _mapping_or_none(error)
+    the request. 429-shaped → ProviderRateLimit; a DEFINITE 4xx code names a
+    request the provider will refuse identically next time, so it raises.
+    Everything else — including the upstream-failure envelopes that carry only
+    a message and metadata — is an upstream that fell over: retryable."""
+    parsed = mapping_or_none(error)
     raw_code = parsed.get("code") if parsed is not None else None
-    code = _int_or_none(raw_code)
+    code = int_or_none(raw_code)
     if code is None:
-        digits = _str_or_none(raw_code)
+        digits = str_or_none(raw_code)
         code = int(digits) if digits is not None and digits.isdigit() else None
     if code == 429:
         return ProviderRateLimit(retry_after=Absent())
-    if code is not None and code >= 500:
-        return ProviderHttpUnavailable()
-    snippet = safe_provider_error_body_snippet({"error": dict(parsed)} if parsed else None)
-    raise ProtocolDefect(
-        code="inband_provider_error",
-        message=f"{provider} returned an unclassified in-band error on an HTTP 200 response"
-        + (f": {snippet}" if snippet else ""),
-    )
+    if code is not None and 400 <= code < 500:
+        snippet = safe_provider_error_body_snippet({"error": dict(parsed)} if parsed else None)
+        raise ProtocolDefect(
+            code="inband_provider_error",
+            message=f"{provider} returned an unclassified in-band error on an HTTP 200 response"
+            + (f": {snippet}" if snippet else ""),
+        )
+    return ProviderHttpUnavailable()
 
 
 # ---------------------------------------------------------------------------
@@ -837,7 +760,7 @@ class OpenAIChatEngine:
             case Present(value=base_url):
                 pass
             case Absent():
-                raise _registry_invalid(row, "openai_chat rows must carry a base_url")
+                raise registry_invalid(row, "openai_chat rows must carry a base_url")
             case _:
                 assert_never(row.base_url)
         return zero_env_client(
@@ -853,7 +776,7 @@ class OpenAIChatEngine:
         provider = _served_provider(row)
         encoded = _encode(provider, row, intent)
         client = self._client(row, credential)
-        started_ms = _monotonic_ms()
+        started_ms = monotonic_ms()
         try:
             try:
                 completion = await client.chat.completions.create(
@@ -887,7 +810,7 @@ class OpenAIChatEngine:
         provider = _served_provider(row)
         encoded = _encode(provider, row, intent)
         client = self._client(row, credential)
-        started_ms = _monotonic_ms()
+        started_ms = monotonic_ms()
         try:
             try:
                 api_stream = await client.chat.completions.create(
@@ -945,11 +868,11 @@ class OpenAIChatEngine:
                             code="malformed_envelope",
                             message=f"{provider} stream chunk is not a chat.completion.chunk",
                         )
-                    request_id = request_id or (_str_or_none(chunk.id) or None)
-                    model = model or (_str_or_none(chunk.model) or None)
+                    request_id = request_id or (str_or_none(chunk.id) or None)
+                    model = model or (str_or_none(chunk.model) or None)
                     if provider == "openrouter":
                         upstream = (
-                            _str_or_none((chunk.model_extra or {}).get("provider")) or upstream
+                            str_or_none((chunk.model_extra or {}).get("provider")) or upstream
                         )
 
                     choice = chunk.choices[0] if chunk.choices else None
@@ -959,14 +882,14 @@ class OpenAIChatEngine:
                         chunk.usage.to_dict() if isinstance(chunk.usage, CompletionUsage) else None
                     )
                     choice_usage = (
-                        _mapping_or_none((choice.model_extra or {}).get("usage"))
+                        mapping_or_none((choice.model_extra or {}).get("usage"))
                         if choice is not None
                         else None
                     )
                     folded = _fold_usage(_fold_usage(raw_usage, choice_usage), top_usage)
                     if folded is not None and folded is not raw_usage:
                         raw_usage = folded
-                        yield UsageEvent(usage=_usage_from_raw(folded))
+                        yield UsageEvent(usage=_usage_from_raw(provider, folded))
                         semantic = True
                     if choice is None:
                         continue
@@ -976,20 +899,20 @@ class OpenAIChatEngine:
                         for tool_event in accumulator.apply(delta.tool_calls or ()):
                             yield tool_event
                             semantic = True
-                        text = _str_or_none(delta.content) or ""
+                        text = str_or_none(delta.content) or ""
                         if text:
                             text_parts.append(text)
                             yield TextDelta(text=text)
                             semantic = True
                         delta_extra = delta.model_extra or {}
-                        reasoning = _str_or_none(delta_extra.get("reasoning_content")) or ""
+                        reasoning = str_or_none(delta_extra.get("reasoning_content")) or ""
                         if reasoning:
                             reasoning_parts.append(reasoning)
                         delta_details = _sequence_or_none(delta_extra.get("reasoning_details"))
                         if delta_details:
                             details.extend(delta_details)  # verbatim, in sequence
 
-                    chunk_finish = _str_or_none(choice.finish_reason)
+                    chunk_finish = str_or_none(choice.finish_reason)
                     # The FIRST terminal frame decides: a provider that repeats
                     # finish_reason on a trailing frame must not re-fold the
                     # accumulator or re-emit ToolCallDone.
@@ -1033,7 +956,7 @@ class OpenAIChatEngine:
                     model=meta_model,
                     provider_request_id=presence_of(request_id),
                     upstream_provider=presence_of(upstream),
-                    usage=Present(_usage_from_raw(raw_usage))
+                    usage=Present(_usage_from_raw(provider, raw_usage))
                     if raw_usage is not None
                     else Absent(),
                     attempt_trace=(
@@ -1042,7 +965,7 @@ class OpenAIChatEngine:
                             signal=FinalAttempt(),
                             status_code=Present(200),
                             started_at_ms=started_ms,
-                            ended_at_ms=_monotonic_ms(),
+                            ended_at_ms=monotonic_ms(),
                         ),
                     ),
                     billability=PossiblyBillable(),
@@ -1118,7 +1041,7 @@ class OpenAIChatEngine:
                     signal=FinalAttempt(),
                     status_code=Present(exc.status_code),
                     started_at_ms=started_ms,
-                    ended_at_ms=_monotonic_ms(),
+                    ended_at_ms=monotonic_ms(),
                 ),
             ),
             billability=PossiblyBillable(),
@@ -1147,10 +1070,10 @@ class OpenAIChatEngine:
             raise TransientAttempt(
                 cause=_classify_inband_error(provider, inband),
                 status_code=Present(200),
-                provider_request_id=presence_of(_str_or_none(completion.id) or None),
+                provider_request_id=presence_of(str_or_none(completion.id) or None),
                 billability=PossiblyBillable(),
             )
-        model = _str_or_none(completion.model)
+        model = str_or_none(completion.model)
         if not model:
             raise ProtocolDefect(
                 code="missing_model", message=f"{provider} response carries no model field"
@@ -1166,17 +1089,17 @@ class OpenAIChatEngine:
                 code="missing_message", message=f"{provider} choice has no message object"
             )
         upstream: Presence[str] = (
-            presence_of(_str_or_none((completion.model_extra or {}).get("provider")))
+            presence_of(str_or_none((completion.model_extra or {}).get("provider")))
             if provider == "openrouter"
             else Absent()
         )
         meta = CallMeta(
             provider=row.provider,
             model=model,
-            provider_request_id=presence_of(_str_or_none(completion.id) or None),
+            provider_request_id=presence_of(str_or_none(completion.id) or None),
             upstream_provider=upstream,
             usage=(
-                Present(_usage_from_raw(completion.usage.to_dict()))
+                Present(_usage_from_raw(provider, completion.usage.to_dict()))
                 if isinstance(completion.usage, CompletionUsage)
                 else Absent()
             ),
@@ -1186,7 +1109,7 @@ class OpenAIChatEngine:
                     signal=FinalAttempt(),
                     status_code=Present(200),
                     started_at_ms=started_ms,
-                    ended_at_ms=_monotonic_ms(),
+                    ended_at_ms=monotonic_ms(),
                 ),
             ),
             billability=PossiblyBillable(),
@@ -1197,10 +1120,10 @@ class OpenAIChatEngine:
         if isinstance(tool_calls, InvalidToolArguments):
             return Failed(meta=meta, failure=tool_calls)
         return _terminal_outcome(
-            finish_reason=_str_or_none(choice.finish_reason),
+            finish_reason=str_or_none(choice.finish_reason),
             meta=meta,
             intent=intent,
-            text=_str_or_none(message.content) or "",
+            text=str_or_none(message.content) or "",
             tool_calls=tool_calls,
             continuation=_continuation_from_message(provider, row, intent, message),
         )

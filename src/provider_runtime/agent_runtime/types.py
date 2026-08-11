@@ -7,9 +7,10 @@ import os.path
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, cast
 from urllib.parse import urlsplit
 
+from ._validation import ENVIRONMENT_NAME, require_tuple, require_unique_strings
 from .errors import InvalidAgentRequest, UnsupportedCapability
 from .policy import PermissionPolicy, PermissionPolicyPatch
 
@@ -31,9 +32,10 @@ AGENT_ROUTES: frozenset[tuple[Backend, AgentTransport]] = frozenset(
     }
 )
 _PROFILE_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
-_ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _REFERENCE_NAME = re.compile(r"[^\x00-\x20\x7f]{1,256}\Z")
-_MCP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+# An MCP server name is a config-entry name and a profile key is a state scope; they are
+# distinct concepts sharing one rule today, so either may be given its own pattern later.
+_MCP_NAME = _PROFILE_KEY
 _HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 _HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_JSON_DEPTH = 64
@@ -50,21 +52,18 @@ class FrozenJsonDict(Mapping[str, object]):
         source = {} if value is None else value
         if not isinstance(source, Mapping):
             raise InvalidAgentRequest("frozen JSON objects require a mapping")
-        frozen: dict[str, object] = {}
-        active = {id(source)}
-        try:
-            for key, child in source.items():
-                if type(key) is not str:
-                    raise InvalidAgentRequest("frozen JSON object keys must be strings")
-                frozen[key] = _freeze_json_value(
-                    child,
-                    context=f"value.{key}",
-                    active=active,
-                    depth=1,
-                )
-        finally:
-            active.remove(id(source))
-        self.__items = tuple(frozen.items())
+        self.__items = _freeze_mapping_items(source, context="value", active=set(), depth=0)
+
+    @classmethod
+    def _of_frozen_items(cls, items: tuple[tuple[str, JsonValue], ...]) -> FrozenJsonDict:
+        """Wrap items `_freeze_mapping_items` just produced, without freezing them again.
+
+        Re-entering `__init__` from the freezer would re-walk every descendant once per
+        level of nesting, which is exponential in depth rather than linear in size.
+        """
+        instance = object.__new__(cls)
+        instance.__items = items
+        return instance
 
     def __setattr__(self, name: str, value: object) -> None:
         if name == "_FrozenJsonDict__items" and not hasattr(self, name):
@@ -137,24 +136,9 @@ def _freeze_json_value(
             raise InvalidAgentRequest(f"{context} numbers must be finite")
         return value
     if isinstance(value, Mapping):
-        identity = id(value)
-        if identity in active:
-            raise InvalidAgentRequest(f"{context} must not contain a reference cycle")
-        active.add(identity)
-        try:
-            frozen: dict[str, object] = {}
-            for key, child in value.items():
-                if type(key) is not str:
-                    raise InvalidAgentRequest(f"{context} object keys must be strings")
-                frozen[key] = _freeze_json_value(
-                    child,
-                    context=f"{context}.{key}",
-                    active=active,
-                    depth=depth + 1,
-                )
-            return FrozenJsonDict(frozen)
-        finally:
-            active.remove(identity)
+        return FrozenJsonDict._of_frozen_items(
+            _freeze_mapping_items(value, context=context, active=active, depth=depth)
+        )
     if isinstance(value, tuple | list):
         identity = id(value)
         if identity in active:
@@ -177,6 +161,39 @@ def _freeze_json_value(
     )
 
 
+def _freeze_mapping_items(
+    source: Mapping[str, object],
+    *,
+    context: str,
+    active: set[int],
+    depth: int,
+) -> tuple[tuple[str, JsonValue], ...]:
+    """The one place a mapping is frozen; every other caller wraps what this returns."""
+    identity = id(source)
+    if identity in active:
+        raise InvalidAgentRequest(f"{context} must not contain a reference cycle")
+    active.add(identity)
+    try:
+        items: list[tuple[str, JsonValue]] = []
+        for key, child in source.items():
+            if type(key) is not str:
+                raise InvalidAgentRequest(f"{context} object keys must be strings")
+            items.append(
+                (
+                    key,
+                    _freeze_json_value(
+                        child,
+                        context=f"{context}.{key}",
+                        active=active,
+                        depth=depth + 1,
+                    ),
+                )
+            )
+    finally:
+        active.remove(identity)
+    return tuple(items)
+
+
 def freeze_json_object(value: Mapping[str, object], *, context: str = "value") -> JsonObject:
     frozen = freeze_json_value(value, context=context)
     if not isinstance(frozen, FrozenJsonDict):
@@ -190,26 +207,11 @@ def _require_non_empty(value: object, field_name: str) -> str:
     return value
 
 
-def _require_tuple(value: object, field_name: str) -> tuple[object, ...]:
-    if not isinstance(value, tuple):
-        raise InvalidAgentRequest(f"{field_name} must be a tuple")
-    return value
-
-
-def _require_unique_strings(value: object, field_name: str) -> tuple[str, ...]:
-    items = _require_tuple(value, field_name)
-    if any(type(item) is not str or not item for item in items):
-        raise InvalidAgentRequest(f"{field_name} entries must be non-empty strings")
-    if len(items) != len(set(items)):
-        raise InvalidAgentRequest(f"{field_name} must not contain duplicate entries")
-    return tuple(item for item in items if isinstance(item, str))
-
-
 def _require_argv(value: object, field_name: str) -> tuple[str, ...]:
-    items = _require_tuple(value, field_name)
+    items = require_tuple(value, field_name)
     if any(type(item) is not str or not item or "\x00" in item for item in items):
         raise InvalidAgentRequest(f"{field_name} entries must be non-empty NUL-free strings")
-    return tuple(item for item in items if isinstance(item, str))
+    return cast(tuple[str, ...], items)
 
 
 def _require_absolute_path(value: object, field_name: str) -> str:
@@ -245,7 +247,7 @@ class CredentialRef:
         if self.name is None:
             raise InvalidAgentRequest(f"CredentialRef.name is required for {self.kind}")
         if self.kind == "api_key_environment":
-            if type(self.name) is not str or _ENVIRONMENT_NAME.fullmatch(self.name) is None:
+            if type(self.name) is not str or ENVIRONMENT_NAME.fullmatch(self.name) is None:
                 raise InvalidAgentRequest("api_key_environment name must be a variable name")
         elif type(self.name) is not str or _REFERENCE_NAME.fullmatch(self.name) is None:
             raise InvalidAgentRequest("secret_reference name must be a non-empty reference")
@@ -406,7 +408,7 @@ class EnvironmentReference:
     source: CredentialRef
 
     def __post_init__(self) -> None:
-        if type(self.name) is not str or _ENVIRONMENT_NAME.fullmatch(self.name) is None:
+        if type(self.name) is not str or ENVIRONMENT_NAME.fullmatch(self.name) is None:
             raise InvalidAgentRequest("environment reference name must be a variable name")
         if not isinstance(self.source, CredentialRef):
             raise InvalidAgentRequest("EnvironmentReference.source must be CredentialRef")
@@ -450,8 +452,8 @@ class McpServerSpec:
         if self.transport not in ("stdio", "streamable_http"):
             raise InvalidAgentRequest(f"unknown MCP transport {self.transport!r}")
         args = _require_argv(self.args, "McpServerSpec.args")
-        _require_tuple(self.environment_refs, "McpServerSpec.environment_refs")
-        _require_tuple(self.header_refs, "McpServerSpec.header_refs")
+        require_tuple(self.environment_refs, "McpServerSpec.environment_refs")
+        require_tuple(self.header_refs, "McpServerSpec.header_refs")
         environment_refs = self.environment_refs
         header_refs = self.header_refs
         if any(not isinstance(item, EnvironmentReference) for item in environment_refs):
@@ -462,8 +464,8 @@ class McpServerSpec:
             raise InvalidAgentRequest("McpServerSpec.environment_refs has duplicate names")
         if len({item.name.lower() for item in header_refs}) != len(header_refs):
             raise InvalidAgentRequest("McpServerSpec.header_refs has duplicate names")
-        _require_unique_strings(self.allowed_tools, "McpServerSpec.allowed_tools")
-        _require_unique_strings(self.denied_tools, "McpServerSpec.denied_tools")
+        require_unique_strings(self.allowed_tools, "McpServerSpec.allowed_tools")
+        require_unique_strings(self.denied_tools, "McpServerSpec.denied_tools")
         if type(self.required) is not bool:
             raise InvalidAgentRequest("McpServerSpec.required must be bool")
         if self.transport == "stdio":
@@ -581,12 +583,12 @@ class AgentSessionRequest:
             raise InvalidAgentRequest("AgentSessionRequest.reasoning must be ReasoningSpec")
         _validate_content(self.system, "AgentSessionRequest.system", allow_empty=True)
         _validate_content(self.developer, "AgentSessionRequest.developer", allow_empty=True)
-        _require_tuple(self.additional_dirs, "additional_dirs")
+        require_tuple(self.additional_dirs, "additional_dirs")
         for index, path in enumerate(self.additional_dirs):
             _require_absolute_path(path, f"AgentSessionRequest.additional_dirs[{index}]")
         if len(self.additional_dirs) != len(set(self.additional_dirs)):
             raise InvalidAgentRequest("AgentSessionRequest.additional_dirs contains duplicates")
-        _require_tuple(self.mcp_servers, "AgentSessionRequest.mcp_servers")
+        require_tuple(self.mcp_servers, "AgentSessionRequest.mcp_servers")
         servers = self.mcp_servers
         if any(not isinstance(server, McpServerSpec) for server in servers):
             raise InvalidAgentRequest("AgentSessionRequest.mcp_servers contains an invalid value")
@@ -610,7 +612,7 @@ class AgentSessionRequest:
 
 
 def _validate_content(value: object, field_name: str, *, allow_empty: bool) -> None:
-    parts = _require_tuple(value, field_name)
+    parts = require_tuple(value, field_name)
     if not allow_empty and not parts:
         raise InvalidAgentRequest(f"{field_name} must be non-empty")
     if any(not isinstance(part, TextContent | ImageContent | FileContent) for part in parts):

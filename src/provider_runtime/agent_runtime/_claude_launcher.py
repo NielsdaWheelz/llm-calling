@@ -23,20 +23,15 @@ the launcher stays transparent for the SDK's `[cli_path, "-v"]` version probe
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
 import signal
 from pathlib import Path
 
-from ._private_files import require_private_directory, write_private_file
+from ._private_files import publish_launcher
 from ._process import ProcessGroup
 from .errors import ExecutableUnavailable, ProtocolDefect, SdkUnavailable
 
 _LAUNCHER_LABEL = "Claude Code launcher"
-# Linux copies the shebang line into a fixed kernel buffer and silently truncates the rest,
-# so an interpreter path that does not fit must fail loudly here instead of producing a
-# launcher that executes something else.
-_MAX_SHEBANG_BYTES = 120
 _GROUP_POLL_SECONDS = 0.02
 _LAUNCHER_PREFIX = "claude-launcher-"
 _LAUNCHER_SOURCE = '''#!{shebang}
@@ -79,31 +74,22 @@ def ensure_claude_launcher(state_root: Path, executable: str, *, interpreter: st
     `AgentRuntime._secure_state_root` creates, chmods to 0700, and mode-asserts before any
     adapter runs — is named in no child environment variable and is inside no sandbox root,
     so it is the nearest place the child cannot reach. That the directory really is private
-    is re-checked here rather than assumed.
+    is re-checked by `publish_launcher` rather than assumed.
 
-    The file name is a digest of the content, so repeated calls and concurrent runtimes
-    converge on one identical file instead of racing to overwrite each other's, and the
-    content is verified after the rename rather than trusted from the write. For the same
-    reason it is not deleted on close: another runtime may be about to exec the identical
-    file, it holds nothing secret, and rewriting it on every open is what keeps it correct.
+    The launcher is not deleted on close: another runtime may be about to exec the identical
+    content-addressed file, it holds nothing secret, and rewriting it on every open is what
+    keeps it correct.
     """
-    if not interpreter or "\0" in interpreter or "\n" in interpreter:
-        raise ExecutableUnavailable(
-            "the running Python interpreter has no usable path to build a Claude launcher"
-        )
     if not executable or "\0" in executable or "\n" in executable:
         raise ExecutableUnavailable("the Claude Code executable path cannot be launched")
-    shebang = f"{interpreter} -I"
-    if len(f"#!{shebang}".encode()) > _MAX_SHEBANG_BYTES:
-        raise ExecutableUnavailable(
-            "the running Python interpreter path is too long for a launcher shebang"
-        )
-    directory = launcher_directory(state_root)
-    require_private_directory(directory, label=_LAUNCHER_LABEL)
-    source = _LAUNCHER_SOURCE.format(shebang=shebang, executable=repr(executable)).encode("utf-8")
-    path = directory / f"{_LAUNCHER_PREFIX}{hashlib.sha256(source).hexdigest()[:32]}"
-    write_private_file(path, source, label=_LAUNCHER_LABEL)
-    return path
+    return publish_launcher(
+        launcher_directory(state_root),
+        label=_LAUNCHER_LABEL,
+        prefix=_LAUNCHER_PREFIX,
+        template=_LAUNCHER_SOURCE,
+        interpreter=interpreter,
+        fields={"executable": repr(executable)},
+    )
 
 
 def launcher_directory(state_root: Path) -> Path:

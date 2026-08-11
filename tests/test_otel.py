@@ -67,7 +67,11 @@ NO_COST: Presence[CostEstimate] = Absent()
 
 
 class RecordedSpan(Span):
-    """Minimal recording implementation of the api's abstract Span."""
+    """Minimal recording implementation of the api's abstract Span.
+
+    `is_recording()` goes False once ended, exactly as the SDK's span does —
+    that predicate is what keeps `call_span` from ending a span twice.
+    """
 
     def __init__(self, name: str, kind: SpanKind, attributes: otel_types.Attributes) -> None:
         self.name = name
@@ -76,10 +80,14 @@ class RecordedSpan(Span):
         self.events: list[tuple[str, dict[str, object]]] = []
         self.statuses: list[Status | StatusCode] = []
         self.exceptions: list[BaseException] = []
-        self.ended = False
+        self.ends = 0
+
+    @property
+    def ended(self) -> bool:
+        return self.ends > 0
 
     def end(self, end_time: int | None = None) -> None:
-        self.ended = True
+        self.ends += 1
 
     def get_span_context(self) -> SpanContext:
         return INVALID_SPAN_CONTEXT
@@ -102,7 +110,7 @@ class RecordedSpan(Span):
         self.name = name
 
     def is_recording(self) -> bool:
-        return True
+        return not self.ended
 
     def set_status(self, status: Status | StatusCode, description: str | None = None) -> None:
         self.statuses.append(status)
@@ -191,6 +199,19 @@ def _default_trace(attempts: int) -> tuple[AttemptRecord, ...]:
         )
         for number in range(1, attempts + 1)
     )
+
+
+# Stands in for the provider body text engine exceptions carry.
+PROVIDER_BODY_TEXT = "SENSITIVE-PROVIDER-BODY-3f19"
+
+
+def _rendered(span: RecordedSpan) -> str:
+    """Everything the span would export: attributes, events, statuses."""
+    statuses = [
+        (status.status_code, status.description) if isinstance(status, Status) else status
+        for status in span.statuses
+    ]
+    return repr((span.attributes, span.events, statuses))
 
 
 START_ATTRIBUTES = {
@@ -285,18 +306,33 @@ def test_call_span_ends_the_span_on_exit() -> None:
     assert span.ended, "exiting call_span must end the span"
 
 
-def test_call_span_records_an_escaping_exception_and_still_ends_the_span() -> None:
+def test_call_span_marks_an_escaping_exception_by_type_name_only() -> None:
+    # Engine exceptions quote provider bodies; the span is content-free, so
+    # neither record_exception (which writes str(error) as an event attribute)
+    # nor a message-bearing status description may be used.
     provider = RecordingTracerProvider()
-    failure = RuntimeError("engine blew up")
     with pytest.raises(RuntimeError):
         with call_span("chat", provider=PROVIDER, model=MODEL, tracer_provider=provider):
-            raise failure
+            raise RuntimeError(f"provider said: {PROVIDER_BODY_TEXT}")
     (span,) = provider.tracer.spans
-    assert span.exceptions == [failure]
-    assert [status.status_code for status in span.statuses if isinstance(status, Status)] == [
-        StatusCode.ERROR
-    ]
+    assert span.exceptions == [], "record_exception puts the exception message on the span"
+    (status,) = span.statuses
+    assert isinstance(status, Status)
+    assert (status.status_code, status.description) == (StatusCode.ERROR, "RuntimeError")
+    assert PROVIDER_BODY_TEXT not in _rendered(span), (
+        f"provider text reached the span: {_rendered(span)}"
+    )
     assert span.ended
+
+
+def test_call_span_does_not_end_a_span_the_caller_already_ended() -> None:
+    # The streaming port ends its span at the terminal event; a second end()
+    # is a warning-logging no-op in opentelemetry-sdk, not a fresh end time.
+    provider = RecordingTracerProvider()
+    with call_span("chat", provider=PROVIDER, model=MODEL, tracer_provider=provider) as span:
+        span.end()
+    assert isinstance(span, RecordedSpan)
+    assert span.ends == 1, f"the span was ended {span.ends} times"
 
 
 def test_call_span_ends_the_span_on_generator_exit_without_marking_it_failed() -> None:

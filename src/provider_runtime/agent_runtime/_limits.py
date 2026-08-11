@@ -6,6 +6,17 @@ from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
 from enum import Enum
 
+# Both adapters read the same untrusted native stream, so they answer to one set of bounds:
+# a limit that differed between the two lanes would be an accident rather than a policy.
+_OPERATION_TIMEOUT_SECONDS = 30.0
+_MAX_EVENT_COUNT = 100_000
+_MAX_MESSAGE_BYTES = 4 * 1024 * 1024
+_MAX_MESSAGE_ITEMS = 100_000
+_MAX_TURN_OUTPUT_BYTES = 64 * 1024 * 1024
+_MAX_EVENT_TEXT_BYTES = 4 * 1024 * 1024
+_MAX_FINAL_TEXT_BYTES = 16 * 1024 * 1024
+_MAX_DIAGNOSTICS = 256
+
 
 class OutputLimitExceeded(Exception):
     """A bounded agent stream exceeded its configured limit."""

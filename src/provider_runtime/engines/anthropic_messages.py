@@ -10,9 +10,10 @@ Wire obligations (spec §5/§6, anthropic_messages row):
 - Reasoning: the row's reasoning map value is a self-describing wire fragment
   (anthropic rows: ``{"output_config": {"effort": "<level>"}}``) merged
   verbatim into the request — the engine carries no per-provider shape
-  knowledge. ``native_reasoning`` records the fragment as compact sorted-keys
-  JSON; a row without a reasoning knob (or an empty fragment) sends nothing
-  and records ``Absent``.
+  knowledge. The shared ``row_reasoning`` owns which levels are expressible and
+  what the row's knob may write; this engine only merges the fragment (one
+  level deep, since ``output_config`` carries both the strict-output format and
+  the effort knob) and stamps the result.
 - Continuations: the prior turn's thinking/redacted_thinking blocks (signatures
   intact) are captured verbatim into ``opaque_payload["blocks"]`` and replayed
   as the LEADING assistant content on the next turn — required for
@@ -43,7 +44,6 @@ Wire obligations (spec §5/§6, anthropic_messages row):
 from __future__ import annotations
 
 import json
-import time
 from base64 import b64encode
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -76,6 +76,16 @@ from anthropic.types import (
 from anthropic.types.output_tokens_details import OutputTokensDetails
 
 from provider_runtime.engines import TransientAttempt
+from provider_runtime.engines._common import (
+    caused_by,
+    int_or_none,
+    monotonic_ms,
+    response_content,
+    retry_after_seconds,
+    row_reasoning,
+    str_or_none,
+    validate_continuation,
+)
 from provider_runtime.errors import (
     CredentialRejected,
     InvalidRequest,
@@ -115,15 +125,12 @@ from provider_runtime.types import (
     ProviderStreamInterrupted,
     ProviderTimeout,
     Refused,
-    ResponseContent,
     ResponsePayload,
     StreamStart,
     StrictJsonOutput,
-    StructuredContent,
     Succeeded,
     SystemMessage,
     TerminalEvent,
-    TextContent,
     TextDelta,
     TextOutput,
     TokenUsage,
@@ -140,8 +147,8 @@ from provider_runtime.types import (
 
 # Request-body keys this engine owns — mapped from core intent fields, or
 # engine-inferred (cache_control, spec §5: no caller annotation). These plus
-# the row's reasoning-fragment top-level keys form the provider_options
-# collision set: naming one is an override, not an extension.
+# every top-level key the row's reasoning knob can write form the
+# provider_options collision set: naming one is an override, not an extension.
 _OWNED_OPTION_KEYS: Final[frozenset[str]] = frozenset(
     {
         "model",
@@ -159,23 +166,16 @@ _OWNED_OPTION_KEYS: Final[frozenset[str]] = frozenset(
 # Blocks that cannot carry cache_control on this wire.
 _UNCACHEABLE_BLOCK_TYPES: Final[frozenset[str]] = frozenset({"thinking", "redacted_thinking"})
 
+# Anthropic proper's host — the SDK's own hardcoded default, pinned by this
+# engine whenever row.base_url is Absent: anthropic 0.121 `_client.py` resolves
+# an omitted base_url from ANTHROPIC_BASE_URL *before* falling back to this
+# same string, so leaving it unset would let the environment reroute a call.
+_CANONICAL_BASE_URL: Final[str] = "https://api.anthropic.com"
+
 _SUCCESS_STOP_REASONS: Final[frozenset[str]] = frozenset({"end_turn", "tool_use", "stop_sequence"})
 # 5xx-shaped in-band stream error types (overloaded_error ≙ 529); everything
 # else in an error event is a ProtocolDefect.
 _TRANSIENT_STREAM_ERROR_TYPES: Final[frozenset[str]] = frozenset({"overloaded_error", "api_error"})
-
-
-def _monotonic_ms() -> int:
-    return int(time.monotonic() * 1000)
-
-
-def _int_or_none(value: object) -> int | None:
-    # bool is an int subclass; token counts are never booleans.
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def _str_or_none(value: object) -> str | None:
-    return value if isinstance(value, str) else None
 
 
 # ---------------------------------------------------------------------------
@@ -189,43 +189,9 @@ class _EncodedRequest:
     native_reasoning: Presence[str]
 
 
-def _reasoning_fragment(
-    row: ModelRow, intent: GenerateIntent
-) -> tuple[dict[str, Any], Presence[str]]:
-    """The row's self-describing reasoning wire fragment for the intent level,
-    plus its ``native_reasoning`` stamp (compact sorted-keys JSON; Absent when
-    nothing is sent)."""
-    match row.reasoning:
-        case Present(value=levels):
-            if intent.reasoning not in levels:
-                raise InvalidRequest(
-                    message=f"reasoning level {intent.reasoning!r} is not declared for {row.ref!r}"
-                )
-            value = levels[intent.reasoning]
-            if not isinstance(value, Mapping):
-                raise RuntimeDefect(
-                    origin="intent",
-                    code="registry_invalid",
-                    message=f"row {row.ref!r}: reasoning values must be request-fragment mappings",
-                )
-            fragment: dict[str, Any] = dict(value)
-            if not fragment:
-                return {}, Absent()
-            return fragment, Present(json.dumps(fragment, sort_keys=True, separators=(",", ":")))
-        case Absent():
-            if intent.reasoning != "none":
-                raise InvalidRequest(
-                    message=f"row {row.ref!r} has no reasoning knob; "
-                    f"level {intent.reasoning!r} is not expressible"
-                )
-            return {}, Absent()
-        case _:
-            assert_never(row.reasoning)
-
-
 def _encode_request(row: ModelRow, intent: GenerateIntent) -> _EncodedRequest:
-    fragment, native_reasoning = _reasoning_fragment(row, intent)
-    collisions = sorted((_OWNED_OPTION_KEYS | fragment.keys()) & set(intent.provider_options))
+    reasoning = row_reasoning(row, intent)
+    collisions = sorted((_OWNED_OPTION_KEYS | reasoning.owned_keys) & set(intent.provider_options))
     if collisions:
         raise InvalidRequest(
             message=f"provider_options keys {collisions!r} collide with engine-mapped request fields"
@@ -268,7 +234,7 @@ def _encode_request(row: ModelRow, intent: GenerateIntent) -> _EncodedRequest:
     # same top-level key (output_config carries both the strict-output format
     # and the effort knob), the two mappings merge one level deep — still with
     # zero knowledge of the fragment's shape.
-    for key, value in fragment.items():
+    for key, value in reasoning.fragment.items():
         existing = params.get(key)
         params[key] = (
             {**existing, **value}
@@ -277,7 +243,7 @@ def _encode_request(row: ModelRow, intent: GenerateIntent) -> _EncodedRequest:
         )
     if intent.provider_options:
         params["extra_body"] = dict(intent.provider_options)
-    return _EncodedRequest(params=params, native_reasoning=native_reasoning)
+    return _EncodedRequest(params=params, native_reasoning=reasoning.native_reasoning)
 
 
 def _encode_messages(
@@ -377,7 +343,7 @@ def _assistant_content(
     content: list[dict[str, object]] = []
     match message.continuation:
         case Present(value=artifact):
-            _validate_continuation(artifact, row, intent)
+            validate_continuation(artifact, row, intent)
             # Thinking/redacted_thinking blocks lead the assistant turn VERBATIM.
             content.extend(_continuation_blocks(artifact))
         case Absent():
@@ -398,20 +364,6 @@ def _assistant_content(
             "or tool calls to encode"
         )
     return content
-
-
-def _validate_continuation(
-    artifact: ContinuationArtifact, row: ModelRow, intent: GenerateIntent
-) -> None:
-    if artifact.target != intent.target or artifact.codec_id != row.continuation_codec:
-        raise InvalidRequest(
-            message=(
-                f"continuation artifact for {artifact.target.provider}/{artifact.target.model} "
-                f"(codec {artifact.codec_id!r}) cannot replay to "
-                f"{intent.target.provider}/{intent.target.model} "
-                f"(codec {row.continuation_codec!r})"
-            )
-        )
 
 
 def _continuation_blocks(artifact: ContinuationArtifact) -> list[dict[str, object]]:
@@ -456,7 +408,7 @@ def _meta(
                 signal=FinalAttempt(),
                 status_code=status_code,
                 started_at_ms=started_ms,
-                ended_at_ms=_monotonic_ms(),
+                ended_at_ms=monotonic_ms(),
             ),
         ),
         billability=billability,
@@ -478,10 +430,10 @@ def _refusal_billability(usage: Presence[TokenUsage]) -> Billability:
 
 def _refusal_detail(details: object) -> str:
     if isinstance(details, RefusalStopDetails):
-        explanation = _str_or_none(details.explanation)
+        explanation = str_or_none(details.explanation)
         if explanation:
             return sanitize_provider_text(explanation)
-        category = _str_or_none(details.category)
+        category = str_or_none(details.category)
         if category:
             return sanitize_provider_text(f"refusal category: {category}")
     return "provider refusal"
@@ -502,13 +454,13 @@ def _terminal_http_failure(error: anthropic.APIStatusError) -> ProviderContextTo
     body = dict(error.body) if isinstance(error.body, Mapping) else None
     inner = body.get("error") if body else None
     message = (
-        (_str_or_none(inner.get("message")) or "").lower() if isinstance(inner, Mapping) else ""
+        (str_or_none(inner.get("message")) or "").lower() if isinstance(inner, Mapping) else ""
     )
     snippet = safe_provider_error_body_snippet(body) or f"HTTP {status}"
 
     if status == 429:
         raise TransientAttempt(
-            cause=ProviderRateLimit(retry_after=_retry_after_seconds(error.response.headers)),
+            cause=ProviderRateLimit(retry_after=retry_after_seconds(error.response.headers)),
             status_code=Present(status),
             provider_request_id=presence_of(error.request_id),
             billability=PossiblyBillable(),
@@ -545,11 +497,16 @@ def _terminal_http_failure(error: anthropic.APIStatusError) -> ProviderContextTo
 
 def _transient_connection(error: anthropic.APIConnectionError) -> TransientAttempt:
     if isinstance(error, anthropic.APITimeoutError):
+        # The SDK collapses every httpx timeout into one type; only the cause
+        # says which. A connect timeout is a pure pre-connect failure — the
+        # handshake never completed, so no request bytes reached the provider.
         return TransientAttempt(
             cause=ProviderTimeout(),
             status_code=Absent(),
             provider_request_id=Absent(),
-            billability=PossiblyBillable(),
+            billability=(
+                NotDispatched() if caused_by(error, httpx.ConnectTimeout) else PossiblyBillable()
+            ),
         )
     # A pure pre-connect failure means no bytes reached the provider; every
     # other transport error implies the connection was at least opened.
@@ -562,17 +519,6 @@ def _transient_connection(error: anthropic.APIConnectionError) -> TransientAttem
         provider_request_id=Absent(),
         billability=billability,
     )
-
-
-def _retry_after_seconds(headers: httpx.Headers) -> Presence[float]:
-    raw = headers.get("retry-after")
-    if raw is None:
-        return Absent()
-    try:
-        seconds = float(raw)
-    except ValueError:
-        return Absent()
-    return Present(seconds) if seconds >= 0 else Absent()
 
 
 def _raise_inband_stream_error(
@@ -622,8 +568,8 @@ class _UsageFold:
         to the cache-INCLUSIVE TokenUsage.input_tokens invariant at ingress."""
         if self.input_tokens is None or self.output_tokens is None:
             return Absent()
-        return Present(
-            TokenUsage.from_components(
+        try:
+            usage = TokenUsage.from_components(
                 input_tokens=self.input_tokens + (self.cache_read or 0) + (self.cache_write or 0),
                 output_tokens=self.output_tokens,
                 total_tokens=Absent(),
@@ -631,11 +577,16 @@ class _UsageFold:
                 cache_read_input_tokens=presence_of(self.cache_read),
                 cache_write_input_tokens=presence_of(self.cache_write),
             )
-        )
+        except ValueError as error:
+            raise ProtocolDefect(
+                code="malformed_usage",
+                message=f"anthropic usage is not valid token accounting: {error}",
+            ) from error
+        return Present(usage)
 
 
 def _fold(current: int | None, incoming: object) -> int | None:
-    value = _int_or_none(incoming)
+    value = int_or_none(incoming)
     return value if value is not None else current
 
 
@@ -658,8 +609,8 @@ def _continuation_of(
 
 
 def _tool_call_of(block: ToolUseBlock) -> ToolCall | InvalidToolArguments:
-    call_id = _str_or_none(block.id) or ""
-    name = _str_or_none(block.name) or ""
+    call_id = str_or_none(block.id) or ""
+    name = str_or_none(block.name) or ""
     arguments = block.input
     if not isinstance(arguments, Mapping):
         return InvalidToolArguments(
@@ -667,31 +618,6 @@ def _tool_call_of(block: ToolUseBlock) -> ToolCall | InvalidToolArguments:
             f"is not a JSON object"
         )
     return ToolCall(id=call_id, name=name, arguments=dict(arguments))
-
-
-def _content_of(
-    intent: GenerateIntent, *, text: str, tool_calls: tuple[ToolCall, ...]
-) -> ResponseContent | InvalidStructuredOutput:
-    """The output arm is the intent's OutputSpec, never re-inferred."""
-    match intent.output:
-        case TextOutput():
-            return TextContent(text=text, tool_calls=tool_calls)
-        case StrictJsonOutput():
-            try:
-                payload = json.loads(text)
-            except json.JSONDecodeError as error:
-                return InvalidStructuredOutput(
-                    safe_detail=f"structured output is not valid JSON "
-                    f"({error.msg} at char {error.pos})"
-                )
-            if not isinstance(payload, dict):
-                return InvalidStructuredOutput(
-                    safe_detail=f"structured output parsed to {type(payload).__name__}, "
-                    f"not a JSON object"
-                )
-            return StructuredContent(payload=payload, text=text)
-        case _:
-            assert_never(intent.output)
 
 
 def _decode_response(
@@ -710,12 +636,12 @@ def _decode_response(
             code="unparseable_response",
             message="anthropic response body is not a JSON message envelope",
         )
-    model = _str_or_none(message.model)
+    model = str_or_none(message.model)
     if model is None:
         raise ProtocolDefect(
             code="missing_model", message="anthropic response envelope is missing 'model'"
         )
-    request_id = _str_or_none(message._request_id) or _str_or_none(message.id)
+    request_id = str_or_none(message._request_id) or str_or_none(message.id)
     fold = _UsageFold()
     if isinstance(message.usage, Usage):
         fold.absorb(message.usage)
@@ -776,7 +702,7 @@ def _decode_response(
     thinking_blocks: list[Mapping[str, object]] = []
     for block in message.content:
         if isinstance(block, TextBlock):
-            text_parts.append(_str_or_none(block.text) or "")
+            text_parts.append(str_or_none(block.text) or "")
         elif isinstance(block, ToolUseBlock):
             parsed = _tool_call_of(block)
             if isinstance(parsed, InvalidToolArguments):
@@ -794,7 +720,7 @@ def _decode_response(
                 f"{getattr(block, 'type', None)!r}",
             )
 
-    content = _content_of(intent, text="".join(text_parts), tool_calls=tuple(tool_calls))
+    content = response_content(intent, text="".join(text_parts), tool_calls=tuple(tool_calls))
     if isinstance(content, InvalidStructuredOutput):
         return Failed(meta=meta, failure=content)
     continuation = _continuation_of(row, intent, thinking_blocks)
@@ -834,7 +760,7 @@ class _StreamState:
 
 
 def _require_index(value: object) -> int:
-    index = _int_or_none(value)
+    index = int_or_none(value)
     if index is None:
         raise ProtocolDefect(
             code="malformed_stream_event",
@@ -851,8 +777,8 @@ def _start_content_block(
     if isinstance(block, TextBlock):
         return None
     if isinstance(block, ToolUseBlock):
-        call_id = _str_or_none(block.id) or ""
-        name = _str_or_none(block.name) or ""
+        call_id = str_or_none(block.id) or ""
+        name = str_or_none(block.name) or ""
         state.open_tools[index] = _OpenToolCall(call_id=call_id, name=name)
         return ToolCallStart(call_id=call_id, name=name)
     if isinstance(block, ThinkingBlock | RedactedThinkingBlock):
@@ -870,7 +796,7 @@ def _absorb_delta(
     index = _require_index(frame.index)
     delta = frame.delta
     if isinstance(delta, NativeTextDelta):
-        text = _str_or_none(delta.text) or ""
+        text = str_or_none(delta.text) or ""
         state.text_parts.append(text)
         return TextDelta(text=text) if text else None
     if isinstance(delta, InputJSONDelta):
@@ -880,7 +806,7 @@ def _absorb_delta(
                 code="malformed_stream_event",
                 message="anthropic input_json_delta arrived for an unknown tool block",
             )
-        partial = _str_or_none(delta.partial_json) or ""
+        partial = str_or_none(delta.partial_json) or ""
         open_tool.arguments += partial
         return (
             ToolCallDelta(call_id=open_tool.call_id, arguments_delta=partial) if partial else None
@@ -898,9 +824,7 @@ def _absorb_delta(
             else ("signature", delta.signature)
         )
         existing = block.get(key)
-        block[key] = (existing if isinstance(existing, str) else "") + (
-            _str_or_none(fragment) or ""
-        )
+        block[key] = (existing if isinstance(existing, str) else "") + (str_or_none(fragment) or "")
         return None
     raise ProtocolDefect(
         code="malformed_stream_event",
@@ -1007,7 +931,7 @@ def _terminal_events(
             message=f"anthropic stream carried unknown stop_reason {state.stop_reason!r}",
         )
 
-    content = _content_of(
+    content = response_content(
         intent, text="".join(state.text_parts), tool_calls=tuple(state.tool_calls)
     )
     if isinstance(content, InvalidStructuredOutput):
@@ -1049,20 +973,44 @@ class AnthropicMessagesEngine:
     def _client_for(
         self, row: ModelRow, credential: ProviderCredential
     ) -> anthropic.AsyncAnthropic:
-        base_url = row.base_url.value if isinstance(row.base_url, Present) else None
-        return anthropic.AsyncAnthropic(
+        """An AsyncAnthropic that dispatches on the row and the credential and
+        nothing ambient.
+
+        The SDK constructor (anthropic 0.121, `_client.py`) reads three request-
+        shaping environment variables. ANTHROPIC_BASE_URL wins over the SDK's
+        own default whenever `base_url` is omitted — pinning the host closes
+        that. ANTHROPIC_AUTH_TOKEN (and, behind it, profile/federation
+        credential discovery on disk) is read only when NO explicit credential
+        argument was passed, so the `api_key=` below already forecloses it.
+        ANTHROPIC_CUSTOM_HEADERS is parsed into the client's default headers
+        unconditionally — that parse merges *under* any `default_headers`
+        argument, so no constructor argument suppresses it; the read lands on
+        exactly `_custom_headers`, and clearing it is the suppression.
+        (ANTHROPIC_WEBHOOK_SIGNING_KEY is read too, but only the webhooks
+        resource consumes it — it never touches a Messages request.)
+        """
+        match row.base_url:
+            case Present(value=base_url):
+                pass
+            case Absent():
+                base_url = _CANONICAL_BASE_URL
+            case _:
+                assert_never(row.base_url)
+        client = anthropic.AsyncAnthropic(
             api_key=credential.key,
             base_url=base_url,
             timeout=self._timeout_s,
             max_retries=0,
             http_client=self._http_client,
         )
+        client._custom_headers = {}
+        return client
 
     async def generate(
         self, row: ModelRow, intent: GenerateIntent, credential: ProviderCredential
     ) -> CallOutcome:
         encoded = _encode_request(row, intent)
-        started_ms = _monotonic_ms()
+        started_ms = monotonic_ms()
         client = self._client_for(row, credential)
         try:
             try:
@@ -1099,7 +1047,7 @@ class AnthropicMessagesEngine:
         self, row: ModelRow, intent: GenerateIntent, credential: ProviderCredential
     ) -> AsyncIterator[CodecStreamEvent]:
         encoded = _encode_request(row, intent)
-        started_ms = _monotonic_ms()
+        started_ms = monotonic_ms()
         client = self._client_for(row, credential)
         events: anthropic.AsyncStream[Any] | None = None
         try:
@@ -1127,15 +1075,15 @@ class AnthropicMessagesEngine:
                 raise _transient_connection(error) from error
 
             status_code = events.response.status_code
-            state = _StreamState(request_id=_str_or_none(events.response.headers.get("request-id")))
+            state = _StreamState(request_id=str_or_none(events.response.headers.get("request-id")))
             yield StreamStart()
             try:
                 async for raw in events:
                     if isinstance(raw, RawMessageStartEvent):
                         message = raw.message
                         if isinstance(message, Message):
-                            state.model = _str_or_none(message.model) or state.model
-                            state.in_band_id = _str_or_none(message.id)
+                            state.model = str_or_none(message.model) or state.model
+                            state.in_band_id = str_or_none(message.id)
                             if isinstance(message.usage, Usage):
                                 state.usage.absorb(message.usage)
                     elif isinstance(raw, RawContentBlockStartEvent):

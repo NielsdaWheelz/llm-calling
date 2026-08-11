@@ -20,7 +20,18 @@ from provider_runtime.errors import sanitize_provider_text
 from provider_runtime.types import Absent, Presence, Present, TokenUsage
 
 from ._claude_launcher import OwnedProcessGroup, ensure_claude_launcher
-from ._limits import OutputLimitExceeded, bounded_payload_size
+from ._limits import (
+    _MAX_DIAGNOSTICS,
+    _MAX_EVENT_COUNT,
+    _MAX_EVENT_TEXT_BYTES,
+    _MAX_FINAL_TEXT_BYTES,
+    _MAX_MESSAGE_BYTES,
+    _MAX_MESSAGE_ITEMS,
+    _MAX_TURN_OUTPUT_BYTES,
+    _OPERATION_TIMEOUT_SECONDS,
+    OutputLimitExceeded,
+    bounded_payload_size,
+)
 from ._process import ProcessLimits, capture_process_output
 from ._sandbox import bubblewrap_network_namespace_available, environment_executable
 from ._structured_output import (
@@ -171,15 +182,7 @@ _QUOTA_ASSISTANT_ERROR = "rate_limit"
 _QUOTA_RATE_LIMIT_STATUS = "rejected"
 _PROCESS_LIMITS = ProcessLimits(max_stderr_bytes=64 * 1024, termination_grace_seconds=0.25)
 _DISCONNECT_TIMEOUT_SECONDS = 25.0
-_OPERATION_TIMEOUT_SECONDS = 30.0
-_MAX_EVENT_COUNT = 100_000
 _MAX_IDENTITY_MESSAGES = 64
-_MAX_MESSAGE_BYTES = 4 * 1024 * 1024
-_MAX_MESSAGE_ITEMS = 100_000
-_MAX_TURN_OUTPUT_BYTES = 64 * 1024 * 1024
-_MAX_EVENT_TEXT_BYTES = 4 * 1024 * 1024
-_MAX_FINAL_TEXT_BYTES = 16 * 1024 * 1024
-_MAX_DIAGNOSTICS = 256
 _SUPPORTED_SDK_VERSION = "0.2.130"
 
 

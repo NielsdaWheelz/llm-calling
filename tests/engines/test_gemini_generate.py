@@ -20,6 +20,7 @@ import json
 import traceback
 from base64 import b64encode
 from collections.abc import Mapping
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -85,14 +86,13 @@ from provider_runtime.types import (
 
 # Reasoning map values are self-describing wire fragments (real shapes only):
 # GenerateContent config params merged verbatim. Gemini 3+ rows carry
-# thinking_config.thinking_level; 2.5-era rows carry thinking_budget; "none"
-# maps to an empty fragment (nothing sent).
+# thinking_config.thinking_level; 2.5-era rows carry thinking_budget. Neither
+# generation can switch thinking off, so no row declares "none".
 LEVEL_REASONING: Mapping[ReasoningLevel, object] = {
     "low": {"thinking_config": {"thinking_level": "LOW"}},
     "high": {"thinking_config": {"thinking_level": "HIGH"}},
 }
 BUDGET_REASONING: Mapping[ReasoningLevel, object] = {
-    "none": {},
     "high": {"thinking_config": {"thinking_budget": 24576}},
 }
 
@@ -331,20 +331,43 @@ async def test_thinking_budget_row_sends_budget_and_reports_native_reasoning(
 
 
 @respx.mock
-async def test_reasoning_none_with_empty_params_sends_no_thinking_config(
+async def test_reasoning_none_on_a_row_declaring_no_none_sends_no_thinking_config(
     engine: GeminiGenerateEngine,
 ) -> None:
+    """spec §14: "none" is the facade default, so it is callable on every row —
+    a row that declares no "none" level sends no thinking config and lets the
+    provider's own default apply. No gemini row can switch thinking off, so
+    every gemini row with a knob is exactly this shape."""
+    assert "none" not in BUDGET_REASONING, "fixture premise: the row declares no 'none' level"
     route = mock_generate(BUDGET_ROW, response_body(model_version="gemini-2.5-flash"))
     outcome = await engine.generate(
         BUDGET_ROW, intent_for(BUDGET_ROW, reasoning="none"), CREDENTIAL
     )
     config = last_request_json(route)["generationConfig"]
     assert isinstance(config, dict)
-    assert "thinkingConfig" not in config, f"'none' maps to an empty fragment; config: {config}"
+    assert "thinkingConfig" not in config, f"nothing may be sent; config: {config}"
     assert isinstance(outcome, Succeeded)
     assert outcome.meta.native_reasoning == Absent(), (
         f"nothing was sent, so native_reasoning must be Absent, got {outcome.meta.native_reasoning}"
     )
+
+
+@respx.mock
+async def test_reasoning_none_still_owns_the_rows_knob_keys(
+    engine: GeminiGenerateEngine,
+) -> None:
+    """Sending nothing does not hand the caller the row's knob: the collision
+    set spans every declared level, in both casings, whatever level is chosen."""
+    with pytest.raises(InvalidRequest, match="thinkingConfig"):
+        await engine.generate(
+            BUDGET_ROW,
+            intent_for(
+                BUDGET_ROW,
+                reasoning="none",
+                provider_options={"thinkingConfig": {"thinking_budget": 0}},
+            ),
+            CREDENTIAL,
+        )
 
 
 async def test_reasoning_level_outside_row_mapping_raises_invalid_request(
@@ -352,6 +375,18 @@ async def test_reasoning_level_outside_row_mapping_raises_invalid_request(
 ) -> None:
     with pytest.raises(InvalidRequest, match="minimal"):
         await engine.generate(LEVEL_ROW, intent_for(LEVEL_ROW, reasoning="minimal"), CREDENTIAL)
+
+
+async def test_reasoning_fragment_that_is_not_config_is_a_registry_defect(
+    engine: GeminiGenerateEngine,
+) -> None:
+    """The fragment is validated ALONE so a bad row defects as registry_invalid
+    — not as an InvalidRequest blaming the caller's provider_options at the
+    merged validation."""
+    row = replace(LEVEL_ROW, reasoning=Present({"high": {"not_a_config_field": 1}}))
+    with pytest.raises(RuntimeDefect, match="reasoning fragment") as excinfo:
+        await engine.generate(row, intent_for(row, reasoning="high"), CREDENTIAL)
+    assert excinfo.value.code == "registry_invalid", f"got {excinfo.value.code}"
 
 
 async def test_reasoning_on_knobless_row_raises_invalid_request(
@@ -666,6 +701,20 @@ async def test_provider_options_owned_key_collision_raises_invalid_request(
         )
 
 
+async def test_provider_options_camel_alias_of_fragment_key_collides(
+    engine: GeminiGenerateEngine,
+) -> None:
+    # A VALID thinkingConfig value: without the camelCase alias in the owned
+    # set this sails past the collision check and overrides the row's reasoning
+    # fragment on the wire.
+    with pytest.raises(InvalidRequest, match="collides"):
+        await engine.generate(
+            LEVEL_ROW,
+            intent_for(LEVEL_ROW, provider_options={"thinkingConfig": {"thinking_level": "LOW"}}),
+            CREDENTIAL,
+        )
+
+
 async def test_provider_options_unknown_config_field_raises_invalid_request(
     engine: GeminiGenerateEngine,
 ) -> None:
@@ -840,6 +889,18 @@ async def test_missing_candidates_without_feedback_raises_protocol_defect(
 async def test_missing_finish_reason_raises_protocol_defect(engine: GeminiGenerateEngine) -> None:
     mock_generate(LEVEL_ROW, response_body(finish_reason=None))
     with pytest.raises(ProtocolDefect, match="finishReason"):
+        await engine.generate(LEVEL_ROW, intent_for(LEVEL_ROW), CREDENTIAL)
+
+
+@respx.mock
+async def test_negative_usage_count_raises_protocol_defect(engine: GeminiGenerateEngine) -> None:
+    # Well-typed counts that violate TokenUsage's own accounting invariant:
+    # the ValueError is a malformed 2xx envelope, not an engine crash.
+    mock_generate(
+        LEVEL_ROW,
+        response_body(usage={"promptTokenCount": -5, "candidatesTokenCount": 20}),
+    )
+    with pytest.raises(ProtocolDefect, match="token accounting"):
         await engine.generate(LEVEL_ROW, intent_for(LEVEL_ROW), CREDENTIAL)
 
 

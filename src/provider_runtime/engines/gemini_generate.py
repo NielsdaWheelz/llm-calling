@@ -9,12 +9,14 @@ malformed envelopes raise `ProtocolDefect`; 401/403 raises `CredentialRejected`.
 Engine decisions (wire-observable):
 
 - Reasoning: `row.reasoning[level]` is a self-describing wire fragment — a
-  mapping of GenerateContent config params merged verbatim into the request
-  ({} = nothing sent). The ROW decides the shape (Gemini 3+ rows carry
+  mapping of GenerateContent config params merged verbatim into the request.
+  The ROW decides the shape (Gemini 3+ rows carry
   `thinking_config.thinking_level`, 2.5-era rows `thinking_budget`); the
-  engine never hardcodes model generations. Fragment top-level keys join the
-  provider_options collision set; `native_reasoning` records the fragment as
-  compact sorted-keys JSON.
+  engine never hardcodes model generations. The shared `row_reasoning` owns
+  which levels are expressible and which keys join the provider_options
+  collision set — in BOTH casings the SDK accepts, which is this engine's own
+  addition. The one gemini-specific check is that the fragment validates as
+  GenerateContent config on its own.
 - Continuation: a Succeeded turn with functionCall parts or thoughtSignatures
   yields an artifact whose payload is `{"parts": <candidate parts verbatim>}`
   (json-mode dumps: camelCase keys, signatures as base64 — the wire shape).
@@ -53,7 +55,6 @@ Engine decisions (wire-observable):
 from __future__ import annotations
 
 import json
-import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Final, assert_never
@@ -65,6 +66,15 @@ from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 
 from provider_runtime.engines import TransientAttempt
+from provider_runtime.engines._common import (
+    RowReasoning,
+    monotonic_ms,
+    registry_invalid,
+    response_content,
+    retry_after_seconds,
+    row_reasoning,
+    validate_continuation,
+)
 from provider_runtime.errors import (
     CredentialRejected,
     InvalidRequest,
@@ -101,15 +111,12 @@ from provider_runtime.types import (
     ProviderRateLimit,
     ProviderStreamInterrupted,
     ProviderTimeout,
-    ResponseContent,
     ResponsePayload,
     StreamStart,
     StrictJsonOutput,
-    StructuredContent,
     Succeeded,
     SystemMessage,
     TerminalEvent,
-    TextContent,
     TextDelta,
     TextOutput,
     TokenUsage,
@@ -127,8 +134,8 @@ from provider_runtime.types import (
 # wire effect the decode contract forecloses (candidate_count: only
 # candidates[0] is decoded, so a caller-requested N would be silently
 # discarded). Both casings the SDK accepts; a provider_options key in this
-# set — or among the row's reasoning-fragment keys, added per call — is an
-# override, not an extension → InvalidRequest.
+# set — or among the keys the row's reasoning knob can write, added per call —
+# is an override, not an extension → InvalidRequest.
 _OWNED_KEYS: Final[frozenset[str]] = frozenset(
     {
         "system_instruction",
@@ -166,16 +173,6 @@ _CONTENT_FILTER_FINISH_REASONS: Final = frozenset(
 _CANONICAL_BASE_URL: Final = "https://generativelanguage.googleapis.com/"
 
 
-def _monotonic_ms() -> int:
-    return int(time.monotonic() * 1000)
-
-
-def _registry_invalid(row: ModelRow, detail: str) -> RuntimeDefect:
-    return RuntimeDefect(
-        origin="intent", code="registry_invalid", message=f"row {row.ref!r}: {detail}"
-    )
-
-
 # ---------------------------------------------------------------------------
 # Encode — intent + row → typed SDK contents and config. The SDK serializes;
 # every content is validated into a `Content` here so a validation failure
@@ -189,8 +186,14 @@ class _Encoded:
     native_reasoning: Presence[str]
 
 
+def _camel(key: str) -> str:
+    """The snake_case config key spelled the way the SDK also accepts it."""
+    head, *tail = key.split("_")
+    return head + "".join(word.capitalize() for word in tail)
+
+
 def _encode(row: ModelRow, intent: GenerateIntent) -> _Encoded:
-    fragment, native_reasoning = _reasoning_fragment(row, intent)
+    reasoning = _row_reasoning(row, intent)
     system_parts, contents = _encode_contents(row, intent)
     config: dict[str, object] = {
         "max_output_tokens": intent.max_output_tokens,
@@ -198,7 +201,7 @@ def _encode(row: ModelRow, intent: GenerateIntent) -> _Encoded:
         # contract holds.
         "automatic_function_calling": {"disable": True},
     }
-    config.update(fragment)
+    config.update(reasoning.fragment)
     if system_parts:
         config["system_instruction"] = {"parts": system_parts}
     if intent.tools:
@@ -239,7 +242,10 @@ def _encode(row: ModelRow, intent: GenerateIntent) -> _Encoded:
                     assert_never(row.structured)
         case _:
             assert_never(intent.output)
-    owned = _OWNED_KEYS | fragment.keys()
+    # The row's knob keys join the owned set in BOTH casings the SDK accepts,
+    # so a camelCase spelling of a snake_case fragment key is caught here as
+    # the override it is, not later as an opaque SDK validation error.
+    owned = _OWNED_KEYS | {alias for key in reasoning.owned_keys for alias in (key, _camel(key))}
     for key in intent.provider_options:
         if key in owned:
             raise InvalidRequest(
@@ -256,42 +262,23 @@ def _encode(row: ModelRow, intent: GenerateIntent) -> _Encoded:
             message=f"provider_options keys {sorted(intent.provider_options)} do not "
             f"validate as GenerateContent config fields"
         ) from None
-    return _Encoded(contents=contents, config=validated, native_reasoning=native_reasoning)
+    return _Encoded(
+        contents=contents, config=validated, native_reasoning=reasoning.native_reasoning
+    )
 
 
-def _reasoning_fragment(
-    row: ModelRow, intent: GenerateIntent
-) -> tuple[Mapping[str, object], Presence[str]]:
-    match row.reasoning:
-        case Absent():
-            if intent.reasoning != "none":
-                raise InvalidRequest(
-                    message=f"row {row.ref!r} has no reasoning knob; "
-                    f"level {intent.reasoning!r} is not expressible"
-                )
-            return {}, Absent()
-        case Present(value=levels):
-            if intent.reasoning not in levels:
-                raise InvalidRequest(
-                    message=f"reasoning level {intent.reasoning!r} is outside the levels "
-                    f"row {row.ref!r} supports"
-                )
-            fragment = levels[intent.reasoning]
-        case _:
-            assert_never(row.reasoning)
-    if not isinstance(fragment, Mapping):
-        raise _registry_invalid(row, "gemini reasoning values must be config-fragment mappings")
-    if not fragment:
-        return {}, Absent()
+def _row_reasoning(row: ModelRow, intent: GenerateIntent) -> RowReasoning:
+    """The shared row knob plus the one gemini-specific check: the fragment is
+    validated ALONE, so a bad row defects as registry_invalid instead of
+    blaming the caller's provider_options at the merged validation."""
+    reasoning = row_reasoning(row, intent)
     try:
-        # Validated alone so a bad row defects as registry_invalid instead of
-        # blaming the caller's provider_options at the merged validation.
-        genai_types.GenerateContentConfig.model_validate(dict(fragment))
+        genai_types.GenerateContentConfig.model_validate(dict(reasoning.fragment))
     except pydantic.ValidationError:
-        raise _registry_invalid(
+        raise registry_invalid(
             row, "gemini reasoning fragment does not validate as GenerateContent config fields"
         ) from None
-    return fragment, Present(json.dumps(dict(fragment), sort_keys=True, separators=(",", ":")))
+    return reasoning
 
 
 def _encode_contents(
@@ -391,12 +378,7 @@ def _assistant_content(
 def _replay_content(
     artifact: ContinuationArtifact, row: ModelRow, intent: GenerateIntent
 ) -> genai_types.Content:
-    if artifact.target != intent.target or artifact.codec_id != row.continuation_codec:
-        raise InvalidRequest(
-            message=f"continuation artifact for {artifact.target.provider}/"
-            f"{artifact.target.model} (codec {artifact.codec_id!r}) cannot replay to "
-            f"{intent.target.provider}/{intent.target.model} (codec {row.continuation_codec!r})"
-        )
+    validate_continuation(artifact, row, intent)
     parts = artifact.opaque_payload.get("parts")
     if not isinstance(parts, Sequence) or isinstance(parts, str | bytes):
         raise InvalidRequest(
@@ -441,8 +423,8 @@ class _UsageFold:
             return Absent()
         # promptTokenCount is already cache-inclusive on this wire; the
         # provider-reported total is authoritative.
-        return Present(
-            TokenUsage.from_components(
+        try:
+            usage = TokenUsage.from_components(
                 input_tokens=self.prompt or 0,
                 output_tokens=self.candidates or 0,
                 total_tokens=presence_of(self.total),
@@ -450,7 +432,12 @@ class _UsageFold:
                 cache_read_input_tokens=presence_of(self.cached),
                 cache_write_input_tokens=Absent(),  # implicit caching bills no writes
             )
-        )
+        except ValueError as error:
+            raise ProtocolDefect(
+                code="malformed_usage",
+                message=f"gemini usage is not valid token accounting: {error}",
+            ) from error
+        return Present(usage)
 
 
 def _usage_presence(
@@ -499,29 +486,6 @@ def _decode_parts(
         elif part.text is not None:
             text_segments.append(part.text)
     return "".join(text_segments), tuple(calls), dumped
-
-
-def _response_content(
-    intent: GenerateIntent, text: str, tool_calls: tuple[ToolCall, ...]
-) -> ResponseContent | InvalidStructuredOutput:
-    match intent.output:
-        case TextOutput():
-            return TextContent(text=text, tool_calls=tool_calls)
-        case StrictJsonOutput():
-            try:
-                payload = json.loads(text)
-            except json.JSONDecodeError as exc:
-                return InvalidStructuredOutput(
-                    safe_detail=f"structured output is not valid JSON ({exc.msg} at char {exc.pos})"
-                )
-            if not isinstance(payload, dict):
-                return InvalidStructuredOutput(
-                    safe_detail=f"structured output parsed to {type(payload).__name__}, "
-                    f"not a JSON object"
-                )
-            return StructuredContent(payload=payload, text=text)
-        case _:
-            assert_never(intent.output)
 
 
 def _continuation(
@@ -598,17 +562,11 @@ def _validation_summary(exc: pydantic.ValidationError) -> str:
 
 
 def _retry_after(exc: genai_errors.APIError) -> Presence[float]:
-    """Numeric Retry-After seconds; the HTTP-date form has no consumer → Absent."""
+    # The SDK types `response` loosely enough that a non-httpx object reaches
+    # here; only a real response has headers to read.
     if not isinstance(exc.response, httpx.Response):
         return Absent()
-    value = exc.response.headers.get("retry-after")
-    if value is None:
-        return Absent()
-    try:
-        seconds = float(value)
-    except ValueError:
-        return Absent()
-    return Present(seconds) if seconds >= 0 else Absent()
+    return retry_after_seconds(exc.response.headers)
 
 
 def _classify_api_error(exc: genai_errors.APIError) -> ProviderContextTooLarge:
@@ -738,7 +696,7 @@ class GeminiGenerateEngine:
     ) -> CallOutcome:
         encoded = _encode(row, intent)
         client = self._client(row, credential)
-        started_ms = _monotonic_ms()
+        started_ms = monotonic_ms()
         try:
             try:
                 response = await client.aio.models.generate_content(
@@ -777,7 +735,7 @@ class GeminiGenerateEngine:
     ) -> AsyncIterator[CodecStreamEvent]:
         encoded = _encode(row, intent)
         client = self._client(row, credential)
-        started_ms = _monotonic_ms()
+        started_ms = monotonic_ms()
         try:
             try:
                 chunks = await client.aio.models.generate_content_stream(
@@ -872,7 +830,7 @@ class GeminiGenerateEngine:
                         continue
                     if finish == "STOP":
                         text = "".join(text_segments)
-                        content = _response_content(intent, text, tuple(tool_calls))
+                        content = response_content(intent, text=text, tool_calls=tuple(tool_calls))
                         if isinstance(content, InvalidStructuredOutput):
                             yield TerminalEvent(outcome=Failed(meta=stream_meta(), failure=content))
                             return
@@ -947,7 +905,7 @@ def _meta(
                 signal=FinalAttempt(),
                 status_code=status_code,
                 started_at_ms=started_ms,
-                ended_at_ms=_monotonic_ms(),
+                ended_at_ms=monotonic_ms(),
             ),
         ),
         billability=PossiblyBillable(),
@@ -1010,7 +968,7 @@ def _decode_response(
         )
     if finish != "STOP":
         return _non_stop_outcome(finish, meta)
-    content = _response_content(intent, text, tool_calls)
+    content = response_content(intent, text=text, tool_calls=tool_calls)
     if isinstance(content, InvalidStructuredOutput):
         return Failed(meta=meta, failure=content)
     return Succeeded(

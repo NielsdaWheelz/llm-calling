@@ -35,6 +35,7 @@ from provider_runtime.types import (
     GenerateIntent,
     ImageBlock,
     Incomplete,
+    InvalidStructuredOutput,
     InvalidToolArguments,
     NotDispatched,
     OutputSpec,
@@ -421,18 +422,37 @@ async def test_generate_merges_row_reasoning_fragment_verbatim() -> None:
 
 
 @respx.mock
-async def test_generate_empty_reasoning_fragment_sends_nothing() -> None:
+async def test_generate_reasoning_none_on_a_row_declaring_no_none_sends_nothing() -> None:
+    """spec §14: "none" is the facade default, so it is callable on every row —
+    a row that declares no "none" level sends no reasoning field and lets the
+    provider's own default apply."""
     route = respx.post(RESPONSES_URL).mock(
         return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
     )
-    levels: Mapping[ReasoningLevel, object] = {"none": {}}
+    levels: Mapping[ReasoningLevel, object] = {"low": {"reasoning": {"effort": "low"}}}
     outcome = await OpenAIResponsesEngine().generate(
         replace(ROW, reasoning=Present(levels)), make_intent(reasoning="none"), CREDENTIAL
     )
     assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
     body = request_body(route)
-    assert "reasoning" not in body, f"empty fragment must send nothing; body: {body!r}"
+    assert "reasoning" not in body, f"nothing may be sent; body: {body!r}"
     assert outcome.meta.native_reasoning == Absent(), (
+        f"native_reasoning: {outcome.meta.native_reasoning!r}"
+    )
+
+
+@respx.mock
+async def test_generate_declared_reasoning_none_still_sends_its_fragment() -> None:
+    """A row that DOES declare "none" (openai spells it as an effort) sends it —
+    the level is not special-cased away, only the undeclared case is."""
+    route = respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
+    )
+    outcome = await OpenAIResponsesEngine().generate(ROW, make_intent(reasoning="none"), CREDENTIAL)
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    body = request_body(route)
+    assert body["reasoning"] == {"effort": "none"}, f"body: {body!r}"
+    assert outcome.meta.native_reasoning == Present('{"reasoning":{"effort":"none"}}'), (
         f"native_reasoning: {outcome.meta.native_reasoning!r}"
     )
 
@@ -440,6 +460,20 @@ async def test_generate_empty_reasoning_fragment_sends_nothing() -> None:
 async def test_generate_rejects_non_mapping_reasoning_value_as_registry_defect() -> None:
     levels: Mapping[ReasoningLevel, object] = {"high": "high"}
     with pytest.raises(RuntimeDefect, match="request-fragment mappings") as exc_info:
+        await OpenAIResponsesEngine().generate(
+            replace(ROW, reasoning=Present(levels)), make_intent(), CREDENTIAL
+        )
+    assert exc_info.value.code == "registry_invalid", f"code: {exc_info.value.code!r}"
+
+
+async def test_generate_rejects_reasoning_fragment_colliding_with_an_engine_set_field() -> None:
+    """The fragment is splatted into the params literal: a row naming a field
+    the engine sets itself silently rewrites the call — here `store`, whose
+    `false` is what makes reasoning replay stateless."""
+    levels: Mapping[ReasoningLevel, object] = {
+        "high": {"reasoning": {"effort": "high"}, "store": True}
+    }
+    with pytest.raises(RuntimeDefect, match="'store'") as exc_info:
         await OpenAIResponsesEngine().generate(
             replace(ROW, reasoning=Present(levels)), make_intent(), CREDENTIAL
         )
@@ -874,12 +908,44 @@ async def test_generate_unknown_terminal_status_is_protocol_defect() -> None:
 
 
 @respx.mock
-async def test_generate_strict_json_non_json_text_is_protocol_defect() -> None:
+async def test_generate_strict_json_non_json_text_is_a_failed_value() -> None:
+    """A provider answering a strict-JSON intent with unparseable output is an
+    expected model failure — the leaf exists for exactly this — not a
+    wire-protocol defect."""
     respx.post(RESPONSES_URL).mock(
         return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
     )
-    with pytest.raises(ProtocolDefect, match="not valid JSON"):
-        await OpenAIResponsesEngine().generate(ROW, make_intent(output=VERDICT_OUTPUT), CREDENTIAL)
+    outcome = await OpenAIResponsesEngine().generate(
+        ROW, make_intent(output=VERDICT_OUTPUT), CREDENTIAL
+    )
+    assert isinstance(outcome, Failed), f"outcome: {outcome!r}"
+    assert isinstance(outcome.failure, InvalidStructuredOutput), f"failure: {outcome.failure!r}"
+    assert "not valid JSON" in outcome.failure.safe_detail, (
+        f"safe_detail: {outcome.failure.safe_detail!r}"
+    )
+    assert_meta(outcome)
+
+
+@respx.mock
+async def test_generate_strict_json_non_object_text_is_a_failed_value() -> None:
+    scalar_item: dict[str, object] = {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "[1, 2]", "annotations": []}],
+    }
+    respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[scalar_item], usage=usage_body()))
+    )
+    outcome = await OpenAIResponsesEngine().generate(
+        ROW, make_intent(output=VERDICT_OUTPUT), CREDENTIAL
+    )
+    assert isinstance(outcome, Failed), f"outcome: {outcome!r}"
+    assert isinstance(outcome.failure, InvalidStructuredOutput), f"failure: {outcome.failure!r}"
+    assert "not a JSON object" in outcome.failure.safe_detail, (
+        f"safe_detail: {outcome.failure.safe_detail!r}"
+    )
 
 
 @respx.mock
@@ -990,6 +1056,21 @@ async def test_generate_timeout_raises_transient_timeout() -> None:
         await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
     assert exc_info.value.cause == ProviderTimeout(), f"cause: {exc_info.value.cause!r}"
     assert exc_info.value.billability == PossiblyBillable(), (
+        f"a read timeout happened after the request was on the wire; "
+        f"billability: {exc_info.value.billability!r}"
+    )
+
+
+@respx.mock
+async def test_generate_connect_timeout_is_timeout_not_dispatched() -> None:
+    """The SDK collapses every httpx timeout into APITimeoutError; the cause
+    chain is the only place the pre-connect rule is still readable."""
+    respx.post(RESPONSES_URL).mock(side_effect=httpx.ConnectTimeout("handshake timed out"))
+    with pytest.raises(TransientAttempt) as exc_info:
+        await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert exc_info.value.cause == ProviderTimeout(), f"cause: {exc_info.value.cause!r}"
+    assert exc_info.value.billability == NotDispatched(), (
+        f"the handshake never completed, so no request bytes reached the provider; "
         f"billability: {exc_info.value.billability!r}"
     )
 
@@ -1634,6 +1715,49 @@ async def test_stream_strict_json_terminal_promotes_structured_content() -> None
     assert outcome.response.content == StructuredContent(
         payload={"verdict": "yes"}, text='{"verdict": "yes"}'
     ), f"content: {outcome.response.content!r}"
+
+
+@respx.mock
+async def test_stream_strict_json_non_json_terminal_is_a_failed_value() -> None:
+    """Same conformance on the stream arm: unparseable strict-JSON output ends
+    the envelope as Failed(InvalidStructuredOutput), never a defect — and no
+    ContinuationDelta rides along with a failed terminal."""
+    done_message: dict[str, object] = {
+        "id": "msg_s1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "not json at all", "annotations": []}],
+    }
+    frames: list[dict[str, object]] = [
+        created_frame(),
+        {
+            "type": "response.output_text.delta",
+            "sequence_number": 1,
+            "output_index": 0,
+            "item_id": "msg_s1",
+            "content_index": 0,
+            "logprobs": [],
+            "delta": "not json at all",
+        },
+        {
+            "type": "response.output_item.done",
+            "sequence_number": 2,
+            "output_index": 0,
+            "item": done_message,
+        },
+        completed_frame(output=[done_message], usage=usage_body()),
+    ]
+    respx.post(RESPONSES_URL).mock(return_value=mock_stream(frames))
+    events = await collect_stream(OpenAIResponsesEngine(), make_intent(output=VERDICT_OUTPUT))
+    assert not any(isinstance(event, ContinuationDelta) for event in events), (
+        f"a failed terminal carries no continuation; events: {events!r}"
+    )
+    terminal = events[-1]
+    assert isinstance(terminal, TerminalEvent), f"events: {events!r}"
+    outcome = terminal.outcome
+    assert isinstance(outcome, Failed), f"terminal outcome: {outcome!r}"
+    assert isinstance(outcome.failure, InvalidStructuredOutput), f"failure: {outcome.failure!r}"
 
 
 # ---------------------------------------------------------------------------

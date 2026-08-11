@@ -11,6 +11,7 @@ constructor fields.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date
@@ -350,9 +351,15 @@ class ProviderRateLimit:
     retry_after: Presence[float]
 
     def __post_init__(self) -> None:
-        if isinstance(self.retry_after, Present) and self.retry_after.value < 0:
+        # A finite non-negative window or nothing: NaN passes every ordering
+        # test in retry.py's cap and deadline arithmetic, and no provider can
+        # honestly state an infinite retry window.
+        if isinstance(self.retry_after, Present) and not (
+            math.isfinite(self.retry_after.value) and self.retry_after.value >= 0
+        ):
             raise ValueError(
-                f"ProviderRateLimit.retry_after must be >= 0; got {self.retry_after.value}"
+                "ProviderRateLimit.retry_after must be a finite value >= 0; "
+                f"got {self.retry_after.value}"
             )
 
 
@@ -388,14 +395,12 @@ type TransientCause = (
 
 
 @dataclass(frozen=True, slots=True)
-class IntentContextTooLarge:
-    limit: int
-    measured: int
-
-
-@dataclass(frozen=True, slots=True)
 class ProviderContextTooLarge:
-    pass
+    """The provider rejected the request as over its context window.
+
+    The only context-overflow signal: nothing in the lane measures a prompt
+    locally before dispatch, so overflow is always the provider's verdict.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,15 +428,11 @@ class TransientExhausted:
 
 
 type ExpectedModelFailure = (
-    IntentContextTooLarge
-    | ProviderContextTooLarge
-    | InvalidToolArguments
-    | InvalidStructuredOutput
-    | TransientExhausted
+    ProviderContextTooLarge | InvalidToolArguments | InvalidStructuredOutput | TransientExhausted
 )
 
-# Ledger union; the runtime's own image is a subset — plan/budget exist for
-# nexus ledger writes.
+# Ledger origin union; the runtime's own image is a subset — plan/budget exist
+# for nexus ledger writes. Carried by every `errors.RuntimeDefect`.
 type FailureOrigin = Literal[
     "intent",
     "plan",
@@ -443,6 +444,9 @@ type FailureOrigin = Literal[
     "tool_arguments",
 ]
 
+# Ledger code vocabulary for nexus's failure_code column. The runtime hands
+# back closed failure VALUES and never maps them to a code itself: a mapping
+# here would be a second, unread source of truth for the ledger's own schema.
 type FailureCode = Literal[
     "rate_limited",
     "timeout",
@@ -452,71 +456,6 @@ type FailureCode = Literal[
     "invalid_tool_arguments",
     "invalid_structured_output",
 ]
-
-# Rationale for the fixed pairs: intent = local pre-network measurement;
-# provider_http = context overflow is classified from the provider's HTTP error
-# body at engine ingress; provider_response = the provider answered with a
-# well-formed envelope whose CONTENT is the failure (invalid structured
-# output). Malformed/unknown terminal envelopes stay operator-side as
-# ProtocolDefect and never map to expected failures.
-
-
-def failure_origin(failure: ExpectedModelFailure) -> FailureOrigin:
-    """TOTAL mapping from expected-failure leaf to its fixed ledger origin."""
-    match failure:
-        case IntentContextTooLarge():
-            return "intent"
-        case ProviderContextTooLarge():
-            return "provider_http"
-        case InvalidToolArguments():
-            return "tool_arguments"
-        case InvalidStructuredOutput():
-            return "provider_response"
-        case TransientExhausted(cause=cause):
-            match cause:
-                case ProviderRateLimit():
-                    return "provider_http"
-                case ProviderTimeout():
-                    return "transport"
-                case ProviderHttpUnavailable():
-                    return "provider_http"
-                case TransportUnavailable():
-                    return "transport"
-                case ProviderStreamInterrupted():
-                    return "provider_stream"
-                case _:
-                    assert_never(cause)
-        case _:
-            assert_never(failure)
-
-
-def failure_code(failure: ExpectedModelFailure) -> FailureCode:
-    """TOTAL mapping from expected-failure leaf to its fixed ledger code."""
-    match failure:
-        case IntentContextTooLarge():
-            return "context_too_large"
-        case ProviderContextTooLarge():
-            return "context_too_large"
-        case InvalidToolArguments():
-            return "invalid_tool_arguments"
-        case InvalidStructuredOutput():
-            return "invalid_structured_output"
-        case TransientExhausted(cause=cause):
-            match cause:
-                case ProviderRateLimit():
-                    return "rate_limited"
-                case ProviderTimeout():
-                    return "timeout"
-                case ProviderHttpUnavailable():
-                    return "provider_unavailable"
-                case TransportUnavailable():
-                    return "provider_unavailable"
-                case ProviderStreamInterrupted():
-                    return "stream_interrupted"
-                case _:
-                    assert_never(cause)
-        case _:
-            assert_never(failure)
 
 
 # ---------------------------------------------------------------------------

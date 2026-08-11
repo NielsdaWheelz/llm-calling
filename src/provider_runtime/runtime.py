@@ -469,6 +469,13 @@ class ProviderRuntime:
 
             def terminal(outcome: StreamOutcome) -> RuntimeStreamEvent:
                 record_outcome(span, outcome.meta, cost_estimate=estimate_cost(outcome.meta))
+                # End here, not at generator close: the idiomatic consumer
+                # breaks after the terminal event, leaving this generator to
+                # the async-generator finalizer — which would stretch the span
+                # to GC time, and never runs at all in a process that exits
+                # without shutdown_asyncgens. `call_span`'s exit still ends an
+                # abandoned or failed stream's span.
+                span.end()
                 return envelope(TerminalEvent(outcome=outcome))
 
             def cancelled_meta(attempt: int, started_ms: int) -> CallMeta:
@@ -614,7 +621,15 @@ class ProviderRuntime:
         reasoning: ReasoningLevel = "none",
         max_output_tokens: int | None = None,
     ) -> CallOutcome:
-        """The 95% call site: one system/user turn against a registry ref."""
+        """The 95% call site: one system/user turn against a registry ref.
+
+        `reasoning` defaults to "none", which is callable on every row: a row
+        declaring a "none" fragment sends it; a row that declares no "none"
+        level sends no reasoning field at all and the provider's own default
+        applies. "none" never raises. Any OTHER level a row does not declare
+        does raise `InvalidRequest` — silently discarding an explicit
+        non-default request is banned.
+        """
         row = resolve(ref)
         user_message = UserMessage(blocks=(PromptBlock(text=user),))
         messages: tuple[PromptMessage, ...] = (

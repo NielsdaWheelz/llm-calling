@@ -481,9 +481,21 @@ def _validate_rows(rows: tuple[ModelRow, ...]) -> None:
         prefix, sep, nickname = row.ref.partition(":")
         if sep != ":" or prefix != row.provider or not nickname:
             raise _invalid(f"ref {row.ref!r} must be '{row.provider}:<model-nickname>'")
-        if row.provider == "openrouter" and not isinstance(row.routing, Present):
-            raise _invalid(f"openrouter row {row.ref!r} must pin routing")
-        if row.provider != "openrouter" and isinstance(row.routing, Present):
+        if row.provider == "openrouter":
+            if not isinstance(row.routing, Present):
+                raise _invalid(f"openrouter row {row.ref!r} must pin routing")
+            # The two pins that make "no implicit rerouting" true on the wire:
+            # fixed in the type, re-checked here because a row is data and this
+            # is where curation defects are caught.
+            routing = row.routing.value
+            if routing.allow_fallbacks or not routing.require_parameters:
+                raise _invalid(
+                    f"openrouter row {row.ref!r} must pin allow_fallbacks=False and "
+                    f"require_parameters=True; got allow_fallbacks="
+                    f"{routing.allow_fallbacks!r}, require_parameters="
+                    f"{routing.require_parameters!r}"
+                )
+        elif isinstance(row.routing, Present):
             raise _invalid(f"non-openrouter row {row.ref!r} must not carry routing")
         _validate_reasoning(row)
         expected_engine = _ENGINE_FOR_PROVIDER[row.provider]

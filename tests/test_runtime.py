@@ -1003,6 +1003,27 @@ EMBED_CALL = EmbeddingCall(model="text-embedding-3-small", inputs=("alpha",), di
 EMBED_CREDENTIAL = ProviderCredential(provider="openai", key="sk-openai-test-key-000")
 
 
+async def test_stream_ends_the_call_span_at_the_terminal_event() -> None:
+    # The idiomatic consumer stops at the terminal event and never closes the
+    # generator: a span ended only at generator finalization would run to GC
+    # time, and would never be exported at all by a process that exits without
+    # shutdown_asyncgens.
+    tracer_provider = RecordingTracerProvider()
+    engine = FakeEngine(stream_script=[happy_stream()])
+    stream = make_runtime(engine, tracer_provider=tracer_provider).stream(make_intent())
+    async for event in stream:
+        if isinstance(event.event, TerminalEvent):
+            break
+    (span,) = tracer_provider.tracer.spans
+    assert span.ended, "the call span must end with the terminal event, not at generator close"
+    assert span.attributes["provider_runtime.attempt_count"] == 1, (
+        "the terminal facts must be recorded before the span ends"
+    )
+    assert isinstance(stream, AsyncGenerator)
+    await stream.aclose()
+    assert span.ends == 1, f"the abandoned generator ended the span again ({span.ends} ends)"
+
+
 async def test_generate_records_the_cost_estimate_on_the_call_span() -> None:
     tracer_provider = RecordingTracerProvider()
     engine = FakeEngine(generate_script=[succeeded()])
@@ -1060,8 +1081,10 @@ async def test_embed_failure_arms_record_the_attempt_count_inside_an_errored_spa
     (span,) = tracer_provider.tracer.spans
     assert span.name == "embeddings text-embedding-3-small"
     assert span.attributes["provider_runtime.attempt_count"] == attempt_count
-    assert span.exceptions == [exc_info.value]
-    assert [status.status_code for status in span.statuses if isinstance(status, Status)] == [
-        StatusCode.ERROR
-    ]
+    assert span.exceptions == [], "the span carries no exception message text"
+    assert [
+        (status.status_code, status.description)
+        for status in span.statuses
+        if isinstance(status, Status)
+    ] == [(StatusCode.ERROR, "NonGenerationCallFailed")]
     assert span.ended

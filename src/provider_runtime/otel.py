@@ -14,9 +14,11 @@ under the call and would detach its token from a foreign context when an
 abandoned stream is finalized. `as_current` attaches it around engine
 interaction only.
 
-NEVER on a span: message content, continuation payloads, credentials. Cache
-token components are reported raw and never summed into any total —
-`TokenUsage.input_tokens` is already cache-inclusive by contract invariant.
+NEVER on a span: message content, continuation payloads, credentials, or
+exception message text (engine exceptions quote provider bodies — only the
+exception TYPE name reaches the status). Cache token components are reported
+raw and never summed into any total — `TokenUsage.input_tokens` is already
+cache-inclusive by contract invariant.
 
 Layering: imports from `types` only — the cost estimate is passed in, because
 `prices` sits alongside this module, not below it.
@@ -86,11 +88,15 @@ def call_span(
     """Open — without attaching — the one client span for a facade call.
 
     Semconv span name "<operation> <model>". The span is started here and ended
-    on exit; an `Exception` leaving the block is recorded with an ERROR status,
-    on the same terms `opentelemetry.trace.use_span` applies (an abandoned
-    generator's `GeneratorExit` is not an error and only ends the span).
-    Callers make the span current with `as_current` — see the module docstring
-    for why it is never ambient across a stream's yields.
+    on exit unless the caller already ended it (the streaming port ends its
+    span at the terminal event so the duration is the call's, not the
+    consumer's). An `Exception` leaving the block sets an ERROR status
+    described by its TYPE NAME ALONE — engine exceptions quote provider bodies
+    and the span is content-free, so `record_exception`, which writes
+    `str(error)` as an event attribute, is deliberately not called. An
+    abandoned generator's `GeneratorExit` is not an error and only ends the
+    span. Callers make the span current with `as_current` — see the module
+    docstring for why it is never ambient across a stream's yields.
 
     `tracer_provider` is the deterministic-test seam; the production default is
     the process-global provider (no-op when none is configured).
@@ -113,11 +119,13 @@ def call_span(
         yield span
     except Exception as error:
         if span.is_recording():
-            span.record_exception(error)
-            span.set_status(Status(StatusCode.ERROR, f"{type(error).__name__}: {error}"))
+            span.set_status(Status(StatusCode.ERROR, type(error).__name__))
         raise
     finally:
-        span.end()
+        # `is_recording()` is False once a span has ended, so a span the caller
+        # already ended is not ended twice (the SDK logs a warning on that).
+        if span.is_recording():
+            span.end()
 
 
 @contextmanager

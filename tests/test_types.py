@@ -11,15 +11,12 @@ from provider_runtime.types import (
     AttemptRecord,
     CallMeta,
     Cancelled,
-    ContinuationArtifact,
     CostEstimate,
     ExpectedModelFailure,
     Failed,
     FinalAttempt,
     GenerateIntent,
     ImageBlock,
-    Incomplete,
-    IntentContextTooLarge,
     InvalidStructuredOutput,
     InvalidToolArguments,
     PossiblyBillable,
@@ -47,99 +44,30 @@ from provider_runtime.types import (
     TransientExhausted,
     TransportUnavailable,
     UserMessage,
-    failure_code,
-    failure_origin,
     presence_of,
 )
 
 # ---------------------------------------------------------------------------
-# failure_origin / failure_code — exhaustive 9-leaf golden table
+# The closed failure taxonomy
 
 
-def _exhausted(cause) -> TransientExhausted:
-    return TransientExhausted(attempts=3, cause=cause)
-
-
-GOLDEN_FAILURE_TABLE = [
-    pytest.param(
-        _exhausted(ProviderRateLimit(retry_after=Present(2.5))),
-        "provider_http",
-        "rate_limited",
-        id="transient-rate-limit",
-    ),
-    pytest.param(
-        _exhausted(ProviderTimeout()),
-        "transport",
-        "timeout",
-        id="transient-timeout",
-    ),
-    pytest.param(
-        _exhausted(ProviderHttpUnavailable()),
-        "provider_http",
-        "provider_unavailable",
-        id="transient-provider-http-unavailable",
-    ),
-    pytest.param(
-        _exhausted(TransportUnavailable()),
-        "transport",
-        "provider_unavailable",
-        id="transient-transport-unavailable",
-    ),
-    pytest.param(
-        _exhausted(ProviderStreamInterrupted(partial_output=True)),
-        "provider_stream",
-        "stream_interrupted",
-        id="transient-stream-interrupted",
-    ),
-    pytest.param(
-        IntentContextTooLarge(limit=100_000, measured=140_000),
-        "intent",
-        "context_too_large",
-        id="intent-context-too-large",
-    ),
-    pytest.param(
-        ProviderContextTooLarge(),
-        "provider_http",
-        "context_too_large",
-        id="provider-context-too-large",
-    ),
-    pytest.param(
-        InvalidToolArguments(safe_detail="arguments were not strict JSON"),
-        "tool_arguments",
-        "invalid_tool_arguments",
-        id="invalid-tool-arguments",
-    ),
-    pytest.param(
-        InvalidStructuredOutput(safe_detail="payload failed Invoice schema validation"),
-        "provider_response",
-        "invalid_structured_output",
-        id="invalid-structured-output",
-    ),
-]
-
-
-def test_golden_failure_table_covers_all_leaves() -> None:
-    # Non-transient leaves + every transient cause wrapped in TransientExhausted,
-    # derived from the unions so a new leaf breaks this test until tabled.
-    non_transient = len(get_args(ExpectedModelFailure.__value__)) - 1
-    transient = len(get_args(TransientCause.__value__))
-    assert len(GOLDEN_FAILURE_TABLE) == non_transient + transient, (
-        "the golden failure table must stay exhaustive over the closed "
-        f"ExpectedModelFailure x TransientCause leaf set "
-        f"(expected {non_transient + transient}, tabled {len(GOLDEN_FAILURE_TABLE)})"
-    )
-
-
-@pytest.mark.parametrize(("failure", "expected_origin", "expected_code"), GOLDEN_FAILURE_TABLE)
-def test_failure_origin_and_code_golden_pairs(failure, expected_origin, expected_code) -> None:
-    origin = failure_origin(failure)
-    code = failure_code(failure)
-    assert origin == expected_origin, (
-        f"failure_origin({failure!r}) must be {expected_origin!r}, got {origin!r}"
-    )
-    assert code == expected_code, (
-        f"failure_code({failure!r}) must be {expected_code!r}, got {code!r}"
-    )
+def test_the_failure_taxonomy_is_closed_and_provider_side_only() -> None:
+    # No IntentContextTooLarge: nothing in the lane measures a prompt locally
+    # before dispatch, so ProviderContextTooLarge — the provider's own verdict
+    # — is the only context-overflow signal.
+    assert set(get_args(ExpectedModelFailure.__value__)) == {
+        ProviderContextTooLarge,
+        InvalidToolArguments,
+        InvalidStructuredOutput,
+        TransientExhausted,
+    }
+    assert set(get_args(TransientCause.__value__)) == {
+        ProviderRateLimit,
+        ProviderTimeout,
+        ProviderHttpUnavailable,
+        TransportUnavailable,
+        ProviderStreamInterrupted,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -243,13 +171,6 @@ def test_presence_of_wraps_values_including_falsy_ones() -> None:
     assert presence_of("req_abc") == Present("req_abc")
 
 
-def test_presence_values_have_structural_equality() -> None:
-    assert Present(3) == Present(3)
-    assert Present(3) != Present(4)
-    assert Absent() == Absent()
-    assert Present(3) != Absent()
-
-
 # ---------------------------------------------------------------------------
 # AttemptRecord validation
 
@@ -293,12 +214,15 @@ def test_transient_exhausted_rejects_attempts_below_one() -> None:
         TransientExhausted(attempts=0, cause=ProviderTimeout())
 
 
-def test_provider_rate_limit_rejects_a_negative_retry_after() -> None:
+def test_provider_rate_limit_admits_only_a_finite_non_negative_retry_after() -> None:
     # A mis-parsed Retry-After header cannot reach the retry loop: the illegal
     # state is unrepresentable, so no downstream clamp exists (or is needed).
+    # NaN is the sharp one — it compares False against retry.py's 60s cap AND
+    # against the deadline, so it would slip through as a NaN sleep.
     assert ProviderRateLimit(retry_after=Present(0.0)).retry_after == Present(0.0)
-    with pytest.raises(ValueError, match="retry_after must be >= 0"):
-        ProviderRateLimit(retry_after=Present(-5.0))
+    for illegal in (-5.0, float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="retry_after must be a finite value >= 0"):
+            ProviderRateLimit(retry_after=Present(illegal))
 
 
 # ---------------------------------------------------------------------------
@@ -441,34 +365,12 @@ def test_succeeded_outcome_retains_meta_and_attempt_trace() -> None:
     )
 
 
-def test_streamed_fable_refusal_is_incomplete_with_refused_status() -> None:
-    outcome = Incomplete(
-        meta=_sample_meta(),
-        reason="content_filter_partial",
-        status="refused",
-        safe_detail=Present("refused by model"),
-    )
-    assert outcome.status == "refused"
-    assert outcome.safe_detail == Present("refused by model")
-
-
 def test_failed_and_cancelled_outcomes_carry_meta() -> None:
     meta = _sample_meta()
     failure = TransientExhausted(attempts=2, cause=ProviderRateLimit(retry_after=Absent()))
     failed = Failed(meta=meta, failure=failure)
     assert failed.failure == failure
     assert Cancelled(meta=meta).meta == meta
-
-
-def test_continuation_artifact_payload_never_enters_repr() -> None:
-    artifact = ContinuationArtifact(
-        target=ProviderTarget(provider="openai", model="gpt-5.6-terra"),
-        codec_id="openai_responses",
-        opaque_payload={"encrypted_content": "SECRET-REPLAY-MATERIAL"},
-    )
-    assert "SECRET-REPLAY-MATERIAL" not in repr(artifact), (
-        "continuation payloads are ephemeral and must never be rendered"
-    )
 
 
 def test_runtime_stream_event_seq_is_one_based() -> None:

@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 from dataclasses import FrozenInstanceError
 from pathlib import Path
-from typing import cast, get_args
+from typing import Any, cast, get_args
 
 import pytest
 
+from provider_runtime.agent_runtime import types as types_module
 from provider_runtime.agent_runtime.errors import InvalidAgentRequest
 from provider_runtime.agent_runtime.events import AGENT_FAILURE_CAUSES, AgentFailureCause
 from provider_runtime.agent_runtime.policy import PermissionPolicy
@@ -318,6 +319,39 @@ def test_json_nesting_is_bounded_with_a_typed_request_error() -> None:
 
     with pytest.raises(InvalidAgentRequest, match="maximum JSON nesting depth"):
         freeze_json_value(value)
+
+
+def test_freezing_a_nested_object_visits_every_node_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Freezing is linear in the payload's size, not exponential in its depth.
+
+    A nested object used to be frozen by the recursive walk and then frozen again by the
+    `FrozenJsonDict` it was handed to, so the work doubled with every level: this 25-deep
+    payload cost 2**25 visits. The counter aborts rather than hangs if that owner splits
+    in two again.
+    """
+    depth = 25
+    expected = 2 * depth + 2
+    original = types_module._freeze_json_value
+    visits = 0
+
+    def counted(value: object, **keywords: Any) -> object:
+        nonlocal visits
+        visits += 1
+        if visits > expected:
+            raise AssertionError("the freezer re-walked descendants it had already frozen")
+        return original(value, **keywords)
+
+    monkeypatch.setattr(types_module, "_freeze_json_value", counted)
+    payload: dict[str, object] = {"leaf": "bottom"}
+    for _ in range(depth):
+        payload = {"child": payload, "leaf": "level"}
+
+    frozen = types_module.freeze_json_value(payload)
+
+    assert visits == expected
+    assert thaw_json_value(frozen) == payload
 
 
 def test_direct_frozen_json_construction_cannot_smuggle_mutable_or_nonfinite_values() -> None:

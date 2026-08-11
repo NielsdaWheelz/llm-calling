@@ -253,7 +253,7 @@ async def test_retry_after_above_sixty_seconds_exhausts_without_retrying() -> No
 async def test_a_negative_retry_after_never_reaches_the_loop() -> None:
     # Why the loop carries no clamp: a mis-parsed Retry-After header cannot be
     # represented, so it can never become an instant zero-backoff retry.
-    with pytest.raises(ValueError, match="retry_after must be >= 0"):
+    with pytest.raises(ValueError, match="retry_after must be a finite value >= 0"):
         ProviderRateLimit(retry_after=Present(-5.0))
     clock = ManualClock()
     sleep = SleepRecorder(clock)

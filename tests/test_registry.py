@@ -171,6 +171,43 @@ def test_openrouter_row_without_routing_is_rejected() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("pins", "violation"),
+    [
+        pytest.param({"allow_fallbacks": True}, "allow_fallbacks", id="fallbacks-enabled"),
+        pytest.param({"require_parameters": False}, "require_parameters", id="parameters-optional"),
+    ],
+)
+def test_openrouter_row_that_unpins_its_routing_is_rejected(
+    pins: Mapping[str, bool], violation: str
+) -> None:
+    # Both pins are fixed in the type, so only a row hand-built past the type
+    # checker can violate them — which is exactly what an unreviewed curation
+    # edit is. The import-time belt names the row.
+    row = _row(
+        ref="openrouter:kimi-k3",
+        provider="openrouter",
+        model_id="moonshotai/kimi-k3",
+        engine="openai_chat",
+        base_url=Present("https://openrouter.ai/api/v1"),
+        routing=Present(
+            OpenRouterRouting(
+                only=("moonshotai",),
+                order=("moonshotai",),
+                quantizations=("fp8",),
+                **pins,  # type: ignore[arg-type]
+            )
+        ),
+    )
+    with pytest.raises(RuntimeDefect) as exc_info:
+        _validate_rows((row,))
+    assert exc_info.value.code == "registry_invalid"
+    assert "openrouter:kimi-k3" in exc_info.value.message, (
+        "the defect message must name the offending row"
+    )
+    assert violation in exc_info.value.message, exc_info.value.message
+
+
 def test_non_openrouter_row_with_routing_is_rejected() -> None:
     with pytest.raises(RuntimeDefect) as exc_info:
         _validate_rows((_row(routing=Present(_pinned_routing())),))

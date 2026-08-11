@@ -10,15 +10,13 @@ environment names, and supervises one private process group.
 
 from __future__ import annotations
 
-import hashlib
 import os
 from pathlib import Path
 
-from ._private_files import require_private_directory, write_private_file
+from ._private_files import publish_launcher
 from .errors import AgentRuntimeDefect, ExecutableUnavailable
 
 _LAUNCHER_LABEL = "Codex launcher"
-_MAX_SHEBANG_BYTES = 120
 _LAUNCHER_PREFIX = "codex-launcher-"
 _LAUNCHER_SOURCE = '''#!{shebang}
 """Supervise the matched Codex runtime with a replaced environment.
@@ -101,10 +99,6 @@ def ensure_codex_launcher(
     interpreter: str,
 ) -> Path:
     """Materialize one content-addressed launcher outside the child-writable profile root."""
-    if not interpreter or "\0" in interpreter or "\n" in interpreter:
-        raise ExecutableUnavailable(
-            "the running Python interpreter has no usable path to build a Codex launcher"
-        )
     executable_text = str(executable)
     if (
         not executable.is_absolute()
@@ -122,22 +116,17 @@ def ensure_codex_launcher(
             "the Codex launcher environment allowlist is malformed",
             code="launcher_environment_invalid",
         )
-    shebang = f"{interpreter} -I"
-    if len(f"#!{shebang}".encode()) > _MAX_SHEBANG_BYTES:
-        raise ExecutableUnavailable(
-            "the running Python interpreter path is too long for a Codex launcher shebang"
-        )
-
-    directory = state_root.parent
-    require_private_directory(directory, label=_LAUNCHER_LABEL)
-    source = _LAUNCHER_SOURCE.format(
-        shebang=shebang,
-        executable=repr(executable_text),
-        environment_names=repr(tuple(sorted(environment_names))),
-    ).encode("utf-8")
-    path = directory / f"{_LAUNCHER_PREFIX}{hashlib.sha256(source).hexdigest()[:32]}"
-    write_private_file(path, source, label=_LAUNCHER_LABEL)
-    return path
+    return publish_launcher(
+        state_root.parent,
+        label=_LAUNCHER_LABEL,
+        prefix=_LAUNCHER_PREFIX,
+        template=_LAUNCHER_SOURCE,
+        interpreter=interpreter,
+        fields={
+            "executable": repr(executable_text),
+            "environment_names": repr(tuple(sorted(environment_names))),
+        },
+    )
 
 
 __all__ = ["ensure_codex_launcher"]

@@ -166,6 +166,7 @@ def test_adapter_and_private_modules_are_not_agent_exports() -> None:
         "_private_files",
         "_process",
         "_structured_output",
+        "_validation",
     ):
         assert name not in agent_runtime.__all__, f"{name} must stay unexported"
 

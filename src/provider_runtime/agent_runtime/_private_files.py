@@ -9,14 +9,20 @@ what makes a change to it — an ownership rule, a mode, an extra check — appl
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 
 from .errors import AgentRuntimeDefect, ExecutableUnavailable
 
 PRIVATE_MODE = 0o700
+# Linux copies the shebang line into a fixed kernel buffer and silently truncates the rest,
+# so an interpreter path that does not fit must fail loudly here instead of producing a
+# launcher that executes something else.
+_MAX_SHEBANG_BYTES = 120
 
 
 def require_private_directory(directory: Path, *, label: str) -> None:
@@ -72,4 +78,36 @@ def write_private_file(path: Path, source: bytes, *, label: str) -> None:
         )
 
 
-__all__ = ["PRIVATE_MODE", "require_private_directory", "write_private_file"]
+def publish_launcher(
+    directory: Path,
+    *,
+    label: str,
+    prefix: str,
+    template: str,
+    interpreter: str,
+    fields: Mapping[str, str],
+) -> Path:
+    """Assemble one launcher around the caller's script body and publish it.
+
+    Everything except the body is the same on both routes: the same interpreter, the same
+    shebang rule, the same content-addressed name, and the same private publication. The
+    name is a digest of the content, so repeated calls and concurrent runtimes converge on
+    one identical file instead of racing to overwrite each other's.
+    """
+    if not interpreter or "\0" in interpreter or "\n" in interpreter:
+        raise ExecutableUnavailable(
+            f"the running Python interpreter has no usable path to build a {label}"
+        )
+    shebang = f"{interpreter} -I"
+    if len(f"#!{shebang}".encode()) > _MAX_SHEBANG_BYTES:
+        raise ExecutableUnavailable(
+            f"the running Python interpreter path is too long for a {label} shebang"
+        )
+    require_private_directory(directory, label=label)
+    source = template.format(shebang=shebang, **fields).encode("utf-8")
+    path = directory / f"{prefix}{hashlib.sha256(source).hexdigest()[:32]}"
+    write_private_file(path, source, label=label)
+    return path
+
+
+__all__ = ["PRIVATE_MODE", "publish_launcher", "require_private_directory", "write_private_file"]

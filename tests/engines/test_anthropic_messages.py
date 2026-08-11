@@ -77,6 +77,15 @@ from provider_runtime.types import (
 
 MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 
+# Every request-affecting environment variable the anthropic SDK reads on its
+# own (0.121 `_client.py`): the host it dispatches to, the bearer credential it
+# falls back to, and headers it injects into every request.
+POISON_ENV = {
+    "ANTHROPIC_BASE_URL": "https://poisoned.invalid",
+    "ANTHROPIC_AUTH_TOKEN": "poison-bearer-token",
+    "ANTHROPIC_CUSTOM_HEADERS": "X-Poison: pwned",
+}
+
 # Real registry shapes (canonical reasoning convention): an anthropic row's
 # reasoning value is the self-describing wire fragment
 # {"output_config": {"effort": "<level>"}} — never a synthetic stand-in.
@@ -569,17 +578,21 @@ async def test_generate_row_without_reasoning_knob_sends_nothing() -> None:
 
 
 @respx.mock
-async def test_generate_empty_reasoning_fragment_sends_nothing() -> None:
+async def test_generate_reasoning_none_on_a_row_declaring_no_none_sends_nothing() -> None:
+    """spec §14: "none" is the facade default, so it is callable on every row —
+    a row that declares no "none" level sends no reasoning field and lets the
+    provider's own default apply. Anthropic effort has no "off" value, so every
+    real anthropic row is exactly this shape."""
     route = respx.post(MESSAGES_URL).mock(
         return_value=mock_response(envelope(content=[TEXT_BLOCK], usage=usage_body()))
     )
-    row = replace(ROW, reasoning=Present({"none": {}}))
+    assert "none" not in REASONING_LEVELS, "fixture premise: the row declares no 'none' level"
     outcome = await AnthropicMessagesEngine().generate(
-        row, make_intent(reasoning="none"), CREDENTIAL
+        ROW, make_intent(reasoning="none"), CREDENTIAL
     )
     assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
     body = request_body(route)
-    assert "output_config" not in body, f"empty fragment must merge nothing; body: {body!r}"
+    assert "output_config" not in body, f"nothing may be sent; body: {body!r}"
     assert outcome.meta.native_reasoning == Absent(), (
         f"native_reasoning: {outcome.meta.native_reasoning!r}"
     )
@@ -860,17 +873,29 @@ async def test_generate_rejects_provider_options_colliding_with_owned_keys(key: 
 
 
 @respx.mock
-async def test_generate_uses_sdk_default_base_url_when_row_base_url_absent(
+async def test_generate_suppresses_every_ambient_sdk_env_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    """Zero-env dispatch: an Absent row base_url resolves to the canonical host
+    in the engine, never to whatever ANTHROPIC_BASE_URL says, and no ambient
+    credential or header the SDK picks up on its own reaches the wire."""
+    for name, value in POISON_ENV.items():
+        monkeypatch.setenv(name, value)
+    poisoned = respx.post("https://poisoned.invalid/v1/messages").mock(
+        return_value=mock_response(envelope(content=[TEXT_BLOCK], usage=usage_body()))
+    )
     route = respx.post(MESSAGES_URL).mock(
         return_value=mock_response(envelope(content=[TEXT_BLOCK], usage=usage_body()))
     )
     row = replace(ROW, base_url=Absent())
     outcome = await AnthropicMessagesEngine().generate(row, make_intent(), CREDENTIAL)
     assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
-    assert route.call_count == 1, "request must hit the SDK default base URL"
+    assert route.call_count == 1, "request must hit the canonical Anthropic host"
+    assert poisoned.call_count == 0, "ANTHROPIC_BASE_URL must never reroute a call"
+    headers = route.calls.last.request.headers
+    assert headers["x-api-key"] == CREDENTIAL.key, f"x-api-key: {headers.get('x-api-key')!r}"
+    assert "authorization" not in headers, f"ANTHROPIC_AUTH_TOKEN reached the wire: {headers!r}"
+    assert "x-poison" not in headers, f"ANTHROPIC_CUSTOM_HEADERS reached the wire: {headers!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -1077,6 +1102,19 @@ async def test_generate_malformed_usage_reports_absent_usage(
 
 
 @respx.mock
+async def test_generate_negative_usage_count_is_protocol_defect() -> None:
+    # Well-typed counts that violate TokenUsage's own accounting invariant:
+    # the ValueError is a malformed 2xx envelope, not an engine crash.
+    respx.post(MESSAGES_URL).mock(
+        return_value=mock_response(
+            envelope(content=[TEXT_BLOCK], usage={"input_tokens": 20, "output_tokens": -1})
+        )
+    )
+    with pytest.raises(ProtocolDefect, match="token accounting"):
+        await AnthropicMessagesEngine().generate(ROW, make_intent(), CREDENTIAL)
+
+
+@respx.mock
 async def test_generate_missing_model_is_protocol_defect() -> None:
     respx.post(MESSAGES_URL).mock(
         return_value=mock_response(envelope(content=[TEXT_BLOCK], model=None, usage=usage_body()))
@@ -1161,6 +1199,21 @@ async def test_generate_timeout_raises_transient_timeout() -> None:
         await AnthropicMessagesEngine().generate(ROW, make_intent(), CREDENTIAL)
     assert exc_info.value.cause == ProviderTimeout(), f"cause: {exc_info.value.cause!r}"
     assert exc_info.value.billability == PossiblyBillable(), (
+        f"a read timeout happened after the request was on the wire; "
+        f"billability: {exc_info.value.billability!r}"
+    )
+
+
+@respx.mock
+async def test_generate_connect_timeout_is_timeout_not_dispatched() -> None:
+    """The SDK collapses every httpx timeout into APITimeoutError; the cause
+    chain is the only place the pre-connect rule is still readable."""
+    respx.post(MESSAGES_URL).mock(side_effect=httpx.ConnectTimeout("handshake timed out"))
+    with pytest.raises(TransientAttempt) as exc_info:
+        await AnthropicMessagesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert exc_info.value.cause == ProviderTimeout(), f"cause: {exc_info.value.cause!r}"
+    assert exc_info.value.billability == NotDispatched(), (
+        f"the handshake never completed, so no request bytes reached the provider; "
         f"billability: {exc_info.value.billability!r}"
     )
 

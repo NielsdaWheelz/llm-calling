@@ -80,12 +80,14 @@ from provider_runtime.types import (
 # into the request; these are the real per-provider shapes, never synthetic
 # stand-ins (an engine that cannot build a callable request must fail here).
 DEEPSEEK_REASONING: Mapping[ReasoningLevel, object] = {
+    # Two parameters, and only the enabling levels carry the effort knob — the
+    # real registry shape, and the reason the collision set cannot be read off
+    # the SELECTED level alone.
     "none": {"thinking": {"type": "disabled"}},
-    "high": {"thinking": {"type": "enabled"}},
+    "high": {"thinking": {"type": "enabled"}, "reasoning_effort": "high"},
 }
 MOONSHOT_REASONING: Mapping[ReasoningLevel, object] = {
-    # Omitting the knob is Moonshot's "off" — an empty fragment sends nothing.
-    "none": {},
+    # Moonshot's model always reasons: there is no "off" level to declare.
     "low": {"reasoning_effort": "low"},
     "high": {"reasoning_effort": "high"},
     "max": {"reasoning_effort": "max"},
@@ -378,12 +380,13 @@ async def test_deepseek_request_uses_max_tokens_and_row_reasoning_fragment(
     )
     body = last_request_json(route)
     assert body["max_tokens"] == 512, f"deepseek must use max_tokens; body: {body}"
-    assert "reasoning_effort" not in body, f"the engine invents no knob shape; body: {body}"
-    assert body["thinking"] == {"type": "enabled"}, (
-        f"the row's fragment must merge verbatim into the body; body: {body}"
+    assert (body["thinking"], body["reasoning_effort"]) == ({"type": "enabled"}, "high"), (
+        f"the row's whole fragment — both parameters — must merge verbatim; body: {body}"
     )
     assert isinstance(outcome, Succeeded)
-    assert outcome.meta.native_reasoning == Present('{"thinking":{"type":"enabled"}}'), (
+    assert outcome.meta.native_reasoning == Present(
+        '{"reasoning_effort":"high","thinking":{"type":"enabled"}}'
+    ), (
         f"native_reasoning is the fragment that went on the wire, as compact sorted-keys "
         f"JSON; got {outcome.meta.native_reasoning}"
     )
@@ -408,15 +411,20 @@ async def test_deepseek_reasoning_none_sends_the_disabling_fragment(
 
 
 @respx.mock
-async def test_empty_reasoning_fragment_sends_nothing_and_reports_absent(
+async def test_reasoning_none_on_a_row_declaring_no_none_sends_nothing(
     engine: OpenAIChatEngine,
 ) -> None:
+    """spec §14: "none" is the facade default, so it is callable on every row —
+    a row that declares no "none" level sends no reasoning field and lets the
+    provider's own default apply. Contrast deepseek above, whose declared
+    "none" fragment IS sent."""
+    assert "none" not in MOONSHOT_REASONING, "fixture premise: the row declares no 'none' level"
     route = mock_completion(MOONSHOT_ROW, completion_body(model="kimi-k3"))
     outcome = await engine.generate(
         MOONSHOT_ROW, intent_for(MOONSHOT_ROW, reasoning="none"), credential_for(MOONSHOT_ROW)
     )
     body = last_request_json(route)
-    assert "reasoning_effort" not in body, f"an empty fragment sends nothing; body: {body}"
+    assert "reasoning_effort" not in body, f"nothing may be sent; body: {body}"
     assert isinstance(outcome, Succeeded)
     assert outcome.meta.native_reasoning == Absent(), (
         f"nothing was sent, so native_reasoning must be Absent, got {outcome.meta.native_reasoning}"
@@ -561,6 +569,21 @@ async def test_tools_and_tool_results_encode_to_chat_completions_wire(
 
 
 @respx.mock
+async def test_request_without_tools_omits_tools_and_tool_choice(
+    engine: OpenAIChatEngine,
+) -> None:
+    route = mock_completion(MOONSHOT_ROW, completion_body(model="kimi-k3"))
+    outcome = await engine.generate(
+        MOONSHOT_ROW, intent_for(MOONSHOT_ROW), credential_for(MOONSHOT_ROW)
+    )
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome}"
+    body = last_request_json(route)
+    assert "tools" not in body and "tool_choice" not in body, (
+        f"a toolless intent must put neither key on the wire; body: {body}"
+    )
+
+
+@respx.mock
 async def test_image_blocks_encode_as_data_url_content_parts(engine: OpenAIChatEngine) -> None:
     route = mock_completion(XAI_ROW, completion_body(model="grok-4"))
     png = b"\x89PNG"
@@ -644,6 +667,35 @@ async def test_provider_options_owned_key_collision_raises_invalid_request(
         await engine.generate(
             row, intent_for(row, provider_options={key: "boom"}), credential_for(row)
         )
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("row", "key"),
+    [
+        # deepseek level "none" sends only `thinking`; `reasoning_effort` is
+        # still the row's knob at every enabling level.
+        (DEEPSEEK_ROW, "reasoning_effort"),
+        # moonshot declares no "none" level at all, so nothing is sent — the
+        # row still owns `reasoning_effort`.
+        (MOONSHOT_ROW, "reasoning_effort"),
+    ],
+)
+async def test_provider_options_collide_with_a_key_the_row_owns_at_another_level(
+    engine: OpenAIChatEngine, row: ModelRow, key: str
+) -> None:
+    """The collision set is the union across ALL the row's declared levels, not
+    the selected one. Reading it off the selected fragment let a caller hand
+    the provider a second, contradictory reasoning knob on the one level whose
+    fragment happens not to name it."""
+    route = mock_completion(row, completion_body(model=row.model_id))
+    with pytest.raises(InvalidRequest, match=key):
+        await engine.generate(
+            row,
+            intent_for(row, reasoning="none", provider_options={key: "max"}),
+            credential_for(row),
+        )
+    assert not route.called, "the request must never be dispatched"
 
 
 @respx.mock
@@ -1716,6 +1768,34 @@ async def test_openrouter_inband_stream_error_post_semantic_reports_the_upstream
     assert excinfo.value.cause == ProviderHttpUnavailable(), f"got {excinfo.value.cause}"
 
 
+# In-band HTTP-200 error objects that name no definite 4xx: the gateway
+# accepted the request and the upstream then failed, so a retry can succeed.
+INDEFINITE_INBAND_ERRORS: list[dict[str, object]] = [
+    {"message": "Provider returned error", "metadata": {"provider_name": "Moonshot"}},
+    {"code": "upstream_error", "message": "Provider returned error"},
+]
+
+
+@pytest.mark.parametrize("error", INDEFINITE_INBAND_ERRORS)
+@respx.mock
+async def test_inband_stream_error_without_a_definite_4xx_code_is_transient(
+    engine: OpenAIChatEngine, error: dict[str, object]
+) -> None:
+    mock_stream(OPENROUTER_ROW, sse_bytes({"error": error}))
+    stream = engine.stream(
+        OPENROUTER_ROW, intent_for(OPENROUTER_ROW), credential_for(OPENROUTER_ROW)
+    )
+    seen: list[CodecStreamEvent] = []
+    with pytest.raises(TransientAttempt) as excinfo:
+        async for event in stream:
+            seen.append(event)
+    assert seen == [StreamStart()], f"only the envelope may precede the failure; got {seen}"
+    assert excinfo.value.cause == ProviderHttpUnavailable(), (
+        f"an in-band error with no definite 4xx code is a retryable upstream failure; "
+        f"got {excinfo.value.cause}"
+    )
+
+
 @respx.mock
 async def test_inband_stream_error_without_a_transient_code_is_a_protocol_defect(
     engine: OpenAIChatEngine,
@@ -1769,17 +1849,27 @@ async def test_429_without_retry_after_has_absent_delay(engine: OpenAIChatEngine
 
 @respx.mock
 async def test_timeouts_raise_transient_provider_timeout(engine: OpenAIChatEngine) -> None:
+    """The SDK collapses every httpx timeout into APITimeoutError; the cause
+    chain is the only place the pre-connect rule is still readable."""
     respx.post(chat_url(XAI_ROW)).mock(side_effect=httpx.ConnectTimeout("boom"))
     with pytest.raises(TransientAttempt) as excinfo:
         await engine.generate(XAI_ROW, intent_for(XAI_ROW), credential_for(XAI_ROW))
     assert excinfo.value.cause == ProviderTimeout(), f"got {excinfo.value.cause}"
     assert excinfo.value.status_code == Absent()
+    assert excinfo.value.billability == NotDispatched(), (
+        f"the handshake never completed, so no request bytes reached the provider; "
+        f"got {excinfo.value.billability}"
+    )
 
     respx.clear()
     respx.post(chat_url(XAI_ROW)).mock(side_effect=httpx.ReadTimeout("boom"))
     with pytest.raises(TransientAttempt) as excinfo:
         await engine.generate(XAI_ROW, intent_for(XAI_ROW), credential_for(XAI_ROW))
     assert excinfo.value.cause == ProviderTimeout(), f"got {excinfo.value.cause}"
+    assert excinfo.value.billability == PossiblyBillable(), (
+        f"a read timeout happened after the request was on the wire; "
+        f"got {excinfo.value.billability}"
+    )
 
 
 @respx.mock
@@ -1934,6 +2024,26 @@ async def test_inband_rate_limit_on_a_200_body_classifies_as_rate_limit(
     )
 
 
+@pytest.mark.parametrize("error", INDEFINITE_INBAND_ERRORS)
+@respx.mock
+async def test_inband_error_without_a_definite_4xx_code_is_transient(
+    engine: OpenAIChatEngine, error: dict[str, object]
+) -> None:
+    respx.post(chat_url(OPENROUTER_ROW)).mock(
+        return_value=httpx.Response(200, json={"error": error})
+    )
+    with pytest.raises(TransientAttempt) as excinfo:
+        await engine.generate(
+            OPENROUTER_ROW, intent_for(OPENROUTER_ROW), credential_for(OPENROUTER_ROW)
+        )
+    assert excinfo.value.cause == ProviderHttpUnavailable(), (
+        f"an in-band error with no definite 4xx code is a retryable upstream failure; "
+        f"got {excinfo.value.cause}"
+    )
+    assert excinfo.value.status_code == Present(200)
+    assert excinfo.value.billability == PossiblyBillable()
+
+
 @respx.mock
 async def test_inband_error_without_a_transient_code_is_a_protocol_defect(
     engine: OpenAIChatEngine,
@@ -1951,6 +2061,48 @@ async def test_inband_error_without_a_transient_code_is_a_protocol_defect(
     assert "sk-live-abcdefghij" not in excinfo.value.message, (
         f"the provider snippet must be sanitized; got {excinfo.value.message!r}"
     )
+
+
+@respx.mock
+async def test_negative_usage_counts_raise_malformed_usage_defect(
+    engine: OpenAIChatEngine,
+) -> None:
+    mock_completion(
+        MOONSHOT_ROW,
+        completion_body(
+            model="kimi-k3",
+            usage={"prompt_tokens": -5, "completion_tokens": 20, "total_tokens": 15},
+        ),
+    )
+    with pytest.raises(ProtocolDefect) as excinfo:
+        await engine.generate(MOONSHOT_ROW, intent_for(MOONSHOT_ROW), credential_for(MOONSHOT_ROW))
+    assert excinfo.value.code == "malformed_usage", f"got {excinfo.value.code}"
+
+
+@respx.mock
+async def test_stream_negative_usage_counts_raise_malformed_usage_defect(
+    engine: OpenAIChatEngine,
+) -> None:
+    mock_stream(
+        MOONSHOT_ROW,
+        sse_bytes(
+            {
+                "id": "s-usage",
+                "model": "kimi-k3",
+                "choices": [{"index": 0, "delta": {"content": "hi"}}],
+            },
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 11, "completion_tokens": -6, "total_tokens": 5},
+            },
+            "[DONE]",
+        ),
+    )
+    stream = engine.stream(MOONSHOT_ROW, intent_for(MOONSHOT_ROW), credential_for(MOONSHOT_ROW))
+    with pytest.raises(ProtocolDefect) as excinfo:
+        async for _ in stream:
+            pass
+    assert excinfo.value.code == "malformed_usage", f"got {excinfo.value.code}"
 
 
 @respx.mock

@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass
 from typing import Literal, cast
 
+from ._validation import ENVIRONMENT_NAME, require_unique_strings
 from .errors import InvalidAgentRequest
 
 type FilesystemMode = Literal["read_only", "workspace_write", "full_access"]
@@ -22,24 +23,12 @@ _FILESYSTEM_ORDER: tuple[FilesystemMode, ...] = (
 )
 _NETWORK_ORDER: tuple[NetworkMode, ...] = ("disabled", "allowlist", "unrestricted")
 _APPROVAL_MODES: tuple[ApprovalMode, ...] = ("deny", "ask", "provider_review", "allow")
-_ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _UNSAFE_DIMENSIONS: tuple[UnsafeDimension, ...] = (
     "filesystem_full_access",
     "network_unrestricted",
     "approval_allow",
 )
-
-
-def _tuple_of_unique_strings(value: object, field: str) -> tuple[str, ...]:
-    if not isinstance(value, tuple):
-        raise InvalidAgentRequest(f"{field} must be a tuple of strings")
-    result = value
-    if any(type(item) is not str or not item for item in result):
-        raise InvalidAgentRequest(f"{field} entries must be non-empty strings")
-    if len(result) != len(set(result)):
-        raise InvalidAgentRequest(f"{field} must not contain duplicate entries")
-    return tuple(item for item in result if isinstance(item, str))
 
 
 def _validate_network_host(host: str) -> None:
@@ -70,7 +59,7 @@ class UnsafeConfirmation:
     acknowledged: tuple[UnsafeDimension, ...]
 
     def __post_init__(self) -> None:
-        acknowledged = _tuple_of_unique_strings(self.acknowledged, "acknowledged")
+        acknowledged = require_unique_strings(self.acknowledged, "acknowledged")
         if any(item not in _UNSAFE_DIMENSIONS for item in acknowledged):
             raise InvalidAgentRequest("acknowledged contains an unknown unsafe dimension")
 
@@ -93,17 +82,17 @@ class PermissionPolicy:
             raise InvalidAgentRequest(f"unknown network mode {self.network!r}")
         if self.approval not in _APPROVAL_MODES:
             raise InvalidAgentRequest(f"unknown approval mode {self.approval!r}")
-        _tuple_of_unique_strings(self.allowed_tools, "allowed_tools")
-        _tuple_of_unique_strings(self.denied_tools, "denied_tools")
-        network_allowlist = _tuple_of_unique_strings(self.network_allowlist, "network_allowlist")
+        require_unique_strings(self.allowed_tools, "allowed_tools")
+        require_unique_strings(self.denied_tools, "denied_tools")
+        network_allowlist = require_unique_strings(self.network_allowlist, "network_allowlist")
         for entry in network_allowlist:
             _validate_network_host(entry)
         if self.network == "allowlist" and not network_allowlist:
             raise InvalidAgentRequest("network allowlist mode requires network_allowlist entries")
         if self.network != "allowlist" and network_allowlist:
             raise InvalidAgentRequest("network_allowlist is only valid in allowlist mode")
-        environment = _tuple_of_unique_strings(self.environment, "environment")
-        if any(_ENVIRONMENT_NAME.fullmatch(name) is None for name in environment):
+        environment = require_unique_strings(self.environment, "environment")
+        if any(ENVIRONMENT_NAME.fullmatch(name) is None for name in environment):
             raise InvalidAgentRequest("environment entries must be valid variable names")
 
         required: set[UnsafeDimension] = set()
@@ -152,9 +141,9 @@ class PermissionPolicyPatch:
         ):
             value = getattr(self, field)
             if value is not None:
-                normalized = _tuple_of_unique_strings(value, field)
+                normalized = require_unique_strings(value, field)
                 if field == "environment" and any(
-                    _ENVIRONMENT_NAME.fullmatch(name) is None for name in normalized
+                    ENVIRONMENT_NAME.fullmatch(name) is None for name in normalized
                 ):
                     raise InvalidAgentRequest("environment entries must be valid variable names")
                 if field == "network_allowlist":

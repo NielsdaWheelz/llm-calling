@@ -25,12 +25,18 @@ from provider_runtime.agent_runtime.policy import PermissionPolicy
 from provider_runtime.agent_runtime.types import CredentialRef, thaw_json_value
 
 
+def _profile(profile_key: str) -> CredentialRef:
+    return CredentialRef(kind="local_account", profile_key=profile_key)
+
+
 def test_profile_state_roots_are_isolated_and_cannot_escape(tmp_path: Path) -> None:
-    root = resolve_state_root(tmp_path, "codex", "personal")
+    root = resolve_state_root(tmp_path, "codex", _profile("personal"))
 
     assert root == (tmp_path / "codex" / "personal").resolve()
+    # `resolve_state_root` takes the constructed credential, so a traversing key has no way
+    # to reach it: `CredentialRef` is the only place the key rule is enforced.
     with pytest.raises(InvalidAgentRequest, match="profile_key"):
-        resolve_state_root(tmp_path, "codex", "../shared")
+        _profile("../shared")
 
 
 def test_profile_state_roots_reject_symlink_aliases_and_escapes(tmp_path: Path) -> None:
@@ -44,9 +50,9 @@ def test_profile_state_roots_reject_symlink_aliases_and_escapes(tmp_path: Path) 
     (codex / "escape").symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(InvalidAgentRequest, match="symlink"):
-        resolve_state_root(tmp_path, "codex", "alias")
+        resolve_state_root(tmp_path, "codex", _profile("alias"))
     with pytest.raises(InvalidAgentRequest, match="symlink"):
-        resolve_state_root(tmp_path, "codex", "escape")
+        resolve_state_root(tmp_path, "codex", _profile("escape"))
 
 
 def test_local_account_environment_scrubs_every_credential_class_variable(tmp_path: Path) -> None:

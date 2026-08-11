@@ -1,10 +1,12 @@
 """Shared openai-protocol code: the two openai-SDK engines plus the embeddings port.
 
 Three call sites drive the same SDK over the same error envelope, so client
-construction, HTTP/transport classification and Retry-After parsing are one
-implementation here. What differs stays with the caller: the registry row each
-engine resolves, the compat engine's provider-parameterized messages and
-gateway shapes, the embeddings port's credential gate and SDK-decode handling.
+construction and HTTP/transport classification are one implementation here.
+What differs stays with the caller: the registry row each engine resolves, the
+compat engine's provider-parameterized messages and gateway shapes, the
+embeddings port's credential gate and SDK-decode handling. Everything not
+specific to this SDK — Retry-After parsing, cause-chain reading — lives in
+`_common`.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import httpx
 import openai
 
 from provider_runtime.engines import TransientAttempt
+from provider_runtime.engines._common import caused_by, retry_after_seconds
 from provider_runtime.errors import (
     CredentialRejected,
     RuntimeDefect,
@@ -26,7 +29,6 @@ from provider_runtime.types import (
     Billability,
     NotDispatched,
     PossiblyBillable,
-    Presence,
     Present,
     ProviderContextTooLarge,
     ProviderHttpUnavailable,
@@ -124,11 +126,16 @@ def terminal_http_failure(error: openai.APIStatusError) -> ProviderContextTooLar
 
 def transient_connection(error: openai.APIConnectionError) -> TransientAttempt:
     if isinstance(error, openai.APITimeoutError):
+        # The SDK collapses every httpx timeout into one type; only the cause
+        # says which. A connect timeout is a pure pre-connect failure — the
+        # handshake never completed, so no request bytes reached the provider.
         return TransientAttempt(
             cause=ProviderTimeout(),
             status_code=Absent(),
             provider_request_id=Absent(),
-            billability=PossiblyBillable(),
+            billability=(
+                NotDispatched() if caused_by(error, httpx.ConnectTimeout) else PossiblyBillable()
+            ),
         )
     # A pure pre-connect failure means no bytes reached the provider; every
     # other transport error implies the connection was at least opened.
@@ -141,15 +148,3 @@ def transient_connection(error: openai.APIConnectionError) -> TransientAttempt:
         provider_request_id=Absent(),
         billability=billability,
     )
-
-
-def retry_after_seconds(headers: httpx.Headers) -> Presence[float]:
-    """Numeric Retry-After seconds; the HTTP-date form has no consumer → Absent."""
-    raw = headers.get("retry-after")
-    if raw is None:
-        return Absent()
-    try:
-        seconds = float(raw)
-    except ValueError:
-        return Absent()
-    return Present(seconds) if seconds >= 0 else Absent()

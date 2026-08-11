@@ -152,7 +152,6 @@ _CHILD_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # the operator's locale, and the system temporary directory both sandboxes already allow.
 _CHILD_LOCALE = "C.UTF-8"
 _CHILD_TMPDIR = "/tmp"
-_PROFILE_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _SENSITIVE_FIELD = re.compile(
     r"(?i)(?:authorization|api[_-]?key|token|secret|password|credential|cookie)"
 )
@@ -240,13 +239,12 @@ def mcp_header_environment_name(backend: Backend, source: CredentialRef) -> str:
     return f"PROVIDER_RUNTIME_MCP_SECRET_{digest}"
 
 
-def resolve_state_root(base: str | Path, backend: Backend, profile_key: str) -> Path:
+def resolve_state_root(base: str | Path, backend: Backend, credential: CredentialRef) -> Path:
+    """Locate one profile's state root; `CredentialRef` is what proves the key is a safe name."""
     if backend not in _STATE_ROOT_ENVIRONMENT:
         raise InvalidAgentRequest(f"unknown agent backend {backend!r}")
-    if type(profile_key) is not str or _PROFILE_KEY.fullmatch(profile_key) is None:
-        raise InvalidAgentRequest("profile_key must be a safe named state scope")
     base_path = Path(base).resolve()
-    state_root = base_path / backend / profile_key
+    state_root = base_path / backend / credential.profile_key
     resolved = state_root.resolve()
     if resolved != state_root:
         raise InvalidAgentRequest("profile state roots must not contain symlink aliases")
