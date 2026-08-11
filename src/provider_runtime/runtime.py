@@ -21,7 +21,6 @@ suitable for durations only — they are not wall-clock times.
 from __future__ import annotations
 
 import asyncio
-import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, assert_never
@@ -32,6 +31,7 @@ from opentelemetry.trace import TracerProvider
 
 from provider_runtime import embeddings
 from provider_runtime.engines import Engine, TransientAttempt
+from provider_runtime.engines._common import monotonic_ms
 from provider_runtime.engines.anthropic_messages import AnthropicMessagesEngine
 from provider_runtime.engines.gemini_generate import GeminiGenerateEngine
 from provider_runtime.engines.openai_chat import OpenAIChatEngine
@@ -122,10 +122,6 @@ class Credentials:
 # Attempt bookkeeping (trace, billability fold, runtime-owned meta)
 
 
-def _monotonic_ms() -> int:
-    return int(time.monotonic() * 1000)
-
-
 def _record(
     attempt: int, signal: AttemptSignal, status_code: Presence[int], started_ms: int
 ) -> AttemptRecord:
@@ -134,7 +130,7 @@ def _record(
         signal=signal,
         status_code=status_code,
         started_at_ms=started_ms,
-        ended_at_ms=_monotonic_ms(),
+        ended_at_ms=monotonic_ms(),
     )
 
 
@@ -388,7 +384,7 @@ class ProviderRuntime:
         tries = attempts(self._retry)
         try:
             async for handle in tries:
-                started_ms = _monotonic_ms()
+                started_ms = monotonic_ms()
                 if cancel is not None and cancel.is_set():
                     trace.append(_record(handle.number, FinalAttempt(), Absent(), started_ms))
                     return Cancelled(
@@ -485,7 +481,7 @@ class ProviderRuntime:
             tries = attempts(self._retry)
             try:
                 async for handle in tries:
-                    started_ms = _monotonic_ms()
+                    started_ms = monotonic_ms()
                     if cancel is not None and cancel.is_set():
                         yield terminal(Cancelled(meta=cancelled_meta(handle.number, started_ms)))
                         return

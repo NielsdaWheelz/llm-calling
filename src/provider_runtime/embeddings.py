@@ -33,6 +33,7 @@ from openai.types import CreateEmbeddingResponse
 from openai.types.create_embedding_response import Usage
 from openai.types.embedding import Embedding
 
+from provider_runtime.engines._common import int_or_none
 from provider_runtime.engines._openai_common import (
     CANONICAL_BASE_URL,
     terminal_http_failure,
@@ -59,11 +60,6 @@ _TIMEOUT_S: Final[float] = 45.0
 
 def _defect(message: str) -> ProtocolDefect:
     return ProtocolDefect(code="invalid_embedding_response", message=message)
-
-
-def _int_or_none(value: object) -> int | None:
-    # bool is an int subclass; token counts are never booleans.
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 # ---------------------------------------------------------------------------
@@ -110,9 +106,9 @@ def _decode_usage(raw: object) -> Presence[TokenUsage]:
         return Absent()
     try:
         usage = TokenUsage.from_components(
-            input_tokens=_int_or_none(raw.prompt_tokens) or 0,
+            input_tokens=int_or_none(raw.prompt_tokens) or 0,
             output_tokens=0,
-            total_tokens=presence_of(_int_or_none(raw.total_tokens)),
+            total_tokens=presence_of(int_or_none(raw.total_tokens)),
             reasoning_tokens=Absent(),
             cache_read_input_tokens=Absent(),
             cache_write_input_tokens=Absent(),

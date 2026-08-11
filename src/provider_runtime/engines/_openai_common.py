@@ -140,7 +140,7 @@ def transient_connection(error: openai.APIConnectionError) -> TransientAttempt:
     # A pure pre-connect failure means no bytes reached the provider; every
     # other transport error implies the connection was at least opened.
     billability: Billability = (
-        NotDispatched() if isinstance(error.__cause__, httpx.ConnectError) else PossiblyBillable()
+        NotDispatched() if caused_by(error, httpx.ConnectError) else PossiblyBillable()
     )
     return TransientAttempt(
         cause=TransportUnavailable(),

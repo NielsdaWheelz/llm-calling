@@ -80,6 +80,7 @@ from provider_runtime.engines._common import (
     caused_by,
     int_or_none,
     monotonic_ms,
+    registry_invalid,
     response_content,
     retry_after_seconds,
     row_reasoning,
@@ -163,6 +164,27 @@ _OWNED_OPTION_KEYS: Final[frozenset[str]] = frozenset(
     }
 )
 
+# Every request key this engine writes itself — the params literal, the
+# conditional system/tools/output branches, and the kwargs added at the call
+# sites. The reasoning fragment merges into that same mapping LAST, so a row
+# naming one of these AT ANY LEVEL silently overrides the engine's value (the
+# caller's max_output_tokens cap, say); that is a poisoned row, not a request.
+# `output_config` is deliberately absent: the fragment's effort knob and this
+# engine's strict-output format key share that one top-level key by design and
+# merge one level deep.
+_ENGINE_SET_REQUEST_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "model",
+        "max_tokens",
+        "messages",
+        "system",
+        "tools",
+        "tool_choice",
+        "extra_body",
+        "stream",
+    }
+)
+
 # Blocks that cannot carry cache_control on this wire.
 _UNCACHEABLE_BLOCK_TYPES: Final[frozenset[str]] = frozenset({"thinking", "redacted_thinking"})
 
@@ -191,6 +213,13 @@ class _EncodedRequest:
 
 def _encode_request(row: ModelRow, intent: GenerateIntent) -> _EncodedRequest:
     reasoning = row_reasoning(row, intent)
+    fragment_collisions = sorted(_ENGINE_SET_REQUEST_KEYS & reasoning.owned_keys)
+    if fragment_collisions:
+        raise registry_invalid(
+            row,
+            f"reasoning fragment keys {fragment_collisions!r} would rewrite request fields "
+            f"the engine sets itself",
+        )
     collisions = sorted((_OWNED_OPTION_KEYS | reasoning.owned_keys) & set(intent.provider_options))
     if collisions:
         raise InvalidRequest(
@@ -511,7 +540,7 @@ def _transient_connection(error: anthropic.APIConnectionError) -> TransientAttem
     # A pure pre-connect failure means no bytes reached the provider; every
     # other transport error implies the connection was at least opened.
     billability: Billability = (
-        NotDispatched() if isinstance(error.__cause__, httpx.ConnectError) else PossiblyBillable()
+        NotDispatched() if caused_by(error, httpx.ConnectError) else PossiblyBillable()
     )
     return TransientAttempt(
         cause=TransportUnavailable(),

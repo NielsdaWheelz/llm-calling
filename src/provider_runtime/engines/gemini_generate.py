@@ -160,6 +160,31 @@ _OWNED_KEYS: Final[frozenset[str]] = frozenset(
     }
 )
 
+# Every config field this engine writes itself, in both casings the SDK
+# accepts. The reasoning fragment is merged into that config FIRST, so a row
+# naming one of these AT ANY LEVEL is silently overwritten by the engine (or
+# collides with it under the other casing at SDK validation); either way the
+# row is poisoned, not the request. Narrower than `_OWNED_KEYS`, which also
+# forecloses fields whose wire effect the decode contract rules out but the
+# engine never sends.
+_ENGINE_SET_CONFIG_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "max_output_tokens",
+        "maxOutputTokens",
+        "automatic_function_calling",
+        "automaticFunctionCalling",
+        "system_instruction",
+        "systemInstruction",
+        "tools",
+        "tool_config",
+        "toolConfig",
+        "response_mime_type",
+        "responseMimeType",
+        "response_json_schema",
+        "responseJsonSchema",
+    }
+)
+
 # Blocked-content finish reasons (see module docstring for the mapping).
 _CONTENT_FILTER_FINISH_REASONS: Final = frozenset(
     {"SAFETY", "PROHIBITED_CONTENT", "RECITATION", "BLOCKLIST", "SPII", "IMAGE_SAFETY"}
@@ -268,10 +293,18 @@ def _encode(row: ModelRow, intent: GenerateIntent) -> _Encoded:
 
 
 def _row_reasoning(row: ModelRow, intent: GenerateIntent) -> RowReasoning:
-    """The shared row knob plus the one gemini-specific check: the fragment is
-    validated ALONE, so a bad row defects as registry_invalid instead of
-    blaming the caller's provider_options at the merged validation."""
+    """The shared row knob plus the two gemini-specific checks: the fragment
+    may not name a config field the engine sends itself, and it is validated
+    ALONE, so a bad row defects as registry_invalid instead of blaming the
+    caller's provider_options at the merged validation."""
     reasoning = row_reasoning(row, intent)
+    collisions = sorted(_ENGINE_SET_CONFIG_KEYS & reasoning.owned_keys)
+    if collisions:
+        raise registry_invalid(
+            row,
+            f"reasoning fragment keys {collisions!r} would rewrite config fields "
+            f"the engine sets itself",
+        )
     try:
         genai_types.GenerateContentConfig.model_validate(dict(reasoning.fragment))
     except pydantic.ValidationError:

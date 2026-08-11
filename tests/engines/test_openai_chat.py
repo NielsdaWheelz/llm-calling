@@ -438,6 +438,21 @@ async def test_non_mapping_reasoning_value_is_a_registry_defect(engine: OpenAICh
     assert excinfo.value.code == "registry_invalid", f"got {excinfo.value.code}"
 
 
+async def test_reasoning_fragment_naming_an_engine_set_field_is_a_registry_defect(
+    engine: OpenAIChatEngine,
+) -> None:
+    """The body is built ON TOP of the fragment, so a row naming a field the
+    engine writes itself loses its knob to the engine's value while
+    CallMeta.native_reasoning still reports the fragment as sent."""
+    poisoned: Mapping[ReasoningLevel, object] = {
+        "high": {"reasoning_effort": "high", "max_completion_tokens": 8}
+    }
+    row = replace(MOONSHOT_ROW, reasoning=Present(poisoned))
+    with pytest.raises(RuntimeDefect, match="max_completion_tokens") as excinfo:
+        await engine.generate(row, intent_for(row), credential_for(row))
+    assert excinfo.value.code == "registry_invalid", f"got {excinfo.value.code}"
+
+
 @respx.mock
 async def test_xai_request_native_structured_output_and_reasoning_effort(
     engine: OpenAIChatEngine,
@@ -1833,6 +1848,23 @@ async def test_429_with_retry_after_raises_transient_rate_limit(engine: OpenAICh
     assert attempt.cause == ProviderRateLimit(retry_after=Present(7.0)), f"got {attempt.cause}"
     assert attempt.status_code == Present(429)
     assert attempt.billability == PossiblyBillable()
+
+
+@respx.mock
+async def test_429_with_infinite_retry_after_has_absent_delay(engine: OpenAIChatEngine) -> None:
+    """`float()` accepts "Infinity" but ProviderRateLimit only holds a finite
+    delay: a provider- or proxy-controlled header must never reach that
+    constructor with a value it rejects."""
+    respx.post(chat_url(MOONSHOT_ROW)).mock(
+        return_value=httpx.Response(
+            429, headers={"retry-after": "Infinity"}, json={"error": {"message": "slow down"}}
+        )
+    )
+    with pytest.raises(TransientAttempt) as excinfo:
+        await engine.generate(MOONSHOT_ROW, intent_for(MOONSHOT_ROW), credential_for(MOONSHOT_ROW))
+    assert excinfo.value.cause == ProviderRateLimit(retry_after=Absent()), (
+        f"got {excinfo.value.cause}"
+    )
 
 
 @respx.mock

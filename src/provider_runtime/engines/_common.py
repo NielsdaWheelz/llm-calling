@@ -15,9 +15,10 @@ Layering: imports from `types`, `errors` and `registry` only; no SDK imports
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, assert_never
 
 import httpx
@@ -79,7 +80,7 @@ class RowReasoning:
     """What the row's reasoning knob contributes to one request."""
 
     # The wire fragment for the requested level, merged verbatim by the engine.
-    fragment: Mapping[str, Any] = field(repr=False)
+    fragment: Mapping[str, Any]
     # The fragment as compact sorted-keys JSON; Absent when nothing is sent.
     native_reasoning: Presence[str]
     # Every request key the row's knob can write, across ALL its declared
@@ -189,7 +190,12 @@ def response_content(
 
 
 def retry_after_seconds(headers: httpx.Headers) -> Presence[float]:
-    """Numeric Retry-After seconds; the HTTP-date form has no consumer → Absent."""
+    """Numeric Retry-After seconds; the HTTP-date form has no consumer → Absent.
+
+    `float` also accepts "inf"/"nan"/"1e400", which ProviderRateLimit rejects —
+    a provider- or proxy-controlled header must never reach that constructor
+    with a value it cannot hold.
+    """
     raw = headers.get("retry-after")
     if raw is None:
         return Absent()
@@ -197,7 +203,7 @@ def retry_after_seconds(headers: httpx.Headers) -> Presence[float]:
         seconds = float(raw)
     except ValueError:
         return Absent()
-    return Present(seconds) if seconds >= 0 else Absent()
+    return Present(seconds) if math.isfinite(seconds) and seconds >= 0 else Absent()
 
 
 def caused_by(error: BaseException, kind: type[BaseException]) -> bool:

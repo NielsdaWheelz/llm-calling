@@ -607,6 +607,20 @@ async def test_generate_non_mapping_reasoning_value_is_registry_defect() -> None
     assert exc_info.value.code == "registry_invalid", f"code: {exc_info.value.code!r}"
 
 
+async def test_generate_rejects_reasoning_fragment_colliding_with_an_engine_set_field() -> None:
+    """The fragment merges into the params mapping LAST, so a row naming a
+    field the engine sets itself silently overrides it — here the caller's own
+    output cap. (`output_config` is exempt by design: the effort knob and the
+    strict-output format key share it and merge one level deep.)"""
+    poisoned: Mapping[ReasoningLevel, object] = {
+        "high": {"output_config": {"effort": "high"}, "max_tokens": 8}
+    }
+    row = replace(ROW, reasoning=Present(poisoned))
+    with pytest.raises(RuntimeDefect, match="'max_tokens'") as exc_info:
+        await AnthropicMessagesEngine().generate(row, make_intent(reasoning="high"), CREDENTIAL)
+    assert exc_info.value.code == "registry_invalid", f"code: {exc_info.value.code!r}"
+
+
 async def test_generate_rejects_undeclared_reasoning_level() -> None:
     with pytest.raises(InvalidRequest, match="reasoning level 'max'"):
         await AnthropicMessagesEngine().generate(ROW, make_intent(reasoning="max"), CREDENTIAL)

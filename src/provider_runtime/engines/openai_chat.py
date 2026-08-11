@@ -124,10 +124,15 @@ from provider_runtime.types import (
 # The compat quirk-sets this engine serves.
 type _Served = Literal["deepseek", "moonshot", "xai", "openrouter"]
 
-# Keys this engine maps from core intent fields; a provider_options key in
-# this set is an override, not an extension → InvalidRequest. The reasoning
-# knob is row data, so every key it can write joins the set per call
-# (`_encode`).
+# Every request key this engine writes itself: the body fields it maps from
+# core intent fields (both output-cap spellings — the provider decides which),
+# plus the kwargs it adds at the call sites. Two roles, one set. A
+# provider_options key in it is an override, not an extension →
+# InvalidRequest; the reasoning knob is row data, so every key IT can write
+# joins that collision set per call (`_encode`). And because the body is built
+# ON TOP of the fragment, a row whose fragment names one of these has its knob
+# silently overwritten by the engine while CallMeta still reports the fragment
+# as sent → registry_invalid.
 _OWNED_KEYS: Final[frozenset[str]] = frozenset(
     {
         "model",
@@ -149,11 +154,7 @@ def _served_provider(row: ModelRow) -> _Served:
         case "deepseek" | "moonshot" | "xai" | "openrouter" as provider:
             return provider
         case other:
-            raise RuntimeDefect(
-                origin="intent",
-                code="registry_invalid",
-                message=f"openai_chat engine does not serve provider {other!r} (row {row.ref!r})",
-            )
+            raise registry_invalid(row, f"openai_chat engine does not serve provider {other!r}")
 
 
 def _sequence_or_none(value: object) -> Sequence[object] | None:
@@ -177,6 +178,13 @@ class _Encoded:
 
 def _encode(provider: _Served, row: ModelRow, intent: GenerateIntent) -> _Encoded:
     reasoning = row_reasoning(row, intent)
+    fragment_collisions = sorted(_OWNED_KEYS & reasoning.owned_keys)
+    if fragment_collisions:
+        raise registry_invalid(
+            row,
+            f"reasoning fragment keys {fragment_collisions!r} would rewrite request fields "
+            f"the engine sets itself",
+        )
     body: dict[str, object] = dict(reasoning.fragment)
     match provider:
         case "moonshot" | "xai":

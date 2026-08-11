@@ -389,6 +389,21 @@ async def test_reasoning_fragment_that_is_not_config_is_a_registry_defect(
     assert excinfo.value.code == "registry_invalid", f"got {excinfo.value.code}"
 
 
+async def test_reasoning_fragment_naming_an_engine_set_config_field_is_a_registry_defect(
+    engine: GeminiGenerateEngine,
+) -> None:
+    """The fragment is merged into the config the engine builds, so a row
+    naming a field the engine writes itself either loses its knob or overrides
+    the caller — here the caller's own output cap."""
+    poisoned: Mapping[ReasoningLevel, object] = {
+        "high": {"thinking_config": {"thinking_level": "HIGH"}, "max_output_tokens": 8}
+    }
+    row = replace(LEVEL_ROW, reasoning=Present(poisoned))
+    with pytest.raises(RuntimeDefect, match="max_output_tokens") as excinfo:
+        await engine.generate(row, intent_for(row, reasoning="high"), CREDENTIAL)
+    assert excinfo.value.code == "registry_invalid", f"got {excinfo.value.code}"
+
+
 async def test_reasoning_on_knobless_row_raises_invalid_request(
     engine: GeminiGenerateEngine,
 ) -> None:
@@ -1516,6 +1531,27 @@ async def test_429_with_negative_retry_after_has_absent_delay(
         return_value=httpx.Response(
             429,
             headers={"retry-after": "-5"},
+            json={"error": {"code": 429, "message": "slow down", "status": "RESOURCE_EXHAUSTED"}},
+        )
+    )
+    with pytest.raises(TransientAttempt) as excinfo:
+        await engine.generate(LEVEL_ROW, intent_for(LEVEL_ROW), CREDENTIAL)
+    assert excinfo.value.cause == ProviderRateLimit(retry_after=Absent()), (
+        f"got {excinfo.value.cause}"
+    )
+
+
+@respx.mock
+async def test_429_with_infinite_retry_after_has_absent_delay(
+    engine: GeminiGenerateEngine,
+) -> None:
+    """`float()` accepts "inf" but ProviderRateLimit only holds a finite delay:
+    a provider- or proxy-controlled header must never reach that constructor
+    with a value it rejects."""
+    respx.post(generate_url(LEVEL_ROW)).mock(
+        return_value=httpx.Response(
+            429,
+            headers={"retry-after": "inf"},
             json={"error": {"code": 429, "message": "slow down", "status": "RESOURCE_EXHAUSTED"}},
         )
     )
