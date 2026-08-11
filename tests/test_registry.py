@@ -488,6 +488,19 @@ def test_context_and_output_caps_match_provider_docs() -> None:
         )
 
 
+def test_deepseek_reasoning_levels_match_the_product_contract() -> None:
+    expected: dict[str, set[ReasoningLevel]] = {
+        "deepseek:deepseek-v4-flash": {"none", "high", "max"},
+        "deepseek:deepseek-v4-pro": {"none", "high", "max"},
+    }
+    for ref, levels in expected.items():
+        row = resolve(ref)
+        assert isinstance(row.reasoning, Present), f"{ref} must expose a reasoning control"
+        assert set(row.reasoning.value) == levels, (
+            f"{ref} must expose exactly {sorted(levels)}, got {sorted(row.reasoning.value)}"
+        )
+
+
 def test_every_declared_level_maps_to_a_distinct_wire_fragment() -> None:
     # Engines hold zero reasoning shape knowledge: they merge row.reasoning[level]
     # verbatim into the request and stamp it into CallMeta.native_reasoning as

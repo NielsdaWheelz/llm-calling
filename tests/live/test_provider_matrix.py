@@ -18,7 +18,9 @@ Environment contract (read by this test module only — the library reads none):
 Per registry row the matrix probes: plain chat, streaming (envelope grammar +
 exactly one terminal), one tool round trip, ``json_out`` (typed reply), and a
 two-turn reasoning continuation replay — each probe skipping cleanly when the
-row's capabilities say unsupported. Every run writes one evidence file into
+row's capabilities say unsupported. DeepSeek additionally proves its
+thinking-mode tool continuation: reasoning + tool call + native continuation
+replay + tool result + final answer. Every run writes one evidence file into
 ``tests/live/evidence/`` (timestamped, per-row per-probe status + usage +
 request ids + the registry revision). Evidence values pass through the
 package's own redaction before they are written.
@@ -273,6 +275,8 @@ def evidence() -> Iterator[_EvidenceRecorder]:
 
 
 _ROW_IDS = [row.ref for row in ROWS]
+_DEEPSEEK_ROWS = tuple(row for row in ROWS if row.provider == "deepseek")
+_DEEPSEEK_ROW_IDS = [row.ref for row in _DEEPSEEK_ROWS]
 
 
 @pytest.mark.parametrize("row", ROWS, ids=_ROW_IDS)
@@ -382,6 +386,78 @@ async def test_tools_probe(row: ModelRow, evidence: _EvidenceRecorder) -> None:
         assert isinstance(final, TextContent) and final.text.strip(), (
             "the tool round trip produced no final answer"
         )
+        record["tool_called"] = call.name
+        record.update(_meta_evidence(second.meta))
+
+
+@pytest.mark.parametrize("row", _DEEPSEEK_ROWS, ids=_DEEPSEEK_ROW_IDS)
+async def test_deepseek_thinking_tool_continuation_probe(
+    row: ModelRow, evidence: _EvidenceRecorder
+) -> None:
+    with evidence.probe(row, "thinking_tool_continuation") as record:
+        runtime = _runtime_for(row)
+        tool = CanonicalTool(
+            name="lookup_temperature",
+            description="Return the current temperature for a city, in celsius.",
+            parameters={
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+                "additionalProperties": False,
+            },
+        )
+        intent = _intent(
+            row,
+            user=(
+                "Call lookup_temperature exactly once for Paris. After receiving the tool result, "
+                "give the final temperature in one terse sentence."
+            ),
+            reasoning="high",
+            tools=(tool,),
+        )
+        first = await runtime.generate(intent)
+        assert isinstance(first, Succeeded), f"thinking tool turn did not succeed: {first!r}"
+        continuation = first.response.continuation
+        assert isinstance(continuation, Present), "thinking tool turn returned no continuation"
+        reasoning = continuation.value.opaque_payload.get("reasoning_content")
+        assert isinstance(reasoning, str) and reasoning.strip(), (
+            "DeepSeek thinking tool continuation omitted reasoning_content"
+        )
+        content = first.response.content
+        assert isinstance(content, TextContent), (
+            f"thinking tool turn decoded {type(content).__name__}"
+        )
+        assert content.tool_calls, "thinking tool turn made no tool call"
+        call = content.tool_calls[0]
+        assert call.name == tool.name, f"unexpected tool called: {call.name!r}"
+
+        second = await runtime.generate(
+            replace(
+                intent,
+                messages=(
+                    *intent.messages,
+                    AssistantMessage(
+                        text=content.text,
+                        tool_calls=content.tool_calls,
+                        continuation=continuation,
+                    ),
+                    ToolResultMessage(
+                        call_id=call.id, output='{"temperature_c": 21}', is_error=False
+                    ),
+                ),
+            )
+        )
+        assert isinstance(second, Succeeded), (
+            f"thinking tool continuation did not succeed: {second!r}"
+        )
+        final = second.response.content
+        assert isinstance(final, TextContent), (
+            f"thinking tool continuation decoded {type(final).__name__}"
+        )
+        assert final.text.strip() and not final.tool_calls, (
+            f"thinking tool continuation produced no final answer: {final!r}"
+        )
+        record["reasoning"] = "high"
         record["tool_called"] = call.name
         record.update(_meta_evidence(second.meta))
 

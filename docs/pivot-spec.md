@@ -87,7 +87,7 @@ those four "official SDK" coverage.
 - `ProviderName` (extended: `+ "deepseek", "xai"`), `ProviderTarget`, `Presence`/`Present`/`Absent`.
 - `ReasoningLevel = "none"|"minimal"|"low"|"medium"|"high"|"xhigh"|"max"` — full seven levels (Nexus uses `minimal`, `xhigh`).
 - Messages: `SystemMessage | UserMessage | AssistantMessage | ToolResultMessage`; `AssistantMessage.continuation: Presence[ContinuationArtifact]`.
-- **`ContinuationArtifact(target, codec_id, opaque_payload)`** — opaque, non-logged, replayable only to the identical target + codec (engine-validated). Carries OpenAI Responses encrypted reasoning items, Anthropic thinking signatures, Gemini `thoughtSignature`, Kimi `reasoning_content`, OpenRouter ordered `reasoning_details`. Engines never parse it.
+- **`ContinuationArtifact(target, codec_id, opaque_payload)`** — opaque, non-logged, replayable only to the identical target + codec (engine-validated). Carries OpenAI Responses encrypted reasoning items, Anthropic thinking signatures, Gemini `thoughtSignature`, DeepSeek/Kimi `reasoning_content`, OpenRouter ordered `reasoning_details`. Engines never parse it.
 - Tools: `CanonicalTool`, `ToolCall`, `ToolChoice`; `OutputSpec = TextOutput | StrictJsonOutput`.
 - `TokenUsage` — including `cache_read_input_tokens` **and `cache_write_input_tokens`** (both `Presence[int]`; cache read ⊆ input, never additive).
 - **`CallMeta`** — the shared terminal metadata on *every* outcome, success or failure: `provider, model, provider_request_id, upstream_provider, usage, attempt_trace, billability`. Extended with `native_reasoning: Presence[str]` (ledger-consumed) and `registry_revision: str`.
@@ -141,7 +141,7 @@ retries, seq-numbering, and span emission live in `runtime.py`. All SDK clients:
 | Adapter | SDK | Serves | Owns |
 |---|---|---|---|
 | `openai_responses` | `openai` | OpenAI proper | Responses API (OpenAI's recommended lane for reasoning/tools/multi-turn); encrypted reasoning items ↔ `ContinuationArtifact`; `store: false`. |
-| `openai_chat` | `openai` (compat client) | deepseek, moonshot, xai, openrouter | DeepSeek: `reasoning_content` preserved into `ContinuationArtifact`, stripped from resends. Kimi K3: model-specific reasoning controls (per registry row), `reasoning_content` continuity. OpenRouter: unified `reasoning` field; ordered `reasoning_details` ↔ continuation; **routing pins from registry row sent on every call** (§7). |
+| `openai_chat` | `openai` (compat client) | deepseek, moonshot, xai, openrouter | DeepSeek thinking-mode tools: `reasoning_content` is preserved and replayed; the default `tool_choice: auto` is omitted for the provider default, while an explicit nondefault choice fails before dispatch because DeepSeek does not support it. Kimi K3: model-specific reasoning controls (per registry row), `reasoning_content` continuity. OpenRouter: unified `reasoning` field; ordered `reasoning_details` ↔ continuation; **routing pins from registry row sent on every call** (§7). |
 | `anthropic_messages` | `anthropic` | anthropic | `cache_control` injection; thinking signatures ↔ continuation; strict tool schemas (`additionalProperties: false`). |
 | `gemini_generate` | `google-genai` | gemini | Reasoning knob is model-generation-specific: `thinkingLevel` (Gemini 3+) vs `thinkingBudget` (2.5) — chosen by registry row, not hardcoded; `thoughtSignature` ↔ continuation. |
 
@@ -224,7 +224,7 @@ capability matrix — validation is behavioral (capability probe), not version-k
 
 ## 12. Acceptance criteria
 
-1. All seven providers callable; DeepSeek + Grok work (first time); multi-turn reasoning + tool continuations round-trip on openai/anthropic/gemini/moonshot/openrouter.
+1. All seven providers callable; DeepSeek + Grok work (first time); multi-turn reasoning + tool continuations round-trip on openai/anthropic/gemini/deepseek/moonshot/openrouter.
 2. `uv run pytest` green offline; `ruff` clean; `pyright` **standard** clean (strict is a later, separate decision).
 3. `CallMeta` present on every terminal outcome incl. failures; `Billability` semantics unchanged from v1 of the lane (Nexus `chat_runs` logic ports without semantic edits).
 4. Negative gates green; zero imports of deleted modules.

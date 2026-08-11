@@ -52,7 +52,11 @@ outcome's opaque `ContinuationArtifact`, to the next intent's messages. The
 artifact carries native reasoning state (encrypted reasoning items, thinking
 signatures, `thoughtSignature`, `reasoning_content`, ordered
 `reasoning_details`) and is replayed verbatim, never parsed, only to the
-identical target — anything else raises `InvalidRequest`.
+identical target — anything else raises `InvalidRequest`. DeepSeek
+thinking-mode tool turns replay `reasoning_content`; default-auto tool turns
+omit `tool_choice`, using the provider's documented default selection. A
+nondefault tool choice is rejected before dispatch because the provider does
+not support it in thinking mode.
 
 `json_out` derives a strict JSON schema from a pydantic model: native strict
 output on openai/anthropic/gemini/xai, JSON mode plus validation on

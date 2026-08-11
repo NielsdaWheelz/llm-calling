@@ -3,10 +3,11 @@
 One engine, four provider quirk-sets (deepseek, moonshot, xai, openrouter) over
 the openai SDK as a compat client. Fixture rows are constructed locally — tests
 never depend on registry ROWS content. Covered per the freeze: exact request
-body/header shapes, response decode, stream decode from raw SSE bytes,
-continuation round-trips (verbatim replay / reasoning_content strip / verbatim
-reasoning_details), the row's reasoning fragment merged verbatim, provider_options
-passthrough vs collision, and the full fault-injection table.
+body/header shapes, response decode, and stream decode from raw SSE bytes.
+Continuation round-trips cover verbatim replay, `reasoning_content` replay,
+and verbatim `reasoning_details`; the suite also covers the row's reasoning
+fragment merged verbatim, provider_options passthrough versus collision, and
+the full fault-injection table.
 """
 
 import json
@@ -67,6 +68,7 @@ from provider_runtime.types import (
     ToolCallDelta,
     ToolCallDone,
     ToolCallStart,
+    ToolChoice,
     ToolResultMessage,
     TransportUnavailable,
     UserMessage,
@@ -242,6 +244,7 @@ def intent_for(
     messages: tuple[PromptMessage, ...] | None = None,
     reasoning: ReasoningLevel = "high",
     tools: tuple[CanonicalTool, ...] = (),
+    tool_choice: ToolChoice = "auto",
     output: TextOutput | StrictJsonOutput | None = None,
     provider_options: dict[str, object] | None = None,
 ) -> GenerateIntent:
@@ -252,7 +255,7 @@ def intent_for(
         max_output_tokens=512,
         reasoning=reasoning,
         tools=tools,
-        tool_choice="auto",
+        tool_choice=tool_choice,
         output=output or TextOutput(),
         provider_options=provider_options or {},
     )
@@ -991,7 +994,7 @@ async def test_malformed_json_envelope_raises_protocol_defect(engine: OpenAIChat
 
 
 @respx.mock
-async def test_deepseek_reasoning_content_preserved_and_stripped_on_resend(
+async def test_deepseek_reasoning_content_preserved_and_replayed_on_resend(
     engine: OpenAIChatEngine,
 ) -> None:
     mock_completion(
@@ -1027,9 +1030,120 @@ async def test_deepseek_reasoning_content_preserved_and_stripped_on_resend(
     body = last_request_json(route)
     messages = body["messages"]
     assert isinstance(messages, list)
-    assert messages[1] == {"role": "assistant", "content": "hello"}, (
-        f"reasoning_content must NEVER be resent to deepseek; messages: {messages}"
+    assert messages[1] == {
+        "role": "assistant",
+        "content": "hello",
+        "reasoning_content": "let me think",
+    }, f"reasoning_content must be replayed to deepseek; messages: {messages}"
+
+
+@respx.mock
+async def test_deepseek_thinking_tool_continuation_replays_reasoning_and_omits_tool_choice(
+    engine: OpenAIChatEngine,
+) -> None:
+    first_route = mock_completion(
+        DEEPSEEK_ROW,
+        completion_body(
+            model="deepseek-reasoner",
+            finish_reason="tool_calls",
+            message={
+                "role": "assistant",
+                "content": "I will search first.",
+                "reasoning_content": "The tool can answer this.",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": '{"query":"x"}'},
+                    }
+                ],
+            },
+        ),
     )
+    first_intent = intent_for(DEEPSEEK_ROW, tools=(SEARCH_TOOL,), reasoning="high")
+    first = await engine.generate(DEEPSEEK_ROW, first_intent, credential_for(DEEPSEEK_ROW))
+    assert isinstance(first, Succeeded), f"first outcome: {first!r}"
+    assert "tool_choice" not in last_request_json(first_route), (
+        "DeepSeek thinking-mode tool requests must rely on the provider default tool choice"
+    )
+
+    continuation = first.response.continuation
+    assert isinstance(continuation, Present), "thinking tool turn must retain continuation state"
+    content = first.response.content
+    assert isinstance(content, TextContent), f"content: {content!r}"
+    (tool_call,) = content.tool_calls
+
+    respx.clear()
+    second_route = mock_completion(
+        DEEPSEEK_ROW,
+        completion_body(
+            model="deepseek-reasoner", message={"role": "assistant", "content": "done"}
+        ),
+    )
+    second_intent = replace(
+        first_intent,
+        messages=(
+            *first_intent.messages,
+            AssistantMessage(
+                text=content.text,
+                tool_calls=content.tool_calls,
+                continuation=continuation,
+            ),
+            ToolResultMessage(call_id=tool_call.id, output='{"result":"found"}', is_error=False),
+        ),
+    )
+    second = await engine.generate(DEEPSEEK_ROW, second_intent, credential_for(DEEPSEEK_ROW))
+    assert isinstance(second, Succeeded), f"second outcome: {second!r}"
+    second_body = last_request_json(second_route)
+    assert "tool_choice" not in second_body, (
+        "DeepSeek thinking-mode tool continuations must rely on the provider default tool choice"
+    )
+    second_messages = second_body["messages"]
+    assert isinstance(second_messages, list), f"body: {second_body}"
+    assert second_messages[-2] == {
+        "role": "assistant",
+        "content": "I will search first.",
+        "reasoning_content": "The tool can answer this.",
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "search", "arguments": '{"query":"x"}'},
+            }
+        ],
+    }, f"reasoning continuation must replay verbatim: {second_messages}"
+
+
+@respx.mock
+async def test_deepseek_nonthinking_tools_keep_explicit_tool_choice(
+    engine: OpenAIChatEngine,
+) -> None:
+    route = mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-reasoner"))
+    await engine.generate(
+        DEEPSEEK_ROW,
+        intent_for(DEEPSEEK_ROW, tools=(SEARCH_TOOL,), reasoning="none"),
+        credential_for(DEEPSEEK_ROW),
+    )
+    assert last_request_json(route)["tool_choice"] == "auto"
+
+
+@respx.mock
+async def test_deepseek_thinking_tools_reject_explicit_nondefault_tool_choice(
+    engine: OpenAIChatEngine,
+) -> None:
+    route = mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-reasoner"))
+    with pytest.raises(InvalidRequest, match="tool_choice"):
+        await engine.generate(
+            DEEPSEEK_ROW,
+            intent_for(
+                DEEPSEEK_ROW,
+                tools=(SEARCH_TOOL,),
+                reasoning="high",
+                tool_choice="none",
+            ),
+            credential_for(DEEPSEEK_ROW),
+        )
+    assert not route.called, "unsupported DeepSeek thinking tool choice must not be dispatched"
 
 
 @respx.mock

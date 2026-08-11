@@ -113,7 +113,7 @@ class ModelRow:
 
 
 # Bumped on any row change; stamped into every CallMeta (ledger-consumed).
-REGISTRY_REVISION: str = "2026-08-10.2"
+REGISTRY_REVISION: str = "2026-08-11.1"
 
 _TEXT_ONLY: Final[frozenset[Literal["text", "image"]]] = frozenset({"text"})
 _TEXT_AND_IMAGE: Final[frozenset[Literal["text", "image"]]] = frozenset({"text", "image"})
@@ -309,12 +309,11 @@ _OPENROUTER_KIMI_K3: Final = ModelRow(
 # hosted API is text-only. The knob is two parameters, both named here: the
 # top-level `reasoning_effort` low|high|max and the `thinking` switch
 # ({"type": "enabled"|"disabled"}, enabled by default, effort default high) —
-# the docs' own example sends them together. Flash honors all three efforts;
-# pro maps low→high, so "low" is omitted (no invented levels).
+# the docs' own example sends them together. Nexus's pinned product contract
+# exposes only none|high|max on both rows: no caller-visible low alias.
 
 _DEEPSEEK_V4_FLASH_REASONING: Final[Mapping[ReasoningLevel, object]] = {
     "none": {"thinking": {"type": "disabled"}},
-    "low": {"thinking": {"type": "enabled"}, "reasoning_effort": "low"},
     "high": {"thinking": {"type": "enabled"}, "reasoning_effort": "high"},
     "max": {"thinking": {"type": "enabled"}, "reasoning_effort": "max"},
 }

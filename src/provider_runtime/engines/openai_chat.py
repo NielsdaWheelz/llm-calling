@@ -2,8 +2,10 @@
 
 One engine, four provider quirk-sets, dispatched flat on `row.provider`:
 
-- deepseek: `max_tokens`; `reasoning_content` preserved into the continuation
-  artifact and STRIPPED from resent messages.
+- deepseek: `max_tokens`; `reasoning_content` preserved in and replayed from
+  the continuation artifact. Default-auto thinking-mode tool calls omit
+  `tool_choice` and rely on DeepSeek's documented default; an explicit
+  nondefault choice is rejected before dispatch.
 - moonshot: `max_completion_tokens`; continuation = the COMPLETE native
   assistant message replayed verbatim, including `reasoning_content`
   (Preserved Thinking).
@@ -196,7 +198,22 @@ def _encode(provider: _Served, row: ModelRow, intent: GenerateIntent) -> _Encode
             assert_never(provider)
     if intent.tools:
         body["tools"] = [_tool_definition(tool) for tool in intent.tools]
-        body["tool_choice"] = intent.tool_choice
+        # DeepSeek's thinking-mode tool guide requires the native assistant
+        # reasoning to be replayed and demonstrates the provider-default tool
+        # selection. Its thinking mode does not support tool_choice: omitting
+        # the default `auto` is semantically exact, whereas omitting an
+        # explicit nondefault choice would silently change caller intent.
+        # Reject that unsupported combination before any network dispatch.
+        if provider == "deepseek" and intent.reasoning != "none":
+            if intent.tool_choice != "auto":
+                raise InvalidRequest(
+                    message=(
+                        "DeepSeek thinking-mode tool calls do not support a nondefault "
+                        f"tool_choice (got {intent.tool_choice!r})"
+                    )
+                )
+        else:
+            body["tool_choice"] = intent.tool_choice
     match intent.output:
         case TextOutput():
             pass
@@ -315,8 +332,14 @@ def _assistant_wire(
                     # Complete-native-message replay, verbatim — including
                     # reasoning_content (Preserved Thinking).
                     return dict(artifact.opaque_payload)
-                case "deepseek" | "xai":
-                    # Same payload shape, but reasoning_content is NEVER resent.
+                case "deepseek":
+                    # DeepSeek thinking-mode tool continuations require the
+                    # complete native assistant message, including
+                    # reasoning_content, on every subsequent request.
+                    return dict(artifact.opaque_payload)
+                case "xai":
+                    # xAI accepts the same payload shape but reasoning_content
+                    # is not replayable there.
                     payload = dict(artifact.opaque_payload)
                     payload.pop("reasoning_content", None)
                     return payload
