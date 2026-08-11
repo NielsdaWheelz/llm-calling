@@ -86,7 +86,11 @@ request = AgentSessionRequest(
     auth=auth,
     open=NewSession(),
     cwd="/absolute/workspace",
-    policy=PermissionPolicy(),
+    # Everything else is the restrictive default (read-only, no network, denied
+    # approvals). `allowed_tools` is explicit because Codex's public SDK cannot filter
+    # its built-in tools at all, so this route refuses a policy that claims they are
+    # off; see "Policy and approvals". Claude takes `PermissionPolicy()` unchanged.
+    policy=PermissionPolicy(allowed_tools=("*",)),
 )
 
 async with AgentRuntime(config) as runtime:
@@ -105,11 +109,23 @@ stream and returns the stream's `AgentTerminal`.
 Validation is behavioral, not table-driven: `open_session` fails closed before
 any billable work when the request asks for something the transport cannot
 enforce (an unenforceable tool filter, a sandbox mode the host cannot provide,
-an approval mode the backend does not have). On Linux, restricted Codex
-workspace writes and Claude network allowlists require `bubblewrap` to create
-its network namespace (Claude's allowlist additionally requires `socat`); hosts
-that cannot are refused during `open_session` instead of failing midway through
-a turn.
+an approval mode the backend does not have). Session instructions and reasoning
+follow the same rule — each is mapped to a real SDK option or refused, never
+dropped: Codex takes `system` as `base_instructions` and `developer` as
+`developer_instructions`; Claude has one instruction channel (`system_prompt`),
+so it takes `system` and refuses `developer`, and it maps
+`ReasoningSpec.summary` onto its only summary control, `thinking.display`
+(`none`/`auto`), refusing the `concise`/`detailed` verbosity it has no knob for.
+
+All of that is session-scoped, because neither SDK can reconfigure a live
+client. `TurnRequest` therefore carries exactly one turn's `input`, an optional
+narrowing `policy` patch, and an optional `timeout_seconds` — there are no
+per-turn instruction, model, reasoning, MCP, or output overrides to pass.
+
+On Linux, restricted Codex workspace writes and Claude network allowlists
+require `bubblewrap` to create its network namespace (Claude's allowlist
+additionally requires `socat`); hosts that cannot are refused during
+`open_session` instead of failing midway through a turn.
 
 ## Ownership boundary
 
@@ -256,11 +272,16 @@ shipped SDK routes cannot reconfigure a live client's policy, so they reject
 per-turn patches; the narrowing algebra still gates the request before the
 adapter sees it.
 
-Codex's public SDK does not expose exact built-in allow/deny filtering. It
-accepts only the sentinel `allowed_tools=("*",)` when built-ins are
-intentionally enabled; specific names would claim a control the SDK cannot
-enforce. Claude validates policies against its exact accepted native tool names
-and verifies the effective tool set the backend reports at session start.
+Codex's public SDK does not expose built-in allow/deny filtering at all — not
+specific names, and no way to turn the built-ins off. The route therefore
+accepts exactly one spelling, the sentinel `allowed_tools=("*",)`: naming
+specific tools would claim a filter the SDK cannot apply, and leaving the tuple
+empty would claim the built-ins are disabled when they are not. Every Codex
+session in this package's own examples and live matrix carries that sentinel;
+the sandbox and approval mode, not the tool list, are what confine a Codex
+session. Claude does accept exact tool names, rejects glob patterns and the two
+network-reaching built-ins outright, and verifies the effective tool set the
+backend reports at session start against the set that was requested.
 
 ## MCP
 
@@ -271,7 +292,10 @@ MCP configuration is session-scoped on both routes.
 - Streamable HTTP MCP requires HTTPS and must fit the network policy.
 - Claude can enforce an exact hostname allowlist but accepts no credential refs.
 - Codex accepts environment/header references, but its route cannot enforce an
-  exact hostname allowlist; remote MCP therefore requires unrestricted network.
+  exact hostname allowlist, so remote MCP requires unrestricted network — and
+  the SDK's sandbox presets only reach the network under `full_access`, so a
+  Codex remote-MCP session is `full_access` + `unrestricted` with both unsafe
+  dimensions acknowledged. It confines nothing; see SECURITY.md.
 
 Secrets are resolved at the process boundary through `secret_resolver` or a
 named environment source, placed only in opaque child-environment aliases, and
@@ -381,10 +405,11 @@ uv run pytest -m live_provider tests/live/test_agent_matrix.py
 An omitted route selector is the release run and covers both shipped routes.
 `LLM_RUNTIME_LIVE_AGENT_ROUTES=codex:sdk` or `claude:sdk` narrows a debugging run
 and certifies nothing. The matrix never enrolls an account or prints tokens.
-Per route it certifies: one full streamed turn under the default restrictive
-policy, a resumed second turn on the same native session, and a structured
-output turn — asserting the six-kind grammar, the terminal shape, and
-normalized `TokenUsage` on the way through.
+Per route it certifies: one full streamed turn under the route's restrictive
+policy (the defaults, plus the `allowed_tools=("*",)` sentinel Codex requires),
+a resumed second turn on the same native session, and a structured output turn
+— asserting the six-kind grammar, the terminal shape, and normalized
+`TokenUsage` on the way through.
 
 ## References
 

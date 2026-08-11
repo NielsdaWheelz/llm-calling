@@ -71,6 +71,7 @@ from provider_runtime.agent_runtime.types import (
     JsonSchemaAgentOutput,
     McpServerSpec,
     NewSession,
+    ReasoningSpec,
     ResumeSession,
     TextContent,
     TurnRequest,
@@ -252,6 +253,7 @@ class ClaudeAgentOptions:
     cli_path: str
     cwd: str
     disallowed_tools: list[str]
+    effort: str | None
     env: dict[str, str]
     fork_session: bool
     include_partial_messages: bool
@@ -261,6 +263,7 @@ class ClaudeAgentOptions:
     permission_mode: str
     resume: str | None
     sandbox: dict[str, object]
+    thinking: dict[str, object] | None
     tools: list[str]
 
     def __init__(self, **values: object) -> None:
@@ -1646,26 +1649,66 @@ async def test_ask_without_handler_rejects_before_sdk_query(
         await adapter.close()
 
 
-async def test_sdk_max_turns_rejects_before_query_because_client_option_is_session_bound(
+async def test_reasoning_maps_onto_thinking_and_refuses_a_verbosity_claude_has_no_knob_for(
     installed_sdk: SimpleNamespace, tmp_path: Path
 ) -> None:
+    """`display` is Claude's whole summary vocabulary: summarized or omitted, no verbosity."""
     adapter = ClaudeSdkAdapter()
-    session = await adapter.open_session(
-        session_request(tmp_path), environment=environment(tmp_path)
-    )
-    client = ClaudeSDKClient.instances[-1]
     try:
-        with pytest.raises(UnsupportedCapability, match="max_turns"):
-            async for _event in adapter.stream_turn(
-                session,
-                TurnRequest(input=(TextContent("fixture:success"),), max_turns=2),
-                approvals=None,
-            ):
-                pass
+        await adapter.open_session(
+            session_request(
+                tmp_path,
+                reasoning=ReasoningSpec(effort="high", thinking_budget=4_096, summary="auto"),
+            ),
+            environment=environment(tmp_path),
+        )
+        options = ClaudeSDKClient.instances[-1].options
+        assert options.effort == "high"
+        assert options.thinking == {
+            "type": "enabled",
+            "budget_tokens": 4_096,
+            "display": "summarized",
+        }
+
+        await adapter.open_session(
+            session_request(tmp_path, reasoning=ReasoningSpec(effort="low", summary="none")),
+            environment=environment(tmp_path),
+        )
+        assert ClaudeSDKClient.instances[-1].options.thinking == {
+            "type": "adaptive",
+            "display": "omitted",
+        }
+
+        with pytest.raises(UnsupportedCapability, match="verbosity"):
+            await adapter.open_session(
+                session_request(
+                    tmp_path, reasoning=ReasoningSpec(effort="low", summary="detailed")
+                ),
+                environment=environment(tmp_path),
+            )
     finally:
         await adapter.close()
 
-    assert client.query_calls == []
+
+async def test_session_developer_instructions_are_refused_rather_than_dropped(
+    installed_sdk: SimpleNamespace, tmp_path: Path
+) -> None:
+    """One instruction channel exists on this SDK, so a second one cannot be honoured.
+
+    Silently dropping it would run a billable turn without the caller's constraints, which
+    is exactly what the fail-closed open contract exists to prevent.
+    """
+    adapter = ClaudeSdkAdapter()
+    try:
+        with pytest.raises(UnsupportedCapability, match="developer instructions"):
+            await adapter.open_session(
+                session_request(tmp_path, developer=(TextContent("never delete files"),)),
+                environment=environment(tmp_path),
+            )
+    finally:
+        await adapter.close()
+
+    assert ClaudeSDKClient.instances == []
 
 
 async def test_new_resume_and_fork_preserve_native_sdk_session_options(

@@ -9,9 +9,12 @@ Wire obligations (spec §6, openai_responses row):
   reproduce them) into ``ContinuationArtifact.opaque_payload["output"]`` and
   spliced back as input items on the next turn. Typed text/tool_calls are never
   re-synthesized alongside a continuation.
-- Reasoning: ``reasoning: {"effort": <native>}`` with the row's exact declared
-  wire value for the intent level; a row without a reasoning knob sends nothing
-  and records ``native_reasoning=Absent``.
+- Reasoning: the row's reasoning map value is a self-describing wire fragment
+  (openai rows: ``{"reasoning": {"effort": "<level>"}}``) merged verbatim into
+  the request — the engine carries no per-provider shape knowledge.
+  ``native_reasoning`` records the fragment as compact sorted-keys JSON; a row
+  without a reasoning knob (or an empty fragment) sends nothing and records
+  ``Absent``.
 - Tools: function tools with ``strict: true`` and a closed top-level schema
   (``additionalProperties: false``); ``tool_choice`` only alongside tools.
 - Output: ``text.format`` ``json_schema`` (strict) on ``structured="native"``
@@ -24,7 +27,11 @@ Wire obligations (spec §6, openai_responses row):
   retry-after, 5xx → unavailable, timeout/transport → timeout/unavailable,
   in-band stream errors and mid-stream cuts → interrupted); expected
   non-retryable failures return outcome values with full CallMeta; malformed
-  envelopes raise ProtocolDefect; 401/403 raises CredentialRejected.
+  envelopes (including malformed usage) raise ProtocolDefect; 401/403 raises
+  CredentialRejected.
+- Base URL: resolved by the engine (row value, else the canonical OpenAI host).
+  The lane reads zero env vars, so the SDK's OPENAI_BASE_URL default is never
+  allowed to decide where a call goes.
 """
 
 from __future__ import annotations
@@ -122,8 +129,9 @@ from provider_runtime.types import (
     presence_of,
 )
 
-# Request-body keys this engine maps from core intent fields; a provider_options
-# key naming one of these is an override, not an extension.
+# Request-body keys this engine maps from core intent fields. These plus the
+# row's reasoning-fragment top-level keys form the provider_options collision
+# set: naming one is an override, not an extension.
 _OWNED_OPTION_KEYS: Final[frozenset[str]] = frozenset(
     {
         "model",
@@ -131,7 +139,6 @@ _OWNED_OPTION_KEYS: Final[frozenset[str]] = frozenset(
         "max_output_tokens",
         "store",
         "include",
-        "reasoning",
         "tools",
         "tool_choice",
         "text",
@@ -139,11 +146,9 @@ _OWNED_OPTION_KEYS: Final[frozenset[str]] = frozenset(
     }
 )
 
-# In-band stream/terminal error codes signalling a retryable provider-side
-# condition (everything else in an error/failed frame is a ProtocolDefect).
-_TRANSIENT_STREAM_ERROR_CODES: Final[frozenset[str]] = frozenset(
-    {"server_error", "rate_limit_exceeded"}
-)
+# The lane reads zero env vars: an Absent row base_url resolves here, never in
+# the SDK (which would consult OPENAI_BASE_URL).
+_DEFAULT_BASE_URL: Final[str] = "https://api.openai.com/v1"
 
 
 def _monotonic_ms() -> int:
@@ -170,8 +175,38 @@ class _EncodedRequest:
     native_reasoning: Presence[str]
 
 
+def _reasoning_fragment(
+    row: ModelRow, intent: GenerateIntent
+) -> tuple[dict[str, Any], Presence[str]]:
+    """The row's self-describing reasoning wire fragment for the intent level,
+    plus its ``native_reasoning`` stamp (compact sorted-keys JSON; Absent when
+    nothing is sent)."""
+    match row.reasoning:
+        case Present(value=levels):
+            if intent.reasoning not in levels:
+                raise InvalidRequest(
+                    message=f"reasoning level {intent.reasoning!r} is not declared for {row.ref!r}"
+                )
+            value = levels[intent.reasoning]
+            if not isinstance(value, Mapping):
+                raise RuntimeDefect(
+                    origin="intent",
+                    code="registry_invalid",
+                    message=f"row {row.ref!r}: reasoning values must be request-fragment mappings",
+                )
+            fragment: dict[str, Any] = dict(value)
+            if not fragment:
+                return {}, Absent()
+            return fragment, Present(json.dumps(fragment, sort_keys=True, separators=(",", ":")))
+        case Absent():
+            return {}, Absent()
+        case _:
+            assert_never(row.reasoning)
+
+
 def _encode_request(row: ModelRow, intent: GenerateIntent) -> _EncodedRequest:
-    collisions = sorted(_OWNED_OPTION_KEYS & set(intent.provider_options))
+    fragment, native_reasoning = _reasoning_fragment(row, intent)
+    collisions = sorted((_OWNED_OPTION_KEYS | fragment.keys()) & set(intent.provider_options))
     if collisions:
         raise InvalidRequest(
             message=f"provider_options keys {collisions!r} collide with engine-mapped request fields"
@@ -182,21 +217,10 @@ def _encode_request(row: ModelRow, intent: GenerateIntent) -> _EncodedRequest:
         "max_output_tokens": intent.max_output_tokens,
         "store": False,
         "include": ["reasoning.encrypted_content"],
+        # The reasoning fragment merges verbatim — the engine never inspects
+        # its shape; its keys collide with nothing this engine maps.
+        **fragment,
     }
-    native_reasoning: Presence[str]
-    match row.reasoning:
-        case Present(value=levels):
-            if intent.reasoning not in levels:
-                raise InvalidRequest(
-                    message=f"reasoning level {intent.reasoning!r} is not declared for {row.ref!r}"
-                )
-            effort = levels[intent.reasoning]
-            params["reasoning"] = {"effort": effort}
-            native_reasoning = Present(str(effort))
-        case Absent():
-            native_reasoning = Absent()
-        case _:
-            assert_never(row.reasoning)
     if intent.tools:
         params["tools"] = [
             {
@@ -364,7 +388,7 @@ def _meta(
 
 
 # ---------------------------------------------------------------------------
-# SDK error classification (port of the old codec's classify_error)
+# SDK error classification
 
 
 def _terminal_http_failure(error: openai.APIStatusError) -> ProviderContextTooLarge:
@@ -466,17 +490,31 @@ def _decode_usage(raw: object) -> Presence[TokenUsage]:
     reasoning = (
         output_details.reasoning_tokens if isinstance(output_details, OutputTokensDetails) else None
     )
+    input_tokens = _int_or_none(raw.input_tokens)
+    output_tokens = _int_or_none(raw.output_tokens)
+    if input_tokens is None or output_tokens is None:
+        # Usage the SDK surfaced without integer prompt/completion counts;
+        # zeroing them would keep the cache components while dropping the
+        # inclusive input they are a subset of.
+        raise ProtocolDefect(
+            code="malformed_usage",
+            message="openai usage carries no integer input/output token counts",
+        )
     # OpenAI's input_tokens is already cache-inclusive — no normalization needed.
-    return Present(
-        TokenUsage.from_components(
-            input_tokens=_int_or_none(raw.input_tokens) or 0,
-            output_tokens=_int_or_none(raw.output_tokens) or 0,
+    try:
+        usage = TokenUsage.from_components(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             total_tokens=presence_of(_int_or_none(raw.total_tokens)),
             reasoning_tokens=presence_of(_int_or_none(reasoning)),
             cache_read_input_tokens=presence_of(_int_or_none(cached)),
             cache_write_input_tokens=presence_of(_int_or_none(cache_write)),
         )
-    )
+    except ValueError as error:
+        raise ProtocolDefect(
+            code="malformed_usage", message=f"openai usage is not valid token accounting: {error}"
+        ) from error
+    return Present(usage)
 
 
 def _dump_items(items: Sequence[object], *, code: str) -> list[Mapping[str, object]]:
@@ -829,7 +867,7 @@ def _raise_stream_error(
             provider_request_id=presence_of(state.request_id),
             billability=PossiblyBillable(),
         )
-    if code in _TRANSIENT_STREAM_ERROR_CODES:
+    if code == "server_error":
         raise TransientAttempt(
             cause=ProviderHttpUnavailable(),
             status_code=Present(status_code),
@@ -840,6 +878,21 @@ def _raise_stream_error(
     raise ProtocolDefect(
         code="provider_stream_failure",
         message=f"openai stream reported a terminal provider error: {snippet or code or '?'}",
+    )
+
+
+def _raise_sdk_stream_error(
+    error: openai.APIError, *, state: _StreamState, status_code: int
+) -> NoReturn:
+    """The SDK decodes an in-band error itself for any frame carrying a
+    top-level ``error`` key (gateway/proxy shape) and raises APIError before
+    our own frame dispatch sees it; classify it exactly like our frames."""
+    body = error.body if isinstance(error.body, Mapping) else {}
+    _raise_stream_error(
+        code=_str_or_none(body.get("code")),
+        message=_str_or_none(body.get("message")) or sanitize_provider_text(error.message),
+        state=state,
+        status_code=status_code,
     )
 
 
@@ -857,7 +910,7 @@ class OpenAIResponsesEngine:
         self._http_client = http_client
 
     def _client_for(self, row: ModelRow, credential: ProviderCredential) -> openai.AsyncOpenAI:
-        base_url = row.base_url.value if isinstance(row.base_url, Present) else None
+        base_url = row.base_url.value if isinstance(row.base_url, Present) else _DEFAULT_BASE_URL
         return openai.AsyncOpenAI(
             api_key=credential.key,
             base_url=base_url,
@@ -1028,6 +1081,8 @@ class OpenAIResponsesEngine:
                     code="malformed_stream_frame",
                     message=f"openai stream frame is not valid JSON: {error}",
                 ) from error
+            except openai.APIError as error:
+                _raise_sdk_stream_error(error, state=state, status_code=status_code)
             # The SSE source ended without a terminal frame: a mid-stream cut.
             raise TransientAttempt(
                 cause=ProviderStreamInterrupted(partial_output=state.semantic_emitted),

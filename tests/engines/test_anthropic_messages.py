@@ -7,7 +7,7 @@ mocking anywhere — respx intercepts the SDK's own httpx transport.
 
 import json
 from base64 import b64encode
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
 
 import httpx
@@ -77,7 +77,13 @@ from provider_runtime.types import (
 
 MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 
-REASONING_LEVELS: Mapping[ReasoningLevel, object] = {"low": 1024, "high": 8192}
+# Real registry shapes (canonical reasoning convention): an anthropic row's
+# reasoning value is the self-describing wire fragment
+# {"output_config": {"effort": "<level>"}} — never a synthetic stand-in.
+REASONING_LEVELS: Mapping[ReasoningLevel, object] = {
+    "low": {"output_config": {"effort": "low"}},
+    "high": {"output_config": {"effort": "high"}},
+}
 
 ROW = ModelRow(
     ref="anthropic:claude-test",
@@ -238,6 +244,18 @@ def mock_stream(frames: list[dict[str, object]], *, request_id: str = "req_s1") 
     )
 
 
+class BrokenByteStream(httpx.AsyncByteStream):
+    """SSE source that dies mid-stream with a transport-level error."""
+
+    def __init__(self, payload: bytes, error: Exception) -> None:
+        self._payload = payload
+        self._error = error
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self._payload
+        raise self._error
+
+
 START_USAGE: dict[str, object] = {
     "input_tokens": 20,
     "output_tokens": 1,
@@ -306,7 +324,7 @@ def assert_meta(
     *,
     request_id: str = "req_abc",
     usage: TokenUsage | None = EXPECTED_USAGE,
-    native_reasoning: str | None = "budget_tokens=8192",
+    native_reasoning: str | None = '{"output_config":{"effort":"high"}}',
     status_code: int = 200,
     model: str = "claude-test-1",
     billability: Billability | None = None,
@@ -370,12 +388,12 @@ async def test_generate_sends_exact_request_body_headers_and_url() -> None:
             }
         ],
         "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
-        "thinking": {"type": "enabled", "budget_tokens": 8192},
+        "output_config": {"effort": "high"},
     }, f"request body: {body!r}"
 
 
 @respx.mock
-async def test_generate_places_cache_breakpoint_on_last_system_block_only() -> None:
+async def test_generate_first_turn_places_cache_breakpoint_on_last_system_block() -> None:
     route = respx.post(MESSAGES_URL).mock(
         return_value=mock_response(envelope(content=[TEXT_BLOCK], usage=usage_body()))
     )
@@ -389,6 +407,73 @@ async def test_generate_places_cache_breakpoint_on_last_system_block_only() -> N
         {"type": "text", "text": "Rules."},
         {"type": "text", "text": "Corpus.", "cache_control": {"type": "ephemeral"}},
     ], f"system: {body.get('system')!r}"
+    assert body["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}], (
+        f"the new turn must stay unmarked: {body.get('messages')!r}"
+    )
+
+
+@respx.mock
+async def test_generate_multi_turn_places_cache_breakpoint_before_final_turn() -> None:
+    route = respx.post(MESSAGES_URL).mock(
+        return_value=mock_response(envelope(content=[TEXT_BLOCK], usage=usage_body()))
+    )
+    intent = make_intent(
+        messages=(
+            SYSTEM,
+            USER,
+            AssistantMessage(text="hello back", tool_calls=(), continuation=Absent()),
+            UserMessage(blocks=(PromptBlock(text="and again"),)),
+        )
+    )
+    outcome = await AnthropicMessagesEngine().generate(ROW, intent, CREDENTIAL)
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    body = request_body(route)
+    # The stable prefix ends at the prior assistant turn; the system fallback
+    # and the final (new) user turn stay unmarked.
+    assert body["system"] == [{"type": "text", "text": "You are terse."}], (
+        f"system: {body.get('system')!r}"
+    )
+    assert body["messages"] == [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "hello back", "cache_control": {"type": "ephemeral"}}
+            ],
+        },
+        {"role": "user", "content": [{"type": "text", "text": "and again"}]},
+    ], f"messages: {body.get('messages')!r}"
+
+
+@respx.mock
+async def test_generate_cache_breakpoint_skips_thinking_blocks() -> None:
+    route = respx.post(MESSAGES_URL).mock(
+        return_value=mock_response(envelope(content=[TEXT_BLOCK], usage=usage_body()))
+    )
+    artifact = ContinuationArtifact(
+        target=TARGET, codec_id="anthropic.v1", opaque_payload={"blocks": (THINKING_BLOCK,)}
+    )
+    intent = make_intent(
+        messages=(
+            SYSTEM,
+            USER,
+            AssistantMessage(text="", tool_calls=(), continuation=Present(artifact)),
+            UserMessage(blocks=(PromptBlock(text="go on"),)),
+        )
+    )
+    outcome = await AnthropicMessagesEngine().generate(ROW, intent, CREDENTIAL)
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    body = request_body(route)
+    # Thinking blocks cannot carry cache_control on this wire: the marker falls
+    # back past the thinking-only assistant turn to the prior user turn.
+    assert body["messages"] == [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}],
+        },
+        {"role": "assistant", "content": [THINKING_BLOCK]},
+        {"role": "user", "content": [{"type": "text", "text": "go on"}]},
+    ], f"messages: {body.get('messages')!r}"
 
 
 @respx.mock
@@ -402,6 +487,9 @@ async def test_generate_without_system_omits_system_and_breakpoint() -> None:
     assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
     body = request_body(route)
     assert "system" not in body, f"system key must be omitted; body: {body!r}"
+    assert body["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}], (
+        f"no breakpoint anywhere on a history-less, system-less turn: {body.get('messages')!r}"
+    )
 
 
 @respx.mock
@@ -445,7 +533,7 @@ async def test_generate_rejects_empty_assistant_turn() -> None:
 
 
 @respx.mock
-async def test_generate_maps_reasoning_level_to_row_thinking_budget() -> None:
+async def test_generate_merges_reasoning_fragment_for_intent_level() -> None:
     route = respx.post(MESSAGES_URL).mock(
         return_value=mock_response(envelope(content=[TEXT_BLOCK], usage=usage_body()))
     )
@@ -454,16 +542,17 @@ async def test_generate_maps_reasoning_level_to_row_thinking_budget() -> None:
     )
     assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
     body = request_body(route)
-    assert body["thinking"] == {"type": "enabled", "budget_tokens": 1024}, (
-        f"thinking: {body.get('thinking')!r}"
+    assert body["output_config"] == {"effort": "low"}, (
+        f"output_config: {body.get('output_config')!r}"
     )
-    assert outcome.meta.native_reasoning == Present("budget_tokens=1024"), (
+    assert "thinking" not in body, f"no thinking key on this wire; body: {body!r}"
+    assert outcome.meta.native_reasoning == Present('{"output_config":{"effort":"low"}}'), (
         f"native_reasoning: {outcome.meta.native_reasoning!r}"
     )
 
 
 @respx.mock
-async def test_generate_omits_thinking_when_row_has_no_reasoning_knob() -> None:
+async def test_generate_row_without_reasoning_knob_sends_nothing() -> None:
     route = respx.post(MESSAGES_URL).mock(
         return_value=mock_response(envelope(content=[TEXT_BLOCK], usage=usage_body()))
     )
@@ -473,10 +562,36 @@ async def test_generate_omits_thinking_when_row_has_no_reasoning_knob() -> None:
     )
     assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
     body = request_body(route)
-    assert "thinking" not in body, f"thinking key must be omitted; body: {body!r}"
+    assert "output_config" not in body, f"no reasoning keys may be sent; body: {body!r}"
     assert outcome.meta.native_reasoning == Absent(), (
         f"native_reasoning: {outcome.meta.native_reasoning!r}"
     )
+
+
+@respx.mock
+async def test_generate_empty_reasoning_fragment_sends_nothing() -> None:
+    route = respx.post(MESSAGES_URL).mock(
+        return_value=mock_response(envelope(content=[TEXT_BLOCK], usage=usage_body()))
+    )
+    row = replace(ROW, reasoning=Present({"none": {}}))
+    outcome = await AnthropicMessagesEngine().generate(
+        row, make_intent(reasoning="none"), CREDENTIAL
+    )
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    body = request_body(route)
+    assert "output_config" not in body, f"empty fragment must merge nothing; body: {body!r}"
+    assert outcome.meta.native_reasoning == Absent(), (
+        f"native_reasoning: {outcome.meta.native_reasoning!r}"
+    )
+
+
+async def test_generate_non_mapping_reasoning_value_is_registry_defect() -> None:
+    # The synthetic int-budget row shape that once masked the uncallable
+    # registry/engine mismatch is a registry defect, not an encodable knob.
+    row = replace(ROW, reasoning=Present({"high": 8192}))
+    with pytest.raises(RuntimeDefect) as exc_info:
+        await AnthropicMessagesEngine().generate(row, make_intent(reasoning="high"), CREDENTIAL)
+    assert exc_info.value.code == "registry_invalid", f"code: {exc_info.value.code!r}"
 
 
 async def test_generate_rejects_undeclared_reasoning_level() -> None:
@@ -538,8 +653,10 @@ async def test_generate_encodes_strict_json_output_via_output_config_format() ->
     )
     body = request_body(route)
     # SDK 0.121.0 wire fact: GA structured output is output_config.format
-    # (JSONOutputFormatParam), not a top-level output_format field.
+    # (JSONOutputFormatParam), not a top-level output_format field. The
+    # reasoning fragment's effort merges into the SAME output_config object.
     assert body["output_config"] == {
+        "effort": "high",
         "format": {
             "type": "json_schema",
             "schema": {
@@ -548,7 +665,7 @@ async def test_generate_encodes_strict_json_output_via_output_config_format() ->
                 "required": ["verdict"],
                 "additionalProperties": False,
             },
-        }
+        },
     }, f"output_config: {body.get('output_config')!r}"
     assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
     assert outcome.response.content == StructuredContent(
@@ -567,7 +684,10 @@ async def test_generate_json_mode_row_sends_no_output_knob() -> None:
         row, make_intent(output=VERDICT_OUTPUT), CREDENTIAL
     )
     body = request_body(route)
-    assert "output_config" not in body, f"output_config must be omitted; body: {body!r}"
+    # json_mode contributes no format knob; only the reasoning fragment remains.
+    assert body["output_config"] == {"effort": "high"}, (
+        f"output_config: {body.get('output_config')!r}"
+    )
     assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
     assert outcome.response.content == StructuredContent(
         payload={"verdict": "no"}, text='{"verdict": "no"}'
@@ -633,6 +753,8 @@ async def test_generate_replays_continuation_blocks_verbatim_and_groups_tool_res
     outcome = await AnthropicMessagesEngine().generate(ROW, intent, CREDENTIAL)
     assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
     body = request_body(route)
+    # The final turn is the tool_results user message, so the inferred cache
+    # breakpoint lands on the assistant turn's last block (the tool_use).
     assert body["messages"] == [
         {"role": "user", "content": [{"type": "text", "text": "hi"}]},
         {
@@ -646,6 +768,7 @@ async def test_generate_replays_continuation_blocks_verbatim_and_groups_tool_res
                     "id": "toolu_1",
                     "name": "search_library",
                     "input": {"query": "cats"},
+                    "cache_control": {"type": "ephemeral"},
                 },
             ],
         },
@@ -727,9 +850,12 @@ async def test_generate_forwards_provider_options_into_request_body() -> None:
     assert body["service_tier"] == "standard_only", f"body: {body!r}"
 
 
-async def test_generate_rejects_provider_options_colliding_with_owned_keys() -> None:
-    intent = make_intent(provider_options={"thinking": {"type": "disabled"}})
-    with pytest.raises(InvalidRequest, match="thinking"):
+# output_config is both engine-mapped and the reasoning fragment's top-level
+# key; cache_control is engine-inferred (spec §5: no caller annotation).
+@pytest.mark.parametrize("key", ["output_config", "cache_control"])
+async def test_generate_rejects_provider_options_colliding_with_owned_keys(key: str) -> None:
+    intent = make_intent(provider_options={key: {"type": "ephemeral"}})
+    with pytest.raises(InvalidRequest, match=key):
         await AnthropicMessagesEngine().generate(ROW, intent, CREDENTIAL)
 
 
@@ -882,7 +1008,26 @@ async def test_generate_max_tokens_maps_to_incomplete() -> None:
 
 
 @respx.mock
+async def test_generate_context_window_exceeded_returns_failed_value() -> None:
+    respx.post(MESSAGES_URL).mock(
+        return_value=mock_response(
+            envelope(
+                content=[TEXT_BLOCK],
+                stop_reason="model_context_window_exceeded",
+                usage=usage_body(),
+            )
+        )
+    )
+    outcome = await AnthropicMessagesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert isinstance(outcome, Failed), f"outcome: {outcome!r}"
+    assert outcome.failure == ProviderContextTooLarge(), f"failure: {outcome.failure!r}"
+    assert_meta(outcome)
+
+
+@respx.mock
 async def test_generate_unknown_stop_reason_is_protocol_defect() -> None:
+    # pause_turn crashes deliberately: it occurs only on server-tool turns,
+    # which this wire never sends (adjudicated — see the engine's decode).
     respx.post(MESSAGES_URL).mock(
         return_value=mock_response(
             envelope(content=[TEXT_BLOCK], stop_reason="pause_turn", usage=usage_body())
@@ -901,6 +1046,34 @@ async def test_generate_malformed_json_envelope_is_protocol_defect() -> None:
     )
     with pytest.raises(ProtocolDefect, match="not valid JSON"):
         await AnthropicMessagesEngine().generate(ROW, make_intent(), CREDENTIAL)
+
+
+@respx.mock
+async def test_generate_non_json_content_type_is_protocol_defect() -> None:
+    # SDK 0.121 returns the raw text for a 2xx served with a non-JSON content
+    # type (non-strict mode); the engine must treat it as a malformed envelope.
+    respx.post(MESSAGES_URL).mock(
+        return_value=httpx.Response(200, headers={"content-type": "text/plain"}, content=b"hello")
+    )
+    with pytest.raises(ProtocolDefect, match="envelope"):
+        await AnthropicMessagesEngine().generate(ROW, make_intent(), CREDENTIAL)
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [{"input_tokens": "lots", "output_tokens": None}, None],
+    ids=["junk-typed", "missing"],
+)
+@respx.mock
+async def test_generate_malformed_usage_reports_absent_usage(
+    usage: dict[str, object] | None,
+) -> None:
+    respx.post(MESSAGES_URL).mock(
+        return_value=mock_response(envelope(content=[TEXT_BLOCK], usage=usage))
+    )
+    outcome = await AnthropicMessagesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    assert_meta(outcome, usage=None)
 
 
 @respx.mock
@@ -1232,6 +1405,117 @@ async def test_stream_max_tokens_incomplete_terminal() -> None:
 
 
 @respx.mock
+async def test_stream_context_window_exceeded_yields_failed_terminal() -> None:
+    frames: list[dict[str, object]] = [
+        message_start_frame(),
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        text_delta_frame(0, "trunc"),
+        {"type": "content_block_stop", "index": 0},
+        message_delta_frame(stop_reason="model_context_window_exceeded"),
+        {"type": "message_stop"},
+    ]
+    respx.post(MESSAGES_URL).mock(return_value=mock_stream(frames))
+    events = await collect_stream(AnthropicMessagesEngine(), make_intent())
+    terminal = events[-1]
+    assert isinstance(terminal, TerminalEvent), f"events: {events!r}"
+    outcome = terminal.outcome
+    assert isinstance(outcome, Failed), f"terminal outcome: {outcome!r}"
+    assert outcome.failure == ProviderContextTooLarge(), f"failure: {outcome.failure!r}"
+    assert not any(isinstance(event, ContinuationDelta) for event in events), (
+        f"no ContinuationDelta on a failed terminal: {events!r}"
+    )
+    assert_meta(outcome, request_id="req_s1")
+
+
+@respx.mock
+async def test_stream_malformed_usage_emits_no_usage_event_and_absent_meta() -> None:
+    frames: list[dict[str, object]] = [
+        message_start_frame(usage={"input_tokens": "lots", "output_tokens": None}),
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        text_delta_frame(0, "hi"),
+        {"type": "content_block_stop", "index": 0},
+        message_delta_frame(stop_reason="end_turn", usage={"output_tokens": "thirty"}),
+        {"type": "message_stop"},
+    ]
+    respx.post(MESSAGES_URL).mock(return_value=mock_stream(frames))
+    events = await collect_stream(AnthropicMessagesEngine(), make_intent())
+    assert not any(isinstance(event, UsageEvent) for event in events), (
+        f"junk-typed usage frames must not fold into a UsageEvent: {events!r}"
+    )
+    terminal = events[-1]
+    assert isinstance(terminal, TerminalEvent), f"events: {events!r}"
+    outcome = terminal.outcome
+    assert isinstance(outcome, Succeeded), f"terminal outcome: {outcome!r}"
+    assert_meta(outcome, request_id="req_s1", usage=None)
+
+
+@pytest.mark.parametrize(
+    ("error", "cause"),
+    [
+        (httpx.ReadTimeout("mid-stream read timeout"), ProviderTimeout()),
+        (httpx.RemoteProtocolError("peer closed connection"), TransportUnavailable()),
+    ],
+    ids=["timeout", "transport"],
+)
+@respx.mock
+async def test_stream_midstream_transport_error_raises_transient(
+    error: Exception, cause: ProviderTimeout | TransportUnavailable
+) -> None:
+    respx.post(MESSAGES_URL).mock(
+        return_value=httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream", "request-id": "req_s1"},
+            stream=BrokenByteStream(sse_bytes([message_start_frame()]), error),
+        )
+    )
+    events: list[CodecStreamEvent] = []
+    with pytest.raises(TransientAttempt) as exc_info:
+        async for event in AnthropicMessagesEngine().stream(ROW, make_intent(), CREDENTIAL):
+            events.append(event)
+    assert events == [StreamStart()], f"events: {events!r}"
+    assert exc_info.value.cause == cause, f"cause: {exc_info.value.cause!r}"
+    # The provider had already accepted the stream: 200 + request id stamped.
+    assert exc_info.value.status_code == Present(200), (
+        f"status_code: {exc_info.value.status_code!r}"
+    )
+    assert exc_info.value.provider_request_id == Present("req_s1"), (
+        f"provider_request_id: {exc_info.value.provider_request_id!r}"
+    )
+
+
+@respx.mock
+async def test_stream_assembles_redacted_thinking_into_continuation() -> None:
+    frames: list[dict[str, object]] = [
+        message_start_frame(),
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "redacted_thinking", "data": "opaque-redacted"},
+        },
+        {"type": "content_block_stop", "index": 0},
+        {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}},
+        text_delta_frame(1, "hi"),
+        {"type": "content_block_stop", "index": 1},
+        message_delta_frame(stop_reason="end_turn"),
+        {"type": "message_stop"},
+    ]
+    respx.post(MESSAGES_URL).mock(return_value=mock_stream(frames))
+    events = await collect_stream(AnthropicMessagesEngine(), make_intent())
+    continuation_delta = next(event for event in events if isinstance(event, ContinuationDelta))
+    assert list(continuation_delta.artifact.opaque_payload["blocks"]) == [REDACTED_BLOCK], (  # type: ignore[arg-type]
+        f"payload blocks must be the verbatim redacted block: "
+        f"{continuation_delta.artifact.opaque_payload!r}"
+    )
+    terminal = events[-1]
+    assert isinstance(terminal, TerminalEvent), f"events: {events!r}"
+    outcome = terminal.outcome
+    assert isinstance(outcome, Succeeded), f"terminal outcome: {outcome!r}"
+    assert outcome.response.continuation == Present(continuation_delta.artifact), (
+        f"terminal continuation: {outcome.response.continuation!r}"
+    )
+
+
+@respx.mock
 async def test_stream_midcut_after_semantic_output_raises_partial_interrupt() -> None:
     frames: list[dict[str, object]] = [
         message_start_frame(),
@@ -1459,6 +1743,9 @@ async def test_continuation_round_trip_replays_decoded_blocks_verbatim() -> None
                     "id": "toolu_1",
                     "name": "search_library",
                     "input": {"query": "cats"},
+                    # The inferred breakpoint: last cacheable block before the
+                    # final (tool_results) turn.
+                    "cache_control": {"type": "ephemeral"},
                 },
             ],
         },

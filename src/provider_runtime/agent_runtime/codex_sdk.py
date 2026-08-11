@@ -279,6 +279,14 @@ class CodexSdkAdapter:
             }
             if request.model is not None:
                 kwargs["model"] = request.model
+            if request.system:
+                # `base_instructions` is the SDK's system-role channel on thread
+                # start/resume/fork (0.144.4 api.py:135) and *replaces* Codex's built-in base
+                # prompt rather than appending to it, which is what a caller asking for
+                # session system instructions is asking for.
+                kwargs["base_instructions"] = self._text_only(
+                    request.system, "Codex system instructions"
+                )
             if request.developer:
                 kwargs["developer_instructions"] = self._text_only(
                     request.developer, "Codex developer instructions"
@@ -346,24 +354,11 @@ class CodexSdkAdapter:
         state = self._state(session)
         if approvals is not None:
             raise UnsupportedCapability("Codex SDK does not expose caller approval callbacks")
-        if any(
-            value is not None
-            for value in (request.model, request.reasoning, request.policy, request.output)
-        ):
-            raise UnsupportedCapability("Codex SDK turn overrides persist and are disabled")
-        if request.system is not None or request.developer is not None:
-            raise UnsupportedCapability("Codex SDK instructions are session-scoped")
-        if request.mcp_servers is not None:
-            raise UnsupportedCapability("Codex SDK MCP configuration is session-scoped")
-        if request.max_turns is not None:
-            raise UnsupportedCapability("Codex SDK does not support max_turns")
-        if request.native is not None:
-            raise UnsupportedCapability("Codex SDK native options are session-scoped")
+        if request.policy is not None:
+            raise UnsupportedCapability("Codex SDK cannot reconfigure policy on a started thread")
 
         policy = state.request.policy
-        inputs = [
-            self._codex_input(state.sdk, part, state.request, policy) for part in request.input
-        ]
+        inputs = [self._codex_input(state.sdk, part) for part in request.input]
         kwargs: dict[str, object] = {
             "approval_mode": self._approval_mode(state.sdk, policy),
         }
@@ -724,8 +719,6 @@ class CodexSdkAdapter:
                 raise ProtocolDefect(f"{method} carried no message")
             self._append_diagnostic(state, sanitize_provider_text(message))
             return AgentNative(native_type=method, payload=redact_native_payload(params))
-        if method in ("thread/status/changed", "mcpServer/startupStatus/updated"):
-            return None
         return AgentNative(
             native_type=sanitize_provider_text(method, limit=128),
             payload=redact_native_payload(params),
@@ -1144,24 +1137,14 @@ class CodexSdkAdapter:
         return "\n\n".join(part.text for part in parts if isinstance(part, TextContent))
 
     @staticmethod
-    def _codex_input(
-        sdk: ModuleType,
-        part: object,
-        request: AgentSessionRequest,
-        policy: PermissionPolicy,
-    ) -> object:
+    def _codex_input(sdk: ModuleType, part: object) -> object:
         if isinstance(part, TextContent):
             return sdk.TextInput(text=part.text)
         if isinstance(part, ImageContent):
-            path = Path(part.path).resolve()
-            roots = tuple(Path(root).resolve() for root in (request.cwd, *request.additional_dirs))
-            if policy.filesystem != "full_access" and not any(
-                path.is_relative_to(root) for root in roots
-            ):
-                raise InvalidAgentRequest("image attachment is outside authorized workspace roots")
-            if not path.is_file() or path.stat().st_size != part.size_bytes:
-                raise InvalidAgentRequest("image attachment path or declared size is invalid")
-            return sdk.LocalImageInput(path=str(path))
+            # Existence, declared size, and containment under the authorized roots are
+            # `AgentRuntime._validate_content_files`'s single check of every turn input, so
+            # this only translates the part the SDK accepts.
+            return sdk.LocalImageInput(path=part.path)
         raise UnsupportedCapability("Codex SDK input supports text and local images")
 
     def _codex_config(self, request: AgentSessionRequest) -> dict[str, object]:
@@ -1232,6 +1215,15 @@ class CodexSdkAdapter:
 
     @staticmethod
     def _append_diagnostic(state: _CodexSessionState, message: str) -> None:
+        """Append one deduplicated turn diagnostic, failing the turn past the bound.
+
+        These come from the turn's own `error`/`warning` notifications, so they are part of
+        the turn's output budget like its text and its frames: exceeding the bound ends the
+        turn as `output_limit_exceeded` through `stream_turn`'s existing handler rather than
+        reporting a silently truncated diagnostic record. Claude's `_record_diagnostic`
+        drops instead, because there the callers are teardown paths with an outcome of their
+        own that must not be replaced by a bound.
+        """
         if message in state.diagnostics:
             return
         if len(state.diagnostics) >= _MAX_DIAGNOSTICS:

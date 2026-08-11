@@ -217,18 +217,52 @@ async def test_retry_after_may_exceed_the_backoff_max_delay() -> None:
     )
 
 
-async def test_retry_after_is_capped_at_sixty_seconds() -> None:
+async def test_retry_after_at_the_sixty_second_cap_is_honored() -> None:
     clock = ManualClock()
     sleep = SleepRecorder(clock)
-    await drive(
+    numbers = await drive(
         policy(max_attempts=2),
+        fail_with=lambda _: ProviderRateLimit(retry_after=Present(60.0)),
+        clock=clock,
+        sleep=sleep,
+    )
+    assert numbers == [1, 2], f"a retry_after exactly at the cap must retry, got {numbers}"
+    assert sleep.delays == [60.0], (
+        f"retry_after at the cap must be slept verbatim, got {sleep.delays}"
+    )
+
+
+async def test_retry_after_above_sixty_seconds_exhausts_without_retrying() -> None:
+    # Never retry before the provider's stated window: a retry_after above
+    # the 60s cap is not honored by an early retry, so the call exhausts
+    # instead of sleeping a clamped, premature delay.
+    clock = ManualClock()
+    sleep = SleepRecorder(clock)
+    numbers = await drive(
+        policy(max_attempts=3),
         fail_with=lambda _: ProviderRateLimit(retry_after=Present(90.0)),
         clock=clock,
         sleep=sleep,
     )
-    assert sleep.delays == [60.0], (
-        f"retry_after above 60s must be clamped to the 60s cap, got {sleep.delays}"
+    assert numbers == [1], (
+        f"a retry_after above 60s must exhaust on the first failed attempt, got {numbers}"
     )
+    assert sleep.delays == [], f"an above-cap retry_after must never be slept, got {sleep.delays}"
+
+
+async def test_negative_retry_after_never_sleeps_negative() -> None:
+    # Speculative (a mis-parsed Retry-After header): retry_after has no
+    # non-negativity invariant at construction, so the loop must not turn a
+    # negative value into an instant zero-backoff retry via a bare sleep().
+    clock = ManualClock()
+    sleep = SleepRecorder(clock)
+    await drive(
+        policy(max_attempts=2),
+        fail_with=lambda _: ProviderRateLimit(retry_after=Present(-5.0)),
+        clock=clock,
+        sleep=sleep,
+    )
+    assert sleep.delays == [0.0], f"a negative retry_after must clamp to 0, got {sleep.delays}"
 
 
 async def test_rate_limit_without_retry_after_uses_backoff() -> None:

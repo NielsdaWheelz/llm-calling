@@ -101,8 +101,14 @@ def _tokens(count: Presence[int]) -> int:
 def _amount_usd_micros(usage: TokenUsage, rates: _Rates) -> int:
     cache_read = _tokens(usage.cache_read_input_tokens)
     cache_write = _tokens(usage.cache_write_input_tokens)
+    # cache_read_input_tokens is documented as a subset of input_tokens, but a
+    # provider can misreport it (e.g. an engine that fails to normalize an
+    # exclusive-count provider's usage frame at ingress); clamp instead of
+    # going negative — the estimate is indicative, never authoritative, so a
+    # clamped-but-well-formed number beats a crash.
+    uncached = max(0, usage.input_tokens - cache_read)
     amount = (
-        (usage.input_tokens - cache_read) * rates.input_mtok
+        uncached * rates.input_mtok
         + cache_read * rates.cache_read_mtok
         + cache_write * rates.cache_write_surcharge_mtok
         + usage.output_tokens * rates.output_mtok

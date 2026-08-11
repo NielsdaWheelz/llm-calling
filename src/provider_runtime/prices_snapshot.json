@@ -5,7 +5,6 @@
   {
    "provider": "anthropic",
    "model": "claude-2",
-   "effective": "2026-08-10",
    "input_mtok_usd": "8",
    "output_mtok_usd": "24",
    "cache_read_mtok_usd": "8",
@@ -14,7 +13,6 @@
   {
    "provider": "anthropic",
    "model": "claude-3-5-haiku-latest",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.8",
    "output_mtok_usd": "4",
    "cache_read_mtok_usd": "0.08",
@@ -23,7 +21,6 @@
   {
    "provider": "anthropic",
    "model": "claude-3-5-sonnet",
-   "effective": "2026-08-10",
    "input_mtok_usd": "3",
    "output_mtok_usd": "15",
    "cache_read_mtok_usd": "0.3",
@@ -32,7 +29,6 @@
   {
    "provider": "anthropic",
    "model": "claude-3-7-sonnet-latest",
-   "effective": "2026-08-10",
    "input_mtok_usd": "3",
    "output_mtok_usd": "15",
    "cache_read_mtok_usd": "0.3",
@@ -41,7 +37,6 @@
   {
    "provider": "anthropic",
    "model": "claude-3-haiku",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.25",
    "output_mtok_usd": "1.25",
    "cache_read_mtok_usd": "0.03",
@@ -50,7 +45,6 @@
   {
    "provider": "anthropic",
    "model": "claude-3-opus-latest",
-   "effective": "2026-08-10",
    "input_mtok_usd": "15",
    "output_mtok_usd": "75",
    "cache_read_mtok_usd": "1.5",
@@ -59,7 +53,6 @@
   {
    "provider": "anthropic",
    "model": "claude-3-sonnet",
-   "effective": "2026-08-10",
    "input_mtok_usd": "3",
    "output_mtok_usd": "15",
    "cache_read_mtok_usd": "0.3",
@@ -68,7 +61,6 @@
   {
    "provider": "anthropic",
    "model": "claude-fable-5",
-   "effective": "2026-08-10",
    "input_mtok_usd": "10",
    "output_mtok_usd": "50",
    "cache_read_mtok_usd": "1",
@@ -77,7 +69,6 @@
   {
    "provider": "anthropic",
    "model": "claude-haiku-4-5",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1",
    "output_mtok_usd": "5",
    "cache_read_mtok_usd": "0.1",
@@ -86,7 +77,6 @@
   {
    "provider": "anthropic",
    "model": "claude-opus-4-0",
-   "effective": "2026-08-10",
    "input_mtok_usd": "15",
    "output_mtok_usd": "75",
    "cache_read_mtok_usd": "1.5",
@@ -95,7 +85,6 @@
   {
    "provider": "anthropic",
    "model": "claude-opus-4-1",
-   "effective": "2026-08-10",
    "input_mtok_usd": "15",
    "output_mtok_usd": "75",
    "cache_read_mtok_usd": "1.5",
@@ -104,7 +93,6 @@
   {
    "provider": "anthropic",
    "model": "claude-opus-4-5",
-   "effective": "2026-08-10",
    "input_mtok_usd": "5",
    "output_mtok_usd": "25",
    "cache_read_mtok_usd": "0.5",
@@ -113,7 +101,6 @@
   {
    "provider": "anthropic",
    "model": "claude-opus-4-6",
-   "effective": "2026-03-13",
    "input_mtok_usd": "5",
    "output_mtok_usd": "25",
    "cache_read_mtok_usd": "0.5",
@@ -122,7 +109,6 @@
   {
    "provider": "anthropic",
    "model": "claude-opus-4-7",
-   "effective": "2026-08-10",
    "input_mtok_usd": "5",
    "output_mtok_usd": "25",
    "cache_read_mtok_usd": "0.5",
@@ -131,7 +117,6 @@
   {
    "provider": "anthropic",
    "model": "claude-opus-4-8",
-   "effective": "2026-08-10",
    "input_mtok_usd": "5",
    "output_mtok_usd": "25",
    "cache_read_mtok_usd": "0.5",
@@ -140,7 +125,6 @@
   {
    "provider": "anthropic",
    "model": "claude-opus-5",
-   "effective": "2026-08-10",
    "input_mtok_usd": "5",
    "output_mtok_usd": "25",
    "cache_read_mtok_usd": "0.5",
@@ -149,7 +133,6 @@
   {
    "provider": "anthropic",
    "model": "claude-sonnet-4-0",
-   "effective": "2026-08-10",
    "input_mtok_usd": "3",
    "output_mtok_usd": "15",
    "cache_read_mtok_usd": "0.3",
@@ -158,7 +141,6 @@
   {
    "provider": "anthropic",
    "model": "claude-sonnet-4-5",
-   "effective": "2026-08-10",
    "input_mtok_usd": "3",
    "output_mtok_usd": "15",
    "cache_read_mtok_usd": "0.3",
@@ -167,7 +149,6 @@
   {
    "provider": "anthropic",
    "model": "claude-sonnet-4-6",
-   "effective": "2026-03-13",
    "input_mtok_usd": "3",
    "output_mtok_usd": "15",
    "cache_read_mtok_usd": "0.3",
@@ -176,7 +157,6 @@
   {
    "provider": "anthropic",
    "model": "claude-sonnet-5",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2",
    "output_mtok_usd": "10",
    "cache_read_mtok_usd": "0.2",
@@ -185,7 +165,6 @@
   {
    "provider": "anthropic",
    "model": "claude-v1",
-   "effective": "2026-08-10",
    "input_mtok_usd": "8",
    "output_mtok_usd": "24",
    "cache_read_mtok_usd": "8",
@@ -194,25 +173,22 @@
   {
    "provider": "deepseek",
    "model": "deepseek-chat",
-   "effective": "2026-08-10",
-   "input_mtok_usd": "0.135",
-   "output_mtok_usd": "0.55",
-   "cache_read_mtok_usd": "0.035",
+   "input_mtok_usd": "0.27",
+   "output_mtok_usd": "1.1",
+   "cache_read_mtok_usd": "0.07",
    "cache_write_surcharge_mtok_usd": "0"
   },
   {
    "provider": "deepseek",
    "model": "deepseek-reasoner",
-   "effective": "2026-08-10",
-   "input_mtok_usd": "0.135",
-   "output_mtok_usd": "0.55",
-   "cache_read_mtok_usd": "0.035",
+   "input_mtok_usd": "0.55",
+   "output_mtok_usd": "2.19",
+   "cache_read_mtok_usd": "0.14",
    "cache_write_surcharge_mtok_usd": "0"
   },
   {
    "provider": "deepseek",
    "model": "deepseek-v3.1-terminus",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.27",
    "output_mtok_usd": "0.95",
    "cache_read_mtok_usd": "0.13",
@@ -221,7 +197,6 @@
   {
    "provider": "deepseek",
    "model": "deepseek-v3.2",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.2288",
    "output_mtok_usd": "0.3432",
    "cache_read_mtok_usd": "0.2288",
@@ -230,7 +205,6 @@
   {
    "provider": "deepseek",
    "model": "deepseek-v3.2-exp",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.27",
    "output_mtok_usd": "0.41",
    "cache_read_mtok_usd": "0.27",
@@ -239,7 +213,6 @@
   {
    "provider": "deepseek",
    "model": "deepseek-v4-flash",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.14",
    "output_mtok_usd": "0.28",
    "cache_read_mtok_usd": "0.0028",
@@ -248,7 +221,6 @@
   {
    "provider": "deepseek",
    "model": "deepseek-v4-pro",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.435",
    "output_mtok_usd": "0.87",
    "cache_read_mtok_usd": "0.003625",
@@ -257,7 +229,6 @@
   {
    "provider": "gemini",
    "model": "claude-3-5-haiku",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.8",
    "output_mtok_usd": "4",
    "cache_read_mtok_usd": "0.08",
@@ -266,7 +237,6 @@
   {
    "provider": "gemini",
    "model": "claude-3-5-sonnet",
-   "effective": "2026-08-10",
    "input_mtok_usd": "3",
    "output_mtok_usd": "15",
    "cache_read_mtok_usd": "0.3",
@@ -275,7 +245,6 @@
   {
    "provider": "gemini",
    "model": "claude-3-7-sonnet",
-   "effective": "2026-08-10",
    "input_mtok_usd": "3",
    "output_mtok_usd": "15",
    "cache_read_mtok_usd": "0.3",
@@ -284,7 +253,6 @@
   {
    "provider": "gemini",
    "model": "claude-3-haiku",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.25",
    "output_mtok_usd": "1.25",
    "cache_read_mtok_usd": "0.03",
@@ -293,7 +261,6 @@
   {
    "provider": "gemini",
    "model": "claude-3-opus",
-   "effective": "2026-08-10",
    "input_mtok_usd": "15",
    "output_mtok_usd": "75",
    "cache_read_mtok_usd": "1.5",
@@ -302,7 +269,6 @@
   {
    "provider": "gemini",
    "model": "claude-4-opus",
-   "effective": "2026-08-10",
    "input_mtok_usd": "15",
    "output_mtok_usd": "75",
    "cache_read_mtok_usd": "1.5",
@@ -311,7 +277,6 @@
   {
    "provider": "gemini",
    "model": "claude-4-sonnet",
-   "effective": "2026-08-10",
    "input_mtok_usd": "3",
    "output_mtok_usd": "15",
    "cache_read_mtok_usd": "0.3",
@@ -320,7 +285,6 @@
   {
    "provider": "gemini",
    "model": "claude-fable-5",
-   "effective": "2026-08-10",
    "input_mtok_usd": "10",
    "output_mtok_usd": "50",
    "cache_read_mtok_usd": "1",
@@ -329,7 +293,6 @@
   {
    "provider": "gemini",
    "model": "claude-opus-4-6",
-   "effective": "2026-08-10",
    "input_mtok_usd": "5",
    "output_mtok_usd": "25",
    "cache_read_mtok_usd": "0.5",
@@ -338,7 +301,6 @@
   {
    "provider": "gemini",
    "model": "claude-opus-4-7",
-   "effective": "2026-08-10",
    "input_mtok_usd": "5",
    "output_mtok_usd": "25",
    "cache_read_mtok_usd": "0.5",
@@ -347,7 +309,6 @@
   {
    "provider": "gemini",
    "model": "claude-opus-4-8",
-   "effective": "2026-08-10",
    "input_mtok_usd": "5",
    "output_mtok_usd": "25",
    "cache_read_mtok_usd": "0.5",
@@ -356,7 +317,6 @@
   {
    "provider": "gemini",
    "model": "claude-opus-5",
-   "effective": "2026-08-10",
    "input_mtok_usd": "5",
    "output_mtok_usd": "25",
    "cache_read_mtok_usd": "0.5",
@@ -365,7 +325,6 @@
   {
    "provider": "gemini",
    "model": "gemini-1.0-pro-vision-001",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.125",
    "output_mtok_usd": "0.375",
    "cache_read_mtok_usd": "0.125",
@@ -374,7 +333,6 @@
   {
    "provider": "gemini",
    "model": "gemini-1.5-flash",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.075",
    "output_mtok_usd": "0.3",
    "cache_read_mtok_usd": "0.01875",
@@ -383,7 +341,6 @@
   {
    "provider": "gemini",
    "model": "gemini-1.5-pro",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.25",
    "output_mtok_usd": "5",
    "cache_read_mtok_usd": "1.25",
@@ -392,7 +349,6 @@
   {
    "provider": "gemini",
    "model": "gemini-2.0-flash",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.1",
    "output_mtok_usd": "0.4",
    "cache_read_mtok_usd": "0.025",
@@ -401,7 +357,6 @@
   {
    "provider": "gemini",
    "model": "gemini-2.0-flash-lite",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.075",
    "output_mtok_usd": "0.3",
    "cache_read_mtok_usd": "0.075",
@@ -410,7 +365,6 @@
   {
    "provider": "gemini",
    "model": "gemini-2.5-flash",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.3",
    "output_mtok_usd": "2.5",
    "cache_read_mtok_usd": "0.03",
@@ -419,7 +373,6 @@
   {
    "provider": "gemini",
    "model": "gemini-2.5-flash-image",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.3",
    "output_mtok_usd": "30",
    "cache_read_mtok_usd": "0.3",
@@ -428,7 +381,6 @@
   {
    "provider": "gemini",
    "model": "gemini-2.5-flash-lite",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.1",
    "output_mtok_usd": "0.4",
    "cache_read_mtok_usd": "0.01",
@@ -437,7 +389,6 @@
   {
    "provider": "gemini",
    "model": "gemini-2.5-flash-preview",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.15",
    "output_mtok_usd": "0.6",
    "cache_read_mtok_usd": "0.15",
@@ -446,7 +397,6 @@
   {
    "provider": "gemini",
    "model": "gemini-2.5-pro",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.25",
    "output_mtok_usd": "10",
    "cache_read_mtok_usd": "0.125",
@@ -455,7 +405,6 @@
   {
    "provider": "gemini",
    "model": "gemini-3-flash-preview",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.5",
    "output_mtok_usd": "3",
    "cache_read_mtok_usd": "0.05",
@@ -464,7 +413,6 @@
   {
    "provider": "gemini",
    "model": "gemini-3-pro-image-preview",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2",
    "output_mtok_usd": "120",
    "cache_read_mtok_usd": "2",
@@ -473,7 +421,6 @@
   {
    "provider": "gemini",
    "model": "gemini-3-pro-preview",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2",
    "output_mtok_usd": "12",
    "cache_read_mtok_usd": "0.2",
@@ -482,7 +429,6 @@
   {
    "provider": "gemini",
    "model": "gemini-3.1-flash-image-preview",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.5",
    "output_mtok_usd": "60",
    "cache_read_mtok_usd": "0.5",
@@ -491,7 +437,6 @@
   {
    "provider": "gemini",
    "model": "gemini-3.1-flash-lite",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.25",
    "output_mtok_usd": "1.5",
    "cache_read_mtok_usd": "0.025",
@@ -500,7 +445,6 @@
   {
    "provider": "gemini",
    "model": "gemini-3.1-pro-preview",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2",
    "output_mtok_usd": "12",
    "cache_read_mtok_usd": "0.2",
@@ -509,7 +453,6 @@
   {
    "provider": "gemini",
    "model": "gemini-3.5-flash",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.5",
    "output_mtok_usd": "9",
    "cache_read_mtok_usd": "0.15",
@@ -518,7 +461,6 @@
   {
    "provider": "gemini",
    "model": "gemini-3.5-flash-lite",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.3",
    "output_mtok_usd": "2.5",
    "cache_read_mtok_usd": "0.03",
@@ -527,7 +469,6 @@
   {
    "provider": "gemini",
    "model": "gemini-3.6-flash",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.5",
    "output_mtok_usd": "7.5",
    "cache_read_mtok_usd": "0.15",
@@ -536,7 +477,6 @@
   {
    "provider": "gemini",
    "model": "gemini-flash-1.5",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.075",
    "output_mtok_usd": "0.3",
    "cache_read_mtok_usd": "0.01875",
@@ -545,7 +485,6 @@
   {
    "provider": "gemini",
    "model": "gemini-flash-1.5-8b",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.0375",
    "output_mtok_usd": "0.15",
    "cache_read_mtok_usd": "0.01",
@@ -554,7 +493,6 @@
   {
    "provider": "gemini",
    "model": "gemini-live-2.5-flash",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.5",
    "output_mtok_usd": "2",
    "cache_read_mtok_usd": "0.5",
@@ -563,7 +501,6 @@
   {
    "provider": "gemini",
    "model": "gemini-pro",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.125",
    "output_mtok_usd": "0.375",
    "cache_read_mtok_usd": "0.125",
@@ -572,7 +509,6 @@
   {
    "provider": "gemini",
    "model": "gemini-pro-1.5",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.25",
    "output_mtok_usd": "5",
    "cache_read_mtok_usd": "0.3125",
@@ -581,7 +517,6 @@
   {
    "provider": "gemini",
    "model": "gemma-2-27b-it",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.65",
    "output_mtok_usd": "0.65",
    "cache_read_mtok_usd": "0.65",
@@ -590,7 +525,6 @@
   {
    "provider": "gemini",
    "model": "gemma-4-26b-a4b-it",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.06",
    "output_mtok_usd": "0.33",
    "cache_read_mtok_usd": "0.06",
@@ -599,7 +533,6 @@
   {
    "provider": "gemini",
    "model": "gemma-4-31b-it",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.12",
    "output_mtok_usd": "0.36",
    "cache_read_mtok_usd": "0.09",
@@ -608,7 +541,6 @@
   {
    "provider": "moonshot",
    "model": "kimi-k2",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.57",
    "output_mtok_usd": "2.3",
    "cache_read_mtok_usd": "0.57",
@@ -617,7 +549,6 @@
   {
    "provider": "moonshot",
    "model": "kimi-k2-0711-preview",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.6",
    "output_mtok_usd": "2.5",
    "cache_read_mtok_usd": "0.15",
@@ -626,7 +557,6 @@
   {
    "provider": "moonshot",
    "model": "kimi-k2-0905-preview",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.6",
    "output_mtok_usd": "2.5",
    "cache_read_mtok_usd": "0.15",
@@ -635,7 +565,6 @@
   {
    "provider": "moonshot",
    "model": "kimi-k2-thinking",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.6",
    "output_mtok_usd": "2.5",
    "cache_read_mtok_usd": "0.15",
@@ -644,7 +573,6 @@
   {
    "provider": "moonshot",
    "model": "kimi-k2-thinking-turbo",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.15",
    "output_mtok_usd": "8",
    "cache_read_mtok_usd": "0.15",
@@ -653,7 +581,6 @@
   {
    "provider": "moonshot",
    "model": "kimi-k2-turbo-preview",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.15",
    "output_mtok_usd": "8",
    "cache_read_mtok_usd": "0.15",
@@ -662,7 +589,6 @@
   {
    "provider": "moonshot",
    "model": "kimi-k2.5",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.6",
    "output_mtok_usd": "3",
    "cache_read_mtok_usd": "0.1",
@@ -671,7 +597,6 @@
   {
    "provider": "moonshot",
    "model": "kimi-k2.6",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.95",
    "output_mtok_usd": "4",
    "cache_read_mtok_usd": "0.16",
@@ -680,7 +605,6 @@
   {
    "provider": "moonshot",
    "model": "kimi-k2.7-code",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.95",
    "output_mtok_usd": "4",
    "cache_read_mtok_usd": "0.19",
@@ -689,7 +613,6 @@
   {
    "provider": "moonshot",
    "model": "kimi-k3",
-   "effective": "2026-08-10",
    "input_mtok_usd": "3",
    "output_mtok_usd": "15",
    "cache_read_mtok_usd": "0.3",
@@ -698,7 +621,6 @@
   {
    "provider": "moonshot",
    "model": "moonshot-v1-128k",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2",
    "output_mtok_usd": "5",
    "cache_read_mtok_usd": "2",
@@ -707,7 +629,6 @@
   {
    "provider": "moonshot",
    "model": "moonshot-v1-32k",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1",
    "output_mtok_usd": "3",
    "cache_read_mtok_usd": "1",
@@ -716,7 +637,6 @@
   {
    "provider": "moonshot",
    "model": "moonshot-v1-8k",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.2",
    "output_mtok_usd": "2",
    "cache_read_mtok_usd": "0.2",
@@ -725,7 +645,6 @@
   {
    "provider": "openai",
    "model": "ada",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.4",
    "output_mtok_usd": "0.4",
    "cache_read_mtok_usd": "0.4",
@@ -734,7 +653,6 @@
   {
    "provider": "openai",
    "model": "babbage",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.5",
    "output_mtok_usd": "0.5",
    "cache_read_mtok_usd": "0.5",
@@ -743,7 +661,6 @@
   {
    "provider": "openai",
    "model": "chatgpt-4o-latest",
-   "effective": "2026-08-10",
    "input_mtok_usd": "5",
    "output_mtok_usd": "15",
    "cache_read_mtok_usd": "5",
@@ -752,7 +669,6 @@
   {
    "provider": "openai",
    "model": "codex-mini",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.5",
    "output_mtok_usd": "6",
    "cache_read_mtok_usd": "0.375",
@@ -761,7 +677,6 @@
   {
    "provider": "openai",
    "model": "computer-use",
-   "effective": "2026-08-10",
    "input_mtok_usd": "3",
    "output_mtok_usd": "12",
    "cache_read_mtok_usd": "3",
@@ -770,7 +685,6 @@
   {
    "provider": "openai",
    "model": "curie",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2",
    "output_mtok_usd": "2",
    "cache_read_mtok_usd": "2",
@@ -779,7 +693,6 @@
   {
    "provider": "openai",
    "model": "davinci",
-   "effective": "2026-08-10",
    "input_mtok_usd": "20",
    "output_mtok_usd": "20",
    "cache_read_mtok_usd": "20",
@@ -788,7 +701,6 @@
   {
    "provider": "openai",
    "model": "ft:gpt-3.5-turbo-",
-   "effective": "2026-08-10",
    "input_mtok_usd": "3",
    "output_mtok_usd": "6",
    "cache_read_mtok_usd": "3",
@@ -797,7 +709,6 @@
   {
    "provider": "openai",
    "model": "ft:gpt-4o",
-   "effective": "2026-08-10",
    "input_mtok_usd": "3.75",
    "output_mtok_usd": "15",
    "cache_read_mtok_usd": "3.75",
@@ -806,7 +717,6 @@
   {
    "provider": "openai",
    "model": "ft:gpt-4o-mini",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.3",
    "output_mtok_usd": "1.2",
    "cache_read_mtok_usd": "0.3",
@@ -815,7 +725,6 @@
   {
    "provider": "openai",
    "model": "gpt-3.5-0301",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.5",
    "output_mtok_usd": "2",
    "cache_read_mtok_usd": "1.5",
@@ -824,7 +733,6 @@
   {
    "provider": "openai",
    "model": "gpt-3.5-turbo",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.5",
    "output_mtok_usd": "1.5",
    "cache_read_mtok_usd": "0.5",
@@ -833,7 +741,6 @@
   {
    "provider": "openai",
    "model": "gpt-3.5-turbo-0613",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.5",
    "output_mtok_usd": "2",
    "cache_read_mtok_usd": "1.5",
@@ -842,7 +749,6 @@
   {
    "provider": "openai",
    "model": "gpt-3.5-turbo-1106",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1",
    "output_mtok_usd": "2",
    "cache_read_mtok_usd": "1",
@@ -851,7 +757,6 @@
   {
    "provider": "openai",
    "model": "gpt-3.5-turbo-16k",
-   "effective": "2026-08-10",
    "input_mtok_usd": "3",
    "output_mtok_usd": "4",
    "cache_read_mtok_usd": "3",
@@ -860,7 +765,6 @@
   {
    "provider": "openai",
    "model": "gpt-3.5-turbo-instruct",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.5",
    "output_mtok_usd": "2",
    "cache_read_mtok_usd": "1.5",
@@ -869,7 +773,6 @@
   {
    "provider": "openai",
    "model": "gpt-4",
-   "effective": "2026-08-10",
    "input_mtok_usd": "30",
    "output_mtok_usd": "60",
    "cache_read_mtok_usd": "30",
@@ -878,7 +781,6 @@
   {
    "provider": "openai",
    "model": "gpt-4-32k",
-   "effective": "2026-08-10",
    "input_mtok_usd": "60",
    "output_mtok_usd": "120",
    "cache_read_mtok_usd": "60",
@@ -887,7 +789,6 @@
   {
    "provider": "openai",
    "model": "gpt-4-turbo",
-   "effective": "2026-08-10",
    "input_mtok_usd": "10",
    "output_mtok_usd": "30",
    "cache_read_mtok_usd": "10",
@@ -896,7 +797,6 @@
   {
    "provider": "openai",
    "model": "gpt-4-vision-preview",
-   "effective": "2026-08-10",
    "input_mtok_usd": "10",
    "output_mtok_usd": "30",
    "cache_read_mtok_usd": "10",
@@ -905,7 +805,6 @@
   {
    "provider": "openai",
    "model": "gpt-4.1",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2",
    "output_mtok_usd": "8",
    "cache_read_mtok_usd": "0.5",
@@ -914,7 +813,6 @@
   {
    "provider": "openai",
    "model": "gpt-4.1-mini",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.4",
    "output_mtok_usd": "1.6",
    "cache_read_mtok_usd": "0.1",
@@ -923,7 +821,6 @@
   {
    "provider": "openai",
    "model": "gpt-4.1-nano",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.1",
    "output_mtok_usd": "0.4",
    "cache_read_mtok_usd": "0.025",
@@ -932,7 +829,6 @@
   {
    "provider": "openai",
    "model": "gpt-4.5-preview",
-   "effective": "2026-08-10",
    "input_mtok_usd": "75",
    "output_mtok_usd": "150",
    "cache_read_mtok_usd": "37.5",
@@ -941,7 +837,6 @@
   {
    "provider": "openai",
    "model": "gpt-4o",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2.5",
    "output_mtok_usd": "10",
    "cache_read_mtok_usd": "1.25",
@@ -950,7 +845,6 @@
   {
    "provider": "openai",
    "model": "gpt-4o-audio-preview",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2.5",
    "output_mtok_usd": "10",
    "cache_read_mtok_usd": "2.5",
@@ -959,7 +853,6 @@
   {
    "provider": "openai",
    "model": "gpt-4o-mini",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.15",
    "output_mtok_usd": "0.6",
    "cache_read_mtok_usd": "0.075",
@@ -968,7 +861,6 @@
   {
    "provider": "openai",
    "model": "gpt-4o-mini-2024-07-18.ft-",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.3",
    "output_mtok_usd": "1.2",
    "cache_read_mtok_usd": "0.3",
@@ -977,7 +869,6 @@
   {
    "provider": "openai",
    "model": "gpt-4o-mini-audio-preview",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.15",
    "output_mtok_usd": "0.6",
    "cache_read_mtok_usd": "0.15",
@@ -986,7 +877,6 @@
   {
    "provider": "openai",
    "model": "gpt-4o-mini-realtime-preview",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.6",
    "output_mtok_usd": "2.4",
    "cache_read_mtok_usd": "0.3",
@@ -995,7 +885,6 @@
   {
    "provider": "openai",
    "model": "gpt-4o-mini-transcribe",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.25",
    "output_mtok_usd": "5",
    "cache_read_mtok_usd": "1.25",
@@ -1004,7 +893,6 @@
   {
    "provider": "openai",
    "model": "gpt-4o-mini-tts",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.6",
    "output_mtok_usd": "12",
    "cache_read_mtok_usd": "0.6",
@@ -1013,7 +901,6 @@
   {
    "provider": "openai",
    "model": "gpt-4o-realtime-preview",
-   "effective": "2026-08-10",
    "input_mtok_usd": "5",
    "output_mtok_usd": "20",
    "cache_read_mtok_usd": "2.5",
@@ -1022,7 +909,6 @@
   {
    "provider": "openai",
    "model": "gpt-4o-search-preview",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2.5",
    "output_mtok_usd": "10",
    "cache_read_mtok_usd": "2.5",
@@ -1031,7 +917,6 @@
   {
    "provider": "openai",
    "model": "gpt-4o-transcribe",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2.5",
    "output_mtok_usd": "10",
    "cache_read_mtok_usd": "2.5",
@@ -1040,7 +925,6 @@
   {
    "provider": "openai",
    "model": "gpt-4o:extended",
-   "effective": "2026-08-10",
    "input_mtok_usd": "6",
    "output_mtok_usd": "18",
    "cache_read_mtok_usd": "6",
@@ -1049,7 +933,6 @@
   {
    "provider": "openai",
    "model": "gpt-5",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.25",
    "output_mtok_usd": "10",
    "cache_read_mtok_usd": "0.125",
@@ -1058,7 +941,6 @@
   {
    "provider": "openai",
    "model": "gpt-5-image",
-   "effective": "2026-08-10",
    "input_mtok_usd": "10",
    "output_mtok_usd": "10",
    "cache_read_mtok_usd": "1.25",
@@ -1067,7 +949,6 @@
   {
    "provider": "openai",
    "model": "gpt-5-image-mini",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2.5",
    "output_mtok_usd": "2",
    "cache_read_mtok_usd": "0.25",
@@ -1076,7 +957,6 @@
   {
    "provider": "openai",
    "model": "gpt-5-mini",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.25",
    "output_mtok_usd": "2",
    "cache_read_mtok_usd": "0.025",
@@ -1085,7 +965,6 @@
   {
    "provider": "openai",
    "model": "gpt-5-nano",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.05",
    "output_mtok_usd": "0.4",
    "cache_read_mtok_usd": "0.005",
@@ -1094,7 +973,6 @@
   {
    "provider": "openai",
    "model": "gpt-5-pro",
-   "effective": "2026-08-10",
    "input_mtok_usd": "15",
    "output_mtok_usd": "120",
    "cache_read_mtok_usd": "15",
@@ -1103,7 +981,6 @@
   {
    "provider": "openai",
    "model": "gpt-5.1",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.25",
    "output_mtok_usd": "10",
    "cache_read_mtok_usd": "0.125",
@@ -1112,7 +989,6 @@
   {
    "provider": "openai",
    "model": "gpt-5.1-codex-mini",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.25",
    "output_mtok_usd": "2",
    "cache_read_mtok_usd": "0.025",
@@ -1121,7 +997,6 @@
   {
    "provider": "openai",
    "model": "gpt-5.2",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.75",
    "output_mtok_usd": "14",
    "cache_read_mtok_usd": "0.175",
@@ -1130,7 +1005,6 @@
   {
    "provider": "openai",
    "model": "gpt-5.2-pro",
-   "effective": "2026-08-10",
    "input_mtok_usd": "21",
    "output_mtok_usd": "168",
    "cache_read_mtok_usd": "21",
@@ -1139,7 +1013,6 @@
   {
    "provider": "openai",
    "model": "gpt-5.3",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.75",
    "output_mtok_usd": "14",
    "cache_read_mtok_usd": "0.175",
@@ -1148,7 +1021,6 @@
   {
    "provider": "openai",
    "model": "gpt-5.3-codex",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.75",
    "output_mtok_usd": "14",
    "cache_read_mtok_usd": "0.175",
@@ -1157,7 +1029,6 @@
   {
    "provider": "openai",
    "model": "gpt-5.4",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2.5",
    "output_mtok_usd": "15",
    "cache_read_mtok_usd": "0.25",
@@ -1166,7 +1037,6 @@
   {
    "provider": "openai",
    "model": "gpt-5.4-image-2",
-   "effective": "2026-08-10",
    "input_mtok_usd": "8",
    "output_mtok_usd": "15",
    "cache_read_mtok_usd": "2",
@@ -1175,7 +1045,6 @@
   {
    "provider": "openai",
    "model": "gpt-5.4-mini",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.75",
    "output_mtok_usd": "4.5",
    "cache_read_mtok_usd": "0.075",
@@ -1184,7 +1053,6 @@
   {
    "provider": "openai",
    "model": "gpt-5.4-nano",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.2",
    "output_mtok_usd": "1.25",
    "cache_read_mtok_usd": "0.02",
@@ -1193,7 +1061,6 @@
   {
    "provider": "openai",
    "model": "gpt-5.4-pro",
-   "effective": "2026-08-10",
    "input_mtok_usd": "30",
    "output_mtok_usd": "180",
    "cache_read_mtok_usd": "30",
@@ -1202,7 +1069,6 @@
   {
    "provider": "openai",
    "model": "gpt-5.5",
-   "effective": "2026-08-10",
    "input_mtok_usd": "5",
    "output_mtok_usd": "30",
    "cache_read_mtok_usd": "0.5",
@@ -1211,7 +1077,6 @@
   {
    "provider": "openai",
    "model": "gpt-5.5-pro",
-   "effective": "2026-08-10",
    "input_mtok_usd": "30",
    "output_mtok_usd": "180",
    "cache_read_mtok_usd": "30",
@@ -1220,7 +1085,6 @@
   {
    "provider": "openai",
    "model": "gpt-5.6-luna",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1",
    "output_mtok_usd": "6",
    "cache_read_mtok_usd": "0.1",
@@ -1229,7 +1093,6 @@
   {
    "provider": "openai",
    "model": "gpt-5.6-sol",
-   "effective": "2026-08-10",
    "input_mtok_usd": "5",
    "output_mtok_usd": "30",
    "cache_read_mtok_usd": "0.5",
@@ -1238,7 +1101,6 @@
   {
    "provider": "openai",
    "model": "gpt-5.6-terra",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2.5",
    "output_mtok_usd": "15",
    "cache_read_mtok_usd": "0.25",
@@ -1247,7 +1109,6 @@
   {
    "provider": "openai",
    "model": "gpt-audio",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2.5",
    "output_mtok_usd": "10",
    "cache_read_mtok_usd": "2.5",
@@ -1256,7 +1117,6 @@
   {
    "provider": "openai",
    "model": "gpt-audio-mini",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.6",
    "output_mtok_usd": "2.4",
    "cache_read_mtok_usd": "0.6",
@@ -1265,7 +1125,6 @@
   {
    "provider": "openai",
    "model": "gpt-chat-latest",
-   "effective": "2026-08-10",
    "input_mtok_usd": "5",
    "output_mtok_usd": "30",
    "cache_read_mtok_usd": "0.5",
@@ -1274,7 +1133,6 @@
   {
    "provider": "openai",
    "model": "gpt-image-1.5",
-   "effective": "2026-08-10",
    "input_mtok_usd": "5",
    "output_mtok_usd": "10",
    "cache_read_mtok_usd": "1.25",
@@ -1283,7 +1141,6 @@
   {
    "provider": "openai",
    "model": "gpt-oss-120b",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.039",
    "output_mtok_usd": "0.18",
    "cache_read_mtok_usd": "0.039",
@@ -1292,7 +1149,6 @@
   {
    "provider": "openai",
    "model": "gpt-oss-20b",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.029",
    "output_mtok_usd": "0.14",
    "cache_read_mtok_usd": "0.029",
@@ -1301,7 +1157,6 @@
   {
    "provider": "openai",
    "model": "gpt-oss-safeguard-20b",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.075",
    "output_mtok_usd": "0.3",
    "cache_read_mtok_usd": "0.037",
@@ -1310,7 +1165,6 @@
   {
    "provider": "openai",
    "model": "gpt-realtime",
-   "effective": "2026-08-10",
    "input_mtok_usd": "4",
    "output_mtok_usd": "16",
    "cache_read_mtok_usd": "0.4",
@@ -1319,7 +1173,6 @@
   {
    "provider": "openai",
    "model": "gpt-realtime-2",
-   "effective": "2026-08-10",
    "input_mtok_usd": "4",
    "output_mtok_usd": "24",
    "cache_read_mtok_usd": "0.4",
@@ -1328,7 +1181,6 @@
   {
    "provider": "openai",
    "model": "gpt-realtime-mini",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.6",
    "output_mtok_usd": "2.4",
    "cache_read_mtok_usd": "0.06",
@@ -1337,7 +1189,6 @@
   {
    "provider": "openai",
    "model": "o1",
-   "effective": "2026-08-10",
    "input_mtok_usd": "15",
    "output_mtok_usd": "60",
    "cache_read_mtok_usd": "7.5",
@@ -1346,7 +1197,6 @@
   {
    "provider": "openai",
    "model": "o1-mini",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.1",
    "output_mtok_usd": "4.4",
    "cache_read_mtok_usd": "0.55",
@@ -1355,7 +1205,6 @@
   {
    "provider": "openai",
    "model": "o1-pro",
-   "effective": "2026-08-10",
    "input_mtok_usd": "150",
    "output_mtok_usd": "600",
    "cache_read_mtok_usd": "150",
@@ -1364,7 +1213,6 @@
   {
    "provider": "openai",
    "model": "o3",
-   "effective": "2025-06-10",
    "input_mtok_usd": "2",
    "output_mtok_usd": "8",
    "cache_read_mtok_usd": "0.5",
@@ -1373,7 +1221,6 @@
   {
    "provider": "openai",
    "model": "o3-deep-research",
-   "effective": "2026-08-10",
    "input_mtok_usd": "10",
    "output_mtok_usd": "40",
    "cache_read_mtok_usd": "2.5",
@@ -1382,7 +1229,6 @@
   {
    "provider": "openai",
    "model": "o3-mini",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.1",
    "output_mtok_usd": "4.4",
    "cache_read_mtok_usd": "0.55",
@@ -1391,7 +1237,6 @@
   {
    "provider": "openai",
    "model": "o3-pro",
-   "effective": "2026-08-10",
    "input_mtok_usd": "20",
    "output_mtok_usd": "80",
    "cache_read_mtok_usd": "20",
@@ -1400,7 +1245,6 @@
   {
    "provider": "openai",
    "model": "o4-mini",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.1",
    "output_mtok_usd": "4.4",
    "cache_read_mtok_usd": "0.275",
@@ -1409,7 +1253,6 @@
   {
    "provider": "openai",
    "model": "o4-mini-deep-research",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2",
    "output_mtok_usd": "8",
    "cache_read_mtok_usd": "0.5",
@@ -1418,7 +1261,6 @@
   {
    "provider": "openai",
    "model": "text-davinci-002",
-   "effective": "2026-08-10",
    "input_mtok_usd": "20",
    "output_mtok_usd": "20",
    "cache_read_mtok_usd": "20",
@@ -1427,7 +1269,6 @@
   {
    "provider": "openai",
    "model": "text-davinci-003",
-   "effective": "2026-08-10",
    "input_mtok_usd": "20",
    "output_mtok_usd": "20",
    "cache_read_mtok_usd": "20",
@@ -1436,7 +1277,6 @@
   {
    "provider": "xai",
    "model": "grok-2-1212",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2",
    "output_mtok_usd": "10",
    "cache_read_mtok_usd": "2",
@@ -1445,7 +1285,6 @@
   {
    "provider": "xai",
    "model": "grok-2-vision-1212",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2",
    "output_mtok_usd": "10",
    "cache_read_mtok_usd": "2",
@@ -1454,7 +1293,6 @@
   {
    "provider": "xai",
    "model": "grok-3",
-   "effective": "2026-08-10",
    "input_mtok_usd": "3",
    "output_mtok_usd": "15",
    "cache_read_mtok_usd": "0.75",
@@ -1463,7 +1301,6 @@
   {
    "provider": "xai",
    "model": "grok-3-fast",
-   "effective": "2026-08-10",
    "input_mtok_usd": "5",
    "output_mtok_usd": "25",
    "cache_read_mtok_usd": "1.25",
@@ -1472,7 +1309,6 @@
   {
    "provider": "xai",
    "model": "grok-3-mini",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.3",
    "output_mtok_usd": "0.5",
    "cache_read_mtok_usd": "0.075",
@@ -1481,7 +1317,6 @@
   {
    "provider": "xai",
    "model": "grok-3-mini-fast",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.6",
    "output_mtok_usd": "4",
    "cache_read_mtok_usd": "0.15",
@@ -1490,7 +1325,6 @@
   {
    "provider": "xai",
    "model": "grok-4-0709",
-   "effective": "2026-08-10",
    "input_mtok_usd": "3",
    "output_mtok_usd": "15",
    "cache_read_mtok_usd": "0.75",
@@ -1499,7 +1333,6 @@
   {
    "provider": "xai",
    "model": "grok-4-1-fast-non-reasoning",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.2",
    "output_mtok_usd": "0.5",
    "cache_read_mtok_usd": "0.05",
@@ -1508,7 +1341,6 @@
   {
    "provider": "xai",
    "model": "grok-4-1-fast-reasoning",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.2",
    "output_mtok_usd": "0.5",
    "cache_read_mtok_usd": "0.05",
@@ -1517,7 +1349,6 @@
   {
    "provider": "xai",
    "model": "grok-4-fast-non-reasoning",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.2",
    "output_mtok_usd": "0.5",
    "cache_read_mtok_usd": "0.05",
@@ -1526,7 +1357,6 @@
   {
    "provider": "xai",
    "model": "grok-4-fast-reasoning",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.2",
    "output_mtok_usd": "0.5",
    "cache_read_mtok_usd": "0.05",
@@ -1535,7 +1365,6 @@
   {
    "provider": "xai",
    "model": "grok-4.20",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.25",
    "output_mtok_usd": "2.5",
    "cache_read_mtok_usd": "0.2",
@@ -1544,7 +1373,6 @@
   {
    "provider": "xai",
    "model": "grok-4.20-multi-agent",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2",
    "output_mtok_usd": "6",
    "cache_read_mtok_usd": "0.2",
@@ -1553,7 +1381,6 @@
   {
    "provider": "xai",
    "model": "grok-4.3",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1.25",
    "output_mtok_usd": "2.5",
    "cache_read_mtok_usd": "0.2",
@@ -1562,7 +1389,6 @@
   {
    "provider": "xai",
    "model": "grok-4.5",
-   "effective": "2026-08-10",
    "input_mtok_usd": "2",
    "output_mtok_usd": "6",
    "cache_read_mtok_usd": "0.5",
@@ -1571,7 +1397,6 @@
   {
    "provider": "xai",
    "model": "grok-build-0.1",
-   "effective": "2026-08-10",
    "input_mtok_usd": "1",
    "output_mtok_usd": "2",
    "cache_read_mtok_usd": "0.2",
@@ -1580,7 +1405,6 @@
   {
    "provider": "xai",
    "model": "grok-code-fast-1",
-   "effective": "2026-08-10",
    "input_mtok_usd": "0.2",
    "output_mtok_usd": "1.5",
    "cache_read_mtok_usd": "0.02",

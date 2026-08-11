@@ -10,11 +10,14 @@ single-terminal grammar), so consumers assert on `RuntimeStreamEvent` exactly
 as against the real runtime.
 
 The dead wire layer has no double here by design: `NoNetworkRuntime` and SSE
-scripting died with it. Layering: imports from `types` and `registry` only
-(plus `pydantic` for the json_out bound) — never `runtime` or the engine
-modules, so importing this module never loads provider SDKs.
+scripting died with it. Layering: imports from `types` and `registry` (plus
+`pydantic` for the json_out bound), plus the one facade type `runtime` itself
+does not re-export from `types` — `NonGenerationCallFailed`, embed's failure
+channel — never the engine modules or anything else from `runtime`.
 
-Captured calls never store the credential key — only the provider name.
+`ScriptedRuntime`'s captured calls never store the credential key — only the
+provider name; `FakeEngine`'s capture the full `ProviderCredential` it was
+called with, key included, matching the real `Engine` protocol call shape.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from typing import Any, Literal
 import pydantic
 
 from provider_runtime.registry import ModelRow
+from provider_runtime.runtime import NonGenerationCallFailed
 from provider_runtime.types import (
     Absent,
     CallOutcome,
@@ -178,6 +182,10 @@ class ScriptedRuntime:
     the wrong model, a stream script violating the one-terminal grammar) is a
     loud `AssertionError`. Cancel signals are accepted for signature parity
     and ignored — scripted results are never raced against anything.
+
+    `embed` is the one method whose expected-failure channel is a raise
+    rather than a value: scripting a `NonGenerationCallFailed` there raises
+    it, mirroring the real facade exactly.
     """
 
     def __init__(
@@ -187,14 +195,16 @@ class ScriptedRuntime:
         stream_scripts: Iterable[Sequence[CodecStreamEvent]] = (),
         json_out_results: Iterable[JsonOutResult] = (),
         chat_outcomes: Iterable[CallOutcome] = (),
-        embed_responses: Iterable[EmbeddingResponse] = (),
+        embed_responses: Iterable[EmbeddingResponse | NonGenerationCallFailed] = (),
     ) -> None:
         self.calls: list[CapturedRuntimeCall] = []
         self._generate_outcomes = deque(generate_outcomes)
         self._stream_scripts = deque(_validated_stream_script(s) for s in stream_scripts)
         self._json_out_results = deque(json_out_results)
         self._chat_outcomes = deque(chat_outcomes)
-        self._embed_responses = deque(embed_responses)
+        self._embed_responses: deque[EmbeddingResponse | NonGenerationCallFailed] = deque(
+            embed_responses
+        )
 
     async def generate(
         self, intent: GenerateIntent, *, cancel: CancelSignal | None = None
@@ -258,7 +268,10 @@ class ScriptedRuntime:
         self, call: EmbeddingCall, *, credential: ProviderCredential
     ) -> EmbeddingResponse:
         self._capture("embed", call, Present(credential.provider))
-        return self._pop(self._embed_responses, "embed", f"model {call.model!r}")
+        result = self._pop(self._embed_responses, "embed", f"model {call.model!r}")
+        if isinstance(result, NonGenerationCallFailed):
+            raise result
+        return result
 
     def _capture(
         self,

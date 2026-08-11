@@ -36,7 +36,8 @@ from provider_runtime.engines.gemini_generate import GeminiGenerateEngine
 from provider_runtime.engines.openai_chat import OpenAIChatEngine
 from provider_runtime.engines.openai_responses import OpenAIResponsesEngine
 from provider_runtime.errors import CredentialMissing, InvalidRequest, ProtocolDefect
-from provider_runtime.otel import call_span, record_outcome
+from provider_runtime.otel import as_current, call_span, record_outcome
+from provider_runtime.prices import estimate_cost
 from provider_runtime.registry import (
     REGISTRY_REVISION,
     EngineId,
@@ -367,8 +368,9 @@ class ProviderRuntime:
         credential = self._credential(row.provider)
         engine = self._engines[row.engine]
         with call_span("chat", provider=row.provider, model=row.model_id) as span:
-            outcome = await self._generate_outcome(row, intent, credential, engine, cancel)
-            record_outcome(span, outcome.meta)
+            with as_current(span):
+                outcome = await self._generate_outcome(row, intent, credential, engine, cancel)
+            record_outcome(span, outcome.meta, cost_estimate=estimate_cost(outcome.meta))
             return outcome
 
     async def _generate_outcome(
@@ -462,7 +464,7 @@ class ProviderRuntime:
                 return RuntimeStreamEvent(seq=seq, event=event)
 
             def terminal(outcome: StreamOutcome) -> RuntimeStreamEvent:
-                record_outcome(span, outcome.meta)
+                record_outcome(span, outcome.meta, cost_estimate=estimate_cost(outcome.meta))
                 return envelope(TerminalEvent(outcome=outcome))
 
             def cancelled_meta(attempt: int, started_ms: int) -> CallMeta:
@@ -479,7 +481,8 @@ class ProviderRuntime:
                     source = engine.stream(row, intent, credential)
                     try:
                         while True:
-                            event = await _race_cancel(_guarded_next(source), cancel)
+                            with as_current(span):
+                                event = await _race_cancel(_guarded_next(source), cancel)
                             if event is None:
                                 # Cancelled mid-attempt: the request was
                                 # already in flight — fold PossiblyBillable.
@@ -654,13 +657,16 @@ class ProviderRuntime:
         attempt_count = 0
         tries = attempts(self._retry)
         with call_span("embeddings", provider="openai", model=call.model) as span:
+            # Both failure arms raise INSIDE the span, so `call_span` marks it
+            # ERROR either way; the finally puts the attempt count on all arms.
             try:
                 async for handle in tries:
                     attempt_count = handle.number
                     try:
-                        result = await embeddings.embed_once(
-                            call, credential, http_client=self._http_client
-                        )
+                        with as_current(span):
+                            result = await embeddings.embed_once(
+                                call, credential, http_client=self._http_client
+                            )
                     except TransientAttempt as failed:
                         last_cause = failed.cause
                         handle.mark_failed(failed.cause)
@@ -672,12 +678,16 @@ class ProviderRuntime:
                             "gen_ai.usage.input_tokens", result.usage.value.input_tokens
                         )
                     return result
+                if last_cause is None:
+                    raise AssertionError("embed attempt loop exhausted without a transient cause")
+                raise NonGenerationCallFailed(
+                    TransientExhausted(attempts=attempt_count, cause=last_cause)
+                )
             finally:
                 if isinstance(tries, AsyncGenerator):
                     await tries.aclose()
-        if last_cause is None:
-            raise AssertionError("embed attempt loop exhausted without a transient cause")
-        raise NonGenerationCallFailed(TransientExhausted(attempts=attempt_count, cause=last_cause))
+                if span.is_recording():
+                    span.set_attribute("provider_runtime.attempt_count", attempt_count)
 
 
 __all__ = [

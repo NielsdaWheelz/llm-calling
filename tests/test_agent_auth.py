@@ -20,7 +20,6 @@ from provider_runtime.agent_runtime.auth import (
 from provider_runtime.agent_runtime.errors import (
     CredentialUnavailable,
     InvalidAgentRequest,
-    ProtocolDefect,
 )
 from provider_runtime.agent_runtime.policy import PermissionPolicy
 from provider_runtime.agent_runtime.types import CredentialRef, thaw_json_value
@@ -178,6 +177,35 @@ def test_policy_can_never_allow_credential_class_environment_names() -> None:
         )
     with pytest.raises(InvalidAgentRequest, match="credential-class"):
         validate_policy_environment("codex", PermissionPolicy(environment=("ANTHROPIC_API_KEY",)))
+
+
+# Provider API keys that authenticate no agent backend but are the operator secrets most
+# likely to be exported in the shell that starts one. They must be as uncopyable as the two
+# backends' own auth names.
+OTHER_PROVIDER_CREDENTIAL_NAMES = (
+    "DEEPSEEK_API_KEY",
+    "GEMINI_API_KEY",
+    "MOONSHOT_API_KEY",
+    "OPENROUTER_API_KEY",
+    "XAI_API_KEY",
+)
+
+
+@pytest.mark.parametrize("name", OTHER_PROVIDER_CREDENTIAL_NAMES)
+def test_no_provider_api_key_can_be_copied_into_an_agent_child(tmp_path: Path, name: str) -> None:
+    assert is_runtime_owned_environment_name(name)
+    with pytest.raises(InvalidAgentRequest, match="credential-class"):
+        validate_policy_environment("codex", PermissionPolicy(environment=(name,)))
+    with pytest.raises(InvalidAgentRequest, match="credential-class"):
+        build_child_environment(
+            AuthEnvironmentRequest(
+                backend="codex",
+                credential=CredentialRef(kind="local_account", profile_key="personal"),
+                inherited_environment={name: "must-never-cross"},
+                allowed_environment=(name,),
+                state_root=tmp_path / "codex" / "personal",
+            )
+        )
 
 
 def test_native_payloads_are_recursively_scrubbed_without_field_allowlists() -> None:
@@ -368,21 +396,32 @@ def test_ordinary_environment_names_stay_forwardable(name: str) -> None:
     assert not is_runtime_owned_environment_name(name)
 
 
-def test_a_non_finite_native_number_is_a_protocol_defect_not_a_silent_stub() -> None:
-    with pytest.raises(ProtocolDefect, match="malformed JSON"):
-        redact_native_payload({"score": float("nan")})
+@pytest.mark.parametrize("value", (float("nan"), float("inf"), float("-inf")))
+def test_a_non_finite_native_number_drops_the_payload_like_any_other_malformed_value(
+    value: float,
+) -> None:
+    """`json.loads` accepts NaN/Infinity, so a backend frame can carry one.
+
+    Every other value redaction cannot represent — an oversized int, a non-string key, a
+    non-JSON type — degrades to the bounded stub. A non-finite float is the same class of
+    malformedness and must not be the one that kills the turn with a defect instead.
+    """
+    assert redact_native_payload({"score": value}) == {
+        "redaction": "payload_dropped",
+        "reason": "shape_limit",
+    }
 
 
-def test_state_root_read_back_is_strict_and_identical_for_every_transport(
+def test_state_root_read_back_is_strict_and_identical_for_every_backend(
     tmp_path: Path,
 ) -> None:
-    """One profile must not mean two different state roots depending on the transport chosen.
+    """One profile must not mean two different state roots on the two shipped backends.
 
-    This resolver is the single owner of that rule for every backend and every transport, so
-    a `profile_key` can never name a directory on one lane and a different one — or nothing
-    at all — on another. It reads back only an existing, absolute, fully resolved directory:
-    a symlinked, missing, relative, or empty value is a credential failure, never a silent
-    redirect to the link's target.
+    This resolver is the single owner of that rule, so a `profile_key` can never name a
+    directory on one lane and a different one — or nothing at all — on the other. It reads
+    back only an existing, absolute, fully resolved directory: a symlinked, missing,
+    relative, or empty value is a credential failure, never a silent redirect to the link's
+    target.
     """
     real = tmp_path / "codex" / "personal"
     real.mkdir(parents=True)

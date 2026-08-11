@@ -12,6 +12,7 @@ from datetime import date
 from decimal import Decimal
 from importlib import resources
 
+from provider_runtime import registry
 from provider_runtime.prices import estimate_cost
 from provider_runtime.types import (
     Absent,
@@ -109,6 +110,16 @@ def test_cache_read_tokens_are_a_discounted_subset_never_additive() -> None:
     assert _micros(uncached) == 3_000, f"uncached estimate was {uncached!r}"
 
 
+def test_cache_read_exceeding_input_tokens_clamps_instead_of_crashing() -> None:
+    # A provider misreport (cache_read > input_tokens) must yield a
+    # well-formed estimate, not a crash: the uncached component clamps at 0
+    # instead of going negative. kimi-k3: cache read $0.3/MTok →
+    # 150 * 0.3 = 45 micros.
+    usage = _usage(100, 0, cache_read=Present(150))
+    estimate = estimate_cost(_meta("moonshot", "kimi-k3", Present(usage)))
+    assert _micros(estimate) == 45, f"estimate was {estimate!r}"
+
+
 def test_half_micros_round_up() -> None:
     # gemini-3.5-flash input $1.5/MTok: 3 tokens = 4.5 micros. Half up gives 5
     # (bankers' rounding would give 4).
@@ -191,7 +202,6 @@ def test_snapshot_rows_carry_every_consumed_field() -> None:
             "xai",
         }, f"unexpected provider in row {row!r}"
         assert isinstance(row["model"], str) and row["model"], row
-        date.fromisoformat(row["effective"])
         for rate_field in ("input_mtok_usd", "output_mtok_usd", "cache_read_mtok_usd"):
             assert Decimal(row[rate_field]) >= 0, f"negative {rate_field} in row {row!r}"
         Decimal(row["cache_write_surcharge_mtok_usd"])  # must parse as a Decimal
@@ -201,18 +211,11 @@ def test_snapshot_rows_carry_every_consumed_field() -> None:
 
 
 def test_snapshot_covers_the_registry_wire_model_ids() -> None:
-    known: tuple[tuple[ProviderName, str], ...] = (
-        ("openai", "gpt-5.6-sol"),
-        ("openai", "gpt-5.6-terra"),
-        ("openai", "gpt-5.6-luna"),
-        ("anthropic", "claude-sonnet-5"),
-        ("anthropic", "claude-fable-5"),
-        ("gemini", "gemini-3.5-flash"),
-        ("moonshot", "kimi-k3"),
-        ("deepseek", "deepseek-v4-pro"),
-        ("deepseek", "deepseek-v4-flash"),
-        ("xai", "grok-4.5"),
-    )
-    for provider, model in known:
-        estimate = estimate_cost(_meta(provider, model, Present(_usage(1_000, 1_000))))
-        assert isinstance(estimate, Present), f"no snapshot price for {provider}:{model}"
+    # Iterates the real registry rather than a hardcoded copy of its ids, so
+    # this stays a live contract check across registry changes — openrouter is
+    # deliberately excluded (its pricing depends on the routed endpoint).
+    for row in registry.ROWS:
+        if row.provider == "openrouter":
+            continue
+        estimate = estimate_cost(_meta(row.provider, row.model_id, Present(_usage(1_000, 1_000))))
+        assert isinstance(estimate, Present), f"no snapshot price for {row.provider}:{row.model_id}"

@@ -34,6 +34,7 @@ from provider_runtime.agent_runtime import (
     McpServerSpec,
     NewSession,
     PermissionPolicy,
+    PermissionPolicyPatch,
     ReasoningSpec,
     ResumeSession,
     SessionMetadata,
@@ -300,6 +301,9 @@ class FakeTurn:
         )
         if self._prompt == "rich":
             yield notification("account/rateLimits/updated", {"rateLimits": {"primary": 10}})
+            yield notification(
+                "thread/status/changed", {"threadId": self._thread_id, "status": "idle"}
+            )
         yield self._turn_completed("completed")
 
 
@@ -796,15 +800,19 @@ async def test_a_full_turn_streams_the_closed_event_grammar(
         "AgentText",
         "AgentUsage",
         "AgentNative",  # unknown method passthrough
+        "AgentNative",  # thread/status/changed
         "AgentNative",  # turn/completed
         "AgentTerminal",
     ], f"unexpected event sequence: {kinds}"
 
+    # Every native frame without a first-class kind travels, with no per-method noise filter:
+    # a method this adapter has no opinion about is exactly what AgentNative is for.
     natives = [event for event in events if isinstance(event, AgentNative)]
     assert [native.native_type for native in natives] == [
         "turn/started",
         "item/reasoning/summaryTextDelta",
         "account/rateLimits/updated",
+        "thread/status/changed",
         "turn/completed",
     ]
 
@@ -1102,6 +1110,28 @@ async def test_declined_file_changes_complete_unsuccessfully(
     assert isinstance(terminal, AgentTerminal) and terminal.status == "succeeded"
 
 
+async def test_session_instructions_reach_both_native_channels(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    """Neither instruction may be dropped: the SDK has a channel for each.
+
+    `base_instructions` replaces Codex's built-in base prompt and `developer_instructions`
+    carries the developer-role text, so a session that names either runs with it applied.
+    """
+    async with runtime(tmp_path) as selected:
+        await selected.open_session(
+            request(
+                tmp_path,
+                system=(TextContent("never delete files"),),
+                developer=(TextContent("prefer small diffs"),),
+            )
+        )
+
+    start = start_call(installed_codex_sdk)
+    assert start["base_instructions"] == "never delete files"
+    assert start["developer_instructions"] == "prefer small diffs"
+
+
 async def test_turn_overrides_and_caller_approvals_are_refused(
     tmp_path: Path, installed_codex_sdk: ModuleType
 ) -> None:
@@ -1118,8 +1148,12 @@ async def test_turn_overrides_and_caller_approvals_are_refused(
 
     async with runtime(tmp_path) as selected:
         session = await selected.open_session(request(tmp_path))
-        with pytest.raises(UnsupportedCapability, match="turn overrides"):
-            await selected.run_turn(session, turn("plain", model="other-model"))
+        # The narrowing algebra accepts the patch; the route still cannot apply it to a
+        # thread that is already started, so the turn is refused before any billable work.
+        with pytest.raises(UnsupportedCapability, match="reconfigure policy"):
+            await selected.run_turn(
+                session, turn("plain", policy=PermissionPolicyPatch(approval="deny"))
+            )
 
 
 async def test_resume_and_fork_enforce_native_thread_identity(

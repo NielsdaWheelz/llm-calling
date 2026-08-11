@@ -26,7 +26,6 @@ from .auth import (
 )
 from .errors import (
     CredentialUnavailable,
-    ExecutableUnavailable,
     InvalidAgentRequest,
     McpConfigurationError,
     ProtocolDefect,
@@ -105,9 +104,12 @@ class AgentRuntimeConfig:
             raise InvalidAgentRequest("state_root_base must be a normalized absolute path")
         if not self.state_root_base.is_dir():
             raise InvalidAgentRequest("state_root_base must be an existing directory")
-        for name, executable in (("claude_executable", self.claude_executable),):
-            if type(executable) is not str or not executable or "\0" in executable:
-                raise InvalidAgentRequest(f"{name} must be a non-empty executable name")
+        if (
+            type(self.claude_executable) is not str
+            or not self.claude_executable
+            or "\0" in self.claude_executable
+        ):
+            raise InvalidAgentRequest("claude_executable must be a non-empty executable name")
         if (
             type(self.max_turn_seconds) not in (int, float)
             or not math.isfinite(self.max_turn_seconds)
@@ -468,8 +470,9 @@ class AgentRuntime:
                 # policy already allows. The adapter still decides whether it can apply the
                 # narrowed policy at all.
                 policy = narrow_policy(policy, request.policy)
-            if request.mcp_servers is not None:
-                validate_mcp_network_policy(request.mcp_servers, policy)
+                # MCP is session-scoped, so a narrowed turn policy must still admit the
+                # servers the session opened with.
+                validate_mcp_network_policy(binding.request.mcp_servers, policy)
             if policy.approval == "ask" and approvals is None:
                 raise InvalidAgentRequest("approval ask policy requires an approval handler")
             if cancel is not None and cancel.is_set():
@@ -820,15 +823,10 @@ class AgentRuntime:
             pass
 
     def _adapter(self, backend: Backend, transport: AgentTransport) -> AgentAdapter:
-        route = (backend, transport)
-        adapter = self._adapters.get(route)
-        if adapter is not None:
-            return adapter
-        if transport == "sdk":
+        adapter = self._adapters.get((backend, transport))
+        if adapter is None:
             raise SdkUnavailable(f"no SDK adapter is registered for {backend!r}")
-        raise ExecutableUnavailable(
-            f"no executable adapter is registered for {backend!r}/{transport!r}"
-        )
+        return adapter
 
     async def _environment(
         self,

@@ -3,10 +3,12 @@
 The runtime drives every retryable call through ``attempts(policy)``: one
 `Attempt` handle per try, retryable failure marked on the handle
 (`mark_failed`), and the iterator sleeps the backoff between tries — a
-jittered exponential curve, `ProviderRateLimit.retry_after` honored up to a
-60s cap, and one wall-clock deadline for the whole call. Iteration ending
-without the runtime breaking out means the budget is exhausted; the runtime
-folds that into `Failed(TransientExhausted)`.
+jittered exponential curve, `ProviderRateLimit.retry_after` honored verbatim
+up to a 60s cap, and each backoff sleep gated by one wall-clock deadline. A
+retry_after ABOVE the 60s cap is never honored by an early retry: the call
+exhausts instead of retrying before the provider's stated window. Iteration
+ending without the runtime breaking out means the budget is exhausted; the
+runtime folds that into `Failed(TransientExhausted)`.
 
 Deliberately a thin explicit generator, not a stamina wrapper: stamina's
 retry-after path (a backoff hook smuggling a float through tenacity call
@@ -40,8 +42,10 @@ from provider_runtime.types import (
 # Default policy
 
 # A provider-sent retry_after is honored verbatim beyond max_delay_s (the
-# provider's explicit instruction outranks our backoff curve) but never past
-# this cap; the deadline still gates the resulting sleep.
+# provider's explicit instruction outranks our backoff curve), up to and
+# including this cap. Above the cap we never retry early: the call exhausts
+# rather than sleeping less than the provider explicitly asked for. Below the
+# cap, the deadline still gates the resulting sleep.
 _RETRY_AFTER_CAP_S: Final[float] = 60.0
 
 # Backoff values ported from the old runtime's external-LLM policy. The 120s
@@ -87,10 +91,11 @@ async def attempts(
     """Yield 1-based attempt handles, sleeping the policy's backoff between them.
 
     The runtime's contract per yielded handle: return/break on a terminal
-    outcome, or `mark_failed(cause)` and iterate. Exhaustion (attempt budget or
-    deadline) ends the iteration; the deadline is checked before each sleep
-    (elapsed + pending delay), so the first attempt always runs and no sleep
-    ever starts past the deadline.
+    outcome, or `mark_failed(cause)` and iterate. Exhaustion (attempt budget,
+    wall-clock deadline, or a retry_after above the honored 60s cap) ends the
+    iteration; the deadline is checked before each sleep (elapsed + pending
+    delay), so the first attempt always runs and no sleep ever starts past the
+    deadline.
 
     `rng`/`clock`/`sleep` are deterministic-test seams with production defaults.
     """
@@ -105,10 +110,25 @@ async def attempts(
                 f"attempts() advanced past attempt {number} without mark_failed(); "
                 "a finished call must stop iterating"
             )
+        if _exceeds_retry_after_cap(cause):
+            return
         delay_s = _delay_s(attempt=number, cause=cause, policy=policy, rng=jitter_rng)
         if number >= policy.max_attempts or _deadline_exhausted(clock() - started, policy, delay_s):
             return
         await sleep(delay_s)
+
+
+def _exceeds_retry_after_cap(cause: TransientCause) -> bool:
+    """True when a provider-stated retry_after asks for more than the 60s cap.
+
+    Never retry early against an explicit provider instruction: the call
+    exhausts instead (spec §8).
+    """
+    return (
+        isinstance(cause, ProviderRateLimit)
+        and isinstance(cause.retry_after, Present)
+        and cause.retry_after.value > _RETRY_AFTER_CAP_S
+    )
 
 
 def _delay_s(
@@ -117,10 +137,12 @@ def _delay_s(
     """Exponential ``initial * 2^(attempt-1)`` plus jitter, capped at max_delay.
 
     A Present `ProviderRateLimit.retry_after` is honored verbatim (no jitter,
-    no max_delay cap) up to the 60s cap.
+    no max_delay cap) — the caller must have already ruled out
+    `_exceeds_retry_after_cap`. Never negative: a mis-parsed Retry-After header
+    must not produce an instant zero-backoff retry.
     """
     if isinstance(cause, ProviderRateLimit) and isinstance(cause.retry_after, Present):
-        return min(cause.retry_after.value, _RETRY_AFTER_CAP_S)
+        return max(0.0, cause.retry_after.value)
     delay = policy.initial_delay_s * (2 ** (attempt - 1))
     if policy.jitter_s > 0:
         delay += rng.uniform(0, policy.jitter_s)

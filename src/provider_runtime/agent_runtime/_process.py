@@ -373,6 +373,11 @@ async def capture_process_output(
             await process.close()
         raise ExecutableUnavailable(f"{purpose} exceeded its startup bound") from None
     except OSError:
+        # Both the spawn that never happened (`process is None`) and a pipe-level failure
+        # after it land here, so the close is conditional rather than absent: a child that
+        # was launched must never be left unreaped just because the read side broke.
+        if process is not None:
+            await process.close()
         raise ExecutableUnavailable(f"{executable_label} executable is unavailable") from None
     except BaseException:
         if process is not None:

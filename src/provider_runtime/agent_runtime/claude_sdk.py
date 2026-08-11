@@ -134,6 +134,11 @@ _COMMAND_TOOL_NAMES = frozenset(dict(_BUILTIN_TOOL_NAMES)["command"])
 # session is published.
 _MCP_TOOL_PREFIX = "mcp__"
 _MCP_CONNECTED_STATUS = "connected"
+# `ThinkingConfig.display` (0.2.130 types.py:1648) is the only reasoning-summary control the
+# SDK has: thinking text is either returned summarized or omitted entirely. There is no
+# verbosity axis, so `concise`/`detailed` are refused rather than flattened onto
+# `summarized`, which would claim a control this transport cannot enforce.
+_THINKING_DISPLAY: dict[str, str] = {"none": "omitted", "auto": "summarized"}
 _SDK_PERMISSION_MODE = "default"
 _INTERRUPT_TIMEOUT_SECONDS = 2.0
 # How long an interrupted turn's tail may take to arrive before the session is declared
@@ -400,6 +405,15 @@ class ClaudeSdkAdapter:
 
         # Everything that can still reject the request runs before the launcher is written,
         # so a rejected session never leaves a file behind.
+        if request.developer:
+            # `ClaudeAgentOptions` has exactly one instruction channel (`system_prompt`,
+            # 0.2.130 types.py:1789) and `request.system` owns it. Folding developer text
+            # into the same string would invent a role split the SDK does not have, and
+            # dropping it would run a billable turn without the caller's constraints.
+            raise UnsupportedCapability(
+                "Claude Agent SDK has one instruction channel; put developer instructions in "
+                "AgentSessionRequest.system"
+            )
         system_prompt = self._optional_instruction(request.system)
         mcp_servers = self._mcp_servers(request)
         output_format = self._output_format(request.output)
@@ -506,23 +520,6 @@ class ClaudeSdkAdapter:
         self._validate_policy_mapping(policy)
         if policy.approval == "ask" and approvals is None:
             raise InvalidAgentRequest("approval='ask' requires an approval handler")
-        if (
-            request.system is not None
-            or request.developer is not None
-            or request.reasoning is not None
-            or request.mcp_servers is not None
-            or request.max_turns is not None
-            or request.output is not None
-            or request.native is not None
-        ):
-            raise UnsupportedCapability(
-                "Claude SDK instructions, reasoning, MCP, max_turns, output, and native options "
-                "are unavailable as per-turn overrides"
-            )
-        if request.model is not None:
-            raise UnsupportedCapability(
-                "Claude SDK model changes persist and are not per-turn overrides"
-            )
 
         state.message_count = 0
         state.output_bytes = 0
@@ -887,7 +884,14 @@ class ClaudeSdkAdapter:
         data = getattr(message, "data", None)
         if not isinstance(data, Mapping):
             raise ProtocolDefect("Claude system/init carried no object payload")
-        if data.get("cwd") != state.request.cwd:
+        reported_cwd = data.get("cwd")
+        # Compared as resolved paths: `AgentSessionRequest.cwd` is validated lexically, so a
+        # workspace reached through a symlink (a `/home -> /var/home` distro, say) is legal
+        # and the backend may echo either spelling. The security fact is that the effective
+        # directory *is* the requested one, not that the two strings match byte for byte.
+        if not isinstance(reported_cwd, str) or not self._same_directory(
+            reported_cwd, state.request.cwd
+        ):
             raise ProtocolDefect(
                 "Claude SDK reported a different effective working directory",
                 code="effective_cwd_mismatch",
@@ -905,6 +909,13 @@ class ClaudeSdkAdapter:
         requested_model = state.request.model
         if requested_model is not None and reported_model != requested_model:
             self._record_diagnostic(state, "effective_model_changed")
+
+    @staticmethod
+    def _same_directory(reported: str, requested: str) -> bool:
+        try:
+            return Path(reported).resolve() == Path(requested).resolve()
+        except OSError:
+            return False
 
     @staticmethod
     def _require_effective_tools(state: _ClaudeSessionState, data: Mapping[str, object]) -> None:
@@ -1059,7 +1070,15 @@ class ClaudeSdkAdapter:
 
     @staticmethod
     def _record_diagnostic(state: _ClaudeSessionState, message: str) -> None:
-        """Append one deduplicated turn diagnostic within the stream's diagnostic bound."""
+        """Append one deduplicated turn diagnostic, dropping anything past the bound.
+
+        Overflow is dropped rather than raised because every caller here is a teardown or
+        observation path — a refused interrupt, a failed disconnect, a substituted model —
+        that already has an outcome to deliver. Raising would replace that outcome with a
+        bound. Codex's `_append_diagnostic` raises for the opposite reason: there the
+        diagnostics come from the turn's own `error`/`warning` frames and are part of the
+        turn's output budget, so exceeding it is an `output_limit_exceeded` terminal.
+        """
         if message in state.diagnostics or len(state.diagnostics) >= _MAX_DIAGNOSTICS:
             return
         state.diagnostics.append(message)
@@ -1553,9 +1572,20 @@ class ClaudeSdkAdapter:
         reasoning = request.reasoning
         if reasoning is None:
             return None
-        if reasoning.thinking_budget is not None:
-            return {"type": "enabled", "budget_tokens": reasoning.thinking_budget}
-        return {"type": "adaptive"}
+        thinking: dict[str, object] = (
+            {"type": "enabled", "budget_tokens": reasoning.thinking_budget}
+            if reasoning.thinking_budget is not None
+            else {"type": "adaptive"}
+        )
+        if reasoning.summary is not None:
+            display = _THINKING_DISPLAY.get(reasoning.summary)
+            if display is None:
+                raise UnsupportedCapability(
+                    "Claude thinking display is omitted or summarized; it has no "
+                    f"{reasoning.summary!r} verbosity"
+                )
+            thinking["display"] = display
+        return thinking
 
     @staticmethod
     def _operation(name: str) -> Literal["command", "file_change", "tool_use"]:

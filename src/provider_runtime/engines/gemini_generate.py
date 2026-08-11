@@ -8,11 +8,13 @@ malformed envelopes raise `ProtocolDefect`; 401/403 raises `CredentialRejected`.
 
 Engine decisions (wire-observable):
 
-- Reasoning: the knob is model-generation-specific — `thinkingLevel` (Gemini
-  3+) vs `thinkingBudget` (2.5-era). The ROW decides: `row.reasoning[level]`
-  is a param mapping forwarded verbatim into ThinkingConfig ({} = nothing
-  sent); the engine never hardcodes model generations. `native_reasoning`
-  records the row's exact wire params (e.g. "thinkingBudget=24576").
+- Reasoning: `row.reasoning[level]` is a self-describing wire fragment — a
+  mapping of GenerateContent config params merged verbatim into the request
+  ({} = nothing sent). The ROW decides the shape (Gemini 3+ rows carry
+  `thinking_config.thinking_level`, 2.5-era rows `thinking_budget`); the
+  engine never hardcodes model generations. Fragment top-level keys join the
+  provider_options collision set; `native_reasoning` records the fragment as
+  compact sorted-keys JSON.
 - Continuation: a Succeeded turn with functionCall parts or thoughtSignatures
   yields an artifact whose payload is `{"parts": <candidate parts verbatim>}`
   (json-mode dumps: camelCase keys, signatures as base64 — the wire shape).
@@ -29,9 +31,9 @@ Engine decisions (wire-observable):
   (SAFETY / PROHIBITED_CONTENT / RECITATION / BLOCKLIST / SPII / IMAGE_SAFETY)
   and blocked prompts (promptFeedback.blockReason, no candidates) both map to
   Incomplete(reason="content_filter_partial"); `Refused` is never constructed.
-- `finishReason: MALFORMED_FUNCTION_CALL` → Failed(InvalidToolArguments) —
-  the provider reporting an unusable tool call is the same expected failure
-  as a strict argument-parse failure.
+- `finishReason: MALFORMED_FUNCTION_CALL` / `UNEXPECTED_TOOL_CALL` →
+  Failed(InvalidToolArguments) — the provider reporting an unusable tool call
+  is the same expected failure as a strict argument-parse failure.
 - provider_request_id: Absent() ALWAYS (registry correlation "none"; the
   body's responseId is not surfaced).
 - provider_options are GenerateContentConfig fields (the SDK's config surface
@@ -121,17 +123,18 @@ from provider_runtime.types import (
     presence_of,
 )
 
-# Config fields this engine maps from core intent fields (both casings the
-# SDK accepts); a provider_options key in this set is an override, not an
-# extension → InvalidRequest.
+# Config fields this engine maps from core intent fields, plus fields whose
+# wire effect the decode contract forecloses (candidate_count: only
+# candidates[0] is decoded, so a caller-requested N would be silently
+# discarded). Both casings the SDK accepts; a provider_options key in this
+# set — or among the row's reasoning-fragment keys, added per call — is an
+# override, not an extension → InvalidRequest.
 _OWNED_KEYS: Final[frozenset[str]] = frozenset(
     {
         "system_instruction",
         "systemInstruction",
         "max_output_tokens",
         "maxOutputTokens",
-        "thinking_config",
-        "thinkingConfig",
         "tools",
         "tool_config",
         "toolConfig",
@@ -141,6 +144,8 @@ _OWNED_KEYS: Final[frozenset[str]] = frozenset(
         "responseJsonSchema",
         "response_schema",
         "responseSchema",
+        "candidate_count",
+        "candidateCount",
         "http_options",
         "httpOptions",
         "automatic_function_calling",
@@ -153,6 +158,13 @@ _CONTENT_FILTER_FINISH_REASONS: Final = frozenset(
     {"SAFETY", "PROHIBITED_CONTENT", "RECITATION", "BLOCKLIST", "SPII", "IMAGE_SAFETY"}
 )
 
+# Pinned explicitly whenever row.base_url is Absent: genai.Client resolves an
+# unset HttpOptions.base_url via GOOGLE_GEMINI_BASE_URL (see _base_url.get_base_url
+# in the installed SDK) before ever reaching the mldev branch's own hardcoded
+# default of the same host — zero-env is a behavioral guarantee, not just a
+# source-text gate, so this engine never lets that fallback trigger.
+_CANONICAL_BASE_URL: Final = "https://generativelanguage.googleapis.com/"
+
 
 def _monotonic_ms() -> int:
     return int(time.monotonic() * 1000)
@@ -161,14 +173,6 @@ def _monotonic_ms() -> int:
 def _registry_invalid(row: ModelRow, detail: str) -> RuntimeDefect:
     return RuntimeDefect(
         origin="intent", code="registry_invalid", message=f"row {row.ref!r}: {detail}"
-    )
-
-
-def _wire_literal(value: object) -> str:
-    return (
-        value
-        if isinstance(value, str)
-        else json.dumps(value, sort_keys=True, separators=(",", ":"))
     )
 
 
@@ -186,7 +190,7 @@ class _Encoded:
 
 
 def _encode(row: ModelRow, intent: GenerateIntent) -> _Encoded:
-    thinking, native_reasoning = _thinking(row, intent)
+    fragment, native_reasoning = _reasoning_fragment(row, intent)
     system_parts, contents = _encode_contents(row, intent)
     config: dict[str, object] = {
         "max_output_tokens": intent.max_output_tokens,
@@ -194,10 +198,9 @@ def _encode(row: ModelRow, intent: GenerateIntent) -> _Encoded:
         # contract holds.
         "automatic_function_calling": {"disable": True},
     }
+    config.update(fragment)
     if system_parts:
         config["system_instruction"] = {"parts": system_parts}
-    if thinking is not None:
-        config["thinking_config"] = thinking
     if intent.tools:
         config["tools"] = [
             genai_types.Tool(
@@ -212,9 +215,14 @@ def _encode(row: ModelRow, intent: GenerateIntent) -> _Encoded:
                 ]
             )
         ]
-        config["tool_config"] = {
-            "function_calling_config": {"mode": "AUTO" if intent.tool_choice == "auto" else "NONE"}
-        }
+        match intent.tool_choice:
+            case "auto":
+                mode = "AUTO"
+            case "none":
+                mode = "NONE"
+            case _:
+                assert_never(intent.tool_choice)
+        config["tool_config"] = {"function_calling_config": {"mode": mode}}
     match intent.output:
         case TextOutput():
             pass
@@ -231,11 +239,12 @@ def _encode(row: ModelRow, intent: GenerateIntent) -> _Encoded:
                     assert_never(row.structured)
         case _:
             assert_never(intent.output)
+    owned = _OWNED_KEYS | fragment.keys()
     for key in intent.provider_options:
-        if key in _OWNED_KEYS:
+        if key in owned:
             raise InvalidRequest(
-                message=f"provider_options key {key!r} collides with a core field "
-                f"the gemini_generate engine maps itself"
+                message=f"provider_options key {key!r} collides with a config field "
+                f"the gemini_generate engine already sends"
             )
     config.update(intent.provider_options)
     try:
@@ -250,9 +259,9 @@ def _encode(row: ModelRow, intent: GenerateIntent) -> _Encoded:
     return _Encoded(contents=contents, config=validated, native_reasoning=native_reasoning)
 
 
-def _thinking(
+def _reasoning_fragment(
     row: ModelRow, intent: GenerateIntent
-) -> tuple[genai_types.ThinkingConfig | None, Presence[str]]:
+) -> tuple[Mapping[str, object], Presence[str]]:
     match row.reasoning:
         case Absent():
             if intent.reasoning != "none":
@@ -260,29 +269,29 @@ def _thinking(
                     message=f"row {row.ref!r} has no reasoning knob; "
                     f"level {intent.reasoning!r} is not expressible"
                 )
-            return None, Absent()
+            return {}, Absent()
         case Present(value=levels):
             if intent.reasoning not in levels:
                 raise InvalidRequest(
                     message=f"reasoning level {intent.reasoning!r} is outside the levels "
                     f"row {row.ref!r} supports"
                 )
-            native = levels[intent.reasoning]
+            fragment = levels[intent.reasoning]
         case _:
             assert_never(row.reasoning)
-    if not isinstance(native, Mapping):
-        raise _registry_invalid(row, "gemini reasoning values must be thinkingConfig mappings")
-    if not native:
-        return None, Absent()
+    if not isinstance(fragment, Mapping):
+        raise _registry_invalid(row, "gemini reasoning values must be config-fragment mappings")
+    if not fragment:
+        return {}, Absent()
     try:
-        config = genai_types.ThinkingConfig.model_validate(dict(native))
+        # Validated alone so a bad row defects as registry_invalid instead of
+        # blaming the caller's provider_options at the merged validation.
+        genai_types.GenerateContentConfig.model_validate(dict(fragment))
     except pydantic.ValidationError:
         raise _registry_invalid(
-            row, "gemini reasoning params do not validate as ThinkingConfig"
+            row, "gemini reasoning fragment does not validate as GenerateContent config fields"
         ) from None
-    return config, Present(
-        ",".join(f"{key}={_wire_literal(native[key])}" for key in sorted(native))
-    )
+    return fragment, Present(json.dumps(dict(fragment), sort_keys=True, separators=(",", ":")))
 
 
 def _encode_contents(
@@ -405,8 +414,9 @@ def _replay_content(
 
 
 # ---------------------------------------------------------------------------
-# Usage — cumulative frames folded field-wise (later non-null wins), normalized
-# ONCE into the cache-INCLUSIVE TokenUsage at the terminal.
+# Usage — cumulative frames folded field-wise: later non-zero wins (proto3
+# JSON omits zero-valued fields, so 0 and null are indistinguishable on this
+# wire), normalized ONCE into the cache-INCLUSIVE TokenUsage at the terminal.
 
 
 @dataclass(slots=True)
@@ -562,12 +572,12 @@ def _non_stop_outcome(finish: str, meta: CallMeta) -> Incomplete | Failed:
         )
     if finish in _CONTENT_FILTER_FINISH_REASONS:
         return _blocked_incomplete(meta, f"finishReason: {finish}")
-    if finish == "MALFORMED_FUNCTION_CALL":
+    if finish in ("MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"):
+        # Both mean the model produced an unusable tool call — the same
+        # expected failure as a strict argument-parse failure.
         return Failed(
             meta=meta,
-            failure=InvalidToolArguments(
-                safe_detail="gemini reported finishReason MALFORMED_FUNCTION_CALL"
-            ),
+            failure=InvalidToolArguments(safe_detail=f"gemini reported finishReason {finish}"),
         )
     raise ProtocolDefect(
         code="unknown_finish_reason",
@@ -577,6 +587,14 @@ def _non_stop_outcome(finish: str, meta: CallMeta) -> Incomplete | Failed:
 
 # ---------------------------------------------------------------------------
 # Error classification — SDK exception → TransientAttempt / defect / value.
+
+
+def _validation_summary(exc: pydantic.ValidationError) -> str:
+    """Error locations and types only — response payload values (which the
+    ValidationError's own message embeds) never enter a defect message."""
+    return "; ".join(
+        f"{'.'.join(str(item) for item in err['loc'])}: {err['type']}" for err in exc.errors()[:3]
+    )
 
 
 def _retry_after(exc: genai_errors.APIError) -> Presence[float]:
@@ -640,11 +658,23 @@ def _classify_api_error(exc: genai_errors.APIError) -> ProviderContextTooLarge:
 
 
 def _inband_cause(exc: genai_errors.APIError) -> TransientCause:
-    """Mid-stream in-band error frames (HTTP stayed 200): 429-shaped →
-    ProviderRateLimit; everything else → ProviderHttpUnavailable."""
-    if exc.code == 429:
+    """Mid-stream in-band error frames (HTTP stayed 200), code parity with
+    `_classify_api_error`: 429 → ProviderRateLimit, 5xx →
+    ProviderHttpUnavailable, anything else is a non-transient error inside a
+    2xx stream → ProtocolDefect."""
+    code = exc.code if isinstance(exc.code, int) else None
+    if code == 429:
         return ProviderRateLimit(retry_after=Absent())
-    return ProviderHttpUnavailable()
+    if code is not None and code >= 500:
+        return ProviderHttpUnavailable()
+    snippet = safe_provider_error_body_snippet(
+        exc.details if isinstance(exc.details, dict) else None
+    )
+    raise ProtocolDefect(
+        code="inband_error_frame",
+        message=f"gemini stream carried a non-transient in-band error frame "
+        f"(code {code}){f': {snippet}' if snippet else ''}",
+    ) from None
 
 
 def _transport_attempt(exc: httpx.TransportError) -> TransientAttempt:
@@ -659,12 +689,15 @@ def _transport_attempt(exc: httpx.TransportError) -> TransientAttempt:
     )
 
 
-def _timeout_attempt() -> TransientAttempt:
+def _timeout_attempt(exc: httpx.TimeoutException) -> TransientAttempt:
+    # A connect timeout is a pure pre-connect failure — the handshake never
+    # completed, so no request bytes reached the provider.
+    dispatched = not isinstance(exc, httpx.ConnectTimeout)
     return TransientAttempt(
         cause=ProviderTimeout(),
         status_code=Absent(),
         provider_request_id=Absent(),
-        billability=PossiblyBillable(),
+        billability=PossiblyBillable() if dispatched else NotDispatched(),
     )
 
 
@@ -686,7 +719,7 @@ class GeminiGenerateEngine:
             case Present(value=base_url):
                 pass
             case Absent():
-                base_url = None  # SDK default
+                base_url = _CANONICAL_BASE_URL  # pinned, never SDK/env-resolved
             case _:
                 assert_never(row.base_url)
         return genai.Client(
@@ -717,7 +750,7 @@ class GeminiGenerateEngine:
                     failure=overflow,
                 )
             except httpx.TimeoutException as exc:
-                raise _timeout_attempt() from exc
+                raise _timeout_attempt(exc) from exc
             except httpx.TransportError as exc:
                 raise _transport_attempt(exc) from exc
             except json.JSONDecodeError as exc:
@@ -726,11 +759,13 @@ class GeminiGenerateEngine:
                 ) from exc
             except pydantic.ValidationError as exc:
                 # Request-side validation cannot reach here: contents and
-                # config were validated in _encode.
+                # config were validated in _encode. The cause embeds response
+                # payloads — never chained; locations + error types stand in.
                 raise ProtocolDefect(
                     code="malformed_envelope",
-                    message="gemini 2xx response does not validate as a GenerateContentResponse",
-                ) from exc
+                    message="gemini 2xx response does not validate as a "
+                    f"GenerateContentResponse ({_validation_summary(exc)})",
+                ) from None
             return _decode_response(row, intent, response, encoded.native_reasoning, started_ms)
         finally:
             # The SDK skips closing an injected httpx client.
@@ -757,7 +792,7 @@ class GeminiGenerateEngine:
                 )
                 return
             except httpx.TimeoutException as exc:
-                raise _timeout_attempt() from exc
+                raise _timeout_attempt(exc) from exc
             except httpx.TransportError as exc:
                 raise _transport_attempt(exc) from exc
 
@@ -789,7 +824,7 @@ class GeminiGenerateEngine:
                     usage=fold.usage(),
                     native_reasoning=encoded.native_reasoning,
                     started_ms=started_ms,
-                    status_code=200,
+                    status_code=Present(200),
                 )
 
             try:
@@ -856,27 +891,25 @@ class GeminiGenerateEngine:
                     else:
                         yield TerminalEvent(outcome=_non_stop_outcome(finish, stream_meta()))
                     return
-            except TransientAttempt:
-                raise
             except genai_errors.APIError as exc:
                 # In-band error frame (HTTP stayed 200), surfaced by the SDK
                 # mid-iteration.
                 raise interrupted(_inband_cause(exc)) from exc
-            except genai_errors.UnknownApiResponseError as exc:
+            except (genai_errors.UnknownApiResponseError, json.JSONDecodeError):
+                # The SDK's frame-parse error embeds the raw frame verbatim —
+                # never chained.
                 raise ProtocolDefect(
                     code="malformed_stream_frame",
                     message="gemini stream frame is not valid JSON",
-                ) from exc
-            except json.JSONDecodeError as exc:
-                raise ProtocolDefect(
-                    code="malformed_stream_frame",
-                    message="gemini stream frame is not valid JSON",
-                ) from exc
+                ) from None
             except pydantic.ValidationError as exc:
+                # The cause embeds frame payloads — never chained; locations +
+                # error types stand in.
                 raise ProtocolDefect(
                     code="malformed_stream_frame",
-                    message="gemini stream frame does not validate as a GenerateContentResponse",
-                ) from exc
+                    message="gemini stream frame does not validate as a "
+                    f"GenerateContentResponse ({_validation_summary(exc)})",
+                ) from None
             except httpx.TimeoutException as exc:
                 raise interrupted(ProviderTimeout()) from exc
             except httpx.TransportError as exc:
@@ -899,7 +932,7 @@ def _meta(
     usage: Presence[TokenUsage],
     native_reasoning: Presence[str],
     started_ms: int,
-    status_code: int,
+    status_code: Presence[int],
 ) -> CallMeta:
     return CallMeta(
         provider=row.provider,
@@ -911,7 +944,7 @@ def _meta(
             AttemptRecord(
                 attempt=1,
                 signal=FinalAttempt(),
-                status_code=Present(status_code),
+                status_code=status_code,
                 started_at_ms=started_ms,
                 ended_at_ms=_monotonic_ms(),
             ),
@@ -935,7 +968,9 @@ def _error_meta(
         usage=Absent(),
         native_reasoning=native_reasoning,
         started_ms=started_ms,
-        status_code=exc.code if isinstance(exc.code, int) else 0,
+        # One normalization rule with _classify_api_error: presence_of for
+        # non-int codes — never a fabricated status.
+        status_code=presence_of(exc.code if isinstance(exc.code, int) else None),
     )
 
 
@@ -953,7 +988,7 @@ def _decode_response(
         usage=_usage_presence(response.usage_metadata),
         native_reasoning=native_reasoning,
         started_ms=started_ms,
-        status_code=200,
+        status_code=Present(200),
     )
     candidates = response.candidates
     if not candidates:

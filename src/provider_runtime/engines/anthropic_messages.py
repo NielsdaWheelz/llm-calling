@@ -2,11 +2,17 @@
 
 Wire obligations (spec §5/§6, anthropic_messages row):
 
-- Caching: ONE inferred ``cache_control: {"type": "ephemeral"}`` breakpoint on
-  the LAST system block — no caller annotation, no other markers.
-- Reasoning: extended thinking ``{"type": "enabled", "budget_tokens": N}`` with
-  the row's declared budget for the intent level; a row without a reasoning
-  knob sends nothing and records ``native_reasoning=Absent``.
+- Caching: ONE inferred ``cache_control: {"type": "ephemeral"}`` breakpoint at
+  the end of the conversation prefix — the final (new) turn excluded, falling
+  back to the last system block on a first turn. Thinking blocks cannot carry
+  the marker on this wire, so it lands on the last block that can. No caller
+  annotation, no other markers.
+- Reasoning: the row's reasoning map value is a self-describing wire fragment
+  (anthropic rows: ``{"output_config": {"effort": "<level>"}}``) merged
+  verbatim into the request — the engine carries no per-provider shape
+  knowledge. ``native_reasoning`` records the fragment as compact sorted-keys
+  JSON; a row without a reasoning knob (or an empty fragment) sends nothing
+  and records ``Absent``.
 - Continuations: the prior turn's thinking/redacted_thinking blocks (signatures
   intact) are captured verbatim into ``opaque_payload["blocks"]`` and replayed
   as the LEADING assistant content on the next turn — required for
@@ -132,21 +138,26 @@ from provider_runtime.types import (
     presence_of,
 )
 
-# Request-body keys this engine maps from core intent fields; a provider_options
-# key naming one of these is an override, not an extension.
+# Request-body keys this engine owns — mapped from core intent fields, or
+# engine-inferred (cache_control, spec §5: no caller annotation). These plus
+# the row's reasoning-fragment top-level keys form the provider_options
+# collision set: naming one is an override, not an extension.
 _OWNED_OPTION_KEYS: Final[frozenset[str]] = frozenset(
     {
         "model",
         "max_tokens",
         "messages",
         "system",
-        "thinking",
+        "cache_control",
         "tools",
         "tool_choice",
         "output_config",
         "stream",
     }
 )
+
+# Blocks that cannot carry cache_control on this wire.
+_UNCACHEABLE_BLOCK_TYPES: Final[frozenset[str]] = frozenset({"thinking", "redacted_thinking"})
 
 _SUCCESS_STOP_REASONS: Final[frozenset[str]] = frozenset({"end_turn", "tool_use", "stop_sequence"})
 # 5xx-shaped in-band stream error types (overloaded_error ≙ 529); everything
@@ -178,8 +189,43 @@ class _EncodedRequest:
     native_reasoning: Presence[str]
 
 
+def _reasoning_fragment(
+    row: ModelRow, intent: GenerateIntent
+) -> tuple[dict[str, Any], Presence[str]]:
+    """The row's self-describing reasoning wire fragment for the intent level,
+    plus its ``native_reasoning`` stamp (compact sorted-keys JSON; Absent when
+    nothing is sent)."""
+    match row.reasoning:
+        case Present(value=levels):
+            if intent.reasoning not in levels:
+                raise InvalidRequest(
+                    message=f"reasoning level {intent.reasoning!r} is not declared for {row.ref!r}"
+                )
+            value = levels[intent.reasoning]
+            if not isinstance(value, Mapping):
+                raise RuntimeDefect(
+                    origin="intent",
+                    code="registry_invalid",
+                    message=f"row {row.ref!r}: reasoning values must be request-fragment mappings",
+                )
+            fragment: dict[str, Any] = dict(value)
+            if not fragment:
+                return {}, Absent()
+            return fragment, Present(json.dumps(fragment, sort_keys=True, separators=(",", ":")))
+        case Absent():
+            if intent.reasoning != "none":
+                raise InvalidRequest(
+                    message=f"row {row.ref!r} has no reasoning knob; "
+                    f"level {intent.reasoning!r} is not expressible"
+                )
+            return {}, Absent()
+        case _:
+            assert_never(row.reasoning)
+
+
 def _encode_request(row: ModelRow, intent: GenerateIntent) -> _EncodedRequest:
-    collisions = sorted(_OWNED_OPTION_KEYS & set(intent.provider_options))
+    fragment, native_reasoning = _reasoning_fragment(row, intent)
+    collisions = sorted((_OWNED_OPTION_KEYS | fragment.keys()) & set(intent.provider_options))
     if collisions:
         raise InvalidRequest(
             message=f"provider_options keys {collisions!r} collide with engine-mapped request fields"
@@ -192,32 +238,6 @@ def _encode_request(row: ModelRow, intent: GenerateIntent) -> _EncodedRequest:
     }
     if system_blocks:
         params["system"] = system_blocks
-    native_reasoning: Presence[str]
-    match row.reasoning:
-        case Present(value=levels):
-            if intent.reasoning not in levels:
-                raise InvalidRequest(
-                    message=f"reasoning level {intent.reasoning!r} is not declared for {row.ref!r}"
-                )
-            budget = levels[intent.reasoning]
-            if isinstance(budget, bool) or not isinstance(budget, int):
-                raise RuntimeDefect(
-                    origin="intent",
-                    code="registry_invalid",
-                    message=f"row {row.ref!r}: anthropic reasoning values must be "
-                    f"thinking budget_tokens ints",
-                )
-            params["thinking"] = {"type": "enabled", "budget_tokens": budget}
-            native_reasoning = Present(f"budget_tokens={budget}")
-        case Absent():
-            if intent.reasoning != "none":
-                raise InvalidRequest(
-                    message=f"row {row.ref!r} has no reasoning knob; "
-                    f"level {intent.reasoning!r} is not expressible"
-                )
-            native_reasoning = Absent()
-        case _:
-            assert_never(row.reasoning)
     if intent.tools:
         params["tools"] = [
             {
@@ -244,6 +264,17 @@ def _encode_request(row: ModelRow, intent: GenerateIntent) -> _EncodedRequest:
             pass
         case _:
             assert_never(intent.output)
+    # The reasoning fragment merges verbatim. When the engine already maps the
+    # same top-level key (output_config carries both the strict-output format
+    # and the effort knob), the two mappings merge one level deep — still with
+    # zero knowledge of the fragment's shape.
+    for key, value in fragment.items():
+        existing = params.get(key)
+        params[key] = (
+            {**existing, **value}
+            if isinstance(existing, Mapping) and isinstance(value, Mapping)
+            else value
+        )
     if intent.provider_options:
         params["extra_body"] = dict(intent.provider_options)
     return _EncodedRequest(params=params, native_reasoning=native_reasoning)
@@ -253,12 +284,12 @@ def _encode_messages(
     row: ModelRow, intent: GenerateIntent
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     system_blocks: list[dict[str, object]] = []
-    messages: list[dict[str, object]] = []
+    turns: list[tuple[str, list[dict[str, object]]]] = []
     pending_tool_results: list[dict[str, object]] = []
 
     def flush_tool_results() -> None:
         if pending_tool_results:
-            messages.append({"role": "user", "content": list(pending_tool_results)})
+            turns.append(("user", list(pending_tool_results)))
             pending_tool_results.clear()
 
     system_phase = True
@@ -287,13 +318,11 @@ def _encode_messages(
                         message="anthropic user turn has no non-empty content blocks to encode "
                         "(Anthropic rejects an empty content array)"
                     )
-                messages.append({"role": "user", "content": content})
+                turns.append(("user", content))
             case AssistantMessage():
                 system_phase = False
                 flush_tool_results()
-                messages.append(
-                    {"role": "assistant", "content": _assistant_content(message, row, intent)}
-                )
+                turns.append(("assistant", _assistant_content(message, row, intent)))
             case ToolResultMessage(call_id=call_id, output=output, is_error=is_error):
                 system_phase = False
                 pending_tool_results.append(
@@ -307,9 +336,21 @@ def _encode_messages(
             case _:
                 assert_never(message)
     flush_tool_results()
-    # The one inferred cache breakpoint: end of the system prompt (spec §5).
-    if system_blocks:
-        system_blocks[-1]["cache_control"] = {"type": "ephemeral"}
+    # The one inferred cache breakpoint (spec §5): the end of the conversation
+    # prefix, the final (new) turn excluded — falling back to the end of the
+    # system prompt on a first turn. Thinking blocks cannot carry cache_control
+    # on this wire, so the marker lands on the last block that can.
+    prefix_blocks = [block for _, content in turns[:-1] for block in content]
+    for block in reversed(prefix_blocks):
+        if block.get("type") not in _UNCACHEABLE_BLOCK_TYPES:
+            block["cache_control"] = {"type": "ephemeral"}
+            break
+    else:
+        if system_blocks:
+            system_blocks[-1]["cache_control"] = {"type": "ephemeral"}
+    messages: list[dict[str, object]] = [
+        {"role": role, "content": content} for role, content in turns
+    ]
     return system_blocks, messages
 
 
@@ -656,14 +697,15 @@ def _content_of(
 def _decode_response(
     row: ModelRow,
     intent: GenerateIntent,
-    message: Message,
+    message: object,
     *,
     native_reasoning: Presence[str],
     started_ms: int,
 ) -> CallOutcome:
+    # Typed `object` honestly: the SDK returns the raw text (a str) for 2xx
+    # bodies served with a non-JSON content type in non-strict mode; that is a
+    # malformed envelope at this boundary.
     if not isinstance(message, Message):
-        # The SDK returns raw text for 2xx bodies served with a non-JSON
-        # content type; that is a malformed envelope at this boundary.
         raise ProtocolDefect(
             code="unparseable_response",
             message="anthropic response body is not a JSON message envelope",
@@ -711,7 +753,14 @@ def _decode_response(
             status="provider_incomplete",
             safe_detail=Absent(),
         )
+    if stop_reason == "model_context_window_exceeded":
+        # Documented HTTP-200 terminal (SDK 0.121 StopReason): generation
+        # crossed the model's context window — an expected failure value.
+        return Failed(meta=meta, failure=ProviderContextTooLarge())
     if not isinstance(stop_reason, str) or stop_reason not in _SUCCESS_STOP_REASONS:
+        # "pause_turn" lands here deliberately: it occurs only on server-tool
+        # turns (web search etc.), and this wire never sends server tools —
+        # CanonicalTool encodes client tools exclusively.
         raise ProtocolDefect(
             code="unknown_stop_reason",
             message=f"anthropic response carried unknown stop_reason {stop_reason!r}",
@@ -762,7 +811,8 @@ def _decode_response(
 class _OpenToolCall:
     call_id: str
     name: str
-    arguments: str = ""
+    # Assembled model output — never in repr.
+    arguments: str = field(default="", repr=False)
 
 
 @dataclass(slots=True)
@@ -773,11 +823,13 @@ class _StreamState:
     usage: _UsageFold = field(default_factory=_UsageFold)
     stop_reason: str | None = None
     stop_details: RefusalStopDetails | None = None
-    text_parts: list[str] = field(default_factory=list)
+    # Assembled response text, tool arguments, and thinking blocks (the
+    # continuation payload material) — never in repr.
+    text_parts: list[str] = field(default_factory=list, repr=False)
     open_tools: dict[int, _OpenToolCall] = field(default_factory=dict)
-    tool_calls: list[ToolCall] = field(default_factory=list)
-    thinking_by_index: dict[int, dict[str, object]] = field(default_factory=dict)
-    thinking_blocks: list[Mapping[str, object]] = field(default_factory=list)
+    tool_calls: list[ToolCall] = field(default_factory=list, repr=False)
+    thinking_by_index: dict[int, dict[str, object]] = field(default_factory=dict, repr=False)
+    thinking_blocks: list[Mapping[str, object]] = field(default_factory=list, repr=False)
     semantic_emitted: bool = False
 
 
@@ -942,7 +994,14 @@ def _terminal_events(
                 )
             )
         ]
+    if state.stop_reason == "model_context_window_exceeded":
+        # Documented HTTP-200 terminal (SDK 0.121 StopReason): generation
+        # crossed the model's context window — an expected failure value.
+        return [TerminalEvent(outcome=Failed(meta=meta, failure=ProviderContextTooLarge()))]
     if state.stop_reason is None or state.stop_reason not in _SUCCESS_STOP_REASONS:
+        # "pause_turn" lands here deliberately: it occurs only on server-tool
+        # turns (web search etc.), and this wire never sends server tools —
+        # CanonicalTool encodes client tools exclusively.
         raise ProtocolDefect(
             code="unknown_stop_reason",
             message=f"anthropic stream carried unknown stop_reason {state.stop_reason!r}",

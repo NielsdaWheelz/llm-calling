@@ -184,7 +184,9 @@ deadline without contortion), one wall-clock
 deadline. Exhaustion → `Failed(TransientExhausted)` with full attempt trace in `CallMeta`.
 Streams: no mid-stream resumption; interruption after any emitted event →
 `ProviderStreamInterrupted`, retried only when zero non-terminal events were emitted.
-`attempt_trace` stays on `CallMeta` (ledger-consumed) *and* is mirrored to span attributes.
+`attempt_trace` stays on `CallMeta` (ledger-consumed) *and* is mirrored to the call span as
+bounded span events (one `provider_runtime.attempt` event per attempt — signal kind, status
+code, duration; never content). An attribute cannot carry a per-attempt list.
 
 ## 9. Observability
 
@@ -284,6 +286,10 @@ only code edits.
 | Pyright | `standard` (as today); strict is a separate future decision | review correction |
 | OTel | `opentelemetry-api` only | review correction |
 | Versioning | Bounded constraints in `pyproject.toml`; locks pin CI/consumer resolutions | review correction |
+| SDK ambient base-URL env sniffing | When `row.base_url` is Absent the engine pins the provider's canonical host explicitly — the SDK must never resolve the base URL from ambient env (`OPENAI_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`, …). Zero-env is a behavioral guarantee, not just a source-text gate; each engine carries a poison-env test | owner, from review round 1 |
+| SDK ambient env sniffing beyond base URL | Same principle for every request-affecting env read an SDK performs (`OPENAI_ORG_ID`, `OPENAI_PROJECT_ID`, `OPENAI_WEBHOOK_SECRET`, `OPENAI_CUSTOM_HEADERS` header injection): suppress engine-side via explicit constructor args where the SDK allows it; where it doesn't, strip at the injected http client. No documented-exception escape hatch | owner, from review round 2 |
+| Requested reasoning level on a knobless row | If `intent.reasoning` names a non-`none` level and `row.reasoning` is Absent, every engine raises `InvalidRequest` ("no reasoning knob; level not expressible"). Silent discard of an explicit caller request is banned — anthropic/gemini already comply; openai engines conform | owner, from review round 2 |
+| Provider-specific request params (e.g. Gemini `cached_content`) | Pass through `provider_options` untouched. §2 bans caching *vocabulary in the contract*, not provider params the contract doesn't model — `provider_options` is exactly that escape hatch. No engine special-casing, no collision entry, no `CallMeta` surface | owner, from review round 1 |
 
 ## 15. Work packages — vertical slices, each PR leaves `main` green
 

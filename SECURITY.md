@@ -37,6 +37,9 @@ rebuilt from a fixed allowlist; the operator's environment is not inherited.
 `HOME`, `PATH`, locale, temp, `CODEX_HOME`, and `CLAUDE_CONFIG_DIR` are
 runtime-owned. Credential-class, provider-selection, and process-control names
 cannot be copied through `PermissionPolicy.environment` or MCP aliases.
+Credential-class is every provider API key the operator may have exported, not
+only the two backends' own auth variables: the agent lane has no use for any of
+them, so none of them reaches a child.
 
 For Codex, the selected environment is passed with public `CodexConfig.env`, but
 the SDK overlays it on `os.environ`. The adapter therefore points public
@@ -91,12 +94,17 @@ and per-turn narrowing cannot swap one reviewer for the other. A caller should
 treat provider review as permission for the provider's maintained policy to
 approve actions within the separately selected filesystem/network sandbox.
 
-Codex does not expose exact built-in tool filters through its public SDK. The
-route rejects specific allow/deny patterns rather than pretending they were
-enforced; only the explicit `allowed_tools=("*",)` sentinel is accepted when
-built-ins are intentionally enabled. Claude validates policies against its
-exact accepted native tool names and verifies the effective tool set the
-backend reports at session start.
+Codex exposes no built-in tool filter through its public SDK — neither specific
+names nor an off switch. The route rejects both rather than pretending either
+was enforced, so `allowed_tools=("*",)` is the only spelling a Codex session
+may carry: an empty tuple would assert that built-ins are disabled when the SDK
+leaves them on. A Codex session is confined by its sandbox mode and approval
+mode, never by its tool list. Claude accepts exact tool names, rejects glob
+patterns and the two network-reaching built-ins (`WebFetch`, `WebSearch`)
+outright, and verifies the effective tool set the backend reports at session
+start against the requested set. It does not reject a name that is simply
+unknown to the CLI; such a name grants nothing, so the effect is a narrower
+session than the caller wrote, never a wider one.
 
 ## MCP and credentials
 
@@ -111,13 +119,16 @@ commands can inspect peer processes and should be assumed able to read every
 stdio MCP credential. Do not use credentialed stdio MCP as a security boundary;
 use a dedicated OS user or container.
 
-Safer supported shapes are:
+The one confined remote-MCP shape is Claude streamable HTTP MCP under an exact
+hostname allowlist, with no credential references supplied by this package.
 
-- Claude streamable HTTP MCP under an exact hostname allowlist, with no
-  credential references supplied by this package;
-- Codex streamable HTTP MCP with reference headers/environment, read-only or
-  workspace-write filesystem, and unrestricted network. Codex cannot enforce an
-  exact hostname allowlist, so this confines filesystem access, not egress.
+Codex streamable HTTP MCP is the shape that carries reference
+headers/environment, and it is not a confinement boundary. Codex cannot enforce
+a hostname allowlist, so remote MCP needs unrestricted network; the SDK's
+sandbox presets only reach the network under `full_access`. A Codex remote-MCP
+session is therefore `full_access` + `unrestricted` with both unsafe dimensions
+acknowledged, which confines neither the filesystem nor egress. Run it as a
+dedicated OS user or in a container, or use the Claude shape instead.
 
 ## Bounds, redaction, cancellation, and cleanup
 

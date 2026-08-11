@@ -12,11 +12,17 @@ and the chat sugar.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+import logging
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 
 import pydantic
 import pytest
+from opentelemetry import trace
+from opentelemetry.context import Context
+from opentelemetry.trace import Link, NoOpTracer, Span, SpanContext, SpanKind, Status, StatusCode
+from opentelemetry.trace.span import INVALID_SPAN_CONTEXT
+from opentelemetry.util import types as otel_types
 
 from provider_runtime import registry
 from provider_runtime.engines import TransientAttempt
@@ -39,6 +45,8 @@ from provider_runtime.types import (
     CanonicalTool,
     CodecStreamEvent,
     ConfirmedNonBillable,
+    ContinuationArtifact,
+    ContinuationDelta,
     Failed,
     FinalAttempt,
     GenerateIntent,
@@ -71,9 +79,14 @@ from provider_runtime.types import (
     TextDelta,
     TextOutput,
     TokenUsage,
+    ToolCall,
+    ToolCallDelta,
+    ToolCallDone,
+    ToolCallStart,
     TransientCause,
     TransientExhausted,
     TransportUnavailable,
+    UsageEvent,
     UserMessage,
     presence_of,
 )
@@ -88,24 +101,15 @@ CREDENTIALS = Credentials(openai="sk-openai-test-key-000", deepseek="sk-deepseek
 
 # A capability-poor row for the tools/streaming gates: no current registry row
 # has tools=False or streaming=False, so those two gates are exercised by
-# EXTENDING the row table (data, not behavior). Drop this if a real
-# capability-poor row ever lands.
-LIMITED_ROW = ModelRow(
+# EXTENDING the row table (data, not behavior). Derived from a real row so the
+# fixture cannot invent field values the registry's own invariants would
+# reject. Drop this if a real capability-poor row ever lands.
+LIMITED_ROW = replace(
+    registry.resolve("openai:gpt-5.6-sol"),
     ref="openai:limited",
-    provider="openai",
     model_id="gpt-limited",
-    engine="openai_responses",
-    base_url=Absent(),
-    context_window=8_000,
-    max_output_tokens=1_000,
-    modalities=frozenset({"text"}),
     tools=False,
     streaming=False,
-    structured="json_mode",
-    reasoning=Absent(),
-    continuation_codec="openai.v1",
-    correlation="header",
-    routing=Absent(),
 )
 
 
@@ -243,7 +247,8 @@ def engine_meta(
             ),
         ),
         billability=billability,
-        native_reasoning=Present("none"),
+        # The wire fragment the engine merged, serialised — never a bare level.
+        native_reasoning=Present('{"reasoning":{"effort":"none"}}'),
         registry_revision=REGISTRY_REVISION,
     )
 
@@ -589,15 +594,58 @@ async def test_stream_retry_after_pre_start_transient_forwards_the_first_stream_
     assert outcome.meta.attempt_trace[0].signal == ProviderRateLimit(retry_after=Present(0.0))
 
 
-async def test_stream_post_semantic_transient_is_terminal_with_partial_output() -> None:
+@pytest.mark.parametrize(
+    "semantic",
+    [
+        pytest.param(TextDelta(text="Hel"), id="text_delta"),
+        pytest.param(ToolCallStart(call_id="c1", name="lookup"), id="tool_call_start"),
+        pytest.param(ToolCallDelta(call_id="c1", arguments_delta='{"q":'), id="tool_call_delta"),
+        pytest.param(
+            ToolCallDone(tool_call=ToolCall(id="c1", name="lookup", arguments={"q": "x"})),
+            id="tool_call_done",
+        ),
+        pytest.param(
+            ContinuationDelta(
+                artifact=ContinuationArtifact(
+                    target=TARGET, codec_id="openai.v1", opaque_payload={"item": "opaque"}
+                )
+            ),
+            id="continuation_delta",
+        ),
+        pytest.param(
+            UsageEvent(
+                usage=TokenUsage(
+                    input_tokens=10,
+                    output_tokens=5,
+                    total_tokens=15,
+                    reasoning_tokens=Absent(),
+                    cache_read_input_tokens=Absent(),
+                    cache_write_input_tokens=Absent(),
+                )
+            ),
+            id="usage_event",
+        ),
+    ],
+)
+async def test_stream_post_semantic_transient_is_terminal_for_every_semantic_event(
+    semantic: CodecStreamEvent,
+) -> None:
+    # Freeze rule: retry ONLY when zero semantic events were emitted. Every
+    # non-StreamStart, non-terminal event counts — narrowing that set to text
+    # and tool deltas would double-deliver usage frames and continuations.
     engine = FakeEngine(
-        stream_script=[[StreamStart(), TextDelta(text="Hel"), transient(TransportUnavailable())]]
+        stream_script=[
+            [StreamStart(), semantic, transient(TransportUnavailable())],
+            happy_stream(),
+        ]
     )
     events = await collect(make_runtime(engine, max_attempts=3), make_intent())
-    assert len(engine.stream_calls) == 1, "no retry after semantic output"
+    assert len(engine.stream_calls) == 1, (
+        f"{type(semantic).__name__} must block stream retry, but a second attempt was dispatched"
+    )
     assert_contiguous_seqs(events)
     terminal = assert_single_terminal(events)
-    assert [type(event.event) for event in events[:-1]] == [StreamStart, TextDelta]
+    assert [event.event for event in events[:-1]] == [StreamStart(), semantic]
     outcome = terminal.outcome
     assert isinstance(outcome, Failed)
     assert outcome.failure == TransientExhausted(
@@ -794,7 +842,9 @@ async def test_chat_builds_intent_from_row_defaults() -> None:
             SystemMessage(blocks=(PromptBlock(text="be brief"),)),
             UserMessage(blocks=(PromptBlock(text="hi"),)),
         ),
-        max_output_tokens=128_000,  # row.max_output_tokens default
+        # The contract is "no explicit cap → the resolved row's cap", not the
+        # figure the row happens to carry today.
+        max_output_tokens=registry.resolve("openai:gpt-5.6-sol").max_output_tokens,
         reasoning="high",
         tools=(),
         tool_choice="auto",
@@ -820,14 +870,103 @@ async def test_chat_unknown_ref_raises_invalid_request() -> None:
 
 
 # ---------------------------------------------------------------------------
-# spans: no-op safety
+# spans: the call span never leaks into the consumer's context
 
 
-async def test_facade_is_safe_with_no_tracer_sdk_configured() -> None:
-    # This suite never configures an OTel SDK: every facade call above already
-    # runs under the api's no-op tracer. This is the explicit smoke for it.
-    engine = FakeEngine(generate_script=[succeeded()], stream_script=[happy_stream()])
-    rt = make_runtime(engine)
-    assert isinstance(await rt.generate(make_intent()), Succeeded)
-    events = await collect(rt, make_intent())
-    assert isinstance(assert_single_terminal(events).outcome, Succeeded)
+class AmbientSpan(Span):
+    """A consumer-owned span held across stream events.
+
+    Deliberately not the api's `NonRecordingSpan`: the no-op tracer hands that
+    class straight back as the span it starts, which would hide whether the
+    runtime attached a span of its own.
+    """
+
+    def end(self, end_time: int | None = None) -> None:
+        return None
+
+    def get_span_context(self) -> SpanContext:
+        return INVALID_SPAN_CONTEXT
+
+    def set_attributes(self, attributes: Mapping[str, otel_types.AttributeValue]) -> None:
+        return None
+
+    def set_attribute(self, key: str, value: otel_types.AttributeValue) -> None:
+        return None
+
+    def add_event(
+        self, name: str, attributes: otel_types.Attributes = None, timestamp: int | None = None
+    ) -> None:
+        return None
+
+    def update_name(self, name: str) -> None:
+        return None
+
+    def is_recording(self) -> bool:
+        return True
+
+    def set_status(self, status: Status | StatusCode, description: str | None = None) -> None:
+        return None
+
+    def record_exception(
+        self,
+        exception: BaseException,
+        attributes: otel_types.Attributes = None,
+        timestamp: int | None = None,
+        escaped: bool = False,
+    ) -> None:
+        return None
+
+
+class ParentRecordingTracer(NoOpTracer):
+    """Records the span each started span would be parented under."""
+
+    def __init__(self) -> None:
+        self.parents: list[Span] = []
+
+    def start_span(
+        self,
+        name: str,
+        context: Context | None = None,
+        kind: SpanKind = SpanKind.INTERNAL,
+        attributes: otel_types.Attributes = None,
+        links: Sequence[Link] | None = None,
+        start_time: int | None = None,
+        record_exception: bool = True,
+        set_status_on_exception: bool = True,
+    ) -> Span:
+        self.parents.append(trace.get_current_span(context))
+        return AmbientSpan()
+
+
+async def test_stream_never_parents_consumer_spans_under_the_call_span() -> None:
+    # The stream generator resumes inside the CONSUMER's context; a call span
+    # left attached across yields would adopt everything the consumer traces
+    # between events.
+    engine = FakeEngine(stream_script=[happy_stream()])
+    consumer_span = AmbientSpan()
+    tracer = ParentRecordingTracer()
+    events: list[RuntimeStreamEvent] = []
+    with trace.use_span(consumer_span, end_on_exit=False):
+        async for event in make_runtime(engine).stream(make_intent()):
+            tracer.start_span("consumer-work")
+            events.append(event)
+    assert len(events) == 4
+    assert tracer.parents == [consumer_span] * 4, (
+        "a consumer span opened between stream events must keep the consumer's own parent"
+    )
+
+
+async def test_abandoning_a_stream_ends_it_without_context_errors(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Abandoning mid-stream and finalizing from a DIFFERENT task is the shape
+    # the event loop's async-generator finalizer uses; a span attached at the
+    # first event would be detached here from a foreign context.
+    engine = FakeEngine(stream_script=[happy_stream()])
+    stream = make_runtime(engine).stream(make_intent())
+    assert isinstance((await anext(stream)).event, StreamStart)
+    assert isinstance(stream, AsyncGenerator)
+    with caplog.at_level(logging.ERROR):
+        await asyncio.ensure_future(stream.aclose())
+    assert caplog.records == [], f"abandoning a stream logged: {caplog.text}"
+    assert engine.streams_closed == 1

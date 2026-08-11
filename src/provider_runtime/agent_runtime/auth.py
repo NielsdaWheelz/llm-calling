@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -63,8 +64,23 @@ _CREDENTIAL_ENVIRONMENT: dict[Backend, tuple[str, ...]] = {
         "CLAUDE_CODE_OAUTH_TOKEN",
     ),
 }
-_ALL_CREDENTIAL_ENVIRONMENT = frozenset(
-    name for names in _CREDENTIAL_ENVIRONMENT.values() for name in names
+# Provider API keys that authenticate no agent backend but are the operator secrets most
+# likely to be exported in the shell that starts one. They are credential-class for exactly
+# the reason the two backends' own names are: a child that receives one can spend it.
+# `GOOGLE_API_KEY` and the rest of the `GOOGLE_`/`AWS_`/`AZURE_` families are already covered
+# by `_AUTH_CONTROL_PREFIXES`; these five match no prefix and must be named.
+_OTHER_PROVIDER_CREDENTIAL_ENVIRONMENT = frozenset(
+    {
+        "DEEPSEEK_API_KEY",
+        "GEMINI_API_KEY",
+        "MOONSHOT_API_KEY",
+        "OPENROUTER_API_KEY",
+        "XAI_API_KEY",
+    }
+)
+_ALL_CREDENTIAL_ENVIRONMENT = (
+    frozenset(name for names in _CREDENTIAL_ENVIRONMENT.values() for name in names)
+    | _OTHER_PROVIDER_CREDENTIAL_ENVIRONMENT
 )
 _AUTH_CONTROL_PREFIXES = (
     "ANTHROPIC_",
@@ -92,11 +108,17 @@ _PROCESS_CONTROL_NAMES = frozenset(
         "LD_PRELOAD",
         "NODE_EXTRA_CA_CERTS",
         "NODE_OPTIONS",
+        # Module search paths for the interpreters a child agent is or can start: Claude Code
+        # is a Node program, and either backend's shell tool can run a script whose imports
+        # these names redirect.
+        "NODE_PATH",
         "NO_PROXY",
         "PATH",
+        "PERL5LIB",
         "PYTHONHOME",
         "PYTHONPATH",
         "REQUESTS_CA_BUNDLE",
+        "RUBYLIB",
         "SHELL",
         "SSL_CERT_DIR",
         "SSL_CERT_FILE",
@@ -243,10 +265,10 @@ def state_root_environment_name(backend: Backend) -> str:
 def state_root_from_environment(backend: Backend, environment: Mapping[str, str]) -> Path:
     """Read back the profile state root the runtime put in one child environment.
 
-    Every transport reads it the same way and to the same standard: the value must be the
+    Both backends read it the same way and to the same standard: the value must be the
     absolute, already-resolved, existing directory `build_child_environment` wrote. Accepting
-    an unresolved or absent path on one transport and not another would let the same profile
-    mean two different state roots depending on which Codex transport a caller selected.
+    an unresolved or absent path on one route and not the other would let the same profile
+    mean two different state roots.
     """
     name = state_root_environment_name(backend)
     value = environment.get(name)
@@ -392,7 +414,14 @@ def _redact_value(
     counter[0] += 1
     if counter[0] > max_items:
         raise _PayloadLimit
-    if value is None or type(value) in (bool, float):
+    if value is None or type(value) is bool:
+        return value
+    if type(value) is float:
+        # `json.loads` accepts NaN/Infinity by default, so a backend frame can carry one.
+        # JSON cannot represent it, which makes it the same class of malformedness as an
+        # oversized integer: the payload is dropped whole, never raised past this boundary.
+        if not math.isfinite(value):
+            raise _PayloadLimit
         return value
     if type(value) is int:
         if not -(2**63) <= value <= 2**63 - 1:

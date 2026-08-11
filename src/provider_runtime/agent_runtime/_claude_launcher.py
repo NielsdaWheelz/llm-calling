@@ -26,14 +26,13 @@ import asyncio
 import hashlib
 import os
 import signal
-import stat
-import tempfile
 from pathlib import Path
 
+from ._private_files import require_private_directory, write_private_file
 from ._process import ProcessGroup
-from .errors import AgentRuntimeDefect, ExecutableUnavailable, ProtocolDefect, SdkUnavailable
+from .errors import ExecutableUnavailable, ProtocolDefect, SdkUnavailable
 
-_PRIVATE_MODE = 0o700
+_LAUNCHER_LABEL = "Claude Code launcher"
 # Linux copies the shebang line into a fixed kernel buffer and silently truncates the rest,
 # so an interpreter path that does not fit must fail loudly here instead of producing a
 # launcher that executes something else.
@@ -100,68 +99,15 @@ def ensure_claude_launcher(state_root: Path, executable: str, *, interpreter: st
             "the running Python interpreter path is too long for a launcher shebang"
         )
     directory = launcher_directory(state_root)
-    _require_private_directory(directory)
+    require_private_directory(directory, label=_LAUNCHER_LABEL)
     source = _LAUNCHER_SOURCE.format(shebang=shebang, executable=repr(executable)).encode("utf-8")
     path = directory / f"{_LAUNCHER_PREFIX}{hashlib.sha256(source).hexdigest()[:32]}"
-    _write_private_file(path, source)
+    write_private_file(path, source, label=_LAUNCHER_LABEL)
     return path
 
 
 def launcher_directory(state_root: Path) -> Path:
     return state_root.parent
-
-
-def _require_private_directory(directory: Path) -> None:
-    try:
-        status = os.stat(directory, follow_symlinks=False)
-    except OSError:
-        raise ExecutableUnavailable(
-            "the runtime-owned directory for the Claude launcher is unavailable"
-        ) from None
-    if (
-        not stat.S_ISDIR(status.st_mode)
-        or stat.S_IMODE(status.st_mode) != _PRIVATE_MODE
-        or status.st_uid != os.geteuid()
-    ):
-        raise AgentRuntimeDefect(
-            "the runtime-owned directory for the Claude launcher is not privately permissioned",
-            code="launcher_directory_unsafe",
-        )
-
-
-def _write_private_file(path: Path, source: bytes) -> None:
-    temporary: str | None = None
-    try:
-        # A unique temporary name per writer: the rename is what publishes the launcher, so
-        # no reader can ever see a partial one and no second writer can truncate this one.
-        descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-        try:
-            # The mode `mkstemp` sets is 0600 and the umask can only narrow it; `fchmod`
-            # states the exact mode the launcher must have to be executable by its owner.
-            os.fchmod(descriptor, _PRIVATE_MODE)
-            os.write(descriptor, source)
-        finally:
-            os.close(descriptor)
-        os.replace(temporary, path)
-    except OSError:
-        if temporary is not None:
-            Path(temporary).unlink(missing_ok=True)
-        raise ExecutableUnavailable("the Claude Code launcher could not be written") from None
-    try:
-        status = os.stat(path, follow_symlinks=False)
-        written = path.read_bytes()
-    except OSError:
-        raise ExecutableUnavailable("the Claude Code launcher could not be verified") from None
-    if (
-        not stat.S_ISREG(status.st_mode)
-        or stat.S_IMODE(status.st_mode) != _PRIVATE_MODE
-        or status.st_uid != os.geteuid()
-        or written != source
-    ):
-        raise AgentRuntimeDefect(
-            "the Claude Code launcher on disk is not the one this runtime wrote",
-            code="launcher_tampered",
-        )
 
 
 class OwnedProcessGroup:

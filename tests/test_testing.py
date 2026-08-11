@@ -15,7 +15,7 @@ import pytest
 from provider_runtime import registry
 from provider_runtime.engines import Engine, TransientAttempt
 from provider_runtime.registry import ModelRow
-from provider_runtime.runtime import Credentials, ProviderRuntime
+from provider_runtime.runtime import Credentials, NonGenerationCallFailed, ProviderRuntime
 from provider_runtime.testing import (
     CapturedRuntimeCall,
     ChatCall,
@@ -38,6 +38,7 @@ from provider_runtime.types import (
     PossiblyBillable,
     Present,
     PromptBlock,
+    ProviderContextTooLarge,
     ProviderCredential,
     ProviderTarget,
     ProviderTimeout,
@@ -157,8 +158,10 @@ class Receipt(pydantic.BaseModel):
 
 
 def test_fake_engine_satisfies_engine_protocol() -> None:
+    # Static anchor only: pyright enforces this assignment's protocol
+    # conformance; there is nothing meaningful left to assert at runtime.
     engine: Engine = FakeEngine([])
-    assert isinstance(engine, FakeEngine)
+    del engine
 
 
 async def test_fake_engine_returns_generate_outcomes_in_script_order() -> None:
@@ -379,6 +382,24 @@ async def test_scripted_embed_returns_response_and_captures_provider_only() -> N
     ]
     # The credential key never lands in the capture record.
     assert CREDENTIAL.key not in repr(runtime.calls)
+
+
+async def test_scripted_embed_raises_a_scripted_non_generation_call_failed() -> None:
+    # embed's expected-failure channel is a raise, not a value — unlike every
+    # other operation's scripted outcomes — so this is the one method that
+    # must be able to script an exception through its normal queue.
+    failure = NonGenerationCallFailed(ProviderContextTooLarge())
+    call = EmbeddingCall(model="text-embedding-3-small", inputs=("a",), dimensions=Absent())
+    runtime = ScriptedRuntime(embed_responses=[failure])
+
+    with pytest.raises(NonGenerationCallFailed) as exc_info:
+        await runtime.embed(call, credential=CREDENTIAL)
+    assert exc_info.value is failure, f"raised: {exc_info.value!r}"
+    # The call is captured before the scripted raise, exactly like a real
+    # engine failing mid-attempt.
+    assert runtime.calls == [
+        CapturedRuntimeCall(operation="embed", call=call, credential_provider=Present("openai"))
+    ]
 
 
 # ---------------------------------------------------------------------------

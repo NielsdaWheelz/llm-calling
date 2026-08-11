@@ -14,9 +14,7 @@ from provider_runtime.agent_runtime.types import (
     AGENT_ROUTES,
     AgentSessionRef,
     AgentSessionRequest,
-    AgentTarget,
     AgentTransport,
-    ApiTarget,
     ApprovalRequest,
     Backend,
     ClaudeNativeOptions,
@@ -34,8 +32,6 @@ from provider_runtime.agent_runtime.types import (
     ResumeSession,
     TextContent,
     TurnRequest,
-    agent_target_to_session_request,
-    api_target_to_provider_target,
     freeze_json_value,
     ref_from_json,
     ref_to_json,
@@ -173,8 +169,6 @@ def test_file_content_and_turn_limits_reject_invalid_local_values() -> None:
     with pytest.raises(InvalidAgentRequest, match="absolute"):
         FileContent(path="input.txt", size_bytes=4, media_type="text/plain")
     with pytest.raises(InvalidAgentRequest, match="positive"):
-        TurnRequest(input=(TextContent("hello"),), max_turns=0)
-    with pytest.raises(InvalidAgentRequest, match="positive"):
         TurnRequest(input=(TextContent("hello"),), timeout_seconds=0)
     with pytest.raises(InvalidAgentRequest, match="non-empty"):
         TurnRequest(input=())
@@ -285,33 +279,6 @@ def test_ref_json_is_strict_versioned_and_round_trips_as_plain_json() -> None:
         ref_from_json({**encoded, "schema_version": "agent-session-ref.v2"})
     with pytest.raises(InvalidAgentRequest, match="unknown fields"):
         ref_from_json({**encoded, "raw_path": "/secret/repo"})
-
-
-def test_target_mapping_is_total_without_collapsing_agent_and_api_results() -> None:
-    api = ApiTarget(
-        provider="openai",
-        model="gpt-native",
-        credential=CredentialRef(
-            kind="api_key_environment", profile_key="api", name="OPENAI_API_KEY"
-        ),
-    )
-    request = _request()
-    agent = AgentTarget(request=request)
-
-    assert api.kind == "api"
-    assert api_target_to_provider_target(api).provider == "openai"
-    assert agent.kind == "agent"
-    assert agent_target_to_session_request(agent) is request
-    with pytest.raises(InvalidAgentRequest, match="API targets"):
-        ApiTarget(provider="openai", model="gpt-native", credential=_credential())
-    with pytest.raises(InvalidAgentRequest, match="not valid for provider"):
-        ApiTarget(
-            provider="anthropic",
-            model="claude-native",
-            credential=CredentialRef(
-                kind="api_key_environment", profile_key="api", name="OPENAI_API_KEY"
-            ),
-        )
 
 
 def test_json_values_are_recursively_immutable_finite_and_serializable() -> None:

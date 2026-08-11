@@ -4,9 +4,10 @@ Native GenerateContent over the google-genai SDK. Fixture rows are constructed
 locally — tests never depend on registry ROWS content. Covered per the freeze:
 exact request body/header shapes, response decode, stream decode from raw SSE
 bytes, continuation round-trip (ordered parts + thoughtSignatures replayed
-verbatim), reasoning-level mapping from row.reasoning (thinkingLevel vs
-thinkingBudget, chosen by the row), provider_options passthrough vs collision,
-and the full fault-injection table.
+verbatim), reasoning fragments merged verbatim from row.reasoning (real wire
+shapes: thinking_config carrying thinking_level on Gemini 3+, thinking_budget
+on 2.5-era — the row decides), provider_options passthrough vs collision, and
+the full fault-injection table.
 
 Wire facts verified against the installed SDK (google-genai 1.75): the mldev
 converter emits camelCase envelope keys but serializes ThinkingConfig and
@@ -16,6 +17,7 @@ part dict payloads unchanged.
 """
 
 import json
+import traceback
 from base64 import b64encode
 from collections.abc import Mapping
 
@@ -81,15 +83,17 @@ from provider_runtime.types import (
 # Fixture rows — local to this file by design (registry ROWS content is
 # another agent's concern).
 
-# Gemini 3+ speaks thinkingLevel; the ROW carries the exact wire key/value.
+# Reasoning map values are self-describing wire fragments (real shapes only):
+# GenerateContent config params merged verbatim. Gemini 3+ rows carry
+# thinking_config.thinking_level; 2.5-era rows carry thinking_budget; "none"
+# maps to an empty fragment (nothing sent).
 LEVEL_REASONING: Mapping[ReasoningLevel, object] = {
-    "low": {"thinkingLevel": "LOW"},
-    "high": {"thinkingLevel": "HIGH"},
+    "low": {"thinking_config": {"thinking_level": "LOW"}},
+    "high": {"thinking_config": {"thinking_level": "HIGH"}},
 }
-# 2.5-era speaks thinkingBudget; "none" maps to empty params (nothing sent).
 BUDGET_REASONING: Mapping[ReasoningLevel, object] = {
     "none": {},
-    "high": {"thinkingBudget": 24576},
+    "high": {"thinking_config": {"thinking_budget": 24576}},
 }
 
 LEVEL_ROW = ModelRow(
@@ -255,15 +259,16 @@ async def collect(events: object) -> list[CodecStreamEvent]:
 
 
 class CutByteStream(httpx.AsyncByteStream):
-    """Yields the given chunks, then dies with a transport error (mid-stream cut)."""
+    """Yields the given chunks, then dies with the given transport error (mid-stream cut)."""
 
-    def __init__(self, chunks: tuple[bytes, ...]) -> None:
+    def __init__(self, chunks: tuple[bytes, ...], error: httpx.TransportError) -> None:
         self._chunks = chunks
+        self._error = error
 
     async def __aiter__(self):
         for chunk in self._chunks:
             yield chunk
-        raise httpx.ReadError("connection cut mid-stream")
+        raise self._error
 
 
 @pytest.fixture
@@ -290,16 +295,19 @@ async def test_request_encodes_contents_config_and_credential_header(
     assert isinstance(config, dict)
     assert config["maxOutputTokens"] == 512, f"config: {config}"
     # The SDK serializes ThinkingConfig with snake_case field names (proto3
-    # JSON accepts both casings); the row chose the thinkingLevel key.
+    # JSON accepts both casings); the row's fragment merges verbatim.
     assert config["thinkingConfig"] == {"thinking_level": "HIGH"}, (
-        f"row.reasoning['high'] must be forwarded into thinkingConfig; config: {config}"
+        f"row.reasoning['high'] must be merged into the config; config: {config}"
     )
     assert "tools" not in body and "toolConfig" not in body, f"body: {body}"
     key = route.calls.last.request.headers["x-goog-api-key"]
     assert key == "test-key", f"credential must ride the x-goog-api-key header, got {key!r}"
     assert isinstance(outcome, Succeeded)
-    assert outcome.meta.native_reasoning == Present("thinkingLevel=HIGH"), (
-        f"native_reasoning must record the exact row wire value, got {outcome.meta.native_reasoning}"
+    assert outcome.meta.native_reasoning == Present(
+        '{"thinking_config":{"thinking_level":"HIGH"}}'
+    ), (
+        f"native_reasoning must record the fragment as compact sorted-keys JSON, "
+        f"got {outcome.meta.native_reasoning}"
     )
 
 
@@ -314,12 +322,12 @@ async def test_thinking_budget_row_sends_budget_and_reports_native_reasoning(
     config = last_request_json(route)["generationConfig"]
     assert isinstance(config, dict)
     assert config["thinkingConfig"] == {"thinking_budget": 24576}, (
-        f"2.5-era rows speak thinkingBudget — the ROW decides the key; config: {config}"
+        f"2.5-era rows speak thinking_budget — the ROW decides the key; config: {config}"
     )
     assert isinstance(outcome, Succeeded)
-    assert outcome.meta.native_reasoning == Present("thinkingBudget=24576"), (
-        f"got {outcome.meta.native_reasoning}"
-    )
+    assert outcome.meta.native_reasoning == Present(
+        '{"thinking_config":{"thinking_budget":24576}}'
+    ), f"got {outcome.meta.native_reasoning}"
 
 
 @respx.mock
@@ -332,7 +340,7 @@ async def test_reasoning_none_with_empty_params_sends_no_thinking_config(
     )
     config = last_request_json(route)["generationConfig"]
     assert isinstance(config, dict)
-    assert "thinkingConfig" not in config, f"'none' maps to empty params; config: {config}"
+    assert "thinkingConfig" not in config, f"'none' maps to an empty fragment; config: {config}"
     assert isinstance(outcome, Succeeded)
     assert outcome.meta.native_reasoning == Absent(), (
         f"nothing was sent, so native_reasoning must be Absent, got {outcome.meta.native_reasoning}"
@@ -393,6 +401,25 @@ async def test_row_base_url_overrides_the_sdk_default(engine: GeminiGenerateEngi
     outcome = await engine.generate(row, intent_for(row), CREDENTIAL)
     assert route.called, "the row's base_url must be honored"
     assert isinstance(outcome, Succeeded)
+
+
+@respx.mock
+async def test_absent_base_url_ignores_poison_sdk_env_var(
+    engine: GeminiGenerateEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # GOOGLE_GEMINI_BASE_URL is the google-genai SDK's own fallback when
+    # HttpOptions.base_url is left unset (google/genai/_base_url.py,
+    # get_base_url); the engine must pin the canonical host explicitly so
+    # this env var is never consulted. If it were, the request would go to
+    # the poison host instead of the one mocked below and respx would raise.
+    monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", "https://poison.example")
+    route = mock_generate(LEVEL_ROW, response_body())
+    outcome = await engine.generate(LEVEL_ROW, intent_for(LEVEL_ROW), CREDENTIAL)
+    assert route.called, (
+        "row.base_url is Absent — the engine must send the canonical host, "
+        "not resolve GOOGLE_GEMINI_BASE_URL"
+    )
+    assert isinstance(outcome, Succeeded), f"got {outcome}"
 
 
 @respx.mock
@@ -591,6 +618,26 @@ async def test_provider_options_config_fields_are_forwarded(engine: GeminiGenera
     assert config["topP"] == 0.9, f"config: {config}"
 
 
+@respx.mock
+async def test_provider_options_cached_content_passes_through_untouched(
+    engine: GeminiGenerateEngine,
+) -> None:
+    # cached_content is a provider-specific GenerateContentConfig field, not
+    # one the engine maps itself — it must reach the wire verbatim via
+    # provider_options, with no engine special-casing and no collision entry.
+    route = mock_generate(LEVEL_ROW, response_body())
+    outcome = await engine.generate(
+        LEVEL_ROW,
+        intent_for(LEVEL_ROW, provider_options={"cached_content": "cachedContents/example"}),
+        CREDENTIAL,
+    )
+    body = last_request_json(route)
+    # cached_content rides the wire as a sibling of generationConfig, not
+    # nested inside it (verified against the installed SDK's mldev converter).
+    assert body["cachedContent"] == "cachedContents/example", f"body: {body}"
+    assert isinstance(outcome, Succeeded), f"got {outcome}"
+
+
 @pytest.mark.parametrize(
     "key",
     [
@@ -606,6 +653,8 @@ async def test_provider_options_config_fields_are_forwarded(engine: GeminiGenera
         "response_schema",
         "http_options",
         "automatic_function_calling",
+        "candidate_count",
+        "candidateCount",
     ],
 )
 async def test_provider_options_owned_key_collision_raises_invalid_request(
@@ -656,7 +705,7 @@ async def test_success_decode_populates_meta_and_usage(engine: GeminiGenerateEng
     )
     assert meta.upstream_provider == Absent()
     assert meta.registry_revision == REGISTRY_REVISION
-    assert meta.native_reasoning == Present("thinkingLevel=HIGH")
+    assert meta.native_reasoning == Present('{"thinking_config":{"thinking_level":"HIGH"}}')
     assert meta.billability == PossiblyBillable()
     assert isinstance(meta.usage, Present)
     usage = meta.usage.value
@@ -755,11 +804,14 @@ async def test_blocked_prompt_maps_to_content_filter_incomplete(
     assert isinstance(outcome.meta.usage, Present), "prompt-blocked usage still folds into meta"
 
 
+@pytest.mark.parametrize("finish", ["MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"])
 @respx.mock
-async def test_malformed_function_call_finish_returns_failed_invalid_tool_arguments(
-    engine: GeminiGenerateEngine,
+async def test_unusable_tool_call_finish_returns_failed_invalid_tool_arguments(
+    engine: GeminiGenerateEngine, finish: str
 ) -> None:
-    mock_generate(LEVEL_ROW, response_body(finish_reason="MALFORMED_FUNCTION_CALL"))
+    # Both finish reasons report the same expected failure: the model produced
+    # a tool call the provider deems unusable.
+    mock_generate(LEVEL_ROW, response_body(finish_reason=finish))
     outcome = await engine.generate(
         LEVEL_ROW, intent_for(LEVEL_ROW, tools=(SEARCH_TOOL,)), CREDENTIAL
     )
@@ -807,10 +859,16 @@ async def test_malformed_json_envelope_raises_protocol_defect(
 @respx.mock
 async def test_invalid_envelope_shape_raises_protocol_defect(engine: GeminiGenerateEngine) -> None:
     respx.post(generate_url(LEVEL_ROW)).mock(
-        return_value=httpx.Response(200, json={"candidates": [{"content": {"parts": "zzz"}}]})
+        return_value=httpx.Response(
+            200, json={"candidates": [{"content": {"parts": "SECRET_PROVIDER_TEXT"}}]}
+        )
     )
-    with pytest.raises(ProtocolDefect):
+    with pytest.raises(ProtocolDefect) as excinfo:
         await engine.generate(LEVEL_ROW, intent_for(LEVEL_ROW), CREDENTIAL)
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert "SECRET_PROVIDER_TEXT" not in rendered, (
+        f"the defect chain must never carry raw provider bodies; rendered: {rendered}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1071,6 +1129,92 @@ async def test_stream_blocked_prompt_yields_incomplete_terminal(
     assert "PROHIBITED_CONTENT" in outcome.safe_detail.value
 
 
+@pytest.mark.parametrize(
+    ("finish", "reason"),
+    [("MAX_TOKENS", "max_output_tokens"), ("SAFETY", "content_filter_partial")],
+)
+@respx.mock
+async def test_stream_non_stop_finish_yields_incomplete_terminal(
+    engine: GeminiGenerateEngine, finish: str, reason: str
+) -> None:
+    mock_stream(
+        LEVEL_ROW,
+        sse_bytes(
+            {
+                "candidates": [{"content": {"role": "model", "parts": [{"text": "par"}]}}],
+                "usageMetadata": {"promptTokenCount": 5, "totalTokenCount": 5},
+            },
+            {
+                "candidates": [
+                    {
+                        "content": {"role": "model", "parts": [{"text": "tial"}]},
+                        "finishReason": finish,
+                    }
+                ],
+                "usageMetadata": {
+                    "promptTokenCount": 5,
+                    "candidatesTokenCount": 9,
+                    "totalTokenCount": 14,
+                },
+            },
+        ),
+    )
+    events = await collect(engine.stream(LEVEL_ROW, intent_for(LEVEL_ROW), CREDENTIAL))
+    kinds = [type(event).__name__ for event in events]
+    assert kinds == ["StreamStart", "TextDelta", "TextDelta", "TerminalEvent"], (
+        f"the terminal must follow the deltas and end the stream; events: {kinds}"
+    )
+    terminal = events[-1]
+    assert isinstance(terminal, TerminalEvent)
+    outcome = terminal.outcome
+    assert isinstance(outcome, Incomplete), f"finish {finish} must be Incomplete, got {outcome}"
+    assert outcome.reason == reason, f"finish: {finish}, got {outcome.reason}"
+    assert outcome.status == "provider_incomplete"
+    assert isinstance(outcome.meta.usage, Present), (
+        f"folded usage must survive onto the Incomplete meta; meta: {outcome.meta}"
+    )
+    usage = outcome.meta.usage.value
+    assert (usage.input_tokens, usage.output_tokens, usage.total_tokens) == (5, 9, 14), (
+        f"usage: {usage}"
+    )
+
+
+@respx.mock
+async def test_stream_structured_output_invalid_json_yields_failed_terminal(
+    engine: GeminiGenerateEngine,
+) -> None:
+    mock_stream(
+        LEVEL_ROW,
+        sse_bytes(
+            {"candidates": [{"content": {"role": "model", "parts": [{"text": "not "}]}}]},
+            {
+                "candidates": [
+                    {
+                        "content": {"role": "model", "parts": [{"text": "json"}]},
+                        "finishReason": "STOP",
+                    }
+                ],
+            },
+        ),
+    )
+    events = await collect(
+        engine.stream(
+            LEVEL_ROW,
+            intent_for(LEVEL_ROW, output=StrictJsonOutput("answer", ANSWER_SCHEMA)),
+            CREDENTIAL,
+        )
+    )
+    kinds = [type(event).__name__ for event in events]
+    assert kinds == ["StreamStart", "TextDelta", "TextDelta", "TerminalEvent"], (
+        f"a Failed terminal must still follow the already-yielded deltas; events: {kinds}"
+    )
+    terminal = events[-1]
+    assert isinstance(terminal, TerminalEvent)
+    outcome = terminal.outcome
+    assert isinstance(outcome, Failed), f"got {outcome}"
+    assert isinstance(outcome.failure, InvalidStructuredOutput), f"got {outcome.failure}"
+
+
 @respx.mock
 async def test_stream_429_at_acceptance_raises_before_stream_start(
     engine: GeminiGenerateEngine,
@@ -1143,7 +1287,7 @@ async def test_stream_transport_cut_after_semantic_output_is_partial(
         return_value=httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            stream=CutByteStream((first,)),
+            stream=CutByteStream((first,), httpx.ReadError("connection cut mid-stream")),
         )
     )
     stream = engine.stream(LEVEL_ROW, intent_for(LEVEL_ROW), CREDENTIAL)
@@ -1155,6 +1299,33 @@ async def test_stream_transport_cut_after_semantic_output_is_partial(
     assert excinfo.value.cause == ProviderStreamInterrupted(partial_output=True), (
         f"semantic output was already yielded; got {excinfo.value.cause}"
     )
+    assert excinfo.value.billability == PossiblyBillable()
+
+
+@respx.mock
+async def test_stream_mid_stream_timeout_pre_semantic_is_provider_timeout(
+    engine: GeminiGenerateEngine,
+) -> None:
+    # A usage-only frame is NOT semantic output; the read then times out.
+    first = sse_bytes({"usageMetadata": {"promptTokenCount": 3, "totalTokenCount": 3}})
+    respx.post(stream_url(LEVEL_ROW)).mock(
+        return_value=httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=CutByteStream((first,), httpx.ReadTimeout("read timed out")),
+        )
+    )
+    stream = engine.stream(LEVEL_ROW, intent_for(LEVEL_ROW), CREDENTIAL)
+    seen: list[CodecStreamEvent] = []
+    with pytest.raises(TransientAttempt) as excinfo:
+        async for event in stream:
+            seen.append(event)
+    assert seen == [StreamStart()], f"only the envelope may precede the timeout; got {seen}"
+    assert excinfo.value.cause == ProviderTimeout(), (
+        f"no semantic output was yielded, so the timeout keeps its own cause; "
+        f"got {excinfo.value.cause}"
+    )
+    assert excinfo.value.status_code == Present(200)
     assert excinfo.value.billability == PossiblyBillable()
 
 
@@ -1178,6 +1349,25 @@ async def test_stream_inband_error_pre_semantic_classifies_rate_limit(
 
 
 @respx.mock
+async def test_stream_inband_5xx_pre_semantic_classifies_unavailable(
+    engine: GeminiGenerateEngine,
+) -> None:
+    mock_stream(
+        LEVEL_ROW,
+        sse_bytes({"error": {"code": 500, "message": "internal", "status": "INTERNAL"}}),
+    )
+    stream = engine.stream(LEVEL_ROW, intent_for(LEVEL_ROW), CREDENTIAL)
+    seen: list[CodecStreamEvent] = []
+    with pytest.raises(TransientAttempt) as excinfo:
+        async for event in stream:
+            seen.append(event)
+    assert seen == [StreamStart()], f"only the envelope may precede the failure; got {seen}"
+    assert excinfo.value.cause == ProviderHttpUnavailable(), (
+        f"5xx-shaped in-band errors classify as unavailable; got {excinfo.value.cause}"
+    )
+
+
+@respx.mock
 async def test_stream_inband_error_post_semantic_is_partial(engine: GeminiGenerateEngine) -> None:
     mock_stream(
         LEVEL_ROW,
@@ -1196,6 +1386,23 @@ async def test_stream_inband_error_post_semantic_is_partial(engine: GeminiGenera
 
 
 @respx.mock
+async def test_stream_inband_non_transient_error_frame_raises_protocol_defect(
+    engine: GeminiGenerateEngine,
+) -> None:
+    # Code parity with the non-stream classifier: a 4xx-shaped in-band frame
+    # is not transient — retrying it as "unavailable" would misclassify a
+    # terminal condition.
+    mock_stream(
+        LEVEL_ROW,
+        sse_bytes({"error": {"code": 403, "message": "denied", "status": "PERMISSION_DENIED"}}),
+    )
+    stream = engine.stream(LEVEL_ROW, intent_for(LEVEL_ROW), CREDENTIAL)
+    with pytest.raises(ProtocolDefect, match="403"):
+        async for _ in stream:
+            pass
+
+
+@respx.mock
 async def test_stream_malformed_frame_raises_protocol_defect(
     engine: GeminiGenerateEngine,
 ) -> None:
@@ -1203,13 +1410,18 @@ async def test_stream_malformed_frame_raises_protocol_defect(
         return_value=httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            content=b"data: {not json\n\n",
+            content=b"data: {not json SECRET_PROVIDER_TEXT\n\n",
         )
     )
     stream = engine.stream(LEVEL_ROW, intent_for(LEVEL_ROW), CREDENTIAL)
-    with pytest.raises(ProtocolDefect):
+    with pytest.raises(ProtocolDefect) as excinfo:
         async for _ in stream:
             pass
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert "SECRET_PROVIDER_TEXT" not in rendered, (
+        "the SDK frame-parse error embeds the raw frame verbatim and must never be "
+        f"chained onto the defect; rendered: {rendered}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1257,12 +1469,19 @@ async def test_timeouts_raise_transient_provider_timeout(engine: GeminiGenerateE
         await engine.generate(LEVEL_ROW, intent_for(LEVEL_ROW), CREDENTIAL)
     assert excinfo.value.cause == ProviderTimeout(), f"got {excinfo.value.cause}"
     assert excinfo.value.status_code == Absent()
+    assert excinfo.value.billability == NotDispatched(), (
+        "a connect timeout is a pure pre-connect failure — the handshake never "
+        f"completed, so no bytes reached the provider; got {excinfo.value.billability}"
+    )
 
     respx.clear()
     respx.post(generate_url(LEVEL_ROW)).mock(side_effect=httpx.ReadTimeout("boom"))
     with pytest.raises(TransientAttempt) as excinfo:
         await engine.generate(LEVEL_ROW, intent_for(LEVEL_ROW), CREDENTIAL)
     assert excinfo.value.cause == ProviderTimeout(), f"got {excinfo.value.cause}"
+    assert excinfo.value.billability == PossiblyBillable(), (
+        f"the request was dispatched before the read timed out; got {excinfo.value.billability}"
+    )
 
 
 @respx.mock

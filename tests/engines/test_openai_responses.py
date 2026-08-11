@@ -7,7 +7,7 @@ mocking anywhere — respx intercepts the SDK's own httpx transport.
 
 import json
 from base64 import b64encode
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
 
 import httpx
@@ -16,7 +16,12 @@ import respx
 
 from provider_runtime.engines import TransientAttempt
 from provider_runtime.engines.openai_responses import OpenAIResponsesEngine
-from provider_runtime.errors import CredentialRejected, InvalidRequest, ProtocolDefect
+from provider_runtime.errors import (
+    CredentialRejected,
+    InvalidRequest,
+    ProtocolDefect,
+    RuntimeDefect,
+)
 from provider_runtime.registry import REGISTRY_REVISION, ModelRow
 from provider_runtime.types import (
     Absent,
@@ -68,7 +73,15 @@ from provider_runtime.types import (
 
 RESPONSES_URL = "https://api.openai.com/v1/responses"
 
-REASONING_LEVELS: Mapping[ReasoningLevel, object] = {"none": "none", "low": "low", "high": "high"}
+# Registry rows carry the real openai wire fragment per level — a self-describing
+# request-parameter mapping the engine merges verbatim.
+REASONING_LEVELS: Mapping[ReasoningLevel, object] = {
+    "none": {"reasoning": {"effort": "none"}},
+    "low": {"reasoning": {"effort": "low"}},
+    "high": {"reasoning": {"effort": "high"}},
+}
+
+NATIVE_REASONING_HIGH = '{"reasoning":{"effort":"high"}}'
 
 ROW = ModelRow(
     ref="openai:gpt-test",
@@ -231,12 +244,28 @@ def sse_bytes(frames: list[dict[str, object]]) -> bytes:
     return b"".join(chunks)
 
 
-def mock_stream(frames: list[dict[str, object]], *, request_id: str = "req_s1") -> httpx.Response:
-    return httpx.Response(
-        200,
-        headers={"content-type": "text/event-stream", "x-request-id": request_id},
-        content=sse_bytes(frames),
-    )
+def stream_headers(request_id: str | None) -> dict[str, str]:
+    headers = {"content-type": "text/event-stream"}
+    if request_id is not None:
+        headers["x-request-id"] = request_id
+    return headers
+
+
+def mock_stream(
+    frames: list[dict[str, object]], *, request_id: str | None = "req_s1"
+) -> httpx.Response:
+    return httpx.Response(200, headers=stream_headers(request_id), content=sse_bytes(frames))
+
+
+def mock_broken_stream(frames: list[dict[str, object]], error: Exception) -> httpx.Response:
+    """A stream whose transport dies mid-body — the shape a real dropped
+    connection takes, as opposed to a well-formed body that simply ends."""
+
+    async def body() -> AsyncIterator[bytes]:
+        yield sse_bytes(frames)
+        raise error
+
+    return httpx.Response(200, headers=stream_headers("req_s1"), content=body())
 
 
 def created_frame(response_id: str = "resp_s1") -> dict[str, object]:
@@ -274,7 +303,7 @@ def assert_meta(
     *,
     request_id: str = "req_abc",
     usage: TokenUsage | None = EXPECTED_USAGE,
-    native_reasoning: str | None = "high",
+    native_reasoning: str | None = NATIVE_REASONING_HIGH,
     status_code: int = 200,
     model: str = "gpt-test-1",
 ) -> None:
@@ -351,6 +380,59 @@ async def test_generate_omits_reasoning_when_row_has_no_reasoning_knob() -> None
 async def test_generate_rejects_undeclared_reasoning_level() -> None:
     with pytest.raises(InvalidRequest, match="reasoning level 'max'"):
         await OpenAIResponsesEngine().generate(ROW, make_intent(reasoning="max"), CREDENTIAL)
+
+
+@respx.mock
+async def test_generate_merges_row_reasoning_fragment_verbatim() -> None:
+    """The row owns the wire shape: whatever mapping it declares for the level
+    is merged as-is and stamped as compact sorted-keys JSON."""
+    route = respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
+    )
+    levels: Mapping[ReasoningLevel, object] = {
+        "low": {"reasoning": {"effort": "low", "summary": "auto"}}
+    }
+    outcome = await OpenAIResponsesEngine().generate(
+        replace(ROW, reasoning=Present(levels)), make_intent(reasoning="low"), CREDENTIAL
+    )
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    body = request_body(route)
+    assert body["reasoning"] == {"effort": "low", "summary": "auto"}, f"body: {body!r}"
+    assert outcome.meta.native_reasoning == Present(
+        '{"reasoning":{"effort":"low","summary":"auto"}}'
+    ), f"native_reasoning: {outcome.meta.native_reasoning!r}"
+
+
+@respx.mock
+async def test_generate_empty_reasoning_fragment_sends_nothing() -> None:
+    route = respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
+    )
+    levels: Mapping[ReasoningLevel, object] = {"none": {}}
+    outcome = await OpenAIResponsesEngine().generate(
+        replace(ROW, reasoning=Present(levels)), make_intent(reasoning="none"), CREDENTIAL
+    )
+    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
+    body = request_body(route)
+    assert "reasoning" not in body, f"empty fragment must send nothing; body: {body!r}"
+    assert outcome.meta.native_reasoning == Absent(), (
+        f"native_reasoning: {outcome.meta.native_reasoning!r}"
+    )
+
+
+async def test_generate_rejects_non_mapping_reasoning_value_as_registry_defect() -> None:
+    levels: Mapping[ReasoningLevel, object] = {"high": "high"}
+    with pytest.raises(RuntimeDefect, match="request-fragment mappings") as exc_info:
+        await OpenAIResponsesEngine().generate(
+            replace(ROW, reasoning=Present(levels)), make_intent(), CREDENTIAL
+        )
+    assert exc_info.value.code == "registry_invalid", f"code: {exc_info.value.code!r}"
+
+
+async def test_generate_rejects_provider_options_colliding_with_reasoning_fragment() -> None:
+    intent = make_intent(provider_options={"reasoning": {"effort": "none"}})
+    with pytest.raises(InvalidRequest, match="reasoning"):
+        await OpenAIResponsesEngine().generate(ROW, intent, CREDENTIAL)
 
 
 @respx.mock
@@ -592,17 +674,23 @@ async def test_generate_rejects_provider_options_colliding_with_owned_keys() -> 
 
 
 @respx.mock
-async def test_generate_uses_sdk_default_base_url_when_row_base_url_absent(
+async def test_generate_ignores_openai_base_url_env_when_row_base_url_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    """Zero-env dispatch: an Absent row base_url resolves to the canonical host
+    in the engine, never to whatever OPENAI_BASE_URL says."""
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://poisoned.invalid/v1")
+    poisoned = respx.post("https://poisoned.invalid/v1/responses").mock(
+        return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
+    )
     route = respx.post(RESPONSES_URL).mock(
         return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
     )
     row = replace(ROW, base_url=Absent())
     outcome = await OpenAIResponsesEngine().generate(row, make_intent(), CREDENTIAL)
     assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
-    assert route.call_count == 1, "request must hit the SDK default base URL"
+    assert route.call_count == 1, "request must hit the canonical OpenAI host"
+    assert poisoned.call_count == 0, "OPENAI_BASE_URL must never reroute a call"
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +873,29 @@ async def test_generate_missing_output_is_protocol_defect() -> None:
         await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
 
 
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {**usage_body(), "input_tokens": -5},
+        {key: value for key, value in usage_body().items() if key != "input_tokens"},
+        {**usage_body(), "output_tokens": "thirty"},
+        {**usage_body(), "input_tokens_details": {"cached_tokens": -1}},
+    ],
+    ids=["negative-input", "missing-input", "non-int-output", "negative-cache-read"],
+)
+@respx.mock
+async def test_generate_malformed_usage_is_protocol_defect(usage: dict[str, object]) -> None:
+    """A 2xx envelope whose usage cannot be read as token accounting is a
+    malformed envelope, not a silently zeroed count."""
+    respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage))
+    )
+    with pytest.raises(ProtocolDefect, match="usage") as exc_info:
+        await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert exc_info.value.code == "malformed_usage", f"code: {exc_info.value.code!r}"
+    assert exc_info.value.origin == "provider_response", f"origin: {exc_info.value.origin!r}"
+
+
 # ---------------------------------------------------------------------------
 # Fault injection — generate
 
@@ -875,6 +986,66 @@ async def test_generate_context_overflow_returns_failed_value() -> None:
     assert isinstance(outcome, Failed), f"outcome: {outcome!r}"
     assert outcome.failure == ProviderContextTooLarge(), f"failure: {outcome.failure!r}"
     assert_meta(outcome, request_id="req_400", usage=None, status_code=400)
+
+
+@respx.mock
+async def test_generate_context_overflow_detected_from_message_text() -> None:
+    """No code on the body — the documented overflow sentence in the message is
+    the only signal, and it must still resolve to the expected failure value."""
+    respx.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(
+            400,
+            headers={"x-request-id": "req_400"},
+            json={
+                "error": {
+                    "message": (
+                        "This model's maximum context length is 400000 tokens, "
+                        "however you requested 512000 tokens."
+                    ),
+                    "type": "invalid_request_error",
+                }
+            },
+        )
+    )
+    outcome = await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert isinstance(outcome, Failed), f"outcome: {outcome!r}"
+    assert outcome.failure == ProviderContextTooLarge(), f"failure: {outcome.failure!r}"
+    assert_meta(outcome, request_id="req_400", usage=None, status_code=400)
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        (402, {"error": {"message": "payment required", "type": "billing_error"}}),
+        (429, {"error": {"message": "You exceeded your quota", "code": "insufficient_quota"}}),
+    ],
+    ids=["402-payment-required", "429-insufficient-quota"],
+)
+@respx.mock
+async def test_generate_quota_exhaustion_is_runtime_defect(
+    status: int, body: dict[str, object]
+) -> None:
+    """Billing exhaustion is an operator fact, never a retryable rate limit —
+    even when the provider signals it with HTTP 429."""
+    respx.post(RESPONSES_URL).mock(return_value=httpx.Response(status, json=body))
+    with pytest.raises(RuntimeDefect) as exc_info:
+        await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert exc_info.value.code == "quota_exhausted", f"code: {exc_info.value.code!r}"
+    assert exc_info.value.origin == "provider_http", f"origin: {exc_info.value.origin!r}"
+
+
+@respx.mock
+async def test_generate_unclassified_4xx_is_runtime_defect() -> None:
+    respx.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(
+            404,
+            json={"error": {"message": "The model does not exist", "code": "model_not_found"}},
+        )
+    )
+    with pytest.raises(RuntimeDefect) as exc_info:
+        await OpenAIResponsesEngine().generate(ROW, make_intent(), CREDENTIAL)
+    assert exc_info.value.code == "unclassified_provider_error", f"code: {exc_info.value.code!r}"
+    assert "model_not_found" in exc_info.value.message, f"message: {exc_info.value.message!r}"
 
 
 @respx.mock
@@ -1060,6 +1231,78 @@ async def test_stream_midcut_before_semantic_output_raises_clean_interrupt() -> 
     )
 
 
+@pytest.mark.parametrize(
+    ("error", "cause"),
+    [
+        (httpx.ReadTimeout("read timed out"), ProviderTimeout()),
+        (httpx.RemoteProtocolError("peer closed connection mid-body"), TransportUnavailable()),
+    ],
+    ids=["read-timeout", "remote-protocol-error"],
+)
+@respx.mock
+async def test_stream_transport_fault_mid_body_raises_transient(
+    error: Exception, cause: ProviderTimeout | TransportUnavailable
+) -> None:
+    respx.post(RESPONSES_URL).mock(return_value=mock_broken_stream([created_frame()], error))
+    events: list[CodecStreamEvent] = []
+    with pytest.raises(TransientAttempt) as exc_info:
+        async for event in OpenAIResponsesEngine().stream(ROW, make_intent(), CREDENTIAL):
+            events.append(event)
+    assert events == [StreamStart()], f"events: {events!r}"
+    assert exc_info.value.cause == cause, f"cause: {exc_info.value.cause!r}"
+    assert exc_info.value.status_code == Present(200), (
+        f"status_code: {exc_info.value.status_code!r}"
+    )
+    assert exc_info.value.provider_request_id == Present("req_s1"), (
+        f"provider_request_id: {exc_info.value.provider_request_id!r}"
+    )
+    assert exc_info.value.billability == PossiblyBillable(), (
+        f"billability: {exc_info.value.billability!r}"
+    )
+
+
+def sdk_error_frame_bytes(error: dict[str, object]) -> bytes:
+    """A frame carrying a top-level "error" key — the gateway/proxy shape the
+    SDK decodes itself and raises as openai.APIError before our dispatch runs."""
+    return b"event: error\ndata: " + json.dumps({"error": error}).encode() + b"\n\n"
+
+
+@respx.mock
+async def test_stream_sdk_decoded_error_frame_rate_limit_raises_transient() -> None:
+    content = sse_bytes([created_frame()]) + sdk_error_frame_bytes(
+        {"code": "rate_limit_exceeded", "message": "slow down"}
+    )
+    respx.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(200, headers=stream_headers("req_s1"), content=content)
+    )
+    with pytest.raises(TransientAttempt) as exc_info:
+        async for _ in OpenAIResponsesEngine().stream(ROW, make_intent(), CREDENTIAL):
+            pass
+    assert exc_info.value.cause == ProviderRateLimit(retry_after=Absent()), (
+        f"cause: {exc_info.value.cause!r}"
+    )
+    assert exc_info.value.provider_request_id == Present("req_s1"), (
+        f"provider_request_id: {exc_info.value.provider_request_id!r}"
+    )
+
+
+@respx.mock
+async def test_stream_sdk_decoded_error_frame_defects_with_sanitized_text() -> None:
+    content = sse_bytes([created_frame()]) + sdk_error_frame_bytes(
+        {"message": "boom mid-stream from sk-not-a-real-key-1234567890"}
+    )
+    respx.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(200, headers=stream_headers("req_s1"), content=content)
+    )
+    with pytest.raises(ProtocolDefect) as exc_info:
+        async for _ in OpenAIResponsesEngine().stream(ROW, make_intent(), CREDENTIAL):
+            pass
+    message = exc_info.value.message
+    assert exc_info.value.code == "provider_stream_failure", f"code: {exc_info.value.code!r}"
+    assert "boom mid-stream" in message, f"message: {message!r}"
+    assert "sk-not-a-real-key-1234567890" not in message, f"unredacted secret: {message!r}"
+
+
 @respx.mock
 async def test_stream_inband_error_event_rate_limit_raises_transient() -> None:
     frames: list[dict[str, object]] = [
@@ -1186,6 +1429,33 @@ async def test_stream_incomplete_terminal() -> None:
     assert outcome.reason == "max_output_tokens", f"reason: {outcome.reason!r}"
     assert outcome.status == "provider_incomplete", f"status: {outcome.status!r}"
     assert_meta(outcome, request_id="req_s1")
+
+
+@respx.mock
+async def test_stream_falls_back_to_envelope_id_when_header_missing() -> None:
+    frames = [created_frame(), completed_frame(output=[], usage=usage_body())]
+    respx.post(RESPONSES_URL).mock(return_value=mock_stream(frames, request_id=None))
+    events = await collect_stream(OpenAIResponsesEngine(), make_intent())
+    terminal = events[-1]
+    assert isinstance(terminal, TerminalEvent), f"events: {events!r}"
+    outcome = terminal.outcome
+    assert isinstance(outcome, Succeeded), f"terminal outcome: {outcome!r}"
+    assert outcome.meta.provider_request_id == Present("resp_s1"), (
+        f"provider_request_id: {outcome.meta.provider_request_id!r}"
+    )
+
+
+@respx.mock
+async def test_stream_malformed_usage_is_protocol_defect() -> None:
+    frames = [
+        created_frame(),
+        completed_frame(output=[], usage={**usage_body(), "output_tokens": -3}),
+    ]
+    respx.post(RESPONSES_URL).mock(return_value=mock_stream(frames))
+    with pytest.raises(ProtocolDefect, match="usage") as exc_info:
+        async for _ in OpenAIResponsesEngine().stream(ROW, make_intent(), CREDENTIAL):
+            pass
+    assert exc_info.value.code == "malformed_usage", f"code: {exc_info.value.code!r}"
 
 
 @respx.mock

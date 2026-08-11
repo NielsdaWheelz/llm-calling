@@ -6,10 +6,16 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
-from provider_runtime.agent_runtime._process import ManagedProcess, ProcessLimits
+from provider_runtime.agent_runtime._process import (
+    ManagedProcess,
+    ProcessLimits,
+    capture_process_output,
+)
+from provider_runtime.agent_runtime.errors import ExecutableUnavailable
 
 LIMITS = ProcessLimits(max_stderr_bytes=128, termination_grace_seconds=0.1)
 
@@ -274,6 +280,44 @@ async def test_pipe_stdin_is_still_available_to_a_transport_that_writes_frames(
             assert await process.stdout.readline() == b"frame\n"
     finally:
         await process.close()
+
+
+async def test_a_pipe_failure_after_the_spawn_still_reaps_the_discovery_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OSError raised after the launch must not leave the child running.
+
+    The spawn-failed case and a broken read both surface as `OSError`; only the first has no
+    process to release, so the mapping to `ExecutableUnavailable` cannot skip the cleanup.
+    """
+    spawned: list[ManagedProcess] = []
+    original = ManagedProcess.spawn
+
+    async def spawn_then_break_stdout(*args: object, **kwargs: object) -> ManagedProcess:
+        process = await original(*cast(Any, args), **cast(Any, kwargs))
+        spawned.append(process)
+
+        async def broken_read(_size: int = -1) -> bytes:
+            raise OSError("pipe went away")
+
+        monkeypatch.setattr(process.stdout, "read", broken_read)
+        return process
+
+    monkeypatch.setattr(ManagedProcess, "spawn", spawn_then_break_stdout)
+    with pytest.raises(ExecutableUnavailable, match="sleeper"):
+        await capture_process_output(
+            (sys.executable, "-c", "import time; time.sleep(30)"),
+            cwd=tmp_path,
+            environment={},
+            limits=LIMITS,
+            startup_timeout_seconds=5.0,
+            max_stdout_bytes=1024,
+            executable_label="sleeper",
+            purpose="pipe failure probe",
+        )
+
+    assert len(spawned) == 1
+    assert spawned[0].returncode is not None, "the launched child was left running"
 
 
 async def test_an_unknown_stdin_mode_is_refused_before_the_spawn(tmp_path: Path) -> None:

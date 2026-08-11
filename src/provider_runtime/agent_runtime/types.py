@@ -10,8 +10,6 @@ from dataclasses import dataclass, field
 from typing import Literal
 from urllib.parse import urlsplit
 
-from provider_runtime.types import ProviderName, ProviderTarget
-
 from .errors import InvalidAgentRequest, UnsupportedCapability
 from .policy import PermissionPolicy, PermissionPolicyPatch
 
@@ -41,20 +39,6 @@ _HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_JSON_DEPTH = 64
 _MIN_JSON_INTEGER = -(2**63)
 _MAX_JSON_INTEGER = 2**63 - 1
-_PROVIDERS: tuple[ProviderName, ...] = (
-    "openai",
-    "anthropic",
-    "gemini",
-    "moonshot",
-    "openrouter",
-)
-_PROVIDER_CREDENTIAL_ENVIRONMENT: dict[ProviderName, tuple[str, ...]] = {
-    "openai": ("OPENAI_API_KEY",),
-    "anthropic": ("ANTHROPIC_API_KEY",),
-    "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
-    "moonshot": ("MOONSHOT_API_KEY",),
-    "openrouter": ("OPENROUTER_API_KEY",),
-}
 
 
 class FrozenJsonDict(Mapping[str, object]):
@@ -635,102 +619,28 @@ def _validate_content(value: object, field_name: str, *, allow_empty: bool) -> N
 
 @dataclass(frozen=True, slots=True)
 class TurnRequest:
+    """One turn's input plus the only two things a turn may say about itself.
+
+    Instructions, model, reasoning, MCP configuration, output shape, and native options are
+    session-scoped on both shipped routes — neither SDK can reconfigure a live client — so
+    they exist once, on `AgentSessionRequest`, and have no per-turn form to reject.
+    `policy` is the spec-mandated narrowing input; `timeout_seconds` bounds this turn.
+    """
+
     input: tuple[ContentPart, ...]
-    system: tuple[ContentPart, ...] | None = None
-    developer: tuple[ContentPart, ...] | None = None
-    model: str | None = None
-    reasoning: ReasoningSpec | None = None
     policy: PermissionPolicyPatch | None = None
-    mcp_servers: tuple[McpServerSpec, ...] | None = None
-    max_turns: int | None = None
     timeout_seconds: float | None = None
-    output: AgentOutputSpec | None = None
-    native: NativeOptions | None = None
 
     def __post_init__(self) -> None:
         _validate_content(self.input, "TurnRequest.input", allow_empty=False)
-        if self.system is not None:
-            _validate_content(self.system, "TurnRequest.system", allow_empty=True)
-        if self.developer is not None:
-            _validate_content(self.developer, "TurnRequest.developer", allow_empty=True)
-        if self.model is not None:
-            _require_non_empty(self.model, "TurnRequest.model")
-        if self.reasoning is not None and not isinstance(self.reasoning, ReasoningSpec):
-            raise InvalidAgentRequest("TurnRequest.reasoning must be ReasoningSpec")
         if self.policy is not None and not isinstance(self.policy, PermissionPolicyPatch):
             raise InvalidAgentRequest("TurnRequest.policy must be PermissionPolicyPatch")
-        if self.mcp_servers is not None:
-            _require_tuple(self.mcp_servers, "TurnRequest.mcp_servers")
-            servers = self.mcp_servers
-            if any(not isinstance(server, McpServerSpec) for server in servers):
-                raise InvalidAgentRequest("TurnRequest.mcp_servers contains an invalid value")
-            if len({server.name for server in servers}) != len(servers):
-                raise InvalidAgentRequest("TurnRequest.mcp_servers contains duplicate names")
-        if self.max_turns is not None and (type(self.max_turns) is not int or self.max_turns <= 0):
-            raise InvalidAgentRequest("TurnRequest.max_turns must be a positive integer")
         if self.timeout_seconds is not None and (
             type(self.timeout_seconds) not in (int, float)
             or not math.isfinite(self.timeout_seconds)
             or self.timeout_seconds <= 0
         ):
             raise InvalidAgentRequest("TurnRequest.timeout_seconds must be positive and finite")
-        if self.output is not None and not isinstance(
-            self.output, TextAgentOutput | JsonSchemaAgentOutput
-        ):
-            raise InvalidAgentRequest("TurnRequest.output is invalid")
-        if self.native is not None and not isinstance(
-            self.native, CodexNativeOptions | ClaudeNativeOptions
-        ):
-            raise InvalidAgentRequest("TurnRequest.native is invalid")
-
-
-@dataclass(frozen=True, slots=True)
-class ApiTarget:
-    provider: ProviderName
-    model: str
-    credential: CredentialRef
-    kind: Literal["api"] = field(default="api", init=False)
-
-    def __post_init__(self) -> None:
-        if self.provider not in _PROVIDERS:
-            raise InvalidAgentRequest(f"unknown API provider {self.provider!r}")
-        _require_non_empty(self.model, "ApiTarget.model")
-        if not isinstance(self.credential, CredentialRef):
-            raise InvalidAgentRequest("ApiTarget.credential must be CredentialRef")
-        if self.credential.kind == "local_account":
-            raise InvalidAgentRequest("API targets require a named API credential reference")
-        if (
-            self.credential.kind == "api_key_environment"
-            and self.credential.name not in _PROVIDER_CREDENTIAL_ENVIRONMENT[self.provider]
-        ):
-            raise InvalidAgentRequest(
-                f"credential environment is not valid for provider {self.provider!r}"
-            )
-
-
-@dataclass(frozen=True, slots=True)
-class AgentTarget:
-    request: AgentSessionRequest
-    kind: Literal["agent"] = field(default="agent", init=False)
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.request, AgentSessionRequest):
-            raise InvalidAgentRequest("AgentTarget.request must be AgentSessionRequest")
-
-
-type CallTarget = ApiTarget | AgentTarget
-
-
-def api_target_to_provider_target(target: ApiTarget) -> ProviderTarget:
-    if not isinstance(target, ApiTarget):
-        raise InvalidAgentRequest("api_target_to_provider_target requires ApiTarget")
-    return ProviderTarget(provider=target.provider, model=target.model)
-
-
-def agent_target_to_session_request(target: AgentTarget) -> AgentSessionRequest:
-    if not isinstance(target, AgentTarget):
-        raise InvalidAgentRequest("agent_target_to_session_request requires AgentTarget")
-    return target.request
 
 
 def ref_to_json(ref: AgentSessionRef) -> JsonObject:

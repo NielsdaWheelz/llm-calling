@@ -15,7 +15,6 @@ mirror)::
         {
           "provider": "<ProviderName>",
           "model": "<upstream model id — exact-then-longest-prefix match key>",
-          "effective": "<ISO date this rate took force upstream, else snapshot_date>",
           "input_mtok_usd": "<Decimal string>",
           "output_mtok_usd": "<Decimal string>",
           "cache_read_mtok_usd": "<Decimal string>",
@@ -35,10 +34,14 @@ Normalization applied (upstream schema → this snapshot):
   moderation) are dropped — `estimate_cost` only prices generate calls.
 - Tiered prices are flattened to the base rate (long-context tier surcharges
   ignored; the estimate is indicative, never authoritative).
-- Conditional price lists are resolved as of the snapshot date: the last entry
-  whose ``start_date`` <= today wins (upstream's "last active" rule);
-  time-of-day off-peak entries are ignored. The chosen entry's ``start_date``
-  becomes the row's ``effective`` date.
+- Conditional price lists are resolved as of the snapshot date: the last
+  ``start_date``-constrained entry with ``start_date`` <= today wins
+  (upstream's "last active" rule). A time-of-day constraint (a daily UTC
+  window, e.g. DeepSeek's off-peak discount hours) has no request timestamp
+  to resolve against, so it is picked as the flat rate only when its window
+  covers MORE than half the day — that is the standard/peak rate, never the
+  minority off-peak discount, which never overrides the otherwise-chosen
+  entry.
 - ``cache_read_mtok_usd`` defaults to the input rate when upstream prices no
   cache read (no discount) — exactly upstream's semantics for unpriced units.
 - ``cache_write_surcharge_mtok_usd`` is upstream ``cache_write_mtok`` MINUS
@@ -59,6 +62,7 @@ from __future__ import annotations
 import json
 import urllib.request
 from datetime import date
+from datetime import time as _time
 from decimal import Decimal
 from pathlib import Path
 
@@ -95,26 +99,44 @@ def _base_rate(value: object) -> Decimal:
     raise ValueError(f"unexpected rate shape: {value!r}")
 
 
-def _resolve_prices(prices: object, today: date) -> tuple[dict[str, object], date] | None:
+def _window_hours(constraint: dict[str, object]) -> float:
+    """Hours a daily UTC ``start_time``..``end_time`` window covers, wrapping midnight."""
+    start = _time.fromisoformat(str(constraint["start_time"]).removesuffix("Z"))
+    end = _time.fromisoformat(str(constraint["end_time"]).removesuffix("Z"))
+    start_h = start.hour + start.minute / 60 + start.second / 3600
+    end_h = end.hour + end.minute / 60 + end.second / 3600
+    span = end_h - start_h
+    return span if span > 0 else span + 24.0
+
+
+def _resolve_prices(prices: object, today: date) -> dict[str, object] | None:
     """Pick the price set in force today; None when no entry applies.
 
-    Upstream rule: the LAST entry whose constraint is active wins. Entries
-    constrained by time of day (off-peak windows) are never chosen here — a
-    snapshot has no request timestamp.
+    Upstream rule: the LAST ``start_date``-constrained entry with
+    ``start_date`` <= today wins. A time-of-day constraint (a daily UTC
+    window) has no request timestamp to resolve against, so it is picked as
+    the flat rate only when its window covers MORE than half the day — that
+    is the standard/peak rate, and the unconstrained fallback is the minority
+    off-peak discount. A window covering half the day or less is a genuine
+    off-peak discount and never overrides the otherwise-chosen entry.
     """
     if isinstance(prices, dict):
-        return prices, today
+        return prices
     assert isinstance(prices, list)
-    chosen: tuple[dict[str, object], date] | None = None
+    chosen: dict[str, object] | None = None
     for entry in prices:
         constraint = entry.get("constraint")
         if constraint is None:
-            chosen = entry["prices"], today
+            chosen = entry["prices"]
         elif "start_date" in constraint:
-            start = date.fromisoformat(constraint["start_date"])
-            if start <= today:
-                chosen = entry["prices"], start
-        # time-of-day constraints: skipped.
+            if date.fromisoformat(constraint["start_date"]) <= today:
+                chosen = entry["prices"]
+        elif "start_time" in constraint and "end_time" in constraint:
+            if _window_hours(constraint) > 12.0:
+                chosen = entry["prices"]
+            # else: a minority off-peak window — never overrides.
+        else:
+            raise ValueError(f"unrecognized price constraint shape: {constraint!r}")
     return chosen
 
 
@@ -128,10 +150,9 @@ def _rows(upstream: list[dict[str, object]], today: date) -> list[dict[str, str]
         models = provider["models"]
         assert isinstance(models, list)
         for model in models:
-            resolved = _resolve_prices(model["prices"], today)
-            if resolved is None:
+            prices = _resolve_prices(model["prices"], today)
+            if prices is None:
                 continue
-            prices, effective = resolved
             if "input_mtok" not in prices or "output_mtok" not in prices:
                 continue  # embeddings/image/moderation — not generate-shaped
             key = (provider_name, str(model["id"]))
@@ -151,7 +172,6 @@ def _rows(upstream: list[dict[str, object]], today: date) -> list[dict[str, str]
                 {
                     "provider": provider_name,
                     "model": str(model["id"]),
-                    "effective": effective.isoformat(),
                     "input_mtok_usd": str(input_rate),
                     "output_mtok_usd": str(_base_rate(prices["output_mtok"])),
                     "cache_read_mtok_usd": str(cache_read),

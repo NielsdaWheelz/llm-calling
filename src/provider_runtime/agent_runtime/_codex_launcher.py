@@ -12,13 +12,12 @@ from __future__ import annotations
 
 import hashlib
 import os
-import stat
-import tempfile
 from pathlib import Path
 
+from ._private_files import require_private_directory, write_private_file
 from .errors import AgentRuntimeDefect, ExecutableUnavailable
 
-_PRIVATE_MODE = 0o700
+_LAUNCHER_LABEL = "Codex launcher"
 _MAX_SHEBANG_BYTES = 120
 _LAUNCHER_PREFIX = "codex-launcher-"
 _LAUNCHER_SOURCE = '''#!{shebang}
@@ -130,64 +129,15 @@ def ensure_codex_launcher(
         )
 
     directory = state_root.parent
-    _require_private_directory(directory)
+    require_private_directory(directory, label=_LAUNCHER_LABEL)
     source = _LAUNCHER_SOURCE.format(
         shebang=shebang,
         executable=repr(executable_text),
         environment_names=repr(tuple(sorted(environment_names))),
     ).encode("utf-8")
     path = directory / f"{_LAUNCHER_PREFIX}{hashlib.sha256(source).hexdigest()[:32]}"
-    _write_private_file(path, source)
+    write_private_file(path, source, label=_LAUNCHER_LABEL)
     return path
-
-
-def _require_private_directory(directory: Path) -> None:
-    try:
-        status = os.stat(directory, follow_symlinks=False)
-    except OSError:
-        raise ExecutableUnavailable(
-            "the runtime-owned directory for the Codex launcher is unavailable"
-        ) from None
-    if (
-        not stat.S_ISDIR(status.st_mode)
-        or stat.S_IMODE(status.st_mode) != _PRIVATE_MODE
-        or status.st_uid != os.geteuid()
-    ):
-        raise AgentRuntimeDefect(
-            "the runtime-owned directory for the Codex launcher is not privately permissioned",
-            code="launcher_directory_unsafe",
-        )
-
-
-def _write_private_file(path: Path, source: bytes) -> None:
-    temporary: str | None = None
-    try:
-        descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-        try:
-            os.fchmod(descriptor, _PRIVATE_MODE)
-            os.write(descriptor, source)
-        finally:
-            os.close(descriptor)
-        os.replace(temporary, path)
-    except OSError:
-        if temporary is not None:
-            Path(temporary).unlink(missing_ok=True)
-        raise ExecutableUnavailable("the Codex launcher could not be written") from None
-    try:
-        status = os.stat(path, follow_symlinks=False)
-        written = path.read_bytes()
-    except OSError:
-        raise ExecutableUnavailable("the Codex launcher could not be verified") from None
-    if (
-        not stat.S_ISREG(status.st_mode)
-        or stat.S_IMODE(status.st_mode) != _PRIVATE_MODE
-        or status.st_uid != os.geteuid()
-        or written != source
-    ):
-        raise AgentRuntimeDefect(
-            "the Codex launcher on disk is not the one this runtime wrote",
-            code="launcher_tampered",
-        )
 
 
 __all__ = ["ensure_codex_launcher"]

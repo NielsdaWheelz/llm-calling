@@ -1,5 +1,6 @@
 """Tests for the model registry: resolution, row invariants, and shipped content."""
 
+import json
 import re
 from collections.abc import Mapping
 from typing import Literal, get_args
@@ -28,6 +29,7 @@ from provider_runtime.types import (
 
 _ABSENT = Absent()
 _TEXT: frozenset[Literal["text", "image"]] = frozenset({"text"})
+_LEVELS: frozenset[str] = frozenset(get_args(ReasoningLevel.__value__))
 
 
 def _row(
@@ -36,6 +38,7 @@ def _row(
     provider: ProviderName = "anthropic",
     model_id: str = "claude-opus-5-20260101",
     engine: EngineId = "anthropic_messages",
+    base_url: Presence[str] = _ABSENT,
     reasoning: Presence[Mapping[ReasoningLevel, object]] = _ABSENT,
     routing: Presence[OpenRouterRouting] = _ABSENT,
     context_window: int = 200_000,
@@ -47,7 +50,7 @@ def _row(
         provider=provider,
         model_id=model_id,
         engine=engine,
-        base_url=Absent(),
+        base_url=base_url,
         context_window=context_window,
         max_output_tokens=64_000,
         modalities=modalities,
@@ -104,7 +107,10 @@ def test_registry_revision_is_a_dated_revision() -> None:
 
 
 def test_a_well_formed_row_set_validates() -> None:
-    reasoning_map: Mapping[ReasoningLevel, object] = {"low": "low", "high": "high"}
+    reasoning_map: Mapping[ReasoningLevel, object] = {
+        "low": {"reasoning": {"effort": "low"}},
+        "high": {"reasoning": {"effort": "high"}},
+    }
     rows = (
         _row(),
         _row(
@@ -119,6 +125,7 @@ def test_a_well_formed_row_set_validates() -> None:
             provider="openrouter",
             model_id="moonshotai/kimi-k3",
             engine="openai_chat",
+            base_url=Present("https://openrouter.ai/api/v1"),
             routing=Present(_pinned_routing()),
         ),
     )
@@ -154,6 +161,7 @@ def test_openrouter_row_without_routing_is_rejected() -> None:
         provider="openrouter",
         model_id="moonshotai/kimi-k3",
         engine="openai_chat",
+        base_url=Present("https://openrouter.ai/api/v1"),
     )
     with pytest.raises(RuntimeDefect) as exc_info:
         _validate_rows((row,))
@@ -172,10 +180,50 @@ def test_non_openrouter_row_with_routing_is_rejected() -> None:
 
 def test_reasoning_keys_outside_reasoning_level_are_rejected() -> None:
     with pytest.raises(RuntimeDefect) as exc_info:
-        _validate_rows((_row(reasoning=Present({"turbo": "think-harder"})),))  # type: ignore
+        _validate_rows((_row(reasoning=Present({"turbo": {"effort": "turbo"}})),))  # type: ignore
     assert exc_info.value.code == "registry_invalid"
     assert "turbo" in exc_info.value.message, (
         "the defect message must name the out-of-union reasoning key"
+    )
+
+
+def test_reasoning_values_that_engines_cannot_merge_are_rejected() -> None:
+    # Engines merge the value verbatim as request parameters: a bare level
+    # string or an empty fragment is a call-time defect, caught at import here.
+    bare_string: Mapping[ReasoningLevel, object] = {"high": "high"}
+    with pytest.raises(RuntimeDefect) as exc_info:
+        _validate_rows((_row(reasoning=Present(bare_string)),))
+    assert exc_info.value.code == "registry_invalid"
+    assert "'high'" in exc_info.value.message, (
+        f"the defect message must name the offending level: {exc_info.value.message!r}"
+    )
+
+    empty_fragment: Mapping[ReasoningLevel, object] = {"high": {}}
+    with pytest.raises(RuntimeDefect) as exc_info:
+        _validate_rows((_row(reasoning=Present(empty_fragment)),))
+    assert exc_info.value.code == "registry_invalid", (
+        "a level mapping to an empty fragment declares a knob that sends nothing"
+    )
+
+
+def test_reasoning_knob_without_levels_is_rejected() -> None:
+    # Present({}) is strictly worse than Absent: every level, including "none",
+    # becomes inexpressible while the row still claims a reasoning knob.
+    with pytest.raises(RuntimeDefect) as exc_info:
+        _validate_rows((_row(reasoning=Present({})),))
+    assert exc_info.value.code == "registry_invalid"
+    assert "no levels" in exc_info.value.message, exc_info.value.message
+
+
+def test_openai_chat_row_without_base_url_is_rejected() -> None:
+    row = _row(
+        ref="moonshot:kimi-k3", provider="moonshot", model_id="kimi-k3", engine="openai_chat"
+    )
+    with pytest.raises(RuntimeDefect) as exc_info:
+        _validate_rows((row,))
+    assert exc_info.value.code == "registry_invalid"
+    assert "base_url" in exc_info.value.message, (
+        "openai_chat serves compatibility hosts; without a base_url the SDK would call OpenAI"
     )
 
 
@@ -189,9 +237,12 @@ def test_engine_must_match_the_providers_dialect() -> None:
 
 
 def test_openrouter_routing_rejects_zero_pins() -> None:
-    with pytest.raises(ValueError, match="must name at least one pin"):
+    # Zero pins is unpinned passthrough with fallbacks merely disabled — the
+    # same curation defect taxonomy as every other row invariant.
+    with pytest.raises(RuntimeDefect, match="must name at least one pin") as exc_info:
         OpenRouterRouting(only=(), order=("moonshotai",), quantizations=("fp8",))
-    with pytest.raises(ValueError, match="must name at least one pin"):
+    assert (exc_info.value.origin, exc_info.value.code) == ("intent", "registry_invalid")
+    with pytest.raises(RuntimeDefect, match="must name at least one pin"):
         OpenRouterRouting(only=("moonshotai",), order=("moonshotai",), quantizations=())
 
 
@@ -242,9 +293,12 @@ def test_row_without_text_modality_is_rejected() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Content — the shipped ROWS. Facts: old catalog.py port (provider docs
-# verified 2026-07-20) for openai/anthropic/gemini/moonshot/openrouter;
-# docs.deepseek.com + docs.x.ai (verified 2026-08-10) for deepseek/xai.
+# Content — the shipped ROWS. Every row's provider facts were re-verified
+# against the vendor docs on 2026-08-10 (source URLs live in the registry's
+# per-provider comments); what the reasoning knob puts on the wire is a
+# provider-doc fact plus the live matrix, not a unit-test constant, so the
+# tests below check the properties engines depend on rather than restating
+# fragments.
 
 # Every target Nexus constructs today (nexus-web llm_profiles.py) must resolve.
 _NEXUS_TARGETS: tuple[tuple[ProviderName, str], ...] = (
@@ -258,28 +312,15 @@ _NEXUS_TARGETS: tuple[tuple[ProviderName, str], ...] = (
 )
 
 
-def test_resolve_returns_the_shipped_row_for_a_ref() -> None:
-    row = resolve("moonshot:kimi-k3")
-    assert row.provider == "moonshot", f"expected the moonshot row, got {row!r}"
-    assert row.model_id == "kimi-k3"
-    assert row.engine == "openai_chat"
-    assert row.base_url == Present("https://api.moonshot.ai/v1"), (
-        "moonshot rides the openai SDK as a compat client and must carry its own base_url"
-    )
-
-
-def test_resolve_target_returns_the_row_matching_wire_identity() -> None:
-    terra = resolve_target(ProviderTarget(provider="openai", model="gpt-5.6-terra"))
-    assert terra.ref == "openai:gpt-5.6-terra", (
-        f"(openai, gpt-5.6-terra) must resolve to its own row, got {terra.ref!r}"
-    )
-    # The openrouter wire id is the pinned dated slug, not the nickname.
-    pinned = resolve_target(
-        ProviderTarget(provider="openrouter", model="moonshotai/kimi-k3-20260715")
-    )
-    assert pinned.ref == "openrouter:kimi-k3", (
-        f"the openrouter row must be keyed by its pinned wire model id, got {pinned.ref!r}"
-    )
+def test_every_row_resolves_by_ref_and_by_wire_identity() -> None:
+    # Callers reach a row either way: by nickname ref (facade) or by the
+    # (provider, wire model id) a continuation replays to.
+    for row in ROWS:
+        assert resolve(row.ref) is row, f"ref {row.ref!r} did not resolve to its own row"
+        target = ProviderTarget(provider=row.provider, model=row.model_id)
+        assert resolve_target(target) is row, (
+            f"({row.provider}, {row.model_id}) resolved to a different row than {row.ref!r}"
+        )
 
 
 def test_every_nexus_consumed_target_has_a_row() -> None:
@@ -378,7 +419,9 @@ def test_modalities_are_verified_facts() -> None:
         )
 
 
-def test_ported_context_and_output_caps_match_the_catalog() -> None:
+def test_context_and_output_caps_match_provider_docs() -> None:
+    # xai publishes no separate output cap for grok-4.5 — the shared window is
+    # the only documented bound. deepseek V4 documents 384k output on both tiers.
     expected = {
         "openai:gpt-5.6-sol": (1_050_000, 128_000),
         "openai:gpt-5.6-terra": (1_050_000, 128_000),
@@ -388,7 +431,15 @@ def test_ported_context_and_output_caps_match_the_catalog() -> None:
         "gemini:gemini-3.5-flash": (1_048_576, 65_536),
         "moonshot:kimi-k3": (1_048_576, 131_072),
         "openrouter:kimi-k3": (1_048_576, 131_072),
+        "deepseek:deepseek-v4-pro": (1_000_000, 384_000),
+        "deepseek:deepseek-v4-flash": (1_000_000, 384_000),
+        "xai:grok-4.5": (500_000, 500_000),
     }
+    assert set(expected) == {row.ref for row in ROWS}, (
+        "every shipped row's token limits are a provider-doc fact and must be listed here; "
+        f"unlisted: {sorted({row.ref for row in ROWS} - set(expected))}, "
+        f"stale: {sorted(set(expected) - {row.ref for row in ROWS})}"
+    )
     for ref, (context_window, max_output_tokens) in expected.items():
         row = resolve(ref)
         assert (row.context_window, row.max_output_tokens) == (
@@ -400,93 +451,52 @@ def test_ported_context_and_output_caps_match_the_catalog() -> None:
         )
 
 
-def test_reasoning_maps_carry_exact_native_wire_values() -> None:
-    # Native values are the provider's own effort/level strings, verbatim; a
-    # model without a level simply omits the key (no invented levels).
-    expected: dict[str, Present[Mapping[ReasoningLevel, object]]] = {
-        # openai: Responses reasoning.effort; xhigh and max are DISTINCT efforts.
-        "openai:gpt-5.6-sol": Present(
-            {
-                "none": "none",
-                "low": "low",
-                "medium": "medium",
-                "high": "high",
-                "xhigh": "xhigh",
-                "max": "max",
-            }
-        ),
-        # anthropic: output_config.effort; no off switch.
-        "anthropic:claude-fable-5": Present(
-            {"low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"}
-        ),
-        # gemini 3.5: thinkingConfig.thinkingLevel strings (not 2.5 thinkingBudget ints).
-        "gemini:gemini-3.5-flash": Present(
-            {"minimal": "minimal", "low": "low", "medium": "medium", "high": "high"}
-        ),
-        # kimi k3: reasoning_effort direct / reasoning.effort via openrouter.
-        "moonshot:kimi-k3": Present({"low": "low", "high": "high", "max": "max"}),
-        "openrouter:kimi-k3": Present({"low": "low", "high": "high", "max": "max"}),
-    }
-    for ref, want in expected.items():
-        row = resolve(ref)
-        assert row.reasoning == want, (
-            f"row {ref!r} reasoning map drifted from the catalog's verified native values: "
-            f"expected {want!r}, got {row.reasoning!r}"
+def test_every_declared_level_maps_to_a_distinct_wire_fragment() -> None:
+    # Engines hold zero reasoning shape knowledge: they merge row.reasoning[level]
+    # verbatim into the request and stamp it into CallMeta.native_reasoning as
+    # compact sorted-keys JSON. A value that is not a non-empty string-keyed
+    # JSON object cannot be merged, and two levels sharing a fragment means one
+    # of them silently sends the other's request.
+    for row in ROWS:
+        if isinstance(row.reasoning, Absent):
+            continue
+        levels = row.reasoning.value
+        assert levels, f"row {row.ref!r} claims a reasoning knob but declares no levels"
+        assert set(levels) <= _LEVELS, (
+            f"row {row.ref!r} declares levels outside ReasoningLevel: {sorted(set(levels) - _LEVELS)}"
         )
-    assert resolve("openai:gpt-5.6-terra").reasoning == expected["openai:gpt-5.6-sol"]
-    assert resolve("openai:gpt-5.6-luna").reasoning == expected["openai:gpt-5.6-sol"]
-    assert resolve("anthropic:claude-sonnet-5").reasoning == expected["anthropic:claude-fable-5"]
+        seen: dict[str, ReasoningLevel] = {}
+        for level, fragment in levels.items():
+            assert isinstance(fragment, Mapping) and fragment, (
+                f"row {row.ref!r} level {level!r} must map to a non-empty request fragment, "
+                f"got {fragment!r}"
+            )
+            stamp = json.dumps(fragment, sort_keys=True, separators=(",", ":"))
+            assert stamp not in seen, (
+                f"row {row.ref!r} levels {seen[stamp]!r} and {level!r} put the identical "
+                f"fragment {stamp} on the wire"
+            )
+            seen[stamp] = level
 
 
-def test_deepseek_rows_carry_verified_facts() -> None:
-    # docs verified 2026-08-10: 1M context / 384K output for both hosted V4
-    # models; thinking enabled by default; reasoning_effort low|high|max on
-    # flash, high|max only on pro; {"thinking": {"type": "disabled"}} is the
-    # exact off-switch fragment on the openai-format wire.
-    thinking_off = {"thinking": {"type": "disabled"}}
-    flash = resolve("deepseek:deepseek-v4-flash")
-    pro = resolve("deepseek:deepseek-v4-pro")
-    for row in (flash, pro):
-        assert (row.context_window, row.max_output_tokens) == (1_000_000, 384_000), (
-            f"row {row.ref!r}: expected (1_000_000, 384_000), "
-            f"got {(row.context_window, row.max_output_tokens)}"
-        )
-        assert row.engine == "openai_chat"
-    assert flash.reasoning == Present(
-        {"none": thinking_off, "low": "low", "high": "high", "max": "max"}
-    ), f"flash reasoning drifted: {flash.reasoning!r}"
-    assert pro.reasoning == Present({"none": thinking_off, "high": "high", "max": "max"}), (
-        f"pro accepts only high|max effort (docs 2026-08-10); a 'low' key would silently "
-        f"upgrade the caller's request: {pro.reasoning!r}"
-    )
-
-
-def test_xai_row_carries_verified_facts() -> None:
-    row = resolve("xai:grok-4.5")
-    assert row.model_id == "grok-4.5"
-    assert row.engine == "openai_chat"
-    assert (row.context_window, row.max_output_tokens) == (500_000, 500_000), (
-        "xAI publishes no separate output cap for grok-4.5; the shared 500k window is "
-        f"the only documented bound — got {(row.context_window, row.max_output_tokens)}"
-    )
-    assert row.reasoning == Present({"low": "low", "medium": "medium", "high": "high"}), (
-        f"grok-4.5 reasoning_effort is low|medium|high and cannot be disabled (no 'none' "
-        f"key): {row.reasoning!r}"
-    )
-
-
-def test_openrouter_row_pins_the_certified_upstream() -> None:
+def test_openrouter_row_pins_a_live_endpoint() -> None:
+    # openrouter.ai/api/v1/models/moonshotai/kimi-k3/endpoints (fetched
+    # 2026-08-10): the first-party endpoint is tag "moonshotai/mxfp4",
+    # quantization "mxfp4", serving "moonshotai/kimi-k3-20260715". With
+    # only+order+quantizations+require_parameters all pinned, a tag or
+    # quantization that no endpoint serves makes every call unroutable.
     row = resolve("openrouter:kimi-k3")
     assert row.model_id == "moonshotai/kimi-k3-20260715", (
-        "the openrouter wire id must stay the catalog's pinned canonical revision"
+        f"the wire id must stay the pinned dated revision, got {row.model_id!r}"
     )
     match row.routing:
         case Present(value=routing):
-            assert routing.only == ("moonshotai/int4",), routing
-            assert routing.order == ("moonshotai/int4",), routing
-            assert routing.quantizations == ("int4",), (
-                "the pinned variant is re-sent as an explicit quantization filter "
-                f"(belt over the endpoint-slug pin): {routing.quantizations!r}"
+            assert routing.only == routing.order == ("moonshotai/mxfp4",), (
+                f"only and order must both name the certified endpoint tag: {routing!r}"
+            )
+            assert routing.quantizations == ("mxfp4",), (
+                "the endpoint's quantization is re-sent as an explicit filter; K3 ships "
+                f"natively in MXFP4 (int4 was K2-era): {routing.quantizations!r}"
             )
         case Absent():
             pytest.fail("openrouter:kimi-k3 must carry routing pins")

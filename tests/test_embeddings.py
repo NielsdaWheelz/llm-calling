@@ -18,7 +18,12 @@ import httpx
 import pytest
 import respx
 
-from provider_runtime.errors import CredentialRejected, ProtocolDefect, RuntimeDefect
+from provider_runtime.errors import (
+    CredentialRejected,
+    InvalidRequest,
+    ProtocolDefect,
+    RuntimeDefect,
+)
 from provider_runtime.runtime import Credentials, NonGenerationCallFailed, ProviderRuntime
 from provider_runtime.types import (
     Absent,
@@ -34,6 +39,7 @@ from provider_runtime.types import (
     TokenUsage,
     TransientCause,
     TransientExhausted,
+    TransportUnavailable,
 )
 
 ABSENT: Absent = Absent()
@@ -80,9 +86,9 @@ def success_body(*, out_of_order: bool = False) -> dict[str, object]:
     }
 
 
-def data_body(rows: list[object]) -> dict[str, object]:
+def data_body(data: object) -> dict[str, object]:
     body = success_body()
-    body["data"] = rows
+    body["data"] = data
     return body
 
 
@@ -128,6 +134,19 @@ async def test_embed_sends_dimensions_when_present() -> None:
         "dimensions": 256,
         "encoding_format": "base64",
     }, f"request body: {body!r}"
+
+
+@respx.mock
+async def test_embed_rejects_a_non_openai_credential() -> None:
+    # This port is openai-only: any other credential's key must never reach
+    # the openai wire.
+    route = respx.post(EMBEDDINGS_URL).mock(return_value=httpx.Response(200, json=success_body()))
+    other = ProviderCredential(provider="anthropic", key="sk-ant-not-a-real-key")
+    with pytest.raises(InvalidRequest, match="openai-only"):
+        await runtime().embed(call(), credential=other)
+    assert route.call_count == 0, (
+        f"the credential must never reach the wire; got {route.call_count} dispatches"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +204,16 @@ async def test_embed_without_usage_is_absent() -> None:
     respx.post(EMBEDDINGS_URL).mock(return_value=httpx.Response(200, json=body))
     response = await runtime().embed(call(), credential=CREDENTIAL)
     assert response.usage == Absent(), f"usage: {response.usage!r}"
+
+
+@respx.mock
+async def test_embed_rejects_negative_usage_counts() -> None:
+    body = success_body()
+    body["usage"] = {"prompt_tokens": -1, "total_tokens": 7}
+    route = respx.post(EMBEDDINGS_URL).mock(return_value=httpx.Response(200, json=body))
+    with pytest.raises(ProtocolDefect, match="token accounting"):
+        await runtime().embed(call(), credential=CREDENTIAL)
+    assert route.call_count == 1, f"defects must not retry; got {route.call_count} dispatches"
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +333,7 @@ async def test_embed_rejects_non_finite_vector_value() -> None:
 
 
 @pytest.mark.parametrize(
-    "rows",
+    "data",
     [
         pytest.param([], id="empty-data"),
         pytest.param(["nope", "nope"], id="non-object-row"),
@@ -315,13 +344,19 @@ async def test_embed_rejects_non_finite_vector_value() -> None:
             ],
             id="malformed-base64",
         ),
+        # A truthy non-iterable `data` (not merely falsy/empty) trips the
+        # SDK's own `for embedding in obj.data` with a TypeError before this
+        # module's decode ever sees it.
+        pytest.param(5, id="truthy-non-list-int"),
+        pytest.param(True, id="truthy-non-list-bool"),
     ],
 )
 @respx.mock
-async def test_embed_sdk_decode_breakage_is_a_protocol_defect(rows: list[object]) -> None:
-    # These envelopes trip the SDK's own base64 post-parse before our decode
-    # ever sees them; the breakage must still surface as a ProtocolDefect.
-    route = respx.post(EMBEDDINGS_URL).mock(return_value=httpx.Response(200, json=data_body(rows)))
+async def test_embed_sdk_decode_breakage_is_a_protocol_defect(data: object) -> None:
+    # These envelopes trip the SDK's own base64 post-parse or its own
+    # `for embedding in obj.data` before our decode ever sees them; the
+    # breakage must still surface as a ProtocolDefect.
+    route = respx.post(EMBEDDINGS_URL).mock(return_value=httpx.Response(200, json=data_body(data)))
     with pytest.raises(ProtocolDefect, match="failed SDK decode"):
         await runtime().embed(call(), credential=CREDENTIAL)
     assert route.call_count == 1, f"defects must not retry; got {route.call_count} dispatches"
@@ -367,6 +402,11 @@ async def test_embed_retries_transient_then_succeeds(first_response: httpx.Respo
             httpx.ReadTimeout("read timed out"),
             ProviderTimeout(),
             id="timeout",
+        ),
+        pytest.param(
+            httpx.ConnectError("no route to host"),
+            TransportUnavailable(),
+            id="connect-error",
         ),
     ],
 )
@@ -436,3 +476,12 @@ async def test_embed_unclassified_error_is_a_defect() -> None:
     with pytest.raises(RuntimeDefect) as exc_info:
         await runtime().embed(call(), credential=CREDENTIAL)
     assert exc_info.value.code == "unclassified_provider_error", f"code: {exc_info.value.code!r}"
+
+
+@respx.mock
+async def test_embed_quota_exhausted_is_a_defect() -> None:
+    route = respx.post(EMBEDDINGS_URL).mock(return_value=error_response(402, "insufficient funds"))
+    with pytest.raises(RuntimeDefect) as exc_info:
+        await runtime().embed(call(), credential=CREDENTIAL)
+    assert exc_info.value.code == "quota_exhausted", f"code: {exc_info.value.code!r}"
+    assert route.call_count == 1, f"defects must not retry; got {route.call_count} dispatches"

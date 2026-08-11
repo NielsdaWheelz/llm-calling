@@ -8,7 +8,8 @@ runtime wraps in `NonGenerationCallFailed`, and defects raise their own types.
 
 Wire: the SDK's own embeddings lane (``AsyncOpenAI.embeddings.create``,
 ``max_retries=0``, explicit timeout, injectable http_client, default base
-URL — the rows are openai-proper only). ``encoding_format`` is deliberately
+URL — this port is openai-only; there is no registry row to select
+otherwise). ``encoding_format`` is deliberately
 omitted so the SDK default applies: it requests base64 on the wire and decodes
 the packed float32 payload back to plain floats itself; a provider answering
 JSON float lists passes through that decode untouched.
@@ -34,6 +35,7 @@ from openai.types.embedding import Embedding
 from provider_runtime.engines import TransientAttempt
 from provider_runtime.errors import (
     CredentialRejected,
+    InvalidRequest,
     ProtocolDefect,
     RuntimeDefect,
     safe_provider_error_body_snippet,
@@ -203,8 +205,8 @@ def _decode_response(
 def _decode_usage(raw: object) -> Presence[TokenUsage]:
     if not isinstance(raw, Usage):
         return Absent()
-    return Present(
-        TokenUsage.from_components(
+    try:
+        usage = TokenUsage.from_components(
             input_tokens=_int_or_none(raw.prompt_tokens) or 0,
             output_tokens=0,
             total_tokens=presence_of(_int_or_none(raw.total_tokens)),
@@ -212,7 +214,11 @@ def _decode_usage(raw: object) -> Presence[TokenUsage]:
             cache_read_input_tokens=Absent(),
             cache_write_input_tokens=Absent(),
         )
-    )
+    except ValueError as error:
+        raise _defect(
+            f"openai embeddings response usage is not valid token accounting: {error}"
+        ) from error
+    return Present(usage)
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +232,10 @@ async def embed_once(
     http_client: httpx.AsyncClient | None,
 ) -> EmbeddingResponse | ProviderContextTooLarge:
     """One openai-SDK embeddings attempt; `ProviderRuntime.embed` owns the loop."""
+    if credential.provider != "openai":
+        raise InvalidRequest(
+            message=f"embeddings port is openai-only; got a {credential.provider!r} credential"
+        )
     client = openai.AsyncOpenAI(
         api_key=credential.key,
         timeout=_TIMEOUT_S,
@@ -245,11 +255,12 @@ async def embed_once(
             return _terminal_http_failure(error)
         except openai.APIConnectionError as error:
             raise _transient_connection(error) from error
-        except (ValueError, AttributeError) as error:
+        except (ValueError, AttributeError, TypeError) as error:
             # The SDK's own 2xx parse trips on malformed envelopes before this
             # module's decode sees them: invalid JSON (JSONDecodeError), empty
             # data or bad base64/length (ValueError), non-object rows in its
-            # base64 post-parse (AttributeError).
+            # base64 post-parse (AttributeError), a truthy non-iterable `data`
+            # (TypeError from its `for embedding in obj.data`).
             raise _defect(f"openai embeddings response failed SDK decode: {error}") from error
     finally:
         if http_client is None:

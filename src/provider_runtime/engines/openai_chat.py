@@ -2,20 +2,25 @@
 
 One engine, four provider quirk-sets, dispatched flat on `row.provider`:
 
-- deepseek: `max_tokens`; no effort knob — `row.reasoning` values are wire
-  params merged verbatim ({} = nothing sent); `reasoning_content` preserved
-  into the continuation artifact and STRIPPED from resent messages.
-- moonshot: `max_completion_tokens`; `reasoning_effort` from `row.reasoning`;
-  continuation = the COMPLETE native assistant message replayed verbatim,
-  including `reasoning_content` (Preserved Thinking).
-- xai: `max_completion_tokens`; `reasoning_effort`; native structured outputs
-  (`response_format` json_schema) on `structured="native"` rows;
-  `reasoning_content` continuity as deepseek (strip on resend).
-- openrouter: `max_tokens`; unified `reasoning {"effort", "exclude": false}`;
-  the row's full routing pins as `provider` on EVERY call (no unpinned
-  passthrough); ordered `reasoning_details` preserved verbatim into the
-  artifact and replayed on assistant messages; upstream provider name from the
-  response body; no `stream_options` (conflicts with require_parameters).
+- deepseek: `max_tokens`; `reasoning_content` preserved into the continuation
+  artifact and STRIPPED from resent messages.
+- moonshot: `max_completion_tokens`; continuation = the COMPLETE native
+  assistant message replayed verbatim, including `reasoning_content`
+  (Preserved Thinking).
+- xai: `max_completion_tokens`; native structured outputs (`response_format`
+  json_schema) on `structured="native"` rows; `reasoning_content` continuity
+  as deepseek (strip on resend).
+- openrouter: `max_tokens`; the row's full routing pins as `provider` on EVERY
+  call (no unpinned passthrough); ordered `reasoning_details` preserved
+  verbatim into the artifact and replayed on assistant messages; upstream
+  provider name from the response body; no `stream_options` (conflicts with
+  require_parameters); in-band error objects on an HTTP-200 body.
+
+Reasoning is NOT a quirk-set: the engine carries zero per-provider reasoning
+shape knowledge. `row.reasoning[level]` is a self-describing request fragment
+merged verbatim into the body, its top-level keys join the `provider_options`
+collision set, and `CallMeta.native_reasoning` is that fragment as compact
+sorted-keys JSON (Absent when the row has no knob or the fragment is empty).
 
 The SDK owns the wire (serialization, transport, SSE, error envelopes); this
 module owns classification against the shared taxonomy and the IR mapping.
@@ -111,15 +116,14 @@ from provider_runtime.types import (
 type _Served = Literal["deepseek", "moonshot", "xai", "openrouter"]
 
 # Keys this engine maps from core intent fields; a provider_options key in
-# this set is an override, not an extension → InvalidRequest.
+# this set is an override, not an extension → InvalidRequest. The reasoning
+# knob is row data, so its keys join the set per call (`_encode`).
 _OWNED_KEYS: Final[frozenset[str]] = frozenset(
     {
         "model",
         "messages",
         "max_tokens",
         "max_completion_tokens",
-        "reasoning",
-        "reasoning_effort",
         "response_format",
         "tools",
         "tool_choice",
@@ -184,8 +188,8 @@ class _Encoded:
 
 
 def _encode(provider: _Served, row: ModelRow, intent: GenerateIntent) -> _Encoded:
-    body: dict[str, object] = {}
-    native_reasoning = _reasoning_into(provider, row, intent, body)
+    reasoning = _reasoning_fragment(row, intent)
+    body: dict[str, object] = dict(reasoning)
     match provider:
         case "moonshot" | "xai":
             body["max_completion_tokens"] = intent.max_output_tokens
@@ -221,8 +225,9 @@ def _encode(provider: _Served, row: ModelRow, intent: GenerateIntent) -> _Encode
             assert_never(intent.output)
     if provider == "openrouter":
         body["provider"] = _routing_pins(row)
+    owned = _OWNED_KEYS | reasoning.keys()
     for key in intent.provider_options:
-        if key in _OWNED_KEYS:
+        if key in owned:
             raise InvalidRequest(
                 message=f"provider_options key {key!r} collides with a core field "
                 f"the openai_chat engine maps itself"
@@ -231,13 +236,16 @@ def _encode(provider: _Served, row: ModelRow, intent: GenerateIntent) -> _Encode
     return _Encoded(
         messages=_encode_messages(provider, row, intent),
         body=body,
-        native_reasoning=native_reasoning,
+        native_reasoning=_native_reasoning(reasoning),
     )
 
 
-def _reasoning_into(
-    provider: _Served, row: ModelRow, intent: GenerateIntent, body: dict[str, object]
-) -> Presence[str]:
+def _reasoning_fragment(row: ModelRow, intent: GenerateIntent) -> Mapping[str, object]:
+    """The row's self-describing request fragment for the requested level.
+
+    The engine knows no provider reasoning shapes: whatever mapping the row
+    supplies is merged verbatim into the request body.
+    """
     match row.reasoning:
         case Absent():
             if intent.reasoning != "none":
@@ -245,50 +253,26 @@ def _reasoning_into(
                     message=f"row {row.ref!r} has no reasoning knob; "
                     f"level {intent.reasoning!r} is not expressible"
                 )
-            return Absent()
+            return {}
         case Present(value=levels):
             if intent.reasoning not in levels:
                 raise InvalidRequest(
                     message=f"reasoning level {intent.reasoning!r} is outside the levels "
                     f"row {row.ref!r} supports"
                 )
-            native = levels[intent.reasoning]
+            fragment = _mapping_or_none(levels[intent.reasoning])
+            if fragment is None:
+                raise _registry_invalid(row, "reasoning values must be request-parameter mappings")
+            return fragment
         case _:
             assert_never(row.reasoning)
-    match provider:
-        case "deepseek":
-            # No effort knob: the row maps levels to wire params, merged verbatim.
-            params = _mapping_or_none(native)
-            if params is None:
-                raise _registry_invalid(row, "deepseek reasoning values must be param mappings")
-            body.update(params)
-            if not params:
-                return Absent()
-            return Present(
-                ",".join(f"{key}={_wire_literal(params[key])}" for key in sorted(params))
-            )
-        case "moonshot" | "xai":
-            effort = _str_or_none(native)
-            if effort is None:
-                raise _registry_invalid(row, "reasoning values must be effort strings")
-            body["reasoning_effort"] = effort
-            return Present(effort)
-        case "openrouter":
-            effort = _str_or_none(native)
-            if effort is None:
-                raise _registry_invalid(row, "reasoning values must be effort strings")
-            body["reasoning"] = {"effort": effort, "exclude": False}
-            return Present(effort)
-        case _:
-            assert_never(provider)
 
 
-def _wire_literal(value: object) -> str:
-    return (
-        value
-        if isinstance(value, str)
-        else json.dumps(value, sort_keys=True, separators=(",", ":"))
-    )
+def _native_reasoning(fragment: Mapping[str, object]) -> Presence[str]:
+    """Exactly what the reasoning knob put on the wire, compact and key-sorted."""
+    if not fragment:
+        return Absent()
+    return Present(json.dumps(dict(fragment), sort_keys=True, separators=(",", ":")))
 
 
 def _registry_invalid(row: ModelRow, detail: str) -> RuntimeDefect:
@@ -570,6 +554,7 @@ class _ToolCallAccumulator:
                     yield ToolCallDelta(call_id=slot.call_id, arguments_delta=fragment)
 
     def finish(self) -> tuple[_FinishedToolCall, ...] | InvalidToolArguments:
+        """Fold the accumulated slots. Pure — repeating it cannot erase calls."""
         finished: list[_FinishedToolCall] = []
         for index in sorted(self._slots):
             slot = self._slots[index]
@@ -591,7 +576,6 @@ class _ToolCallAccumulator:
                     },
                 )
             )
-        self._slots.clear()
         return tuple(finished)
 
 
@@ -831,18 +815,27 @@ def _transport_attempt(exc: openai.APIConnectionError) -> TransientAttempt:
     )
 
 
-def _inband_cause(body: object) -> TransientCause:
-    """OpenRouter in-band error chunks (HTTP stays 200): 429-shaped →
-    ProviderRateLimit; 5xx-shaped and unknown → ProviderHttpUnavailable."""
-    error = _mapping_or_none(body)
-    code = _int_or_none(error.get("code")) if error is not None else None
-    if code is None and error is not None:
-        raw = _str_or_none(error.get("code"))
-        if raw is not None and raw.isdigit():
-            code = int(raw)
+def _classify_inband_error(provider: _Served, error: object) -> TransientCause:
+    """Classify an in-band error object carried by an HTTP-200 body — the
+    OpenRouter shape for an upstream that failed after the gateway accepted
+    the request. 429-shaped → ProviderRateLimit; 5xx-shaped → transient;
+    anything else is no modeled failure of ours and raises."""
+    parsed = _mapping_or_none(error)
+    raw_code = parsed.get("code") if parsed is not None else None
+    code = _int_or_none(raw_code)
+    if code is None:
+        digits = _str_or_none(raw_code)
+        code = int(digits) if digits is not None and digits.isdigit() else None
     if code == 429:
         return ProviderRateLimit(retry_after=Absent())
-    return ProviderHttpUnavailable()
+    if code is not None and code >= 500:
+        return ProviderHttpUnavailable()
+    snippet = safe_provider_error_body_snippet({"error": dict(parsed)} if parsed else None)
+    raise ProtocolDefect(
+        code="inband_provider_error",
+        message=f"{provider} returned an unclassified in-band error on an HTTP 200 response"
+        + (f": {snippet}" if snippet else ""),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -969,12 +962,11 @@ class OpenAIChatEngine:
             raw_usage: Mapping[str, object] | None = None
 
             def interrupted(cause: TransientCause) -> TransientAttempt:
-                # Post-semantic-output ANY transient is terminal for the runtime;
-                # the leaf is rebuilt here because only the engine knows what it
-                # already yielded.
-                final = ProviderStreamInterrupted(partial_output=True) if semantic else cause
+                # What actually happened, on an open stream. Whether a
+                # post-semantic transient is retryable — and the leaf that
+                # then stands for it — is the runtime's call, not ours.
                 return TransientAttempt(
-                    cause=final,
+                    cause=cause,
                     status_code=Present(200),
                     provider_request_id=presence_of(request_id),
                     billability=PossiblyBillable(),
@@ -1032,7 +1024,10 @@ class OpenAIChatEngine:
                             details.extend(delta_details)  # verbatim, in sequence
 
                     chunk_finish = _str_or_none(choice.finish_reason)
-                    if chunk_finish is not None:
+                    # The FIRST terminal frame decides: a provider that repeats
+                    # finish_reason on a trailing frame must not re-fold the
+                    # accumulator or re-emit ToolCallDone.
+                    if chunk_finish is not None and finish_reason is None:
                         if chunk_finish == "error":
                             # Off-spec openrouter shape: transient by contract
                             # even without a top-level error object.
@@ -1055,7 +1050,7 @@ class OpenAIChatEngine:
             except openai.APIError as exc:
                 # In-band mid-stream error chunk (HTTP stays 200), surfaced by
                 # the SDK as a bare APIError carrying the error object.
-                raise interrupted(_inband_cause(exc.body)) from exc
+                raise interrupted(_classify_inband_error(provider, exc.body)) from exc
             except json.JSONDecodeError as exc:
                 raise ProtocolDefect(
                     code="malformed_json",
@@ -1095,8 +1090,13 @@ class OpenAIChatEngine:
                 )
                 return
             if finish_reason is None:
-                # The stream ended without a terminal frame — a cut, not a close.
-                raise interrupted(ProviderStreamInterrupted(partial_output=False))
+                # The stream ended without a terminal frame — a cut, not a
+                # close. The SDK consumes `[DONE]` invisibly and ends iteration
+                # the same way on byte exhaustion, so the old lane's `saw_done`
+                # guarantee does not survive renting the wire: a truncation
+                # after the finish frame but before a provider's trailing usage
+                # frame decodes as a clean close with incomplete usage.
+                raise interrupted(ProviderStreamInterrupted(partial_output=semantic))
             if model is None:
                 raise ProtocolDefect(
                     code="missing_model", message=f"{provider} stream carried no model field"
@@ -1173,6 +1173,16 @@ class OpenAIChatEngine:
             raise ProtocolDefect(
                 code="malformed_envelope",
                 message=f"{provider} 2xx response is not a chat.completion envelope",
+            )
+        inband = (completion.model_extra or {}).get("error")
+        if inband is not None:
+            # HTTP 200 carrying an error object: the upstream failed after the
+            # gateway accepted the request. Same classifier as the stream arm.
+            raise TransientAttempt(
+                cause=_classify_inband_error(provider, inband),
+                status_code=Present(200),
+                provider_request_id=presence_of(_str_or_none(completion.id) or None),
+                billability=PossiblyBillable(),
             )
         model = _str_or_none(completion.model)
         if not model:
