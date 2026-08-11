@@ -15,6 +15,8 @@ Rules:
   both shipped routes; a narrowed run certifies nothing;
 - ``LLM_RUNTIME_LIVE_CODEX_SDK_MODELS`` / ``LLM_RUNTIME_LIVE_CLAUDE_SDK_MODELS``
   optionally widen a route beyond the backend's default model;
+- ``LLM_RUNTIME_LIVE_CLAUDE_EXECUTABLE`` optionally pins the exact CLI binary under
+  test when ambient ``claude`` resolves to a dispatch wrapper;
 - every certified route writes one sanitized evidence file into
   ``tests/live/evidence/``.
 
@@ -141,6 +143,19 @@ def _route_models(route: LiveRoute) -> tuple[str | None, ...]:
     return models if models else (None,)
 
 
+def _claude_executable() -> str:
+    # Certification pins the exact CLI build under test. Ambient `claude` may be a
+    # dispatch wrapper (e.g. an account router) that cannot run under the scrubbed
+    # child environment; the override names the real binary.
+    raw = os.environ.get("LLM_RUNTIME_LIVE_CLAUDE_EXECUTABLE")
+    if raw is None:
+        return "claude"
+    path = Path(raw)
+    if not path.is_absolute() or not path.is_file() or not os.access(path, os.X_OK):
+        _fail("LLM_RUNTIME_LIVE_CLAUDE_EXECUTABLE must be an absolute executable path")
+    return raw
+
+
 def _grammar_evidence(events: list[AgentEvent]) -> dict[str, object]:
     terminals = [event for event in events if isinstance(event, AgentTerminal)]
     assert len(terminals) == 1, (
@@ -172,7 +187,9 @@ def _grammar_evidence(events: list[AgentEvent]) -> dict[str, object]:
 
 
 async def _certify_route(route: LiveRoute, model: str | None) -> dict[str, object]:
-    config = AgentRuntimeConfig(state_root_base=_state_root_base())
+    config = AgentRuntimeConfig(
+        state_root_base=_state_root_base(), claude_executable=_claude_executable()
+    )
     auth = CredentialRef(kind="local_account", profile_key=_profile())
     workspace = _state_root_base() / "live-workspace"
     workspace.mkdir(mode=0o700, exist_ok=True)
