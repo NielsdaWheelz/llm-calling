@@ -28,6 +28,7 @@ from provider_runtime.agent_runtime import (
     AgentText,
     AgentToolUse,
     AgentUsage,
+    CodexNativeOptions,
     CredentialRef,
     ForkSession,
     JsonSchemaAgentOutput,
@@ -79,6 +80,7 @@ class FakeLocalImageInput:
 @dataclass(slots=True)
 class FakeConfig:
     codex_bin: str | None = None
+    config_overrides: tuple[str, ...] = ()
     cwd: str | None = None
     env: dict[str, str] | None = None
     client_name: str = ""
@@ -602,6 +604,111 @@ async def test_open_session_points_the_sdk_at_the_owned_launcher(
     for name in config.env:
         assert f"'{name}'" in source, f"launcher must embed the child environment name {name}"
     assert config.env["CODEX_HOME"].endswith("codex/personal")
+
+
+async def test_disabled_builtin_tools_emit_the_complete_certified_codex_policy(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    async with runtime(tmp_path) as selected:
+        await selected.open_session(
+            request(
+                tmp_path,
+                native=CodexNativeOptions(web_search=False, builtin_tools="disabled"),
+            )
+        )
+
+    config = cast(FakeConfig, sdk_state(installed_codex_sdk)["clients"][0].config)
+    assert config.config_overrides == ('forced_login_method="chatgpt"',)
+    assert start_call(installed_codex_sdk)["config"] == {
+        "apps": {"_default": {"enabled": False}},
+        "features": {
+            "apply_patch_streaming_events": False,
+            "apps": False,
+            "artifact": False,
+            "auth_elicitation": False,
+            "browser_use": False,
+            "browser_use_external": False,
+            "browser_use_full_cdp_access": False,
+            "code_mode": False,
+            "code_mode_host": False,
+            "code_mode_only": False,
+            "computer_use": False,
+            "chronicle": False,
+            "current_time_reminder": False,
+            "default_mode_request_user_input": False,
+            "deferred_executor": False,
+            "enable_fanout": False,
+            "enable_mcp_apps": False,
+            "exec_permission_approvals": False,
+            "goals": False,
+            "guardian_approval": False,
+            "hooks": False,
+            "image_generation": False,
+            "in_app_browser": False,
+            "memories": False,
+            "mentions_v2": False,
+            "multi_agent": False,
+            "multi_agent_v2": False,
+            "non_prefixed_mcp_tool_names": False,
+            "plugins": False,
+            "plugin_sharing": False,
+            "remote_plugin": False,
+            "request_permissions_tool": False,
+            "rollout_budget": False,
+            "shell_snapshot": False,
+            "shell_tool": False,
+            "shell_zsh_fork": False,
+            "skill_mcp_dependency_install": False,
+            "standalone_web_search": False,
+            "terminal_visualization_instructions": False,
+            "token_budget": False,
+            "tool_call_mcp_elicitation": False,
+            "tool_suggest": False,
+            "unified_exec": False,
+            "unified_exec_zsh_fork": False,
+            "web_search_cached": False,
+            "web_search_request": False,
+            "workspace_dependencies": False,
+        },
+        "include_apps_instructions": False,
+        "include_collaboration_mode_instructions": False,
+        "include_environment_context": False,
+        "include_permissions_instructions": False,
+        "mcp_servers": {},
+        "shell_environment_policy": {"exclude": [], "inherit": "core"},
+        "skills": {"bundled": {"enabled": False}, "include_instructions": False},
+        "tools": {"experimental_request_user_input": {"enabled": False}},
+        "web_search": "disabled",
+    }
+
+
+@pytest.mark.parametrize(
+    ("sdk_version", "runtime_version", "server_version"),
+    (
+        ("0.145.0", "0.145.0", "0.145.0 (linux; x86_64)"),
+        ("0.144.4", "0.145.0", "0.145.0 (linux; x86_64)"),
+        ("0.144.4", "0.144.4", "0.145.0 (linux; x86_64)"),
+    ),
+)
+async def test_disabled_builtin_tools_reject_uncertified_runtime_versions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sdk_version: str,
+    runtime_version: str,
+    server_version: str,
+) -> None:
+    module = fake_sdk(version=sdk_version, server_version=server_version)
+    install_codex_modules(monkeypatch, module, fake_runtime_package(version=runtime_version))
+
+    with pytest.raises(UnsupportedCapability, match="builtin tool policy"):
+        async with runtime(tmp_path) as selected:
+            await selected.open_session(
+                request(tmp_path, native=CodexNativeOptions(builtin_tools="disabled"))
+            )
+
+    assert all(client.closed for client in sdk_state(module)["clients"]), (
+        "a client opened before server-version rejection must still be closed"
+    )
 
 
 async def test_api_key_session_auth_is_rejected_before_any_client_starts(

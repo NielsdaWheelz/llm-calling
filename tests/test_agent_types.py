@@ -176,7 +176,7 @@ def test_file_content_and_turn_limits_reject_invalid_local_values() -> None:
 
 
 def test_native_options_are_typed_preserved_and_backend_paired() -> None:
-    native = CodexNativeOptions(web_search=False)
+    native = CodexNativeOptions(web_search=False, builtin_tools="disabled")
     request = AgentSessionRequest(
         backend="codex",
         transport="sdk",
@@ -200,6 +200,10 @@ def test_native_options_are_typed_preserved_and_backend_paired() -> None:
         )
     with pytest.raises(TypeError):
         CodexNativeOptions(untyped_option=True)  # type: ignore[call-arg]
+    with pytest.raises(InvalidAgentRequest, match="builtin_tools"):
+        CodexNativeOptions(builtin_tools="enabled")  # type: ignore[arg-type]
+    with pytest.raises(InvalidAgentRequest, match="forbids web search"):
+        CodexNativeOptions(web_search=True, builtin_tools="disabled")
     with pytest.raises(InvalidAgentRequest, match="unrestricted network"):
         AgentSessionRequest(
             backend="codex",

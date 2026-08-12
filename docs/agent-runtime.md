@@ -317,6 +317,14 @@ Native extension objects are versioned, backend-specific escape hatches:
 
 - `CodexNativeOptions(web_search=...)` is session-scoped and requires
   unrestricted network when enabled;
+- `CodexNativeOptions(builtin_tools="disabled")` disables the execution,
+  integration, and local-context feature set certified for the pinned Codex
+  runtime. It also suppresses app, skill, environment, permission, and collaboration
+  instructions plus request-user-input.
+  Codex 0.144.4 has no per-thread switch for its always-registered planning,
+  `apply_patch`, or `view_image` tools, so callers needing a strict text-only
+  contract must additionally reject every native tool event and run Codex in an
+  empty, read-only sandbox;
 - `ClaudeNativeOptions(include_partial_messages=...)` is session-scoped.
 
 Unknown or wrong-backend native options fail before SDK startup.
