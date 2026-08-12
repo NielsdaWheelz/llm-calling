@@ -214,6 +214,7 @@ def _encode(provider: _Served, row: ModelRow, intent: GenerateIntent) -> _Encode
                 )
         else:
             body["tool_choice"] = intent.tool_choice
+    messages = _encode_messages(provider, row, intent)
     match intent.output:
         case TextOutput():
             pass
@@ -230,8 +231,13 @@ def _encode(provider: _Served, row: ModelRow, intent: GenerateIntent) -> _Encode
                     }
                 case "json_mode":
                     # json_mode rows constrain to a JSON object; the caller's
-                    # schema is enforced by validation (json_out), not the wire.
+                    # schema is enforced by validation (json_out). Compile the
+                    # typed output contract into a protocol instruction too:
+                    # JSON-mode providers do not receive the schema on the
+                    # wire, and some reject response_format unless the prompt
+                    # explicitly asks for JSON.
                     body["response_format"] = {"type": "json_object"}
+                    _insert_json_mode_instruction(messages, output)
                 case _:
                     assert_never(row.structured)
         case _:
@@ -247,7 +253,7 @@ def _encode(provider: _Served, row: ModelRow, intent: GenerateIntent) -> _Encode
             )
     body.update(intent.provider_options)
     return _Encoded(
-        messages=_encode_messages(provider, row, intent),
+        messages=messages,
         body=body,
         native_reasoning=reasoning.native_reasoning,
     )
@@ -280,6 +286,29 @@ def _tool_definition(tool: CanonicalTool) -> dict[str, object]:
             "parameters": dict(tool.parameters),
         },
     }
+
+
+def _insert_json_mode_instruction(
+    messages: list[dict[str, object]], output: StrictJsonOutput
+) -> None:
+    """Place the protocol instruction after application system messages."""
+    index = 0
+    while index < len(messages) and messages[index].get("role") == "system":
+        index += 1
+    name = json.dumps(output.name, ensure_ascii=False)
+    schema = json.dumps(
+        dict(output.schema), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    messages.insert(
+        index,
+        {
+            "role": "system",
+            "content": (
+                f"Return only one JSON object for output {name} that matches this JSON Schema "
+                f"exactly: {schema}"
+            ),
+        },
+    )
 
 
 def _encode_messages(

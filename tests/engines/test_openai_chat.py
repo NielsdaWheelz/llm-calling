@@ -505,6 +505,43 @@ async def test_json_mode_row_sends_json_object_response_format(engine: OpenAICha
 
 
 @respx.mock
+async def test_json_mode_compiles_the_schema_into_a_protocol_system_message(
+    engine: OpenAIChatEngine,
+) -> None:
+    route = mock_completion(
+        DEEPSEEK_ROW,
+        completion_body(
+            model="deepseek-reasoner", message={"role": "assistant", "content": '{"answer":"x"}'}
+        ),
+    )
+    await engine.generate(
+        DEEPSEEK_ROW,
+        intent_for(
+            DEEPSEEK_ROW,
+            messages=(
+                SystemMessage((PromptBlock("Follow the application rules."),)),
+                UserMessage((PromptBlock("Return the requested object."),)),
+            ),
+            output=StrictJsonOutput("answer", ANSWER_SCHEMA),
+        ),
+        credential_for(DEEPSEEK_ROW),
+    )
+
+    messages = last_request_json(route)["messages"]
+    assert isinstance(messages, list), f"messages: {messages!r}"
+    assert messages[0] == {"role": "system", "content": "Follow the application rules."}
+    assert messages[2] == {"role": "user", "content": "Return the requested object."}
+    assert messages[1] == {
+        "role": "system",
+        "content": (
+            'Return only one JSON object for output "answer" that matches this JSON Schema '
+            'exactly: {"additionalProperties":false,"properties":{"answer":{"type":"string"}},'
+            '"required":["answer"],"type":"object"}'
+        ),
+    }
+
+
+@respx.mock
 async def test_openrouter_request_sends_pins_reasoning_and_max_tokens(
     engine: OpenAIChatEngine,
 ) -> None:
