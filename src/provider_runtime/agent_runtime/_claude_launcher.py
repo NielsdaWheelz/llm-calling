@@ -34,7 +34,7 @@ from .errors import ExecutableUnavailable, ProtocolDefect, SdkUnavailable
 _LAUNCHER_LABEL = "Claude Code launcher"
 _GROUP_POLL_SECONDS = 0.02
 _LAUNCHER_PREFIX = "claude-launcher-"
-_LAUNCHER_SOURCE = '''#!{shebang}
+_LAUNCHER_SOURCE = '''{preamble}
 """Give this process its own session, then become the real Claude Code executable.
 
 Written by provider_runtime.agent_runtime; see _claude_launcher.py. `execv` keeps the pid,
