@@ -18,7 +18,7 @@ from .errors import AgentRuntimeDefect, ExecutableUnavailable
 
 _LAUNCHER_LABEL = "Codex launcher"
 _LAUNCHER_PREFIX = "codex-launcher-"
-_LAUNCHER_SOURCE = '''#!{shebang}
+_LAUNCHER_SOURCE = '''{preamble}
 """Supervise the matched Codex runtime with a replaced environment.
 
 Written by provider_runtime.agent_runtime; see _codex_launcher.py. The official SDK owns
