@@ -63,6 +63,20 @@ output on openai/anthropic/gemini/xai, JSON mode plus validation on
 deepseek/moonshot and the pinned OpenRouter row. A validation miss returns
 `Failed(InvalidStructuredOutput)` with full `CallMeta` — no repair, no retry.
 
+### Portable tools
+
+Install `provider-runtime[llm-tools]` for the optional portable-tool adapter.
+For each model request, pass its frozen plan and persisted revealed-target set
+in `ToolPublication`, call `provider_runtime.tool_adapter.lower_tools`, then
+use the returned request-scoped object's `decode_tool_call` for every provider
+tool call. Canonical dotted ids remain application identity;
+double-underscore aliases exist only on that provider request. Native and
+Discoverable plans publish tools; HostTable plans never do. Where an engine
+observes raw arguments, its ingress owns non-UTF-8 and transport-size rejection
+before constructing a `ToolCall`; an SDK that exposes only parsed JSON cannot
+attest raw transport bytes. The adapter separately enforces valid bounded JSON
+and the selected grant's canonical `ParsedJson` input-byte ceiling.
+
 ## Architecture
 
 ```
@@ -79,6 +93,7 @@ runtime.py     ProviderRuntime: dispatch, intent gates, retry loop, stream
 engines/       the four protocol adapters (Engine protocol; one attempt each)
 embeddings.py  OpenAI-only embedding port on the openai SDK
 testing.py     FakeEngine + ScriptedRuntime test doubles
+tool_adapter.py request-scoped llm-tools lowering and canonical name decode
 agent_runtime/ agent lane: typed session requests, security kernel, auth
                isolation, event normalization, both official SDK adapters
 ```
