@@ -525,10 +525,19 @@ def validate_mcp_network_policy(
 @dataclass(frozen=True, slots=True)
 class CodexNativeOptions:
     web_search: bool | None = None
+    builtin_tools: Literal["disabled"] | None = None
 
     def __post_init__(self) -> None:
         if self.web_search is not None and type(self.web_search) is not bool:
             raise InvalidAgentRequest("CodexNativeOptions.web_search must be bool when present")
+        if self.builtin_tools not in (None, "disabled"):
+            raise InvalidAgentRequest(
+                "CodexNativeOptions.builtin_tools must be 'disabled' when present"
+            )
+        if self.builtin_tools == "disabled" and self.web_search is True:
+            raise InvalidAgentRequest(
+                "CodexNativeOptions.builtin_tools='disabled' forbids web search"
+            )
 
 
 @dataclass(frozen=True, slots=True)

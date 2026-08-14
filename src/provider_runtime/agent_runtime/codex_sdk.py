@@ -112,6 +112,59 @@ _RUNTIME_VERSION_PREFIX = re.compile(
 )
 _REQUIRED_MCP_STARTUP_FAILURE = "required MCP servers failed to initialize"
 
+# The configurable execution, integration, and local-context features in the
+# certified Codex 0.144.4 runtime. Keep this as one closed vendor mapping behind
+# `CodexNativeOptions.builtin_tools`; callers must not depend on Codex feature names.
+_DISABLED_BUILTIN_FEATURES = (
+    "apply_patch_streaming_events",
+    "apps",
+    "artifact",
+    "auth_elicitation",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "code_mode",
+    "code_mode_host",
+    "code_mode_only",
+    "computer_use",
+    "chronicle",
+    "current_time_reminder",
+    "default_mode_request_user_input",
+    "deferred_executor",
+    "enable_fanout",
+    "enable_mcp_apps",
+    "exec_permission_approvals",
+    "goals",
+    "guardian_approval",
+    "hooks",
+    "image_generation",
+    "in_app_browser",
+    "memories",
+    "mentions_v2",
+    "multi_agent",
+    "multi_agent_v2",
+    "non_prefixed_mcp_tool_names",
+    "plugins",
+    "plugin_sharing",
+    "remote_plugin",
+    "request_permissions_tool",
+    "rollout_budget",
+    "shell_snapshot",
+    "shell_tool",
+    "shell_zsh_fork",
+    "skill_mcp_dependency_install",
+    "standalone_web_search",
+    "terminal_visualization_instructions",
+    "token_budget",
+    "tool_call_mcp_elicitation",
+    "tool_suggest",
+    "unified_exec",
+    "unified_exec_zsh_fork",
+    "web_search_cached",
+    "web_search_request",
+    "workspace_dependencies",
+)
+
 _TURN_SCOPED_METHODS = frozenset(
     {
         "error",
@@ -271,7 +324,13 @@ class CodexSdkAdapter:
                     "Codex workspace_write requires bubblewrap network namespaces on this host"
                 )
 
-        sdk, client = await self._open_client(cwd=request.cwd, environment=environment)
+        native = request.native
+        sdk, client = await self._open_client(
+            cwd=request.cwd,
+            environment=environment,
+            require_certified_builtin_policy=isinstance(native, CodexNativeOptions)
+            and native.builtin_tools == "disabled",
+        )
         try:
             await self._verify_auth(client)
             kwargs: dict[str, object] = {
@@ -477,10 +536,18 @@ class CodexSdkAdapter:
             )
 
     async def _open_client(
-        self, *, cwd: str | None, environment: Mapping[str, str]
+        self,
+        *,
+        cwd: str | None,
+        environment: Mapping[str, str],
+        require_certified_builtin_policy: bool = False,
     ) -> tuple[ModuleType, Any]:
         sdk = self._load_sdk()
         sdk_version = self._sdk_version(sdk)
+        if require_certified_builtin_policy and sdk_version != _CERTIFIED_SDK_VERSION:
+            raise UnsupportedCapability(
+                "Codex builtin tool policy is not certified for this SDK version"
+            )
         if sdk_version != _CERTIFIED_SDK_VERSION:
             warnings.warn(
                 f"Codex SDK {sdk_version} differs from the certified "
@@ -490,6 +557,10 @@ class CodexSdkAdapter:
             )
         runtime = self._load_runtime_package()
         runtime_version = self._runtime_version(runtime)
+        if require_certified_builtin_policy and runtime_version != _CERTIFIED_SDK_VERSION:
+            raise UnsupportedCapability(
+                "Codex builtin tool policy is not certified for this bundled runtime version"
+            )
         if runtime_version != sdk_version:
             warnings.warn(
                 f"Codex bundled runtime {runtime_version} differs from SDK "
@@ -497,6 +568,7 @@ class CodexSdkAdapter:
                 RuntimeWarning,
                 stacklevel=2,
             )
+        client: Any = None
         try:
             child_environment = dict(environment)
             bundled_path_dir = runtime.bundled_path_dir()
@@ -519,6 +591,7 @@ class CodexSdkAdapter:
             )
             config = sdk.CodexConfig(
                 codex_bin=str(launcher),
+                config_overrides=('forced_login_method="chatgpt"',),
                 cwd=cwd,
                 env=child_environment,
                 client_name="provider_runtime",
@@ -529,6 +602,10 @@ class CodexSdkAdapter:
             async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
                 await client.__aenter__()
             executable_version = self._executable_version(client)
+            if require_certified_builtin_policy and executable_version != _CERTIFIED_SDK_VERSION:
+                raise UnsupportedCapability(
+                    "Codex builtin tool policy is not certified for this executable version"
+                )
             if executable_version != runtime_version:
                 warnings.warn(
                     f"Codex server reported version {executable_version}, the bundled "
@@ -536,11 +613,21 @@ class CodexSdkAdapter:
                     RuntimeWarning,
                     stacklevel=2,
                 )
+        except UnsupportedCapability:
+            if client is not None:
+                await client.close()
+            raise
         except TimeoutError:
+            if client is not None:
+                await client.close()
             raise ExecutableUnavailable("Codex SDK initialization timed out") from None
         except CredentialUnavailable:
+            if client is not None:
+                await client.close()
             raise
         except Exception as error:
+            if client is not None:
+                await client.close()
             raise ExecutableUnavailable(
                 f"Codex SDK initialization failed: {sanitize_provider_text(str(error))}"
             ) from None
@@ -1163,6 +1250,22 @@ class CodexSdkAdapter:
         native = request.native
         if isinstance(native, CodexNativeOptions) and native.web_search is not None:
             config["web_search"] = "live" if native.web_search else "disabled"
+        if isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled":
+            config.update(
+                {
+                    "apps": {"_default": {"enabled": False}},
+                    "features": {name: False for name in _DISABLED_BUILTIN_FEATURES},
+                    "include_apps_instructions": False,
+                    "include_collaboration_mode_instructions": False,
+                    "include_environment_context": False,
+                    "include_permissions_instructions": False,
+                    "skills": {
+                        "bundled": {"enabled": False},
+                        "include_instructions": False,
+                    },
+                    "tools": {"experimental_request_user_input": {"enabled": False}},
+                }
+            )
         if request.policy.filesystem == "workspace_write":
             config["sandbox_workspace_write"] = {
                 "writable_roots": [request.cwd, *request.additional_dirs],
