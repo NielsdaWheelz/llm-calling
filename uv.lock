@@ -606,7 +606,7 @@ wheels = [
 [[package]]
 name = "llm-tools"
 version = "0.1.0"
-source = { git = "https://github.com/NielsdaWheelz/llm-tools.git?rev=a24e00045a0cea4e8e0f29b0fa0fefea7cdfa6a5#a24e00045a0cea4e8e0f29b0fa0fefea7cdfa6a5" }
+source = { git = "https://github.com/NielsdaWheelz/llm-tools.git?rev=8df458a199703120005296ae12f997b39d208fed#8df458a199703120005296ae12f997b39d208fed" }
 dependencies = [
     { name = "httpx" },
     { name = "pydantic" },
@@ -917,7 +917,7 @@ requires-dist = [
     { name = "claude-agent-sdk", marker = "extra == 'claude-sdk'", specifier = ">=0.2.130,<1" },
     { name = "google-genai", specifier = ">=1.38,<2" },
     { name = "httpx", specifier = ">=0.28.0" },
-    { name = "llm-tools", marker = "extra == 'llm-tools'", git = "https://github.com/NielsdaWheelz/llm-tools.git?rev=a24e00045a0cea4e8e0f29b0fa0fefea7cdfa6a5" },
+    { name = "llm-tools", marker = "extra == 'llm-tools'", git = "https://github.com/NielsdaWheelz/llm-tools.git?rev=8df458a199703120005296ae12f997b39d208fed" },
     { name = "openai", specifier = ">=2.0,<3" },
     { name = "openai-codex", marker = "extra == 'agent-sdks'", specifier = ">=0.144.4,<1" },
     { name = "openai-codex", marker = "extra == 'codex-sdk'", specifier = ">=0.144.4,<1" },
