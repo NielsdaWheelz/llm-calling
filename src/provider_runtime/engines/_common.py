@@ -24,7 +24,7 @@ from typing import Any, assert_never
 import httpx
 
 from provider_runtime.errors import InvalidRequest, RuntimeDefect
-from provider_runtime.registry import ModelRow
+from provider_runtime.registry import _ModelRow as ModelRow
 from provider_runtime.types import (
     Absent,
     ContinuationArtifact,

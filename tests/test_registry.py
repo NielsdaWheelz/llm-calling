@@ -9,17 +9,27 @@ import pytest
 
 from provider_runtime.errors import InvalidRequest, RuntimeDefect
 from provider_runtime.registry import (
+    _ROWS as ROWS,
+)
+from provider_runtime.registry import (
     REGISTRY_REVISION,
-    ROWS,
-    EngineId,
-    ModelRow,
-    OpenRouterRouting,
     _validate_rows,
-    resolve,
-    resolve_target,
+)
+from provider_runtime.registry import (
+    _ModelRow as ModelRow,
+)
+from provider_runtime.registry import (
+    _OpenRouterRouting as OpenRouterRouting,
+)
+from provider_runtime.registry import (
+    _resolve as resolve,
+)
+from provider_runtime.registry import (
+    _resolve_target as resolve_target,
 )
 from provider_runtime.types import (
     Absent,
+    EngineId,
     Presence,
     Present,
     ProviderName,
@@ -58,6 +68,9 @@ def _row(
         streaming=True,
         structured="native",
         reasoning=reasoning,
+        source_default_reasoning=Absent(),
+        upgrade=Absent(),
+        retirement=Absent(),
         continuation_codec=continuation_codec or f"{provider}.v1",
         correlation="header",
         routing=routing,

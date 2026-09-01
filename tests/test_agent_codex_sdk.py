@@ -11,6 +11,7 @@ import sys
 import traceback
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
@@ -29,6 +30,7 @@ from provider_runtime.agent_runtime import (
     AgentToolUse,
     AgentUsage,
     CodexNativeOptions,
+    CodexSandboxControls,
     CredentialRef,
     ForkSession,
     JsonSchemaAgentOutput,
@@ -36,7 +38,6 @@ from provider_runtime.agent_runtime import (
     NewSession,
     PermissionPolicy,
     PermissionPolicyPatch,
-    ReasoningSpec,
     ResumeSession,
     SessionMetadata,
     SessionQuery,
@@ -57,6 +58,13 @@ from provider_runtime.agent_runtime.errors import (
     SessionUnavailable,
     UnsupportedCapability,
 )
+from provider_runtime.agent_runtime.model_catalog import (
+    AGENT_BACKEND_CONTRACT_REVISION,
+    AgentModelCatalog,
+    AgentModelFacts,
+    AgentReasoningFacts,
+)
+from provider_runtime.agent_runtime.types import _ResolvedCodexSessionRequest
 from provider_runtime.types import Absent, Present, TokenUsage
 
 ANSWER_SCHEMA: dict[str, object] = {
@@ -481,25 +489,64 @@ def auth() -> CredentialRef:
 
 
 def request(tmp_path: Path, **changes: object) -> AgentSessionRequest:
-    value = AgentSessionRequest(
-        backend="codex",
-        transport="sdk",
+    value = _ResolvedCodexSessionRequest(
         auth=auth(),
         open=NewSession(),
         cwd=str(tmp_path.resolve()),
         policy=PermissionPolicy(allowed_tools=("*",)),
-        model="native-model",
+        model_key="codex-test",
+        reasoning="high",
+        agent_definition_revision="agent-definition-test",
+        row_fingerprint="f" * 64,
+        dispatch_model="native-model",
+        native_reasoning="high",
     )
     return replace(value, **changes)
 
 
-def runtime(tmp_path: Path) -> AgentRuntime:
+def catalog() -> AgentModelCatalog:
+    return AgentModelCatalog(
+        backend_contract_revision=AGENT_BACKEND_CONTRACT_REVISION,
+        definition_revision="agent-definition-test",
+        native_revision=Absent(),
+        observed_at=datetime(2026, 8, 31, tzinfo=UTC),
+        models=(
+            AgentModelFacts(
+                key="codex-test",
+                dispatch_model="native-model",
+                label="Codex Test",
+                source_context_window=Absent(),
+                source_max_output_tokens=Absent(),
+                input_modalities=("text", "image"),
+                reasoning=(
+                    AgentReasoningFacts(key="high", label="High", native_wire_value="high"),
+                    AgentReasoningFacts(key="low", label="Low", native_wire_value="low"),
+                ),
+                source_default_reasoning=Present("high"),
+                upgrade=Absent(),
+                retirement=Absent(),
+                row_fingerprint="f" * 64,
+            ),
+        ),
+        diagnostics=(),
+    )
+
+
+class CatalogCodexSdkAdapter(CodexSdkAdapter):
+    async def model_catalog(self, *, environment: Mapping[str, str]) -> AgentModelCatalog:
+        del environment
+        return catalog()
+
+
+def runtime(
+    tmp_path: Path, *, sandbox_controls: CodexSandboxControls | None = None
+) -> AgentRuntime:
     state = tmp_path / "state"
     state.mkdir(mode=0o700, exist_ok=True)
     # The Claude adapter is a separate lane; the Codex tests register only their own route.
     return AgentRuntime(
-        AgentRuntimeConfig(state_root_base=state),
-        adapters=(CodexSdkAdapter(),),
+        AgentRuntimeConfig(state_root_base=state, codex_sandbox=sandbox_controls),
+        adapters=(CatalogCodexSdkAdapter(sandbox_controls=sandbox_controls),),
     )
 
 
@@ -872,6 +919,53 @@ async def test_workspace_write_probes_bubblewrap_and_maps_the_sandbox_network_to
     }
 
 
+async def test_typed_tmpdir_and_workspace_write_controls_reach_every_open_path(
+    tmp_path: Path,
+    installed_codex_sdk: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def available(*, cwd: Path, environment: Mapping[str, str]) -> bool:
+        return True
+
+    monkeypatch.setattr(codex_sdk_module, "bubblewrap_network_namespace_available", available)
+    child_tmpdir = tmp_path / "child-tmp"
+    child_tmpdir.mkdir(mode=0o700)
+    controls = CodexSandboxControls(
+        child_tmpdir=str(child_tmpdir.resolve()),
+        exclude_slash_tmp=True,
+        exclude_tmpdir_env_var=False,
+    )
+    policy = PermissionPolicy(filesystem="workspace_write", allowed_tools=("*",))
+
+    async with runtime(tmp_path, sandbox_controls=controls) as selected:
+        started = await selected.open_session(request(tmp_path, policy=policy))
+        resumed = await selected.open_session(
+            request(tmp_path, policy=policy, open=ResumeSession(started.ref))
+        )
+        forked = await selected.open_session(
+            request(tmp_path, policy=policy, open=ForkSession(started.ref))
+        )
+
+    assert resumed.ref == started.ref
+    assert forked.ref.native_session_id != started.ref.native_session_id
+    calls = [
+        payload
+        for name, payload in sdk_state(installed_codex_sdk)["calls"]
+        if name in ("start", "resume", "fork")
+    ]
+    assert len(calls) == 3
+    for call in calls:
+        assert call["config"]["sandbox_workspace_write"] == {
+            "writable_roots": [str(tmp_path.resolve())],
+            "network_access": False,
+            "exclude_slash_tmp": True,
+            "exclude_tmpdir_env_var": False,
+        }
+    clients = sdk_state(installed_codex_sdk)["clients"]
+    assert len(clients) == 3
+    assert all(client.config.env["TMPDIR"] == str(child_tmpdir.resolve()) for client in clients)
+
+
 async def test_sdk_version_drift_warns_and_the_client_still_opens(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1020,7 +1114,7 @@ async def test_structured_output_passes_the_plain_schema_through_natively(
     output = JsonSchemaAgentOutput(name="answer", schema=ANSWER_SCHEMA)
     async with runtime(tmp_path) as selected:
         session = await selected.open_session(
-            request(tmp_path, output=output, reasoning=ReasoningSpec(effort="low"))
+            request(tmp_path, output=output, reasoning="low", native_reasoning="low")
         )
         result = await selected.run_turn(session, turn("plain"))
 

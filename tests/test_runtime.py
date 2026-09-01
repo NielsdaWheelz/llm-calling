@@ -48,7 +48,8 @@ from provider_runtime.errors import (
     ProtocolDefect,
 )
 from provider_runtime.prices import estimate_cost
-from provider_runtime.registry import REGISTRY_REVISION, ModelRow
+from provider_runtime.registry import REGISTRY_REVISION
+from provider_runtime.registry import _ModelRow as ModelRow
 from provider_runtime.runtime import Credentials, ProviderRuntime
 from provider_runtime.types import (
     Absent,
@@ -123,7 +124,7 @@ CREDENTIALS = Credentials(openai="sk-openai-test-key-000", deepseek="sk-deepseek
 # fixture cannot invent field values the registry's own invariants would
 # reject. Drop this if a real capability-poor row ever lands.
 LIMITED_ROW = replace(
-    registry.resolve("openai:gpt-5.6-sol"),
+    registry._resolve("openai:gpt-5.6-sol"),
     ref="openai:limited",
     model_id="gpt-limited",
     tools=False,
@@ -492,7 +493,7 @@ async def test_generate_image_block_to_text_only_row_raises_invalid_request() ->
 async def test_generate_tools_on_toolless_row_raises_invalid_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(registry, "ROWS", (*registry.ROWS, LIMITED_ROW))
+    monkeypatch.setattr(registry, "_ROWS", (*registry._ROWS, LIMITED_ROW))
     engine = FakeEngine()
     tool = CanonicalTool(name="lookup", description="", parameters={"type": "object"})
     with pytest.raises(InvalidRequest):
@@ -721,7 +722,7 @@ async def test_stream_bare_engine_exhaustion_is_a_protocol_defect() -> None:
 async def test_stream_on_non_streaming_row_raises_invalid_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(registry, "ROWS", (*registry.ROWS, LIMITED_ROW))
+    monkeypatch.setattr(registry, "_ROWS", (*registry._ROWS, LIMITED_ROW))
     engine = FakeEngine()
     with pytest.raises(InvalidRequest):
         make_runtime(engine).stream(
@@ -903,7 +904,7 @@ async def test_chat_builds_intent_from_row_defaults() -> None:
         ),
         # The contract is "no explicit cap → the resolved row's cap", not the
         # figure the row happens to carry today.
-        max_output_tokens=registry.resolve("openai:gpt-5.6-sol").max_output_tokens,
+        max_output_tokens=registry._resolve("openai:gpt-5.6-sol").max_output_tokens,
         reasoning="high",
         tools=(),
         tool_choice="auto",

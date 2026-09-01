@@ -43,6 +43,7 @@ from .events import (
     AgentUsage,
     validate_event_stream,
 )
+from .model_catalog import AgentModelCatalog
 from .policy import PermissionPolicy, narrow_policy
 from .sessions import (
     AgentSession,
@@ -61,6 +62,9 @@ from .types import (
     AgentTransport,
     ApprovalHandler,
     Backend,
+    ClaudeNativeSessionRequest,
+    CodexCatalogSessionRequest,
+    CodexSandboxControls,
     ContentPart,
     CredentialRef,
     FileContent,
@@ -70,6 +74,7 @@ from .types import (
     ResumeSession,
     TextContent,
     TurnRequest,
+    _ResolvedCodexSessionRequest,
     validate_mcp_network_policy,
 )
 
@@ -90,6 +95,7 @@ class AgentRuntimeConfig:
     state_root_base: Path
     claude_executable: str = "claude"
     max_turn_seconds: float = 3_600.0
+    codex_sandbox: CodexSandboxControls | None = None
     secret_resolver: SecretResolver | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -118,6 +124,10 @@ class AgentRuntimeConfig:
             raise InvalidAgentRequest("max_turn_seconds must be positive and finite")
         if self.secret_resolver is not None and not callable(self.secret_resolver):
             raise InvalidAgentRequest("secret_resolver must be callable when configured")
+        if self.codex_sandbox is not None and not isinstance(
+            self.codex_sandbox, CodexSandboxControls
+        ):
+            raise InvalidAgentRequest("codex_sandbox must be CodexSandboxControls when configured")
 
 
 class AgentAdapter(Protocol):
@@ -133,6 +143,8 @@ class AgentAdapter(Protocol):
         ...
 
     def validate_auth(self, credential: CredentialRef) -> None: ...
+
+    async def model_catalog(self, *, environment: Mapping[str, str]) -> AgentModelCatalog: ...
 
     async def list_sessions(
         self, query: SessionQuery, *, environment: Mapping[str, str]
@@ -243,6 +255,30 @@ class AgentRuntime:
     async def list_sessions(self, query: SessionQuery) -> SessionPage:
         return await self._run_owned_operation(lambda: self._list_sessions_owned(query))
 
+    async def model_catalog(
+        self,
+        backend: Backend,
+        auth: CredentialRef,
+        *,
+        transport: AgentTransport = "sdk",
+    ) -> AgentModelCatalog:
+        """Read the authenticated native catalog for one exact Agent route."""
+        return await self._run_owned_operation(
+            lambda: self._model_catalog_owned(backend, transport, auth)
+        )
+
+    async def _model_catalog_owned(
+        self,
+        backend: Backend,
+        transport: AgentTransport,
+        auth: CredentialRef,
+    ) -> AgentModelCatalog:
+        self._require_open()
+        adapter = self._adapter(backend, transport)
+        adapter.validate_auth(auth)
+        environment, _ = await self._environment(backend, auth, ())
+        return await adapter.model_catalog(environment=environment)
+
     async def _list_sessions_owned(self, query: SessionQuery) -> SessionPage:
         self._require_open()
         adapter = self._adapter(query.backend, query.transport)
@@ -275,6 +311,10 @@ class AgentRuntime:
         return await adapter.read_session(ref, options, environment=environment)
 
     async def open_session(self, request: AgentSessionRequest) -> AgentSession:
+        if not isinstance(request, CodexCatalogSessionRequest | ClaudeNativeSessionRequest):
+            raise InvalidAgentRequest(
+                "open_session requires CodexCatalogSessionRequest or ClaudeNativeSessionRequest"
+            )
         return await self._run_owned_operation(lambda: self._open_session_locked(request))
 
     async def _run_owned_operation(self, operation: Callable[[], Awaitable[Any]]) -> Any:
@@ -316,6 +356,9 @@ class AgentRuntime:
                 cwd=request.cwd,
                 cwd_scopes_sessions=adapter.cwd_scopes_sessions,
             )
+        if isinstance(request, CodexCatalogSessionRequest):
+            catalog = await adapter.model_catalog(environment=environment)
+            request = self._resolve_codex_catalog_request(request, catalog)
         environment.update(
             await self._mcp_environment(
                 request.backend,
@@ -341,6 +384,41 @@ class AgentRuntime:
             binding.ref_validated = True
         self._sessions[session] = binding
         return session
+
+    @staticmethod
+    def _resolve_codex_catalog_request(
+        request: CodexCatalogSessionRequest,
+        catalog: AgentModelCatalog,
+    ) -> _ResolvedCodexSessionRequest:
+        if request.agent_definition_revision != catalog.definition_revision:
+            raise InvalidAgentRequest("Codex catalog definition revision is stale")
+        rows = tuple(row for row in catalog.models if row.key == request.model_key)
+        if len(rows) != 1:
+            raise InvalidAgentRequest("Codex model_key is absent from the current catalog")
+        row = rows[0]
+        if row.row_fingerprint != request.row_fingerprint:
+            raise InvalidAgentRequest("Codex model row fingerprint is stale")
+        reasoning = tuple(item for item in row.reasoning if item.key == request.reasoning)
+        if len(reasoning) != 1:
+            raise InvalidAgentRequest("Codex reasoning key is unsupported for the model")
+        return _ResolvedCodexSessionRequest(
+            auth=request.auth,
+            open=request.open,
+            cwd=request.cwd,
+            policy=request.policy,
+            model_key=request.model_key,
+            reasoning=request.reasoning,
+            agent_definition_revision=request.agent_definition_revision,
+            row_fingerprint=request.row_fingerprint,
+            system=request.system,
+            developer=request.developer,
+            additional_dirs=request.additional_dirs,
+            mcp_servers=request.mcp_servers,
+            output=request.output,
+            native=request.native,
+            dispatch_model=row.dispatch_model,
+            native_reasoning=reasoning[0].native_wire_value,
+        )
 
     async def run_turn(
         self,
@@ -1245,7 +1323,7 @@ def _default_adapters(config: AgentRuntimeConfig) -> tuple[AgentAdapter, ...]:
     from .codex_sdk import CodexSdkAdapter
 
     return (
-        CodexSdkAdapter(),
+        CodexSdkAdapter(sandbox_controls=config.codex_sandbox),
         ClaudeSdkAdapter(executable=_resolve_executable(config.claude_executable)),
     )
 

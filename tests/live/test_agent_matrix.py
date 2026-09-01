@@ -51,11 +51,14 @@ from provider_runtime.agent_runtime import (
     AgentTransport,
     AgentUsage,
     Backend,
+    ClaudeNativeSessionRequest,
+    CodexCatalogSessionRequest,
     CredentialRef,
     JsonSchemaAgentOutput,
     NewSession,
     PermissionPolicy,
     ResumeSession,
+    TextAgentOutput,
     TextContent,
     TurnRequest,
 )
@@ -195,15 +198,48 @@ async def _certify_route(route: LiveRoute, model: str | None) -> dict[str, objec
     workspace.mkdir(mode=0o700, exist_ok=True)
     evidence: dict[str, object] = {"route": route.name, "model": model or "backend-default"}
     async with AgentRuntime(config) as runtime:
-        request = AgentSessionRequest(
-            backend=route.backend,
-            transport=route.transport,
-            auth=auth,
-            open=NewSession(),
-            cwd=str(workspace.resolve()),
-            policy=_route_policy(route),
-            model=model,
+        catalog = (
+            await runtime.model_catalog("codex", auth, transport=route.transport)
+            if route.backend == "codex"
+            else None
         )
+
+        def session_request(
+            opening: NewSession | ResumeSession,
+            *,
+            output: JsonSchemaAgentOutput | None = None,
+        ) -> AgentSessionRequest:
+            selected_output = output if output is not None else TextAgentOutput()
+            if catalog is None:
+                return ClaudeNativeSessionRequest(
+                    auth=auth,
+                    open=opening,
+                    cwd=str(workspace.resolve()),
+                    policy=_route_policy(route),
+                    model=model,
+                    output=selected_output,
+                )
+            rows = tuple(row for row in catalog.models if model is None or row.key == model)
+            assert rows, f"Codex catalog has no requested model key {model!r}"
+            row = rows[0]
+            reasoning = (
+                row.source_default_reasoning.value
+                if isinstance(row.source_default_reasoning, Present)
+                else row.reasoning[0].key
+            )
+            return CodexCatalogSessionRequest(
+                auth=auth,
+                open=opening,
+                cwd=str(workspace.resolve()),
+                policy=_route_policy(route),
+                model_key=row.key,
+                reasoning=reasoning,
+                agent_definition_revision=catalog.definition_revision,
+                row_fingerprint=row.row_fingerprint,
+                output=selected_output,
+            )
+
+        request = session_request(NewSession())
         session = await runtime.open_session(request)
         events = [
             event
@@ -219,17 +255,7 @@ async def _certify_route(route: LiveRoute, model: str | None) -> dict[str, objec
         ref = session.ref
         await runtime.close_session(session)
 
-        resumed = await runtime.open_session(
-            AgentSessionRequest(
-                backend=route.backend,
-                transport=route.transport,
-                auth=auth,
-                open=ResumeSession(ref),
-                cwd=str(workspace.resolve()),
-                policy=_route_policy(route),
-                model=model,
-            )
-        )
+        resumed = await runtime.open_session(session_request(ResumeSession(ref)))
         second = await runtime.run_turn(
             resumed,
             TurnRequest(
@@ -247,16 +273,7 @@ async def _certify_route(route: LiveRoute, model: str | None) -> dict[str, objec
         await runtime.close_session(resumed)
 
         structured_session = await runtime.open_session(
-            AgentSessionRequest(
-                backend=route.backend,
-                transport=route.transport,
-                auth=auth,
-                open=NewSession(),
-                cwd=str(workspace.resolve()),
-                policy=_route_policy(route),
-                model=model,
-                output=_STRUCTURED_OUTPUT,
-            )
+            session_request(NewSession(), output=_STRUCTURED_OUTPUT)
         )
         structured = await runtime.run_turn(
             structured_session,

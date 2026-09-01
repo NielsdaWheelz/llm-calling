@@ -69,7 +69,7 @@ from pathlib import Path
 from provider_runtime.agent_runtime import (
     AgentRuntime,
     AgentRuntimeConfig,
-    AgentSessionRequest,
+    CodexCatalogSessionRequest,
     CredentialRef,
     NewSession,
     PermissionPolicy,
@@ -80,20 +80,22 @@ from provider_runtime.agent_runtime import (
 config = AgentRuntimeConfig(state_root_base=Path("/private/agent-state"))
 auth = CredentialRef(kind="local_account", profile_key="personal")
 
-request = AgentSessionRequest(
-    backend="codex",
-    transport="sdk",
-    auth=auth,
-    open=NewSession(),
-    cwd="/absolute/workspace",
-    # Everything else is the restrictive default (read-only, no network, denied
-    # approvals). `allowed_tools` is explicit because Codex's public SDK cannot filter
-    # its built-in tools at all, so this route refuses a policy that claims they are
-    # off; see "Policy and approvals". Claude takes `PermissionPolicy()` unchanged.
-    policy=PermissionPolicy(allowed_tools=("*",)),
-)
-
 async with AgentRuntime(config) as runtime:
+    catalog = await runtime.model_catalog("codex", auth)
+    model = catalog.models[0]  # Application selection, never a library default.
+    reasoning = model.reasoning[0]
+    request = CodexCatalogSessionRequest(
+        auth=auth,
+        open=NewSession(),
+        cwd="/absolute/workspace",
+        model_key=model.key,
+        reasoning=reasoning.key,
+        agent_definition_revision=catalog.definition_revision,
+        row_fingerprint=model.row_fingerprint,
+        # Everything else is the restrictive default. `allowed_tools` is explicit
+        # because Codex cannot filter its built-ins; see "Policy and approvals".
+        policy=PermissionPolicy(allowed_tools=("*",)),
+    )
     session = await runtime.open_session(request)
     terminal = await runtime.run_turn(
         session,
@@ -101,6 +103,26 @@ async with AgentRuntime(config) as runtime:
     )
     await runtime.close_session(session)
 ```
+
+## Model catalog and tagged requests
+
+`AgentRuntime.model_catalog("codex", auth)` drives the authenticated public
+SDK RPC `model/list` through every page and returns every visible row in native
+order. `AgentModelCatalog` carries a content-derived definition revision;
+each `AgentModelFacts` carries exact model/dispatch identity, ordered reasoning
+facts, modalities, lifecycle/upgrade facts, and a content-derived row
+fingerprint. The pinned public SDK reports neither context-window nor
+max-output capacity, so both source-capacity fields are honestly `Absent` and
+do not make a row unusable. Product request budgets remain caller-owned.
+
+The session request is the closed union
+`CodexCatalogSessionRequest | ClaudeNativeSessionRequest`. The Codex arm must
+carry the selected catalog revision and row fingerprint; `open_session`
+re-reads the catalog, rejects stale or unsupported selections, and resolves
+the server-only dispatch model and reasoning wire value before billable work.
+There is no free-form Codex model path or compatibility constructor. Claude's
+native arm remains separate because that SDK exposes no equivalent public
+catalog; asking the Claude route for one raises `UnsupportedCapability`.
 
 For streamed UI or telemetry, iterate `runtime.stream_turn(...)` instead of
 calling `run_turn(...)`. `run_turn` is the terminal projection of that same
@@ -140,6 +162,7 @@ The official SDKs own:
 This package owns the retained security kernel and the lifecycle around it:
 
 - one closed `(backend, transport)` selection;
+- authenticated Codex catalog discovery and exact catalog-bound selection;
 - an isolated state root and child environment;
 - restrictive permission defaults and narrowing-only policy changes;
 - unsafe-action confirmation for model-initiated shell/filesystem/network/MCP
@@ -304,6 +327,20 @@ named environment source, placed only in opaque child-environment aliases, and
 never copied into public values. Stdio MCP under full access is not a credential
 boundary: a same-uid command can inspect peer processes. Use a dedicated OS user
 or container for credentialed stdio servers.
+
+Applications with a canonical `llm-tools` plan use
+`lower_mcp_tools(McpToolPublication(...))`. It projects exactly that frozen
+plan into one authenticated HTTPS MCP server plus an immutable reverse index;
+`PublishedMcpTools.observe` maps Codex `AgentToolUse` observations back to
+canonical tool ids and rejects names outside the publication without retaining
+their payload. The existing provider function-tool adapter and this MCP
+adapter share the same exposure/alias owner.
+
+Nexus-style confined launches may configure `AgentRuntimeConfig.codex_sandbox`
+with `CodexSandboxControls(child_tmpdir, exclude_slash_tmp,
+exclude_tmpdir_env_var)`. The child `TMPDIR` and both workspace-write sandbox
+flags are applied on new, resumed, and forked Codex sessions. The application
+still owns directory creation, mode, and no-symlink policy.
 
 ## Structured output and native options
 

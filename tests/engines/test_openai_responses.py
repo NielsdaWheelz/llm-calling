@@ -22,7 +22,8 @@ from provider_runtime.errors import (
     ProtocolDefect,
     RuntimeDefect,
 )
-from provider_runtime.registry import REGISTRY_REVISION, ModelRow
+from provider_runtime.registry import REGISTRY_REVISION
+from provider_runtime.registry import _ModelRow as ModelRow
 from provider_runtime.types import (
     Absent,
     AssistantMessage,
@@ -70,6 +71,7 @@ from provider_runtime.types import (
     ToolResultMessage,
     TransportUnavailable,
     UserMessage,
+    thaw_json_value,
 )
 
 RESPONSES_URL = "https://api.openai.com/v1/responses"
@@ -97,6 +99,9 @@ ROW = ModelRow(
     streaming=True,
     structured="native",
     reasoning=Present(REASONING_LEVELS),
+    source_default_reasoning=Absent(),
+    upgrade=Absent(),
+    retirement=Absent(),
     continuation_codec="openai.v1",
     correlation="header",
     routing=Absent(),
@@ -786,7 +791,7 @@ async def test_generate_decodes_success_usage_meta_and_continuation() -> None:
     artifact = continuation.value
     assert artifact.target == TARGET, f"artifact.target: {artifact.target!r}"
     assert artifact.codec_id == "openai.v1", f"artifact.codec_id: {artifact.codec_id!r}"
-    assert list(artifact.opaque_payload["output"]) == output, (  # type: ignore[arg-type]
+    assert thaw_json_value(artifact.opaque_payload)["output"] == output, (  # type: ignore[index]
         f"payload items must be the verbatim wire output: {artifact.opaque_payload!r}"
     )
 
@@ -1291,9 +1296,11 @@ async def test_stream_decodes_deltas_tool_calls_continuation_and_terminal() -> N
     assert isinstance(continuation_delta, ContinuationDelta), f"{continuation_delta!r}"
     artifact = continuation_delta.artifact
     assert artifact.target == TARGET and artifact.codec_id == "openai.v1", f"{artifact!r}"
-    assert list(artifact.opaque_payload["output"]) == [done_fc, done_reasoning, done_message], (  # type: ignore[arg-type]
-        f"payload items must be the verbatim done items in order: {artifact.opaque_payload!r}"
-    )
+    assert thaw_json_value(artifact.opaque_payload)["output"] == [  # type: ignore[index]
+        done_fc,
+        done_reasoning,
+        done_message,
+    ], f"payload items must be the verbatim done items in order: {artifact.opaque_payload!r}"
 
     terminal = events[8]
     assert isinstance(terminal, TerminalEvent), f"{terminal!r}"

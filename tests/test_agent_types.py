@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from typing import Any, cast, get_args
 
 import pytest
 
-from provider_runtime.agent_runtime import types as types_module
+from provider_runtime import types as provider_types_module
 from provider_runtime.agent_runtime.errors import InvalidAgentRequest
 from provider_runtime.agent_runtime.events import AGENT_FAILURE_CAUSES, AgentFailureCause
 from provider_runtime.agent_runtime.policy import PermissionPolicy
@@ -19,6 +19,8 @@ from provider_runtime.agent_runtime.types import (
     ApprovalRequest,
     Backend,
     ClaudeNativeOptions,
+    ClaudeNativeSessionRequest,
+    CodexCatalogSessionRequest,
     CodexNativeOptions,
     CredentialRef,
     EnvironmentReference,
@@ -38,6 +40,7 @@ from provider_runtime.agent_runtime.types import (
     ref_to_json,
     thaw_json_value,
 )
+from provider_runtime.types import JsonValueError
 
 
 def _credential() -> CredentialRef:
@@ -57,13 +60,15 @@ def _ref() -> AgentSessionRef:
 
 
 def _request() -> AgentSessionRequest:
-    return AgentSessionRequest(
-        backend="codex",
-        transport="sdk",
+    return CodexCatalogSessionRequest(
         auth=_credential(),
         open=NewSession(),
         cwd="/workspace/repo",
         policy=PermissionPolicy(),
+        model_key="codex-test",
+        reasoning="high",
+        agent_definition_revision="agent-definition-test",
+        row_fingerprint="f" * 64,
     )
 
 
@@ -83,13 +88,8 @@ def test_credential_references_never_accept_values_or_ambiguous_sources() -> Non
 
 
 def test_agent_routes_are_closed_and_request_collections_are_owned_tuples() -> None:
-    request = AgentSessionRequest(
-        backend="codex",
-        transport="sdk",
-        auth=_credential(),
-        open=NewSession(),
-        cwd="/workspace/repo",
-        policy=PermissionPolicy(),
+    request = replace(
+        _request(),
         system=(TextContent("system"),),
         additional_dirs=("/workspace/shared",),
     )
@@ -98,32 +98,24 @@ def test_agent_routes_are_closed_and_request_collections_are_owned_tuples() -> N
     assert request.additional_dirs == ("/workspace/shared",)
     with pytest.raises(FrozenInstanceError):
         request.cwd = "/other"  # type: ignore[misc]
-    with pytest.raises(InvalidAgentRequest, match="unsupported backend/transport pair"):
-        AgentSessionRequest(
-            backend="codex",
+    with pytest.raises(TypeError):
+        CodexCatalogSessionRequest(
+            backend="codex",  # pyright: ignore[reportCallIssue]
             transport="wire",  # type: ignore[arg-type]
             auth=_credential(),
             open=NewSession(),
             cwd="/workspace/repo",
             policy=PermissionPolicy(),
+            model_key="codex-test",
+            reasoning="high",
+            agent_definition_revision="agent-definition-test",
+            row_fingerprint="f" * 64,
         )
     with pytest.raises(InvalidAgentRequest, match="absolute"):
-        AgentSessionRequest(
-            backend="codex",
-            transport="sdk",
-            auth=_credential(),
-            open=NewSession(),
-            cwd="relative/repo",
-            policy=PermissionPolicy(),
-        )
+        replace(_request(), cwd="relative/repo")
     with pytest.raises(InvalidAgentRequest, match="additional_dirs contains duplicates"):
-        AgentSessionRequest(
-            backend="codex",
-            transport="sdk",
-            auth=_credential(),
-            open=NewSession(),
-            cwd="/workspace/repo",
-            policy=PermissionPolicy(),
+        replace(
+            _request(),
             additional_dirs=("/workspace/shared", "/workspace/shared"),
         )
 
@@ -152,13 +144,15 @@ def test_frozen_json_backing_storage_cannot_be_mutated_or_bypass_integer_bounds(
 def test_every_declared_backend_transport_pair_is_constructible(
     backend: Backend, transport: AgentTransport
 ) -> None:
-    request = AgentSessionRequest(
-        backend=backend,
-        transport=transport,
-        auth=_credential(),
-        open=NewSession(),
-        cwd="/workspace/repo",
-        policy=PermissionPolicy(),
+    request = (
+        _request()
+        if backend == "codex"
+        else ClaudeNativeSessionRequest(
+            auth=_credential(),
+            open=NewSession(),
+            cwd="/workspace/repo",
+            policy=PermissionPolicy(),
+        )
     )
 
     assert (request.backend, request.transport) == (backend, transport)
@@ -177,27 +171,11 @@ def test_file_content_and_turn_limits_reject_invalid_local_values() -> None:
 
 def test_native_options_are_typed_preserved_and_backend_paired() -> None:
     native = CodexNativeOptions(web_search=False, builtin_tools="disabled")
-    request = AgentSessionRequest(
-        backend="codex",
-        transport="sdk",
-        auth=_credential(),
-        open=NewSession(),
-        cwd="/workspace/repo",
-        policy=PermissionPolicy(),
-        native=native,
-    )
+    request = replace(_request(), native=native)
 
     assert request.native is native
     with pytest.raises(InvalidAgentRequest, match="CodexNativeOptions"):
-        AgentSessionRequest(
-            backend="codex",
-            transport="sdk",
-            auth=_credential(),
-            open=NewSession(),
-            cwd="/workspace/repo",
-            policy=PermissionPolicy(),
-            native=ClaudeNativeOptions(include_partial_messages=True),
-        )
+        replace(_request(), native=ClaudeNativeOptions(include_partial_messages=True))
     with pytest.raises(TypeError):
         CodexNativeOptions(untyped_option=True)  # type: ignore[call-arg]
     with pytest.raises(InvalidAgentRequest, match="builtin_tools"):
@@ -205,15 +183,7 @@ def test_native_options_are_typed_preserved_and_backend_paired() -> None:
     with pytest.raises(InvalidAgentRequest, match="forbids web search"):
         CodexNativeOptions(web_search=True, builtin_tools="disabled")
     with pytest.raises(InvalidAgentRequest, match="unrestricted network"):
-        AgentSessionRequest(
-            backend="codex",
-            transport="sdk",
-            auth=_credential(),
-            open=NewSession(),
-            cwd="/workspace/repo",
-            policy=PermissionPolicy(),
-            native=CodexNativeOptions(web_search=True),
-        )
+        replace(_request(), native=CodexNativeOptions(web_search=True))
 
 
 def test_mcp_servers_accept_references_only_and_enforce_transport_shape() -> None:
@@ -263,13 +233,8 @@ def test_mcp_servers_accept_references_only_and_enforce_transport_shape() -> Non
             allowed_tools=("read", "read"),
         )
     with pytest.raises(InvalidAgentRequest, match="duplicate names"):
-        AgentSessionRequest(
-            backend="codex",
-            transport="sdk",
-            auth=_credential(),
-            open=NewSession(),
-            cwd="/workspace/repo",
-            policy=PermissionPolicy(),
+        replace(
+            _request(),
             mcp_servers=(spec, spec),
         )
 
@@ -337,7 +302,7 @@ def test_freezing_a_nested_object_visits_every_node_exactly_once(
     """
     depth = 25
     expected = 2 * depth + 2
-    original = types_module._freeze_json_value
+    original = provider_types_module._freeze_json_value
     visits = 0
 
     def counted(value: object, **keywords: Any) -> object:
@@ -347,12 +312,12 @@ def test_freezing_a_nested_object_visits_every_node_exactly_once(
             raise AssertionError("the freezer re-walked descendants it had already frozen")
         return original(value, **keywords)
 
-    monkeypatch.setattr(types_module, "_freeze_json_value", counted)
+    monkeypatch.setattr(provider_types_module, "_freeze_json_value", counted)
     payload: dict[str, object] = {"leaf": "bottom"}
     for _ in range(depth):
         payload = {"child": payload, "leaf": "level"}
 
-    frozen = types_module.freeze_json_value(payload)
+    frozen = provider_types_module.freeze_json_value(payload)
 
     assert visits == expected
     assert thaw_json_value(frozen) == payload
@@ -367,9 +332,9 @@ def test_direct_frozen_json_construction_cannot_smuggle_mutable_or_nonfinite_val
     nested = cast(tuple[FrozenJsonDict, ...], frozen["items"])
     with pytest.raises(TypeError):
         nested[0]["value"] = "changed"  # pyright: ignore[reportIndexIssue]
-    with pytest.raises(InvalidAgentRequest, match="finite"):
+    with pytest.raises(JsonValueError, match="finite"):
         FrozenJsonDict({"bad": float("nan")})
-    with pytest.raises(InvalidAgentRequest, match="JSON-safe"):
+    with pytest.raises(JsonValueError, match="JSON-safe"):
         FrozenJsonDict({"bad": object()})
 
     approval = ApprovalRequest(operation="command", summary="run checks", native_payload=frozen)
@@ -400,26 +365,12 @@ def test_absolute_paths_are_validated_lexically_without_touching_the_filesystem(
     link = tmp_path / "link"
     link.symlink_to(real, target_is_directory=True)
 
-    request = AgentSessionRequest(
-        backend="codex",
-        transport="sdk",
-        auth=_credential(),
-        open=NewSession(),
-        cwd=str(link),
-        policy=PermissionPolicy(),
-    )
+    request = replace(_request(), cwd=str(link))
 
     assert request.cwd == str(link)
     for rejected in ("/workspace/../etc", "/workspace/./repo", "/workspace//repo", "/workspace/"):
         with pytest.raises(InvalidAgentRequest, match="normalized absolute path"):
-            AgentSessionRequest(
-                backend="codex",
-                transport="sdk",
-                auth=_credential(),
-                open=NewSession(),
-                cwd=rejected,
-                policy=PermissionPolicy(),
-            )
+            replace(_request(), cwd=rejected)
 
 
 def test_closed_route_and_failure_vocabularies_have_exactly_one_owner() -> None:

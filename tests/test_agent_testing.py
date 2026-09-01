@@ -21,6 +21,7 @@ from provider_runtime.agent_runtime.testing import (
 from provider_runtime.agent_runtime.types import (
     AgentSessionRef,
     AgentSessionRequest,
+    CodexCatalogSessionRequest,
     CredentialRef,
     NewSession,
     TextAgentOutput,
@@ -48,13 +49,13 @@ def _ref() -> AgentSessionRef:
 
 
 def _request(tmp_path: Path) -> AgentSessionRequest:
-    return AgentSessionRequest(
-        backend="codex",
-        transport="sdk",
+    return CodexCatalogSessionRequest(
         auth=_auth(),
         open=NewSession(),
-        model=None,
-        reasoning=None,
+        model_key="codex-test",
+        reasoning="high",
+        agent_definition_revision="agent-definition-test",
+        row_fingerprint="f" * 64,
         system=(),
         developer=(),
         cwd=str(tmp_path),

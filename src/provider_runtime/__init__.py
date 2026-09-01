@@ -2,10 +2,11 @@
 
 The facade re-exports the names the 95% call site touches: the runtime and
 its credentials, the intent vocabulary, the terminal outcomes, the stream
-envelope, the embed port, and derived cost estimation. The FULL contract
-vocabulary stays importable from ``provider_runtime.types``; registry rows
-from ``provider_runtime.registry``; test doubles from
-``provider_runtime.testing``.
+envelope, the embed port, and derived cost estimation. The full contract
+vocabulary stays importable from ``provider_runtime.types``; the sole public
+provider-catalog query from ``provider_runtime.registry``; test doubles from
+``provider_runtime.testing``. Registry rows and resolution remain private to
+the runtime.
 """
 
 from provider_runtime.errors import NonGenerationCallFailed

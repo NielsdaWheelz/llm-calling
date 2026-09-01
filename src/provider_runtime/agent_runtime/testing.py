@@ -16,6 +16,7 @@ from typing import Literal
 from provider_runtime.types import CancelSignal
 
 from .events import AgentEvent, AgentTerminal
+from .model_catalog import AgentModelCatalog
 from .sessions import (
     AgentSession,
     SessionPage,
@@ -26,11 +27,17 @@ from .sessions import (
 from .types import (
     AgentSessionRef,
     AgentSessionRequest,
+    AgentTransport,
     ApprovalHandler,
+    Backend,
+    ClaudeNativeSessionRequest,
+    CodexCatalogSessionRequest,
+    CredentialRef,
     TurnRequest,
 )
 
 type AgentRuntimeOperation = Literal[
+    "model_catalog",
     "list_sessions",
     "read_session",
     "open_session",
@@ -38,7 +45,8 @@ type AgentRuntimeOperation = Literal[
     "stream_turn",
 ]
 type CapturedAgentSubject = (
-    SessionQuery
+    tuple[Backend, AgentTransport, CredentialRef]
+    | SessionQuery
     | tuple[AgentSessionRef, SessionReadOptions]
     | AgentSessionRequest
     | tuple[AgentSession, TurnRequest]
@@ -57,11 +65,13 @@ def _unexpected(operation: AgentRuntimeOperation, subject: object) -> str:
     route = "unknown"
     if isinstance(subject, SessionQuery):
         route = f"{subject.backend}/{subject.transport}"
-    elif isinstance(subject, AgentSessionRequest):
+    elif isinstance(subject, CodexCatalogSessionRequest | ClaudeNativeSessionRequest):
         route = f"{subject.backend}/{subject.transport}"
     elif isinstance(subject, tuple) and subject:
         first = subject[0]
-        if isinstance(first, AgentSessionRef):
+        if first in ("codex", "claude") and len(subject) == 3:
+            route = f"{subject[0]}/{subject[1]}"
+        elif isinstance(first, AgentSessionRef):
             route = f"{first.backend}/{first.transport}"
         elif isinstance(first, AgentSession) and first.ref_is_complete:
             route = f"{first.ref.backend}/{first.ref.transport}"
@@ -79,6 +89,15 @@ class NoNetworkAgentRuntime:
 
     async def list_sessions(self, query: SessionQuery) -> SessionPage:
         raise AssertionError(_unexpected("list_sessions", query))
+
+    async def model_catalog(
+        self,
+        backend: Backend,
+        auth: CredentialRef,
+        *,
+        transport: AgentTransport = "sdk",
+    ) -> AgentModelCatalog:
+        raise AssertionError(_unexpected("model_catalog", (backend, transport, auth)))
 
     async def read_session(
         self, ref: AgentSessionRef, options: SessionReadOptions
@@ -117,6 +136,7 @@ class NoNetworkAgentRuntime:
 
 @dataclass(slots=True)
 class _Scripts:
+    catalogs: deque[AgentModelCatalog]
     pages: deque[SessionPage]
     snapshots: deque[SessionSnapshot]
     sessions: deque[AgentSession]
@@ -141,6 +161,7 @@ class ScriptedAgentRuntime(NoNetworkAgentRuntime):
     def __init__(
         self,
         *,
+        model_catalogs: Iterable[AgentModelCatalog] = (),
         session_pages: Iterable[SessionPage] = (),
         session_snapshots: Iterable[SessionSnapshot] = (),
         sessions: Iterable[AgentSession] = (),
@@ -148,6 +169,7 @@ class ScriptedAgentRuntime(NoNetworkAgentRuntime):
     ) -> None:
         self.calls: list[CapturedAgentCall] = []
         self._scripts = _Scripts(
+            catalogs=deque(model_catalogs),
             pages=deque(session_pages),
             snapshots=deque(session_snapshots),
             sessions=deque(sessions),
@@ -157,6 +179,17 @@ class ScriptedAgentRuntime(NoNetworkAgentRuntime):
     async def list_sessions(self, query: SessionQuery) -> SessionPage:
         self.calls.append(CapturedAgentCall("list_sessions", query))
         return _pop(self._scripts.pages, "list_sessions")
+
+    async def model_catalog(
+        self,
+        backend: Backend,
+        auth: CredentialRef,
+        *,
+        transport: AgentTransport = "sdk",
+    ) -> AgentModelCatalog:
+        subject = (backend, transport, auth)
+        self.calls.append(CapturedAgentCall("model_catalog", subject))
+        return _pop(self._scripts.catalogs, "model_catalog")
 
     async def read_session(
         self, ref: AgentSessionRef, options: SessionReadOptions

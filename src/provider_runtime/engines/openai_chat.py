@@ -74,7 +74,8 @@ from provider_runtime.errors import (
     RuntimeDefect,
     safe_provider_error_body_snippet,
 )
-from provider_runtime.registry import REGISTRY_REVISION, ModelRow
+from provider_runtime.registry import REGISTRY_REVISION
+from provider_runtime.registry import _ModelRow as ModelRow
 from provider_runtime.types import (
     Absent,
     AssistantMessage,
