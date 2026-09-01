@@ -214,7 +214,7 @@ def test_snapshot_covers_the_registry_wire_model_ids() -> None:
     # Iterates the real registry rather than a hardcoded copy of its ids, so
     # this stays a live contract check across registry changes — openrouter is
     # deliberately excluded (its pricing depends on the routed endpoint).
-    for row in registry.ROWS:
+    for row in registry._ROWS:
         if row.provider == "openrouter":
             continue
         estimate = estimate_cost(_meta(row.provider, row.model_id, Present(_usage(1_000, 1_000))))

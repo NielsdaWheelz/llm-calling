@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Literal
 
 from provider_runtime.errors import sanitize_provider_text
+from provider_runtime.types import thaw_json_value
 
 from .errors import (
     CredentialUnavailable,
@@ -24,7 +25,6 @@ from .types import (
     CredentialRef,
     FrozenJsonDict,
     JsonObject,
-    thaw_json_value,
 )
 from .types import (
     freeze_json_object as _freeze_json_object,

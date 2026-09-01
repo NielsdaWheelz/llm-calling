@@ -48,7 +48,10 @@ and write included), the full attempt trace, billability, the exact native
 reasoning value sent, and the registry revision.
 
 Multi-turn: append the returned assistant text and tool calls, plus the
-outcome's opaque `ContinuationArtifact`, to the next intent's messages. The
+outcome's opaque `ContinuationArtifact`, to the next intent's messages. Use
+`provider_runtime.continuation.encode_continuation` / `decode_continuation`
+when crossing a persistence boundary; the bounded canonical codec binds bytes
+to the exact target and provider codec. The
 artifact carries native reasoning state (encrypted reasoning items, thinking
 signatures, `thoughtSignature`, `reasoning_content`, ordered
 `reasoning_details`) and is replayed verbatim, never parsed, only to the
@@ -77,6 +80,14 @@ before constructing a `ToolCall`; an SDK that exposes only parsed JSON cannot
 attest raw transport bytes. The adapter separately enforces valid bounded JSON
 and the selected grant's canonical `ParsedJson` input-byte ceiling.
 
+For Codex MCP, pass the same frozen plan to
+`provider_runtime.agent_runtime.tool_projection.lower_mcp_tools(`
+`McpToolPublication(...))`. The returned server configuration publishes the
+same request-local aliases and its `observe` method narrows SDK MCP events back
+to canonical tool ids. The optional projection module is not re-exported from
+the dependency-light `agent_runtime` package. Neither adapter chooses tools
+from a product operation name.
+
 ## Architecture
 
 ```
@@ -84,7 +95,8 @@ types.py       the contract: frozen value vocabulary (intents, outcomes,
                stream events, usage, failures, CallMeta)
 errors.py      RuntimeDefect hierarchy + provider-text redaction; defects
                raise, they are never a returned value
-registry.py    ModelRow capability table, resolve(), REGISTRY_REVISION
+registry.py    private capability rows/resolution; public api_model_catalog()
+continuation.py bounded canonical provider-continuation codec
 retry.py       single retry owner: DEFAULT_RETRY + the attempt iterator
 otel.py        one span per facade call over opentelemetry-api only
 prices.py      estimate_cost(meta) over the vendored genai-prices snapshot
@@ -94,8 +106,8 @@ engines/       the four protocol adapters (Engine protocol; one attempt each)
 embeddings.py  OpenAI-only embedding port on the openai SDK
 testing.py     FakeEngine + ScriptedRuntime test doubles
 tool_adapter.py request-scoped llm-tools lowering and canonical name decode
-agent_runtime/ agent lane: typed session requests, security kernel, auth
-               isolation, event normalization, both official SDK adapters
+agent_runtime/ agent lane: authenticated model catalog, tagged session
+               requests, MCP projection, security kernel, SDK adapters
 ```
 
 | Engine | SDK | Serves |
@@ -110,14 +122,17 @@ SDK types never cross the contract boundary, and SDK imports are confined to
 attempt and classify errors against the shared taxonomy; the runtime owns
 retries, sequence numbering, spans, and attempt-trace accumulation.
 
-## Registry and pinning
+## Provider catalog and pinning
 
-Every callable model is a hand-curated `ModelRow` in `registry.py`: exact wire
-model id, engine, context window and output cap, modalities, tool/streaming/
-structured-output capability, and the exact native reasoning wire value per
-declared level. Rows are contract facts, verified against provider docs —
-never a place to remember guesses. Any row change bumps `REGISTRY_REVISION`,
-which is stamped into every `CallMeta` and flows into the consumer's ledger.
+`provider_runtime.registry.api_model_catalog()` is the sole public catalog
+oracle. It returns an immutable, ordered `ApiModelCatalog` containing exact
+dispatch, capacity, modality, tool, streaming, structured-output, reasoning,
+default, lifecycle, continuation-codec, revision, and row-fingerprint facts.
+The hand-curated rows and their resolution functions are private runtime
+owners; consumers select and compare only public catalog facts. Rows are
+verified against provider docs, never a place to remember guesses. Any row
+change bumps the catalog's `registry_revision`, which is also stamped into
+every `CallMeta` and flows into the consumer's ledger.
 
 OpenRouter is one pinned, policy-constrained target, never a substrate: every
 OpenRouter row carries explicit routing pins (`only`, `order`,
@@ -159,6 +174,14 @@ account; API-key session credentials are rejected, and quota exhaustion ends
 the turn with an `AgentQuotaExhausted` terminal — the lane never overflows
 onto API rates. Child environments are runtime-owned and scrubbed. The full
 living contract is [docs/agent-runtime.md](docs/agent-runtime.md).
+
+Codex selection is catalog-bound: query
+`AgentRuntime.model_catalog("codex", auth)`, then submit a
+`CodexCatalogSessionRequest` with the exact model key, reasoning key,
+definition revision, and row fingerprint. The runtime re-reads and validates
+those facts before opening a session and never accepts a free-form Codex model.
+Claude uses the separate `ClaudeNativeSessionRequest` arm and reports model
+catalog discovery as `UnsupportedCapability`.
 
 ## Development
 

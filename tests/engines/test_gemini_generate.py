@@ -34,7 +34,8 @@ from provider_runtime.errors import (
     ProtocolDefect,
     RuntimeDefect,
 )
-from provider_runtime.registry import REGISTRY_REVISION, ModelRow
+from provider_runtime.registry import REGISTRY_REVISION
+from provider_runtime.registry import _ModelRow as ModelRow
 from provider_runtime.types import (
     Absent,
     AssistantMessage,
@@ -78,6 +79,7 @@ from provider_runtime.types import (
     TransportUnavailable,
     UsageEvent,
     UserMessage,
+    thaw_json_value,
 )
 
 # ---------------------------------------------------------------------------
@@ -109,6 +111,9 @@ LEVEL_ROW = ModelRow(
     streaming=True,
     structured="native",
     reasoning=Present(LEVEL_REASONING),
+    source_default_reasoning=Absent(),
+    upgrade=Absent(),
+    retirement=Absent(),
     continuation_codec="gemini.v1",
     correlation="none",
     routing=Absent(),
@@ -127,6 +132,9 @@ BUDGET_ROW = ModelRow(
     streaming=True,
     structured="native",
     reasoning=Present(BUDGET_REASONING),
+    source_default_reasoning=Absent(),
+    upgrade=Absent(),
+    retirement=Absent(),
     continuation_codec="gemini.v1",
     correlation="none",
     routing=Absent(),
@@ -146,6 +154,9 @@ KNOBLESS_ROW = ModelRow(
     streaming=True,
     structured="json_mode",
     reasoning=Absent(),
+    source_default_reasoning=Absent(),
+    upgrade=Absent(),
+    retirement=Absent(),
     continuation_codec="gemini.v1",
     correlation="none",
     routing=Absent(),
@@ -441,6 +452,9 @@ async def test_row_base_url_overrides_the_sdk_default(engine: GeminiGenerateEngi
         streaming=True,
         structured="native",
         reasoning=Present(LEVEL_REASONING),
+        source_default_reasoning=Absent(),
+        upgrade=Absent(),
+        retirement=Absent(),
         continuation_codec="gemini.v1",
         correlation="none",
         routing=Absent(),
@@ -974,7 +988,7 @@ async def test_thought_signatures_round_trip_verbatim(engine: GeminiGenerateEngi
     artifact = continuation.value
     assert artifact.codec_id == LEVEL_ROW.continuation_codec
     assert artifact.target == ProviderTarget(provider="gemini", model="gemini-3-pro")
-    assert artifact.opaque_payload == {
+    assert thaw_json_value(artifact.opaque_payload) == {
         "parts": [
             {"text": "calling now", "thoughtSignature": "c2ln"},
             {
@@ -1152,7 +1166,7 @@ async def test_stream_decodes_text_tools_continuation_and_folds_usage(
     assert isinstance(continuation_event, ContinuationDelta)
     artifact = continuation_event.artifact
     assert artifact.codec_id == "gemini.v1"
-    payload_parts = artifact.opaque_payload.get("parts")
+    payload_parts = thaw_json_value(artifact.opaque_payload)["parts"]  # type: ignore[index]
     assert payload_parts == [
         {"text": "Hel"},
         {"text": "internal plan", "thought": True},

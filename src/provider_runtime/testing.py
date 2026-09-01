@@ -30,7 +30,7 @@ from typing import Any, Literal
 import pydantic
 
 from provider_runtime.errors import NonGenerationCallFailed
-from provider_runtime.registry import ModelRow
+from provider_runtime.registry import _ModelRow as ModelRow
 from provider_runtime.types import (
     Absent,
     CallOutcome,

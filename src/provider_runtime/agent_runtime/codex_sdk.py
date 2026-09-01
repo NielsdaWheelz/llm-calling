@@ -25,7 +25,7 @@ from types import ModuleType
 from typing import Any, Literal, cast
 
 from provider_runtime.errors import sanitize_provider_text
-from provider_runtime.types import Absent, Presence, Present, TokenUsage
+from provider_runtime.types import Absent, Presence, Present, TokenUsage, thaw_json_value
 
 from ._codex_launcher import ensure_codex_launcher
 from ._limits import (
@@ -73,6 +73,7 @@ from .events import (
     AgentToolUse,
     AgentUsage,
 )
+from .model_catalog import AgentModelCatalog, read_codex_model_catalog
 from .policy import PermissionPolicy
 from .sessions import (
     AgentSession,
@@ -91,6 +92,7 @@ from .types import (
     AgentSessionRequest,
     ApprovalHandler,
     CodexNativeOptions,
+    CodexSandboxControls,
     CredentialRef,
     ForkSession,
     ImageContent,
@@ -99,7 +101,7 @@ from .types import (
     ResumeSession,
     TextContent,
     TurnRequest,
-    thaw_json_value,
+    _ResolvedCodexSessionRequest,
     validate_mcp_network_policy,
 )
 
@@ -197,7 +199,7 @@ class _CodexSessionState:
     sdk: ModuleType
     client: Any
     thread: Any
-    request: AgentSessionRequest
+    request: _ResolvedCodexSessionRequest
     ref: AgentSessionRef
     turn: Any | None = None
     turn_id: str | None = None
@@ -219,13 +221,70 @@ class CodexSdkAdapter:
     # Codex threads resume from any directory; the ref keeps cwd as provenance only.
     cwd_scopes_sessions: Literal[False] = False
 
-    def __init__(self) -> None:
+    def __init__(self, *, sandbox_controls: CodexSandboxControls | None = None) -> None:
+        if sandbox_controls is not None and not isinstance(sandbox_controls, CodexSandboxControls):
+            raise InvalidAgentRequest(
+                "sandbox_controls must be CodexSandboxControls when configured"
+            )
+        self._sandbox_controls = sandbox_controls
         self._sessions: dict[AgentSession, _CodexSessionState] = {}
         self._dead_sessions: weakref.WeakSet[AgentSession] = weakref.WeakSet()
         self._clients: set[Any] = set()
 
     def validate_auth(self, credential: CredentialRef) -> None:
         self._require_local_auth(credential.kind)
+
+    async def model_catalog(self, *, environment: Mapping[str, str]) -> AgentModelCatalog:
+        sdk, runtime, _sdk_version, runtime_version = self._sdk_runtime()
+        config = self._client_configuration(sdk, runtime, cwd=None, environment=environment)
+        try:
+            async_client_module = importlib.import_module("openai_codex.async_client")
+            generated_module = importlib.import_module("openai_codex.generated.v2_all")
+            client_type = async_client_module.AsyncCodexClient
+            response_model = generated_module.ModelListResponse
+        except (AttributeError, ModuleNotFoundError):
+            raise SdkUnavailable("Codex SDK is missing the public generic model RPC") from None
+        try:
+            client = client_type(config)
+        except Exception as error:
+            raise ExecutableUnavailable(
+                f"Codex SDK model client construction failed: {sanitize_provider_text(str(error))}"
+            ) from None
+        self._clients.add(client)
+        try:
+            await self._call(
+                client.start(),
+                operation="model discovery start",
+                failure="executable",
+            )
+            metadata = await self._call(
+                client.initialize(),
+                operation="model discovery initialization",
+                failure="executable",
+            )
+            executable_version = self._metadata_version(metadata)
+            self._warn_runtime_drift(executable_version, runtime_version)
+            response = await self._call(
+                client.account_read(),
+                operation="account discovery",
+                failure="credential",
+            )
+            self._validate_auth_response(response)
+            try:
+                async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
+                    return await read_codex_model_catalog(client, response_model)
+            except ProtocolDefect:
+                raise
+            except TimeoutError:
+                raise ExecutableUnavailable("Codex SDK model discovery timed out") from None
+            except Exception as error:
+                raise ExecutableUnavailable(
+                    f"Codex SDK model discovery failed: {sanitize_provider_text(str(error))}"
+                ) from None
+        except TimeoutError:
+            raise ExecutableUnavailable("Codex SDK model discovery timed out") from None
+        finally:
+            await self._close_client(client)
 
     async def list_sessions(
         self,
@@ -307,8 +366,10 @@ class CodexSdkAdapter:
         *,
         environment: Mapping[str, str],
     ) -> AgentSession:
-        if request.backend != self.backend or request.transport != self.transport:
-            raise InvalidAgentRequest("CodexSdkAdapter received a different route")
+        if not isinstance(request, _ResolvedCodexSessionRequest):
+            raise InvalidAgentRequest(
+                "CodexSdkAdapter requires a catalog-validated runtime request"
+            )
         self._require_local_auth(request.auth.kind)
         self._validate_policy_mapping(request.policy)
         validate_mcp_network_policy(request.mcp_servers, request.policy)
@@ -339,8 +400,7 @@ class CodexSdkAdapter:
                 "cwd": request.cwd,
                 "sandbox": self._sandbox(sdk, request.policy),
             }
-            if request.model is not None:
-                kwargs["model"] = request.model
+            kwargs["model"] = request.dispatch_model
             if request.system:
                 # `base_instructions` is the SDK's system-role channel on thread
                 # start/resume/fork (0.144.4 api.py:135) and *replaces* Codex's built-in base
@@ -424,11 +484,7 @@ class CodexSdkAdapter:
         kwargs: dict[str, object] = {
             "approval_mode": self._approval_mode(state.sdk, policy),
         }
-        reasoning = state.request.reasoning
-        if reasoning is not None:
-            kwargs["effort"] = reasoning.effort
-            if reasoning.summary is not None:
-                kwargs["summary"] = reasoning.summary
+        kwargs["effort"] = state.request.native_reasoning
         output = state.request.output
         if isinstance(output, JsonSchemaAgentOutput):
             # The schema is a plain frozen JSON mapping; the backend enforces it natively.
@@ -542,61 +598,16 @@ class CodexSdkAdapter:
         environment: Mapping[str, str],
         require_certified_builtin_policy: bool = False,
     ) -> tuple[ModuleType, Any]:
-        sdk = self._load_sdk()
-        sdk_version = self._sdk_version(sdk)
-        if require_certified_builtin_policy and sdk_version != _CERTIFIED_SDK_VERSION:
-            raise UnsupportedCapability(
-                "Codex builtin tool policy is not certified for this SDK version"
-            )
-        if sdk_version != _CERTIFIED_SDK_VERSION:
-            warnings.warn(
-                f"Codex SDK {sdk_version} differs from the certified "
-                f"{_CERTIFIED_SDK_VERSION}; continuing on the behavioral probe",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        runtime = self._load_runtime_package()
-        runtime_version = self._runtime_version(runtime)
-        if require_certified_builtin_policy and runtime_version != _CERTIFIED_SDK_VERSION:
-            raise UnsupportedCapability(
-                "Codex builtin tool policy is not certified for this bundled runtime version"
-            )
-        if runtime_version != sdk_version:
-            warnings.warn(
-                f"Codex bundled runtime {runtime_version} differs from SDK "
-                f"{sdk_version}; continuing on the behavioral probe",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        sdk, runtime, _sdk_version, runtime_version = self._sdk_runtime(
+            require_certified_builtin_policy=require_certified_builtin_policy
+        )
         client: Any = None
         try:
-            child_environment = dict(environment)
-            bundled_path_dir = runtime.bundled_path_dir()
-            if bundled_path_dir is not None:
-                path_dir = Path(bundled_path_dir).resolve(strict=True)
-                if not path_dir.is_dir():
-                    raise ExecutableUnavailable("the bundled Codex PATH directory is invalid")
-                existing_path = child_environment.get("PATH", "")
-                entries = tuple(entry for entry in existing_path.split(os.pathsep) if entry)
-                child_environment["PATH"] = os.pathsep.join(
-                    (str(path_dir), *(entry for entry in entries if entry != str(path_dir)))
-                )
-            bundled_executable = Path(runtime.bundled_codex_path()).resolve(strict=True)
-            state_root = state_root_from_environment("codex", environment)
-            launcher = ensure_codex_launcher(
-                state_root,
-                bundled_executable,
-                tuple(child_environment),
-                interpreter=sys.executable,
-            )
-            config = sdk.CodexConfig(
-                codex_bin=str(launcher),
-                config_overrides=('forced_login_method="chatgpt"',),
+            config = self._client_configuration(
+                sdk,
+                runtime,
                 cwd=cwd,
-                env=child_environment,
-                client_name="provider_runtime",
-                client_title="provider-runtime",
-                client_version="0.1.0",
+                environment=environment,
             )
             client = sdk.AsyncCodex(config)
             async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
@@ -606,13 +617,7 @@ class CodexSdkAdapter:
                 raise UnsupportedCapability(
                     "Codex builtin tool policy is not certified for this executable version"
                 )
-            if executable_version != runtime_version:
-                warnings.warn(
-                    f"Codex server reported version {executable_version}, the bundled "
-                    f"runtime is {runtime_version}; continuing on the behavioral probe",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+            self._warn_runtime_drift(executable_version, runtime_version)
         except UnsupportedCapability:
             if client is not None:
                 await client.close()
@@ -634,6 +639,89 @@ class CodexSdkAdapter:
         self._clients.add(client)
         return sdk, client
 
+    def _sdk_runtime(
+        self,
+        *,
+        require_certified_builtin_policy: bool = False,
+    ) -> tuple[ModuleType, ModuleType, str, str]:
+        sdk = self._load_sdk()
+        sdk_version = self._sdk_version(sdk)
+        if require_certified_builtin_policy and sdk_version != _CERTIFIED_SDK_VERSION:
+            raise UnsupportedCapability(
+                "Codex builtin tool policy is not certified for this SDK version"
+            )
+        if sdk_version != _CERTIFIED_SDK_VERSION:
+            warnings.warn(
+                f"Codex SDK {sdk_version} differs from the certified "
+                f"{_CERTIFIED_SDK_VERSION}; continuing on the behavioral probe",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        runtime = self._load_runtime_package()
+        runtime_version = self._runtime_version(runtime)
+        if require_certified_builtin_policy and runtime_version != _CERTIFIED_SDK_VERSION:
+            raise UnsupportedCapability(
+                "Codex builtin tool policy is not certified for this bundled runtime version"
+            )
+        if runtime_version != sdk_version:
+            warnings.warn(
+                f"Codex bundled runtime {runtime_version} differs from SDK "
+                f"{sdk_version}; continuing on the behavioral probe",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        return sdk, runtime, sdk_version, runtime_version
+
+    def _client_configuration(
+        self,
+        sdk: ModuleType,
+        runtime: ModuleType,
+        *,
+        cwd: str | None,
+        environment: Mapping[str, str],
+    ) -> object:
+        child_environment = dict(environment)
+        controls = self._sandbox_controls
+        if controls is not None:
+            child_environment["TMPDIR"] = controls.child_tmpdir
+        bundled_path_dir = runtime.bundled_path_dir()
+        if bundled_path_dir is not None:
+            path_dir = Path(bundled_path_dir).resolve(strict=True)
+            if not path_dir.is_dir():
+                raise ExecutableUnavailable("the bundled Codex PATH directory is invalid")
+            existing_path = child_environment.get("PATH", "")
+            entries = tuple(entry for entry in existing_path.split(os.pathsep) if entry)
+            child_environment["PATH"] = os.pathsep.join(
+                (str(path_dir), *(entry for entry in entries if entry != str(path_dir)))
+            )
+        bundled_executable = Path(runtime.bundled_codex_path()).resolve(strict=True)
+        state_root = state_root_from_environment("codex", environment)
+        launcher = ensure_codex_launcher(
+            state_root,
+            bundled_executable,
+            tuple(child_environment),
+            interpreter=sys.executable,
+        )
+        return sdk.CodexConfig(
+            codex_bin=str(launcher),
+            config_overrides=('forced_login_method="chatgpt"',),
+            cwd=cwd,
+            env=child_environment,
+            client_name="provider_runtime",
+            client_title="provider-runtime",
+            client_version="0.1.0",
+        )
+
+    @staticmethod
+    def _warn_runtime_drift(executable_version: str, runtime_version: str) -> None:
+        if executable_version != runtime_version:
+            warnings.warn(
+                f"Codex server reported version {executable_version}, the bundled "
+                f"runtime is {runtime_version}; continuing on the behavioral probe",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+
     async def _close_client(self, client: Any) -> None:
         self._clients.discard(client)
         await client.close()
@@ -649,6 +737,9 @@ class CodexSdkAdapter:
         response = await self._call(
             client.account(), operation="account discovery", failure="credential"
         )
+        self._validate_auth_response(response)
+
+    def _validate_auth_response(self, response: object) -> None:
         payload = self._mapping(response, "Codex SDK account response")
         account = payload.get("account")
         if account is None:
@@ -1159,7 +1250,11 @@ class CodexSdkAdapter:
 
     @classmethod
     def _executable_version(cls, client: Any) -> str:
-        metadata = cls._mapping(client.metadata, "Codex SDK initialize metadata")
+        return cls._metadata_version(client.metadata)
+
+    @classmethod
+    def _metadata_version(cls, value: object) -> str:
+        metadata = cls._mapping(value, "Codex SDK initialize metadata")
         server = cls._mapping(metadata.get("serverInfo"), "Codex SDK server metadata")
         version = server.get("version")
         if not isinstance(version, str) or not version:
@@ -1267,10 +1362,19 @@ class CodexSdkAdapter:
                 }
             )
         if request.policy.filesystem == "workspace_write":
-            config["sandbox_workspace_write"] = {
+            workspace_write: dict[str, object] = {
                 "writable_roots": [request.cwd, *request.additional_dirs],
                 "network_access": request.policy.network == "unrestricted",
             }
+            controls = self._sandbox_controls
+            if controls is not None:
+                workspace_write.update(
+                    {
+                        "exclude_slash_tmp": controls.exclude_slash_tmp,
+                        "exclude_tmpdir_env_var": controls.exclude_tmpdir_env_var,
+                    }
+                )
+            config["sandbox_workspace_write"] = workspace_write
         if request.mcp_servers:
             servers: dict[str, object] = {}
             for server in request.mcp_servers:

@@ -189,19 +189,8 @@ class PublishedTools:
 
 def lower_tools(publication: ToolPublication) -> PublishedTools:
     """Publish exactly the tools selected by one frozen plan."""
-
     plan = publication.plan
-    match plan.exposure:
-        case Native():
-            if publication.revealed_targets:
-                raise ValueError("Native publication cannot carry revealed targets")
-            tool_ids = tuple(grant.id for grant in plan.profile.ordered_grants)
-        case Discoverable():
-            tool_ids = published_tool_ids(plan, publication.revealed_targets)
-        case HostTable():
-            raise ValueError("HostTable plans are never provider-published")
-        case other:
-            assert_never(other)
+    tool_ids = _publication_tool_ids(publication)
 
     tools: list[CanonicalTool] = []
     reverse: dict[str, ToolId] = {}
@@ -233,6 +222,21 @@ def lower_tools(publication: ToolPublication) -> PublishedTools:
         _canonical_by_wire_name=MappingProxyType(reverse),
         _max_input_bytes_by_tool_id=MappingProxyType(max_input_bytes),
     )
+
+
+def _publication_tool_ids(publication: ToolPublication) -> tuple[ToolId, ...]:
+    plan = publication.plan
+    match plan.exposure:
+        case Native():
+            if publication.revealed_targets:
+                raise ValueError("Native publication cannot carry revealed targets")
+            return tuple(grant.id for grant in plan.profile.ordered_grants)
+        case Discoverable():
+            return published_tool_ids(plan, publication.revealed_targets)
+        case HostTable():
+            raise ValueError("HostTable plans are never provider-published")
+        case other:
+            assert_never(other)
 
 
 def _wire_name(tool_id: ToolId) -> str:

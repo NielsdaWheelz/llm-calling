@@ -17,7 +17,7 @@ from types import ModuleType
 from typing import Any, Literal, cast
 
 from provider_runtime.errors import sanitize_provider_text
-from provider_runtime.types import Absent, Presence, Present, TokenUsage
+from provider_runtime.types import Absent, Presence, Present, TokenUsage, thaw_json_value
 
 from ._claude_launcher import OwnedProcessGroup, ensure_claude_launcher
 from ._limits import (
@@ -75,6 +75,7 @@ from .events import (
     AgentToolUse,
     AgentUsage,
 )
+from .model_catalog import AgentModelCatalog
 from .policy import PermissionPolicy, tool_is_allowed
 from .sessions import (
     AgentSession,
@@ -93,6 +94,7 @@ from .types import (
     ApprovalHandler,
     ApprovalRequest,
     ClaudeNativeOptions,
+    ClaudeNativeSessionRequest,
     CredentialRef,
     ForkSession,
     FrozenJsonDict,
@@ -101,7 +103,6 @@ from .types import (
     ResumeSession,
     TextContent,
     TurnRequest,
-    thaw_json_value,
     validate_mcp_network_policy,
 )
 
@@ -265,7 +266,7 @@ class _ClaudeQuotaSignal:
 class _ClaudeSessionState:
     sdk: Any
     client: Any
-    request: AgentSessionRequest
+    request: ClaudeNativeSessionRequest
     state_root: Path
     ref: AgentSessionRef | None
     process_group: OwnedProcessGroup | None = None
@@ -321,6 +322,10 @@ class ClaudeSdkAdapter:
     def validate_auth(self, credential: CredentialRef) -> None:
         self._require_local_auth(credential.kind)
 
+    async def model_catalog(self, *, environment: Mapping[str, str]) -> AgentModelCatalog:
+        del environment
+        raise UnsupportedCapability("Claude SDK does not expose a supported model catalog")
+
     async def list_sessions(
         self,
         query: SessionQuery,
@@ -360,8 +365,8 @@ class ClaudeSdkAdapter:
         *,
         environment: Mapping[str, str],
     ) -> AgentSession:
-        if request.backend != self.backend or request.transport != self.transport:
-            raise InvalidAgentRequest("ClaudeSdkAdapter received a different route")
+        if not isinstance(request, ClaudeNativeSessionRequest):
+            raise InvalidAgentRequest("ClaudeSdkAdapter requires ClaudeNativeSessionRequest")
         self._require_local_auth(request.auth.kind)
         self._validate_policy_mapping(request.policy)
         validate_mcp_network_policy(request.mcp_servers, request.policy)
@@ -1492,7 +1497,7 @@ class ClaudeSdkAdapter:
         return "\n\n".join(part.text for part in request.input if isinstance(part, TextContent))
 
     @staticmethod
-    def _mcp_servers(request: AgentSessionRequest) -> dict[str, object]:
+    def _mcp_servers(request: ClaudeNativeSessionRequest) -> dict[str, object]:
         result: dict[str, object] = {}
         for server in request.mcp_servers:
             if server.transport != "streamable_http":
@@ -1516,7 +1521,7 @@ class ClaudeSdkAdapter:
         return result
 
     @staticmethod
-    def _mcp_startup_diagnostics(request: AgentSessionRequest, status: object) -> list[str]:
+    def _mcp_startup_diagnostics(request: ClaudeNativeSessionRequest, status: object) -> list[str]:
         """Classify the CLI's `mcp_status` answer before the session becomes usable.
 
         Claude Code 2.1.220 answers the `mcp_status` control request with
@@ -1571,7 +1576,7 @@ class ClaudeSdkAdapter:
         return {"type": "json_schema", "schema": thaw_json_value(output.schema)}
 
     @staticmethod
-    def _thinking(request: AgentSessionRequest) -> dict[str, object] | None:
+    def _thinking(request: ClaudeNativeSessionRequest) -> dict[str, object] | None:
         reasoning = request.reasoning
         if reasoning is None:
             return None
