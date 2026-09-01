@@ -81,10 +81,12 @@ attest raw transport bytes. The adapter separately enforces valid bounded JSON
 and the selected grant's canonical `ParsedJson` input-byte ceiling.
 
 For Codex MCP, pass the same frozen plan to
-`agent_runtime.lower_mcp_tools(McpToolPublication(...))`. The returned server
-configuration publishes the same request-local aliases and its `observe`
-method narrows SDK MCP events back to canonical tool ids. Neither adapter
-chooses tools from a product operation name.
+`provider_runtime.agent_runtime.tool_projection.lower_mcp_tools(`
+`McpToolPublication(...))`. The returned server configuration publishes the
+same request-local aliases and its `observe` method narrows SDK MCP events back
+to canonical tool ids. The optional projection module is not re-exported from
+the dependency-light `agent_runtime` package. Neither adapter chooses tools
+from a product operation name.
 
 ## Architecture
 
