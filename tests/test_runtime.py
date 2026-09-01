@@ -79,6 +79,7 @@ from provider_runtime.types import (
     ProviderContextTooLarge,
     ProviderCredential,
     ProviderHttpUnavailable,
+    ProviderName,
     ProviderRateLimit,
     ProviderStreamInterrupted,
     ProviderTarget,
@@ -201,6 +202,7 @@ def make_runtime(
     *,
     max_attempts: int = 3,
     credentials: Credentials = CREDENTIALS,
+    endpoint_overrides: Mapping[ProviderName, str] | None = None,
     tracer_provider: TracerProvider | None = None,
 ) -> ProviderRuntime:
     return ProviderRuntime(
@@ -220,6 +222,7 @@ def make_runtime(
             "anthropic_messages": engine,
             "gemini_generate": engine,
         },
+        endpoint_overrides=endpoint_overrides,
         tracer_provider=tracer_provider,
     )
 
@@ -358,6 +361,35 @@ async def test_generate_dispatches_resolved_row_with_credential_and_keeps_engine
     assert trace[0].signal == FinalAttempt()
     assert outcome.meta.provider_request_id == Present("req-final")
     assert outcome.meta.billability == PossiblyBillable()
+
+
+async def test_explicit_endpoint_origin_is_applied_after_registry_resolution() -> None:
+    engine = FakeEngine(generate_script=[succeeded()])
+    runtime = make_runtime(
+        engine,
+        endpoint_overrides={"openai": "https://127.0.0.1:24443"},
+    )
+
+    await runtime.generate(make_intent())
+
+    ((row, _intent, _credential),) = engine.generate_calls
+    assert row.base_url == Present("https://127.0.0.1:24443/v1")
+    source = registry._resolve("openai:gpt-5.6-sol")
+    assert source.base_url == Absent(), "dispatch overrides must not mutate catalog source facts"
+
+
+@pytest.mark.parametrize(
+    "origin",
+    (
+        "http://127.0.0.1:24443",
+        "https://user@127.0.0.1:24443",
+        "https://127.0.0.1:24443/path",
+        "https://127.0.0.1:24443?query=1",
+    ),
+)
+def test_endpoint_override_accepts_only_https_origins(origin: str) -> None:
+    with pytest.raises(ValueError, match="HTTPS origin"):
+        make_runtime(FakeEngine(), endpoint_overrides={"openai": origin})
 
 
 async def test_generate_retries_transient_then_accumulates_and_renumbers_trace() -> None:
