@@ -46,7 +46,15 @@ from provider_runtime import (
     ProviderRuntime,
 )
 from provider_runtime.errors import sanitize_provider_text
-from provider_runtime.registry import REGISTRY_REVISION, ROWS, ModelRow
+from provider_runtime.registry import (
+    _ROWS as ROWS,
+)
+from provider_runtime.registry import (
+    REGISTRY_REVISION,
+)
+from provider_runtime.registry import (
+    _ModelRow as ModelRow,
+)
 from provider_runtime.types import (
     Absent,
     AssistantMessage,

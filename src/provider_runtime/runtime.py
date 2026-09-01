@@ -46,10 +46,15 @@ from provider_runtime.otel import as_current, call_span, record_outcome
 from provider_runtime.prices import estimate_cost
 from provider_runtime.registry import (
     REGISTRY_REVISION,
-    EngineId,
-    ModelRow,
-    resolve,
-    resolve_target,
+)
+from provider_runtime.registry import (
+    _ModelRow as ModelRow,
+)
+from provider_runtime.registry import (
+    _resolve as resolve,
+)
+from provider_runtime.registry import (
+    _resolve_target as resolve_target,
 )
 from provider_runtime.retry import DEFAULT_RETRY, attempts
 from provider_runtime.types import (
@@ -65,6 +70,7 @@ from provider_runtime.types import (
     ConfirmedNonBillable,
     EmbeddingCall,
     EmbeddingResponse,
+    EngineId,
     Failed,
     FinalAttempt,
     GenerateIntent,

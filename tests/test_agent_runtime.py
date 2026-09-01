@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator, Mapping
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -27,6 +29,12 @@ from provider_runtime.agent_runtime.events import (
     AgentText,
     AgentUsage,
 )
+from provider_runtime.agent_runtime.model_catalog import (
+    AGENT_BACKEND_CONTRACT_REVISION,
+    AgentModelCatalog,
+    AgentModelFacts,
+    AgentReasoningFacts,
+)
 from provider_runtime.agent_runtime.policy import (
     PermissionPolicy,
     PermissionPolicyPatch,
@@ -49,6 +57,8 @@ from provider_runtime.agent_runtime.types import (
     ApprovalHandler,
     ApprovalRequest,
     Backend,
+    ClaudeNativeSessionRequest,
+    CodexCatalogSessionRequest,
     CredentialRef,
     EnvironmentReference,
     FileContent,
@@ -57,6 +67,7 @@ from provider_runtime.agent_runtime.types import (
     NewSession,
     TextContent,
     TurnRequest,
+    _ResolvedCodexSessionRequest,
 )
 from provider_runtime.types import Absent, Present, TokenUsage
 
@@ -99,13 +110,49 @@ def request(
     backend: Backend = "codex",
     transport: AgentTransport = "sdk",
 ) -> AgentSessionRequest:
-    return AgentSessionRequest(
-        backend=backend,
-        transport=transport,
-        auth=CredentialRef(kind="local_account", profile_key="personal"),
-        open=NewSession(),
-        cwd=str(tmp_path.resolve()),
-        policy=PermissionPolicy(),
+    if transport != "sdk":
+        raise AssertionError(f"test fixture has no {transport!r} transport")
+    common = {
+        "auth": CredentialRef(kind="local_account", profile_key="personal"),
+        "open": NewSession(),
+        "cwd": str(tmp_path.resolve()),
+        "policy": PermissionPolicy(),
+    }
+    if backend == "codex":
+        return CodexCatalogSessionRequest(
+            **common,
+            model_key="codex-test",
+            reasoning="high",
+            agent_definition_revision="agent-definition-test",
+            row_fingerprint="f" * 64,
+        )
+    return ClaudeNativeSessionRequest(**common, model="claude-test")
+
+
+def codex_catalog() -> AgentModelCatalog:
+    return AgentModelCatalog(
+        backend_contract_revision=AGENT_BACKEND_CONTRACT_REVISION,
+        definition_revision="agent-definition-test",
+        native_revision=Absent(),
+        observed_at=datetime(2026, 8, 31, tzinfo=UTC),
+        models=(
+            AgentModelFacts(
+                key="codex-test",
+                dispatch_model="codex-test-wire",
+                label="Codex Test",
+                source_context_window=Absent(),
+                source_max_output_tokens=Absent(),
+                input_modalities=("text", "image"),
+                reasoning=(
+                    AgentReasoningFacts(key="high", label="High", native_wire_value="high"),
+                ),
+                source_default_reasoning=Present("high"),
+                upgrade=Absent(),
+                retirement=Absent(),
+                row_fingerprint="f" * 64,
+            ),
+        ),
+        diagnostics=(),
     )
 
 
@@ -179,6 +226,7 @@ class ScriptedAdapter:
         self.auth_calls = 0
         self.open_calls = 0
         self.read_calls = 0
+        self.model_catalog_calls = 0
         self.interrupt_calls = 0
         self.close_session_calls = 0
         self.close_calls = 0
@@ -215,6 +263,13 @@ class ScriptedAdapter:
     ) -> SessionPage:
         self.last_environment = dict(environment)
         return SessionPage(sessions=())
+
+    async def model_catalog(self, *, environment: Mapping[str, str]) -> AgentModelCatalog:
+        self.model_catalog_calls += 1
+        self.last_environment = dict(environment)
+        if self.backend != "codex":
+            raise UnsupportedCapability("scripted Claude catalog is unavailable")
+        return codex_catalog()
 
     async def read_session(
         self,
@@ -364,6 +419,7 @@ async def test_runtime_opens_streams_and_projects_one_terminal_result(tmp_path: 
         session = await runtime.open_session(request(tmp_path))
         events = [event async for event in runtime.stream_turn(session, turn())]
         result = await runtime.run_turn(session, turn())
+        resolved = adapter.requests[session]
         await runtime.close_session(session)
 
     assert [type(event).__name__ for event in events] == ["AgentText", "AgentTerminal"], (
@@ -373,6 +429,59 @@ async def test_runtime_opens_streams_and_projects_one_terminal_result(tmp_path: 
     assert result.status == "succeeded"
     assert result.final_text == "done"
     assert result.session_ref == session.ref
+    assert isinstance(resolved, _ResolvedCodexSessionRequest)
+    assert resolved.dispatch_model == "codex-test-wire"
+    assert resolved.native_reasoning == "high"
+    assert adapter.model_catalog_calls == 1
+
+
+async def test_model_catalog_is_an_authenticated_route_query_without_session_effects(
+    tmp_path: Path,
+) -> None:
+    adapter = ScriptedAdapter()
+    auth = CredentialRef(kind="local_account", profile_key="personal")
+    async with runtime_for(tmp_path, adapter) as runtime:
+        catalog = await runtime.model_catalog("codex", auth)
+
+    assert catalog == codex_catalog()
+    assert adapter.model_catalog_calls == 1
+    assert adapter.open_calls == 0
+
+
+async def test_open_session_rejects_values_outside_the_tagged_request_union(
+    tmp_path: Path,
+) -> None:
+    adapter = ScriptedAdapter()
+    async with runtime_for(tmp_path, adapter) as runtime:
+        with pytest.raises(InvalidAgentRequest, match="CodexCatalogSessionRequest"):
+            await runtime.open_session(object())  # type: ignore[arg-type]
+
+    assert adapter.auth_calls == 0
+    assert adapter.open_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    (
+        ({"agent_definition_revision": "stale"}, "definition revision"),
+        ({"row_fingerprint": "0" * 64}, "row fingerprint"),
+        ({"model_key": "missing"}, "model_key"),
+        ({"reasoning": "unsupported"}, "reasoning key"),
+    ),
+)
+async def test_codex_catalog_selection_fails_before_adapter_open(
+    tmp_path: Path,
+    changes: Mapping[str, object],
+    message: str,
+) -> None:
+    adapter = ScriptedAdapter()
+    selected = replace(request(tmp_path), **changes)
+    async with runtime_for(tmp_path, adapter) as runtime:
+        with pytest.raises(InvalidAgentRequest, match=message):
+            await runtime.open_session(selected)
+
+    assert adapter.model_catalog_calls == 1
+    assert adapter.open_calls == 0
 
 
 async def test_quota_exhaustion_is_the_named_terminal_value(tmp_path: Path) -> None:
@@ -514,14 +623,7 @@ async def test_selected_adapter_failure_never_invokes_another_transport(tmp_path
 
 async def test_ask_without_handler_is_rejected_before_adapter_stream(tmp_path: Path) -> None:
     adapter = ScriptedAdapter()
-    ask_request = AgentSessionRequest(
-        backend="codex",
-        transport="sdk",
-        auth=CredentialRef(kind="local_account", profile_key="personal"),
-        open=NewSession(),
-        cwd=str(tmp_path.resolve()),
-        policy=PermissionPolicy(approval="ask"),
-    )
+    ask_request = replace(request(tmp_path), policy=PermissionPolicy(approval="ask"))
     async with runtime_for(tmp_path, adapter) as runtime:
         session = await runtime.open_session(ask_request)
         with pytest.raises(InvalidAgentRequest, match="approval handler"):
@@ -546,14 +648,7 @@ async def test_turn_policy_patch_may_only_narrow(tmp_path: Path) -> None:
 
 async def test_approval_handler_exception_becomes_typed_failure(tmp_path: Path) -> None:
     adapter = ScriptedAdapter(request_approval=True)
-    ask_request = AgentSessionRequest(
-        backend="codex",
-        transport="sdk",
-        auth=CredentialRef(kind="local_account", profile_key="personal"),
-        open=NewSession(),
-        cwd=str(tmp_path.resolve()),
-        policy=PermissionPolicy(approval="ask"),
-    )
+    ask_request = replace(request(tmp_path), policy=PermissionPolicy(approval="ask"))
 
     async def broken_handler(_request: ApprovalRequest) -> str:
         raise RuntimeError("handler crashed")
@@ -579,14 +674,7 @@ async def test_approval_handler_exception_becomes_typed_failure(tmp_path: Path) 
 
 async def test_missing_cwd_is_rejected_before_adapter_open(tmp_path: Path) -> None:
     adapter = ScriptedAdapter()
-    missing = AgentSessionRequest(
-        backend="codex",
-        transport="sdk",
-        auth=CredentialRef(kind="local_account", profile_key="personal"),
-        open=NewSession(),
-        cwd=str((tmp_path / "absent").resolve()),
-        policy=PermissionPolicy(),
-    )
+    missing = replace(request(tmp_path), cwd=str((tmp_path / "absent").resolve()))
     async with runtime_for(tmp_path, adapter) as runtime:
         with pytest.raises(InvalidAgentRequest, match="does not exist"):
             await runtime.open_session(missing)
@@ -817,12 +905,8 @@ async def test_mcp_references_are_materialized_only_at_safe_child_aliases(
         url="https://mcp.example.test/mcp",
         header_refs=(HeaderReference(name="Authorization", source=source),),
     )
-    mcp_request = AgentSessionRequest(
-        backend="codex",
-        transport="sdk",
-        auth=CredentialRef(kind="local_account", profile_key="personal"),
-        open=NewSession(),
-        cwd=str(tmp_path.resolve()),
+    mcp_request = replace(
+        request(tmp_path),
         policy=PermissionPolicy(
             network="unrestricted",
             unsafe_confirmation=UnsafeConfirmation(("network_unrestricted",)),
@@ -861,12 +945,8 @@ async def test_mcp_rejects_primary_credential_destination_before_resolution(
         command="python3",
         environment_refs=(EnvironmentReference(name="OPENAI_API_KEY", source=source),),
     )
-    bad_request = AgentSessionRequest(
-        backend="codex",
-        transport="sdk",
-        auth=CredentialRef(kind="local_account", profile_key="personal"),
-        open=NewSession(),
-        cwd=str(tmp_path.resolve()),
+    bad_request = replace(
+        request(tmp_path),
         policy=stdio_mcp_policy(),
         mcp_servers=(spec,),
     )
@@ -890,12 +970,8 @@ async def test_mcp_rejects_state_root_and_process_control_destinations(
         command="python3",
         environment_refs=(EnvironmentReference(name=destination, source=source),),
     )
-    bad_request = AgentSessionRequest(
-        backend="codex",
-        transport="sdk",
-        auth=CredentialRef(kind="local_account", profile_key="personal"),
-        open=NewSession(),
-        cwd=str(tmp_path.resolve()),
+    bad_request = replace(
+        request(tmp_path),
         policy=stdio_mcp_policy(),
         mcp_servers=(spec,),
     )
@@ -928,12 +1004,8 @@ async def test_mcp_rejects_cross_server_destination_collision(tmp_path: Path) ->
             environment_refs=(EnvironmentReference(name="SHARED", source=second_source),),
         ),
     )
-    bad_request = AgentSessionRequest(
-        backend="codex",
-        transport="sdk",
-        auth=CredentialRef(kind="local_account", profile_key="personal"),
-        open=NewSession(),
-        cwd=str(tmp_path.resolve()),
+    bad_request = replace(
+        request(tmp_path),
         policy=stdio_mcp_policy(),
         mcp_servers=servers,
     )
@@ -945,12 +1017,8 @@ async def test_mcp_rejects_cross_server_destination_collision(tmp_path: Path) ->
 async def test_stdio_mcp_requires_the_unsafe_policy_pair(tmp_path: Path) -> None:
     adapter = ScriptedAdapter()
     spec = McpServerSpec(name="tool", transport="stdio", command="python3")
-    confined_request = AgentSessionRequest(
-        backend="codex",
-        transport="sdk",
-        auth=CredentialRef(kind="local_account", profile_key="personal"),
-        open=NewSession(),
-        cwd=str(tmp_path.resolve()),
+    confined_request = replace(
+        request(tmp_path),
         policy=PermissionPolicy(),
         mcp_servers=(spec,),
     )
@@ -970,12 +1038,8 @@ async def test_missing_secret_resolver_is_typed_before_adapter_effect(tmp_path: 
         url="https://mcp.example.test/mcp",
         header_refs=(HeaderReference(name="Authorization", source=source),),
     )
-    mcp_request = AgentSessionRequest(
-        backend="codex",
-        transport="sdk",
-        auth=CredentialRef(kind="local_account", profile_key="personal"),
-        open=NewSession(),
-        cwd=str(tmp_path.resolve()),
+    mcp_request = replace(
+        request(tmp_path),
         policy=PermissionPolicy(
             network="unrestricted",
             unsafe_confirmation=UnsafeConfirmation(("network_unrestricted",)),
@@ -1005,12 +1069,8 @@ async def test_secret_resolver_exception_is_mapped_without_leaking_detail(tmp_pa
         url="https://mcp.example.test/mcp",
         header_refs=(HeaderReference(name="Authorization", source=source),),
     )
-    mcp_request = AgentSessionRequest(
-        backend="codex",
-        transport="sdk",
-        auth=CredentialRef(kind="local_account", profile_key="personal"),
-        open=NewSession(),
-        cwd=str(tmp_path.resolve()),
+    mcp_request = replace(
+        request(tmp_path),
         policy=PermissionPolicy(
             network="unrestricted",
             unsafe_confirmation=UnsafeConfirmation(("network_unrestricted",)),

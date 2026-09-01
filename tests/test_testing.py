@@ -14,7 +14,7 @@ import pytest
 
 from provider_runtime import registry
 from provider_runtime.engines import Engine, TransientAttempt
-from provider_runtime.registry import ModelRow
+from provider_runtime.registry import _ModelRow as ModelRow
 from provider_runtime.runtime import Credentials, NonGenerationCallFailed, ProviderRuntime
 from provider_runtime.testing import (
     CapturedRuntimeCall,
@@ -72,6 +72,9 @@ ROW = ModelRow(
     streaming=True,
     structured="native",
     reasoning=Absent(),
+    source_default_reasoning=Absent(),
+    upgrade=Absent(),
+    retirement=Absent(),
     continuation_codec="openai.v1",
     correlation="header",
     routing=Absent(),
@@ -249,7 +252,7 @@ async def test_fake_engine_stream_rejects_a_generate_step() -> None:
 
 async def test_fake_engine_drives_provider_runtime_generate() -> None:
     """FakeEngine is what test_runtime.py-style consumers inject at the seam."""
-    row = next(candidate for candidate in registry.ROWS if candidate.provider == "openai")
+    row = next(candidate for candidate in registry._ROWS if candidate.provider == "openai")
     outcome = succeeded()
     engine = FakeEngine([outcome])
     runtime = ProviderRuntime(

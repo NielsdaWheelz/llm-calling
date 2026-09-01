@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Protocol
 
-from provider_runtime.registry import ModelRow
+from provider_runtime.registry import _ModelRow as ModelRow
 from provider_runtime.types import (
     Billability,
     CallOutcome,

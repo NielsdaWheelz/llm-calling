@@ -22,7 +22,8 @@ from provider_runtime.errors import (
     ProtocolDefect,
     RuntimeDefect,
 )
-from provider_runtime.registry import REGISTRY_REVISION, ModelRow
+from provider_runtime.registry import REGISTRY_REVISION
+from provider_runtime.registry import _ModelRow as ModelRow
 from provider_runtime.types import (
     Absent,
     AssistantMessage,
@@ -107,6 +108,9 @@ ROW = ModelRow(
     streaming=True,
     structured="native",
     reasoning=Present(REASONING_LEVELS),
+    source_default_reasoning=Absent(),
+    upgrade=Absent(),
+    retirement=Absent(),
     continuation_codec="anthropic.v1",
     correlation="header",
     routing=Absent(),

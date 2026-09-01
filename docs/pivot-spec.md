@@ -53,7 +53,8 @@ Design stance (binding):
 | `src/provider_runtime/__init__.py` | Facade + `__all__` (≤ 40 names) | rewritten |
 | `src/provider_runtime/types.py` | The contract (§4) — **trimmed in place**, not replaced | keep name; Nexus continuity |
 | `src/provider_runtime/errors.py` | `RuntimeDefect` hierarchy + secret redaction | ported, trimmed |
-| `src/provider_runtime/registry.py` | `ModelRow` capability table + `resolve()` + `REGISTRY_REVISION` | ex-`catalog.py` contract-facts |
+| `src/provider_runtime/registry.py` | private capability rows/resolution + public immutable `api_model_catalog()` | ex-`catalog.py` contract-facts |
+| `src/provider_runtime/continuation.py` | bounded canonical continuation encode/decode | public persistence boundary |
 | `src/provider_runtime/prices.py` | `estimate_cost(meta) -> Presence[CostEstimate]` over vendored snapshot | indicative, never authoritative |
 | `src/provider_runtime/prices_snapshot.json` | Vendored `pydantic/genai-prices` data | refreshed by script, manually |
 | `src/provider_runtime/retry.py` | Single retry owner (owned explicit loop) | `RetryPolicy(` in one module |
@@ -150,7 +151,9 @@ the shared taxonomy. `CallMeta` is populated on every path, including failures.
 
 ## 7. Registry
 
-`ModelRow` (hand-curated, one screen per provider):
+The public `ApiModelCatalog` is the only consumer catalog. Its immutable rows
+project the following facts from a private hand-curated `_ModelRow` owner (one
+screen per provider); only `ProviderRuntime` may resolve private rows:
 
 ```
 ref, provider, model_id, engine, base_url,
@@ -254,7 +257,7 @@ What Nexus consumes and what v2 guarantees:
 | `EmbeddingCall` → `runtime.embed` (`semantic_chunks.py`) | port kept, same shape |
 | `ScriptedRuntime` (tests), `nexus_test_control` wire-level SSE scripting | IR-level `ScriptedRuntime`/`FakeEngine`; wire scripting has no replacement (by design) |
 | `CATALOG`, `ChatModelContract` imports | replaced by `registry` rows; mostly mechanical, semantic edits called out below |
-| `DirectCertification` startup gate (`llm_profiles.py`) | **deleted** — `ModelRow` has no certification field; the gate is re-founded on live-matrix evidence (out-of-band), or removed |
+| `DirectCertification` startup gate (`llm_profiles.py`) | **deleted** — public `ApiModelFacts` has no certification field; the gate is re-founded on live-matrix evidence (out-of-band), or removed |
 | `contract.reasoning.levels` (`llm_profiles.py`) | `row.reasoning` mapping keys; `Absent` = model has no reasoning knob |
 | `contract.output_limit`, `contract.pricing.reasoning_reserve_tokens` (`chat_runs.py`) | `row.max_output_tokens`; v2 has **no reserve-tokens fact** — Nexus owns its reserve policy locally |
 | `plan.request_fingerprint` (`llm_ledger.py`) | **deleted, no replacement** — the `llm_calls.request_fingerprint` column is retired at pin bump |

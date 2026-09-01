@@ -66,6 +66,7 @@ from provider_runtime.agent_runtime.types import (
     ApprovalHandler,
     ApprovalRequest,
     ClaudeNativeOptions,
+    ClaudeNativeSessionRequest,
     CredentialRef,
     ForkSession,
     JsonSchemaAgentOutput,
@@ -618,9 +619,7 @@ def session_request(
 ) -> AgentSessionRequest:
     cwd = tmp_path / "repo"
     cwd.mkdir(exist_ok=True)
-    request = AgentSessionRequest(
-        backend="claude",
-        transport="sdk",
+    request = ClaudeNativeSessionRequest(
         auth=auth,
         open=NewSession(),
         cwd=str(cwd.resolve()),
@@ -864,6 +863,13 @@ async def test_absent_sdk_extra_is_sdk_unavailable(tmp_path: Path) -> None:
         await ClaudeSdkAdapter().open_session(
             session_request(tmp_path), environment=environment(tmp_path)
         )
+
+
+async def test_claude_model_catalog_is_an_explicit_unsupported_capability() -> None:
+    adapter = ClaudeSdkAdapter(executable=str(CLAUDE_EXECUTABLE))
+
+    with pytest.raises(UnsupportedCapability, match="model catalog"):
+        await adapter.model_catalog(environment={})
 
 
 async def test_sdk_version_drift_is_one_runtime_warning_and_the_session_still_opens(

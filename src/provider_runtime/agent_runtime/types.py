@@ -10,8 +10,23 @@ from dataclasses import dataclass, field
 from typing import Literal, cast
 from urllib.parse import urlsplit
 
+from provider_runtime.types import (
+    FrozenJsonDict,
+    JsonObject,
+    JsonValue,
+    JsonValueError,
+)
+from provider_runtime.types import (
+    freeze_json_object as _freeze_json_object,
+)
+from provider_runtime.types import (
+    freeze_json_value as _freeze_json_value,
+)
+from provider_runtime.types import thaw_json_value as thaw_json_value
+
 from ._validation import ENVIRONMENT_NAME, require_tuple, require_unique_strings
 from .errors import InvalidAgentRequest, UnsupportedCapability
+from .model_catalog import AgentReasoningKey
 from .policy import PermissionPolicy, PermissionPolicyPatch
 
 type Backend = Literal["codex", "claude"]
@@ -39,166 +54,20 @@ _MCP_NAME = _PROFILE_KEY
 _HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 _HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_JSON_DEPTH = 64
-_MIN_JSON_INTEGER = -(2**63)
-_MAX_JSON_INTEGER = 2**63 - 1
-
-
-class FrozenJsonDict(Mapping[str, object]):
-    """An immutable mapping containing recursively frozen JSON values."""
-
-    __slots__ = ("__items",)
-
-    def __init__(self, value: Mapping[str, object] | None = None) -> None:
-        source = {} if value is None else value
-        if not isinstance(source, Mapping):
-            raise InvalidAgentRequest("frozen JSON objects require a mapping")
-        self.__items = _freeze_mapping_items(source, context="value", active=set(), depth=0)
-
-    @classmethod
-    def _of_frozen_items(cls, items: tuple[tuple[str, JsonValue], ...]) -> FrozenJsonDict:
-        """Wrap items `_freeze_mapping_items` just produced, without freezing them again.
-
-        Re-entering `__init__` from the freezer would re-walk every descendant once per
-        level of nesting, which is exponential in depth rather than linear in size.
-        """
-        instance = object.__new__(cls)
-        instance.__items = items
-        return instance
-
-    def __setattr__(self, name: str, value: object) -> None:
-        if name == "_FrozenJsonDict__items" and not hasattr(self, name):
-            super().__setattr__(name, value)
-            return
-        raise AttributeError("FrozenJsonDict is immutable")
-
-    def __getitem__(self, key: str) -> object:
-        if not isinstance(key, str):
-            raise TypeError("frozen JSON object keys must be strings")
-        for candidate, value in self.__items:
-            if candidate == key:
-                return value
-        raise KeyError(key)
-
-    def __iter__(self):
-        return (key for key, _value in self.__items)
-
-    def __len__(self) -> int:
-        return len(self.__items)
-
-    def __repr__(self) -> str:
-        return f"FrozenJsonDict({dict(self.items())!r})"
-
-    def __hash__(self) -> int:
-        # Mapping supplies structural, key-order-insensitive __eq__, so the hash must be
-        # order-insensitive too or equal payloads land in different buckets.
-        return hash(frozenset(self.__items))
-
-
-def thaw_json_value(value: object) -> object:
-    """Return ordinary dict/list JSON data for serializers and wire encoders."""
-    if isinstance(value, FrozenJsonDict):
-        return {key: thaw_json_value(child) for key, child in value.items()}
-    if isinstance(value, tuple):
-        return [thaw_json_value(child) for child in value]
-    return value
-
-
-type JsonScalar = None | bool | int | float | str
-type JsonValue = JsonScalar | tuple[JsonValue, ...] | FrozenJsonDict
-type JsonObject = FrozenJsonDict
 
 
 def freeze_json_value(value: object, *, context: str = "value") -> JsonValue:
-    return _freeze_json_value(value, context=context, active=set(), depth=0)
-
-
-def _freeze_json_value(
-    value: object,
-    *,
-    context: str,
-    active: set[int],
-    depth: int,
-) -> JsonValue:
-    if depth > _MAX_JSON_DEPTH:
-        raise InvalidAgentRequest(f"{context} exceeds the maximum JSON nesting depth")
-    if value is None:
-        return None
-    if type(value) is bool:
-        return bool(value)
-    if type(value) is int:
-        if not _MIN_JSON_INTEGER <= value <= _MAX_JSON_INTEGER:
-            raise InvalidAgentRequest(f"{context} integers must fit in signed 64 bits")
-        return int(value)
-    if type(value) is str:
-        return str(value)
-    if type(value) is float:
-        if not math.isfinite(value):
-            raise InvalidAgentRequest(f"{context} numbers must be finite")
-        return value
-    if isinstance(value, Mapping):
-        return FrozenJsonDict._of_frozen_items(
-            _freeze_mapping_items(value, context=context, active=active, depth=depth)
-        )
-    if isinstance(value, tuple | list):
-        identity = id(value)
-        if identity in active:
-            raise InvalidAgentRequest(f"{context} must not contain a reference cycle")
-        active.add(identity)
-        try:
-            return tuple(
-                _freeze_json_value(
-                    child,
-                    context=f"{context}[{index}]",
-                    active=active,
-                    depth=depth + 1,
-                )
-                for index, child in enumerate(value)
-            )
-        finally:
-            active.remove(identity)
-    raise InvalidAgentRequest(
-        f"{context} must contain JSON-safe values; got {type(value).__name__}"
-    )
-
-
-def _freeze_mapping_items(
-    source: Mapping[str, object],
-    *,
-    context: str,
-    active: set[int],
-    depth: int,
-) -> tuple[tuple[str, JsonValue], ...]:
-    """The one place a mapping is frozen; every other caller wraps what this returns."""
-    identity = id(source)
-    if identity in active:
-        raise InvalidAgentRequest(f"{context} must not contain a reference cycle")
-    active.add(identity)
     try:
-        items: list[tuple[str, JsonValue]] = []
-        for key, child in source.items():
-            if type(key) is not str:
-                raise InvalidAgentRequest(f"{context} object keys must be strings")
-            items.append(
-                (
-                    key,
-                    _freeze_json_value(
-                        child,
-                        context=f"{context}.{key}",
-                        active=active,
-                        depth=depth + 1,
-                    ),
-                )
-            )
-    finally:
-        active.remove(identity)
-    return tuple(items)
+        return _freeze_json_value(value, context=context)
+    except JsonValueError as error:
+        raise InvalidAgentRequest(str(error)) from None
 
 
 def freeze_json_object(value: Mapping[str, object], *, context: str = "value") -> JsonObject:
-    frozen = freeze_json_value(value, context=context)
-    if not isinstance(frozen, FrozenJsonDict):
-        raise InvalidAgentRequest(f"{context} must be a JSON object")
-    return frozen
+    try:
+        return _freeze_json_object(value, context=context)
+    except JsonValueError as error:
+        raise InvalidAgentRequest(str(error)) from None
 
 
 def _require_non_empty(value: object, field_name: str) -> str:
@@ -541,6 +410,22 @@ class CodexNativeOptions:
 
 
 @dataclass(frozen=True, slots=True)
+class CodexSandboxControls:
+    """Explicit child temporary root and Codex workspace-write /tmp policy."""
+
+    child_tmpdir: str
+    exclude_slash_tmp: bool
+    exclude_tmpdir_env_var: bool
+
+    def __post_init__(self) -> None:
+        _require_absolute_path(self.child_tmpdir, "CodexSandboxControls.child_tmpdir")
+        if type(self.exclude_slash_tmp) is not bool:
+            raise InvalidAgentRequest("CodexSandboxControls.exclude_slash_tmp must be bool")
+        if type(self.exclude_tmpdir_env_var) is not bool:
+            raise InvalidAgentRequest("CodexSandboxControls.exclude_tmpdir_env_var must be bool")
+
+
+@dataclass(frozen=True, slots=True)
 class ClaudeNativeOptions:
     include_partial_messages: bool | None = None
 
@@ -554,70 +439,113 @@ class ClaudeNativeOptions:
             )
 
 
-type NativeOptions = CodexNativeOptions | ClaudeNativeOptions
-
-
-@dataclass(frozen=True, slots=True)
-class AgentSessionRequest:
-    backend: Backend
-    transport: AgentTransport
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _SessionRequestBase:
     auth: CredentialRef
     open: SessionOpen
     cwd: str
     policy: PermissionPolicy
-    model: str | None = None
-    reasoning: ReasoningSpec | None = None
     system: tuple[ContentPart, ...] = ()
     developer: tuple[ContentPart, ...] = ()
     additional_dirs: tuple[str, ...] = ()
     mcp_servers: tuple[McpServerSpec, ...] = ()
     output: AgentOutputSpec = TextAgentOutput()
-    native: NativeOptions | None = None
 
-    def __post_init__(self) -> None:
-        if (self.backend, self.transport) not in AGENT_ROUTES:
-            raise InvalidAgentRequest(
-                f"unsupported backend/transport pair: {self.backend!r}/{self.transport!r}"
-            )
+    def _validate_common(self, owner: str) -> None:
         if not isinstance(self.auth, CredentialRef):
-            raise InvalidAgentRequest("AgentSessionRequest.auth must be CredentialRef")
+            raise InvalidAgentRequest(f"{owner}.auth must be CredentialRef")
         if not isinstance(self.open, NewSession | ResumeSession | ForkSession):
-            raise InvalidAgentRequest("AgentSessionRequest.open is invalid")
-        _require_absolute_path(self.cwd, "AgentSessionRequest.cwd")
+            raise InvalidAgentRequest(f"{owner}.open is invalid")
+        _require_absolute_path(self.cwd, f"{owner}.cwd")
         if not isinstance(self.policy, PermissionPolicy):
-            raise InvalidAgentRequest("AgentSessionRequest.policy must be PermissionPolicy")
-        if self.model is not None:
-            _require_non_empty(self.model, "AgentSessionRequest.model")
-        if self.reasoning is not None and not isinstance(self.reasoning, ReasoningSpec):
-            raise InvalidAgentRequest("AgentSessionRequest.reasoning must be ReasoningSpec")
-        _validate_content(self.system, "AgentSessionRequest.system", allow_empty=True)
-        _validate_content(self.developer, "AgentSessionRequest.developer", allow_empty=True)
+            raise InvalidAgentRequest(f"{owner}.policy must be PermissionPolicy")
+        _validate_content(self.system, f"{owner}.system", allow_empty=True)
+        _validate_content(self.developer, f"{owner}.developer", allow_empty=True)
         require_tuple(self.additional_dirs, "additional_dirs")
         for index, path in enumerate(self.additional_dirs):
-            _require_absolute_path(path, f"AgentSessionRequest.additional_dirs[{index}]")
+            _require_absolute_path(path, f"{owner}.additional_dirs[{index}]")
         if len(self.additional_dirs) != len(set(self.additional_dirs)):
-            raise InvalidAgentRequest("AgentSessionRequest.additional_dirs contains duplicates")
-        require_tuple(self.mcp_servers, "AgentSessionRequest.mcp_servers")
+            raise InvalidAgentRequest(f"{owner}.additional_dirs contains duplicates")
+        require_tuple(self.mcp_servers, f"{owner}.mcp_servers")
         servers = self.mcp_servers
         if any(not isinstance(server, McpServerSpec) for server in servers):
-            raise InvalidAgentRequest("AgentSessionRequest.mcp_servers contains an invalid value")
+            raise InvalidAgentRequest(f"{owner}.mcp_servers contains an invalid value")
         if len({server.name for server in servers}) != len(servers):
-            raise InvalidAgentRequest("AgentSessionRequest.mcp_servers contains duplicate names")
+            raise InvalidAgentRequest(f"{owner}.mcp_servers contains duplicate names")
         if not isinstance(self.output, TextAgentOutput | JsonSchemaAgentOutput):
-            raise InvalidAgentRequest("AgentSessionRequest.output is invalid")
-        if self.native is not None:
-            if self.backend == "codex" and not isinstance(self.native, CodexNativeOptions):
-                raise InvalidAgentRequest("codex requests require CodexNativeOptions")
-            if self.backend == "claude" and not isinstance(self.native, ClaudeNativeOptions):
-                raise InvalidAgentRequest("claude requests require ClaudeNativeOptions")
-            if (
-                isinstance(self.native, CodexNativeOptions)
-                and self.native.web_search is True
-                and self.policy.network != "unrestricted"
-            ):
-                raise InvalidAgentRequest(
-                    "CodexNativeOptions.web_search requires unrestricted network policy"
-                )
+            raise InvalidAgentRequest(f"{owner}.output is invalid")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CodexCatalogSessionRequest(_SessionRequestBase):
+    model_key: str
+    reasoning: AgentReasoningKey
+    agent_definition_revision: str
+    row_fingerprint: str
+    native: CodexNativeOptions | None = None
+    backend: Literal["codex"] = field(default="codex", init=False)
+    transport: Literal["sdk"] = field(default="sdk", init=False)
+
+    def __post_init__(self) -> None:
+        self._validate_common("CodexCatalogSessionRequest")
+        _require_non_empty(self.model_key, "CodexCatalogSessionRequest.model_key")
+        _require_non_empty(self.reasoning, "CodexCatalogSessionRequest.reasoning")
+        _require_non_empty(
+            self.agent_definition_revision,
+            "CodexCatalogSessionRequest.agent_definition_revision",
+        )
+        if _HEX_SHA256.fullmatch(self.row_fingerprint) is None:
+            raise InvalidAgentRequest(
+                "CodexCatalogSessionRequest.row_fingerprint must be a SHA-256 hex digest"
+            )
+        if self.native is not None and not isinstance(self.native, CodexNativeOptions):
+            raise InvalidAgentRequest(
+                "CodexCatalogSessionRequest.native must be CodexNativeOptions"
+            )
+        if (
+            isinstance(self.native, CodexNativeOptions)
+            and self.native.web_search is True
+            and self.policy.network != "unrestricted"
+        ):
+            raise InvalidAgentRequest(
+                "CodexNativeOptions.web_search requires unrestricted network policy"
+            )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ClaudeNativeSessionRequest(_SessionRequestBase):
+    model: str | None = None
+    reasoning: ReasoningSpec | None = None
+    native: ClaudeNativeOptions | None = None
+    backend: Literal["claude"] = field(default="claude", init=False)
+    transport: Literal["sdk"] = field(default="sdk", init=False)
+
+    def __post_init__(self) -> None:
+        self._validate_common("ClaudeNativeSessionRequest")
+        if self.model is not None:
+            _require_non_empty(self.model, "ClaudeNativeSessionRequest.model")
+        if self.reasoning is not None and not isinstance(self.reasoning, ReasoningSpec):
+            raise InvalidAgentRequest("ClaudeNativeSessionRequest.reasoning must be ReasoningSpec")
+        if self.native is not None and not isinstance(self.native, ClaudeNativeOptions):
+            raise InvalidAgentRequest(
+                "ClaudeNativeSessionRequest.native must be ClaudeNativeOptions"
+            )
+
+
+type AgentSessionRequest = CodexCatalogSessionRequest | ClaudeNativeSessionRequest
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _ResolvedCodexSessionRequest(CodexCatalogSessionRequest):
+    """Runtime-only Codex arm after current-catalog validation."""
+
+    dispatch_model: str
+    native_reasoning: str
+
+    def __post_init__(self) -> None:
+        CodexCatalogSessionRequest.__post_init__(self)
+        _require_non_empty(self.dispatch_model, "resolved Codex dispatch_model")
+        _require_non_empty(self.native_reasoning, "resolved Codex native_reasoning")
 
 
 def _validate_content(value: object, field_name: str, *, allow_empty: bool) -> None:
