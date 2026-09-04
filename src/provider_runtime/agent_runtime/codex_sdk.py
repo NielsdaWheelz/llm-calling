@@ -104,8 +104,8 @@ from .types import (
 )
 
 # The one version the adapter was certified against. Drift from it is reported as a
-# RuntimeWarning and the behavioral probe decides fitness; only a missing module or a
-# missing public surface remains a hard `SdkUnavailable`.
+# RuntimeWarning and the behavioral probe decides fitness; a missing required surface,
+# including the routed resume-usage seam, remains a hard `SdkUnavailable`.
 _CERTIFIED_SDK_VERSION = "0.144.4"
 _RUNTIME_VERSION_PREFIX = re.compile(
     r"(?P<version>[0-9]+(?:\.[0-9]+){2}(?:[-+][0-9A-Za-z.-]+)?)(?:\s|$)"
@@ -192,6 +192,144 @@ _PATCH_APPLY_STATUS: dict[str, FileChangeStatus] = {
 }
 
 
+def _presence_delta(
+    current: Presence[int], baseline: Presence[int], *, field_name: str
+) -> Presence[int]:
+    match current, baseline:
+        case Present(value=current_count), Present(value=baseline_count):
+            if current_count < baseline_count:
+                raise ProtocolDefect(
+                    f"Codex cumulative usage {field_name} decreased within one session"
+                )
+            return Present(current_count - baseline_count)
+        case Absent(), Absent():
+            return Absent()
+        case _:
+            raise ProtocolDefect(f"Codex cumulative usage {field_name} changed field presence")
+
+
+def _usage_delta(current: TokenUsage, baseline: TokenUsage) -> TokenUsage:
+    """Subtract two validated cumulative snapshots without inventing counters."""
+    input_tokens = current.input_tokens - baseline.input_tokens
+    output_tokens = current.output_tokens - baseline.output_tokens
+    total_tokens = current.total_tokens - baseline.total_tokens
+    if input_tokens < 0 or output_tokens < 0 or total_tokens < 0:
+        raise ProtocolDefect("Codex cumulative usage decreased within one session")
+    usage = TokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        reasoning_tokens=_presence_delta(
+            current.reasoning_tokens,
+            baseline.reasoning_tokens,
+            field_name="reasoning_tokens",
+        ),
+        cache_read_input_tokens=_presence_delta(
+            current.cache_read_input_tokens,
+            baseline.cache_read_input_tokens,
+            field_name="cache_read_input_tokens",
+        ),
+        cache_write_input_tokens=_presence_delta(
+            current.cache_write_input_tokens,
+            baseline.cache_write_input_tokens,
+            field_name="cache_write_input_tokens",
+        ),
+    )
+    if usage.total_tokens != usage.input_tokens + usage.output_tokens:
+        raise ProtocolDefect("Codex cumulative usage delta was internally inconsistent")
+    return usage
+
+
+@dataclass(slots=True)
+class _CodexUsageAccounting:
+    """Turn-local projection of Codex's thread-cumulative usage snapshots.
+
+    ``baseline_known`` with no ``cumulative`` value is the synthetic zero boundary of a
+    brand-new thread. A restored thread starts unknown: its first replayed cumulative
+    snapshot establishes the boundary and is never exposed as usage for the new turn.
+    """
+
+    baseline_known: bool
+    cumulative: TokenUsage | None = None
+    turn_baseline: TokenUsage | None = None
+    turn_zero_baseline: bool = False
+    turn_requires_rebase: bool = False
+    snapshot_seen: bool = False
+    advanced: bool = False
+    local_usage: TokenUsage | None = None
+    turn_open: bool = False
+
+    def begin_turn(self) -> None:
+        if self.turn_open:
+            raise ProtocolDefect("Codex usage accounting began overlapping turns")
+        self.turn_open = True
+        self.turn_baseline = self.cumulative
+        self.turn_zero_baseline = self.baseline_known and self.cumulative is None
+        self.turn_requires_rebase = not self.baseline_known
+        self.snapshot_seen = False
+        self.advanced = False
+        self.local_usage = None
+
+    def observe(self, cumulative: TokenUsage) -> TokenUsage | None:
+        if not self.turn_open:
+            raise ProtocolDefect("Codex usage snapshot arrived outside its turn")
+
+        if self.turn_requires_rebase and not self.snapshot_seen:
+            # Resume/fork and recovery after a missing notification replay historical
+            # cumulative state. It is a boundary, never usage attributable to this call.
+            if self.cumulative is not None:
+                _usage_delta(cumulative, self.cumulative)
+            self.turn_baseline = cumulative
+            self.cumulative = cumulative
+            self.snapshot_seen = True
+            return None
+
+        previous = self.cumulative
+        if previous is not None:
+            _usage_delta(cumulative, previous)
+            if cumulative == previous:
+                self.snapshot_seen = True
+                return None
+        elif not self.turn_zero_baseline:
+            raise ProtocolDefect("Codex usage accounting had no reliable baseline")
+
+        baseline = self.turn_baseline
+        if baseline is None and not self.turn_zero_baseline:
+            raise ProtocolDefect("Codex usage accounting lost its turn baseline")
+        local = (
+            cumulative
+            if self.turn_zero_baseline
+            else _usage_delta(cumulative, cast(TokenUsage, baseline))
+        )
+        self.cumulative = cumulative
+        self.snapshot_seen = True
+        self.advanced = True
+        self.local_usage = local
+        return local
+
+    def finish_turn(self) -> Presence[TokenUsage]:
+        if not self.turn_open:
+            raise ProtocolDefect("Codex usage accounting finalized a turn more than once")
+        self.turn_open = False
+        usage = self.local_usage
+        if self.advanced:
+            self.baseline_known = True
+        else:
+            # With no advancing snapshot, Codex did not prove the post-turn cumulative
+            # boundary. The next snapshot is baseline-only so hidden history is never
+            # charged to a later invocation.
+            self.baseline_known = False
+        return Absent() if usage is None else Present(usage)
+
+    def abandon_turn(self) -> None:
+        if not self.turn_open:
+            return
+        self.turn_open = False
+        # Runtime cancellation can stop consumption before Codex's final usage frame.
+        # Preserve usage already emitted, but do not reuse a possibly partial boundary.
+        self.baseline_known = False
+
+
 @dataclass(slots=True)
 class _CodexSessionState:
     sdk: ModuleType
@@ -199,13 +337,13 @@ class _CodexSessionState:
     thread: Any
     request: AgentSessionRequest
     ref: AgentSessionRef
+    usage_accounting: _CodexUsageAccounting
     turn: Any | None = None
     turn_id: str | None = None
     message_count: int = 0
     output_bytes: int = 0
     final_text: str = ""
     final_text_bytes: int = 0
-    usage: TokenUsage | None = None
     diagnostics: list[str] = field(default_factory=list)
     active_mcp_calls: dict[str, tuple[str, str]] = field(default_factory=dict)
     quota_exhausted: bool = False
@@ -386,6 +524,11 @@ class CodexSdkAdapter:
                 native_session_id == request.open.ref.native_session_id
             ):
                 raise ProtocolDefect("Codex SDK fork did not mint a new thread id")
+            restored_usage = (
+                None
+                if isinstance(request.open, NewSession)
+                else self._restored_usage_baseline(client, native_session_id)
+            )
 
             ref = self._make_ref(
                 native_session_id=native_session_id,
@@ -400,6 +543,11 @@ class CodexSdkAdapter:
                 thread=thread,
                 request=request,
                 ref=ref,
+                usage_accounting=_CodexUsageAccounting(
+                    baseline_known=isinstance(request.open, NewSession)
+                    or restored_usage is not None,
+                    cumulative=restored_usage,
+                ),
             )
             return session
         except BaseException:
@@ -447,7 +595,7 @@ class CodexSdkAdapter:
         state.output_bytes = 0
         state.final_text = ""
         state.final_text_bytes = 0
-        state.usage = None
+        state.usage_accounting.begin_turn()
         state.diagnostics.clear()
         state.active_mcp_calls.clear()
         state.quota_exhausted = False
@@ -457,12 +605,14 @@ class CodexSdkAdapter:
             stream = turn.stream()
             async for notification in stream:
                 for event in self._notification_events(state, notification):
-                    yield event
                     if isinstance(event, AgentTerminal):
                         terminal_seen = True
                         state.turn = None
+                    yield event
+                    if isinstance(event, AgentTerminal):
                         return
         except OutputLimitExceeded:
+            usage = state.usage_accounting.finish_turn()
             try:
                 await turn.interrupt()
             finally:
@@ -472,7 +622,7 @@ class CodexSdkAdapter:
                 failure=AgentFailure("output_limit_exceeded"),
                 final_text=state.final_text,
                 session_ref=state.ref,
-                usage=self._terminal_usage(state),
+                usage=usage,
                 diagnostics=tuple(state.diagnostics),
             )
             return
@@ -485,6 +635,7 @@ class CodexSdkAdapter:
         except Exception as error:
             message = sanitize_provider_text(str(error)) or "Codex SDK turn failed"
             self._append_diagnostic(state, message)
+            usage = state.usage_accounting.finish_turn()
             await self._destroy_session(session, state)
             yield AgentTerminal(
                 status="failed",
@@ -493,10 +644,12 @@ class CodexSdkAdapter:
                 else AgentFailure("backend_failed"),
                 final_text=state.final_text,
                 session_ref=state.ref,
-                usage=self._terminal_usage(state),
+                usage=usage,
                 diagnostics=tuple(state.diagnostics),
             )
             return
+        finally:
+            state.usage_accounting.abandon_turn()
         if not terminal_seen:
             await self._destroy_session(session, state)
             raise MissingTerminalEvent()
@@ -633,6 +786,65 @@ class CodexSdkAdapter:
             ) from None
         self._clients.add(client)
         return sdk, client
+
+    def _restored_usage_baseline(self, client: Any, native_session_id: str) -> TokenUsage | None:
+        """Read the cumulative snapshot app-server replayed during resume/fork.
+
+        Codex emits this notification before answering ``thread/resume`` but assigns it
+        the last restored turn id. The high-level SDK therefore leaves it in its routed
+        pending-turn queue rather than exposing it through the next new turn's stream.
+        The certified SDK has no public accessor for an already-pending turn frame, so this
+        is one narrow, behaviorally checked compatibility seam over its router. No queue is
+        mutated: the adapter only snapshots the already-complete replay.
+        """
+        try:
+            async_client = client._client
+            sync_client = async_client._sync
+            router = sync_client._router
+            lock = router._lock
+            pending = router._pending_turn_notifications
+            if not isinstance(pending, Mapping):
+                raise TypeError
+            with lock:
+                notifications = tuple(
+                    notification for routed in pending.values() for notification in tuple(routed)
+                )
+        except (AttributeError, TypeError):
+            raise SdkUnavailable(
+                "Codex SDK does not expose the routed resume usage required for accounting"
+            ) from None
+
+        snapshots: list[TokenUsage] = []
+        replay_bytes = 0
+        for notification in notifications:
+            if getattr(notification, "method", None) != "thread/tokenUsage/updated":
+                continue
+            payload = getattr(notification, "payload", None)
+            raw_params = getattr(payload, "params", payload)
+            bounded_params = getattr(raw_params, "root", raw_params)
+            try:
+                replay_bytes += bounded_payload_size(
+                    bounded_params,
+                    _MAX_MESSAGE_BYTES,
+                    max_items=_MAX_MESSAGE_ITEMS,
+                )
+            except OutputLimitExceeded:
+                raise ProtocolDefect(
+                    "Codex SDK restored usage payload exceeded its ingress bound"
+                ) from None
+            if len(snapshots) >= _MAX_EVENT_COUNT or replay_bytes > _MAX_TURN_OUTPUT_BYTES:
+                raise ProtocolDefect("Codex SDK restored usage replay exceeded its ingress bound")
+            params = self._mapping(raw_params, "Codex SDK restored token usage notification")
+            if params.get("threadId") != native_session_id:
+                continue
+            snapshots.append(self._decode_token_usage(params))
+        if not snapshots:
+            return None
+        baseline = snapshots[0]
+        for snapshot in snapshots[1:]:
+            _usage_delta(snapshot, baseline)
+            baseline = snapshot
+        return baseline
 
     async def _close_client(self, client: Any) -> None:
         self._clients.discard(client)
@@ -786,9 +998,9 @@ class CodexSdkAdapter:
                 payload=freeze_native_json_object({"changes": params.get("changes")}),
             )
         if method == "thread/tokenUsage/updated":
-            usage = self._token_usage(params)
-            state.usage = usage
-            return AgentUsage(usage)
+            cumulative = self._token_usage(params)
+            usage = state.usage_accounting.observe(cumulative)
+            return None if usage is None else AgentUsage(usage)
         if method == "error":
             error = self._mapping(params.get("error"), "error notification")
             message = error.get("message")
@@ -934,7 +1146,7 @@ class CodexSdkAdapter:
             raise ProtocolDefect("turn completed with active MCP tool calls")
         turn = self._mapping(params.get("turn"), "turn/completed turn")
         status = turn.get("status")
-        usage = self._terminal_usage(state)
+        usage = state.usage_accounting.finish_turn()
         diagnostics = tuple(state.diagnostics)
         if status == "completed":
             structured = None
@@ -986,46 +1198,97 @@ class CodexSdkAdapter:
         raise ProtocolDefect("turn/completed carried an impossible status")
 
     def _token_usage(self, params: Mapping[str, object]) -> TokenUsage:
-        """Normalize the ``tokenUsage.total`` member into the provider lane's noun.
+        """Validate one Codex snapshot and return its cumulative ``total`` member.
 
         ``inputTokens`` is already cache-inclusive (OpenAI wire semantics), so it maps
-        straight onto ``TokenUsage.input_tokens`` without re-adding cache components.
+        straight onto ``TokenUsage.input_tokens`` without re-adding cache components. The
+        ``last`` member is validated as a consistency witness, never used as the accounting
+        source: one AgentRuntime turn can contain several upstream requests.
         """
+        return self._decode_token_usage(params)
+
+    def _decode_token_usage(self, params: Mapping[str, object]) -> TokenUsage:
         token_usage = self._mapping(params.get("tokenUsage"), "token usage")
-        total = self._mapping(token_usage.get("total"), "token usage total")
+        total = self._usage_member(token_usage, "total")
+        last = self._usage_member(token_usage, "last")
+        self._validate_last_usage(last, total)
+        return total
+
+    def _usage_member(self, token_usage: Mapping[str, object], member_name: str) -> TokenUsage:
+        member = self._mapping(token_usage.get(member_name), f"token usage {member_name}")
+        total_tokens = self._usage_presence(member, member_name, "totalTokens")
+        if isinstance(total_tokens, Absent):
+            raise ProtocolDefect(f"tokenUsage.{member_name}.totalTokens was missing")
         try:
-            return TokenUsage.from_components(
-                input_tokens=self._usage_count(total, "inputTokens"),
-                output_tokens=self._usage_count(total, "outputTokens"),
-                total_tokens=self._usage_presence(total, "totalTokens"),
-                reasoning_tokens=self._usage_presence(total, "reasoningOutputTokens"),
-                cache_read_input_tokens=self._usage_presence(total, "cachedInputTokens"),
-                cache_write_input_tokens=self._usage_presence(total, "cacheWriteInputTokens"),
+            usage = TokenUsage.from_components(
+                input_tokens=self._usage_count(member, member_name, "inputTokens"),
+                output_tokens=self._usage_count(member, member_name, "outputTokens"),
+                total_tokens=total_tokens,
+                reasoning_tokens=self._usage_presence(member, member_name, "reasoningOutputTokens"),
+                cache_read_input_tokens=self._usage_presence(
+                    member, member_name, "cachedInputTokens"
+                ),
+                cache_write_input_tokens=self._usage_presence(
+                    member, member_name, "cacheWriteInputTokens"
+                ),
             )
         except ValueError:
             raise ProtocolDefect("thread/tokenUsage/updated carried negative counts") from None
+        if isinstance(total_tokens, Present) and total_tokens.value != (
+            usage.input_tokens + usage.output_tokens
+        ):
+            raise ProtocolDefect(
+                f"tokenUsage.{member_name} totalTokens was internally inconsistent"
+            )
+        if (
+            self._presence_value(usage.reasoning_tokens) > usage.output_tokens
+            or self._presence_value(usage.cache_read_input_tokens)
+            + self._presence_value(usage.cache_write_input_tokens)
+            > usage.input_tokens
+        ):
+            raise ProtocolDefect(
+                f"tokenUsage.{member_name} component counts were internally inconsistent"
+            )
+        return usage
 
     @staticmethod
-    def _usage_count(member: Mapping[str, object], key: str) -> int:
+    def _usage_count(member: Mapping[str, object], member_name: str, key: str) -> int:
         value = member.get(key)
         if value is None:
-            return 0
+            raise ProtocolDefect(f"tokenUsage.{member_name}.{key} was missing")
         if type(value) is not int:
-            raise ProtocolDefect(f"tokenUsage.total.{key} was not an integer")
+            raise ProtocolDefect(f"tokenUsage.{member_name}.{key} was not an integer")
         return value
 
     @staticmethod
-    def _usage_presence(member: Mapping[str, object], key: str) -> Presence[int]:
+    def _usage_presence(member: Mapping[str, object], member_name: str, key: str) -> Presence[int]:
         value = member.get(key)
         if value is None:
             return Absent()
         if type(value) is not int:
-            raise ProtocolDefect(f"tokenUsage.total.{key} was not an integer")
+            raise ProtocolDefect(f"tokenUsage.{member_name}.{key} was not an integer")
         return Present(value)
 
     @staticmethod
-    def _terminal_usage(state: _CodexSessionState) -> Presence[TokenUsage]:
-        return Absent() if state.usage is None else Present(state.usage)
+    def _presence_value(value: Presence[int]) -> int:
+        return value.value if isinstance(value, Present) else 0
+
+    @classmethod
+    def _validate_last_usage(cls, last: TokenUsage, total: TokenUsage) -> None:
+        if (
+            last.input_tokens > total.input_tokens
+            or last.output_tokens > total.output_tokens
+            or last.total_tokens > total.total_tokens
+        ):
+            raise ProtocolDefect("tokenUsage.last exceeded tokenUsage.total")
+        for last_value, total_value in (
+            (last.reasoning_tokens, total.reasoning_tokens),
+            (last.cache_read_input_tokens, total.cache_read_input_tokens),
+            (last.cache_write_input_tokens, total.cache_write_input_tokens),
+        ):
+            if isinstance(last_value, Present):
+                if not isinstance(total_value, Present) or last_value.value > total_value.value:
+                    raise ProtocolDefect("tokenUsage.last exceeded tokenUsage.total")
 
     def _validate_notification_identity(
         self, state: _CodexSessionState, method: str, params: Mapping[str, object]

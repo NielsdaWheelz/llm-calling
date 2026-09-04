@@ -22,10 +22,13 @@ Rules:
 
 Per route the matrix certifies, against the real subscription account: one full
 streamed turn under the default restrictive policy (six-kind grammar, exactly
-one terminal, normalized ``TokenUsage``), a resumed second turn on the same
-native session, and a structured-output turn. The matrix never enrolls an
-account and never prints tokens; evidence values pass through the package's own
-redaction before they are written.
+one terminal, normalized ``TokenUsage``), close/reopen/resume on the same native
+session, and a structured-output turn. Codex additionally runs at least six
+turns on that thread and independently witnesses the raw cumulative snapshots:
+the invocation-local terminal values must sum exactly to the native cumulative
+delta without counting the restored resume snapshot. The matrix never enrolls
+an account or prints credentials; evidence values pass through the package's
+own redaction before they are written.
 """
 
 from __future__ import annotations
@@ -34,10 +37,11 @@ import asyncio
 import hashlib
 import json
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Never
+from typing import Any, Never
 
 import pytest
 
@@ -59,8 +63,9 @@ from provider_runtime.agent_runtime import (
     TextContent,
     TurnRequest,
 )
+from provider_runtime.agent_runtime.codex_sdk import CodexSdkAdapter
 from provider_runtime.agent_runtime.types import AGENT_ROUTES
-from provider_runtime.types import Present, TokenUsage
+from provider_runtime.types import Absent, Presence, Present, TokenUsage
 from tests.live.agent_matrix import parse_model_list
 
 pytestmark = pytest.mark.live_provider
@@ -93,6 +98,29 @@ class LiveRoute:
 
     def __str__(self) -> str:
         return self.name
+
+
+class _ObservedCodexSdkAdapter(CodexSdkAdapter):
+    """Live-only witness for the native cumulative values before projection."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cumulative_by_thread: dict[str, list[tuple[str, TokenUsage]]] = {}
+        self.restored_by_thread: dict[str, list[TokenUsage]] = {}
+
+    def _token_usage(self, params: Mapping[str, object]) -> TokenUsage:
+        cumulative = super()._token_usage(params)
+        thread_id = params.get("threadId")
+        turn_id = params.get("turnId")
+        assert isinstance(thread_id, str) and isinstance(turn_id, str)
+        self.cumulative_by_thread.setdefault(thread_id, []).append((turn_id, cumulative))
+        return cumulative
+
+    def _restored_usage_baseline(self, client: Any, native_session_id: str) -> TokenUsage | None:
+        baseline = super()._restored_usage_baseline(client, native_session_id)
+        if baseline is not None:
+            self.restored_by_thread.setdefault(native_session_id, []).append(baseline)
+        return baseline
 
 
 # The whole shipped route algebra, derived from the package's own closed table so the release
@@ -186,6 +214,107 @@ def _grammar_evidence(events: list[AgentEvent]) -> dict[str, object]:
     }
 
 
+def _optional_count(value: Presence[int]) -> int | None:
+    if isinstance(value, Present):
+        return value.value
+    assert isinstance(value, Absent)
+    return None
+
+
+def _usage_components(usage: TokenUsage) -> dict[str, int | None]:
+    return {
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens,
+        "reasoning_tokens": _optional_count(usage.reasoning_tokens),
+        "cache_read_input_tokens": _optional_count(usage.cache_read_input_tokens),
+        "cache_write_input_tokens": _optional_count(usage.cache_write_input_tokens),
+    }
+
+
+def _sum_usage(usages: list[TokenUsage]) -> dict[str, int | None]:
+    components = [_usage_components(usage) for usage in usages]
+    result: dict[str, int | None] = {}
+    for name in components[0]:
+        values = [item[name] for item in components]
+        if all(value is None for value in values):
+            result[name] = None
+            continue
+        assert all(type(value) is int for value in values), (
+            f"Codex usage field presence changed across live turn deltas: {name}"
+        )
+        result[name] = sum(value for value in values if isinstance(value, int))
+    return result
+
+
+def _usage_difference(current: TokenUsage, baseline: TokenUsage) -> dict[str, int | None]:
+    current_components = _usage_components(current)
+    baseline_components = _usage_components(baseline)
+    result: dict[str, int | None] = {}
+    for name, current_value in current_components.items():
+        baseline_value = baseline_components[name]
+        if current_value is None and baseline_value is None:
+            result[name] = None
+            continue
+        assert type(current_value) is int and type(baseline_value) is int
+        assert current_value >= baseline_value
+        result[name] = current_value - baseline_value
+    return result
+
+
+def _codex_usage_evidence(
+    observer: _ObservedCodexSdkAdapter,
+    thread_id: str,
+    terminals: list[AgentTerminal],
+) -> dict[str, object]:
+    assert len(terminals) >= 6
+    local = []
+    for terminal in terminals:
+        assert isinstance(terminal.usage, Present), (
+            f"Codex live turn supplied no attributable usage: {terminal!r}"
+        )
+        local.append(terminal.usage.value)
+
+    snapshots = observer.cumulative_by_thread[thread_id]
+    by_turn: dict[str, list[TokenUsage]] = {}
+    for turn_id, snapshot in snapshots:
+        by_turn.setdefault(turn_id, []).append(snapshot)
+    assert len(by_turn) == len(terminals), (
+        f"expected one raw cumulative group per Codex turn; got {len(by_turn)} "
+        f"for {len(terminals)} turns"
+    )
+    groups = list(by_turn.values())
+    restored = observer.restored_by_thread[thread_id]
+    assert restored == [groups[0][-1]], (
+        "Codex close/reopen/resume did not expose the restored cumulative baseline"
+    )
+
+    expected_turns = [_usage_components(groups[0][-1])]
+    expected_turns.append(_usage_difference(groups[1][-1], restored[0]))
+    expected_turns.extend(
+        _usage_difference(groups[index][-1], groups[index - 1][-1])
+        for index in range(2, len(groups))
+    )
+    assert [_usage_components(usage) for usage in local] == expected_turns, (
+        "a Codex terminal did not equal its independently witnessed fixed-baseline delta"
+    )
+
+    invocation_sum = _sum_usage(local)
+    cumulative_delta = _usage_components(groups[-1][-1])
+    assert invocation_sum == cumulative_delta, (
+        "invocation-local Codex usage did not sum to the real cumulative delta: "
+        f"local={invocation_sum!r} cumulative={cumulative_delta!r}"
+    )
+    return {
+        "turn_count": len(terminals),
+        "resume_replay_observed": True,
+        "resume_history_excluded": True,
+        "local_sum_matches_cumulative_delta": True,
+        "invocation_sum": invocation_sum,
+        "cumulative_delta": cumulative_delta,
+    }
+
+
 async def _certify_route(route: LiveRoute, model: str | None) -> dict[str, object]:
     config = AgentRuntimeConfig(
         state_root_base=_state_root_base(), claude_executable=_claude_executable()
@@ -194,7 +323,9 @@ async def _certify_route(route: LiveRoute, model: str | None) -> dict[str, objec
     workspace = _state_root_base() / "live-workspace"
     workspace.mkdir(mode=0o700, exist_ok=True)
     evidence: dict[str, object] = {"route": route.name, "model": model or "backend-default"}
-    async with AgentRuntime(config) as runtime:
+    observer = _ObservedCodexSdkAdapter() if route.backend == "codex" else None
+    adapters = (observer,) if observer is not None else None
+    async with AgentRuntime(config, adapters=adapters) as runtime:
         request = AgentSessionRequest(
             backend=route.backend,
             transport=route.transport,
@@ -216,6 +347,8 @@ async def _certify_route(route: LiveRoute, model: str | None) -> dict[str, objec
             )
         ]
         evidence["stream_turn"] = _grammar_evidence(events)
+        first = events[-1]
+        assert isinstance(first, AgentTerminal)
         ref = session.ref
         await runtime.close_session(session)
 
@@ -244,6 +377,28 @@ async def _certify_route(route: LiveRoute, model: str | None) -> dict[str, objec
             "status": second.status,
             "same_native_session": second.session_ref.native_session_id == ref.native_session_id,
         }
+        thread_terminals = [first, second]
+        if observer is not None:
+            for turn_number in range(3, 7):
+                result = await runtime.run_turn(
+                    resumed,
+                    TurnRequest(
+                        input=(
+                            TextContent(
+                                f"Reply with only the single digit {turn_number}, no punctuation"
+                            ),
+                        ),
+                        timeout_seconds=_TURN_TIMEOUT_SECONDS,
+                    ),
+                )
+                assert result.status == "succeeded", (
+                    f"Codex live usage turn {turn_number} failed: "
+                    f"{result.failure!r} {result.diagnostics}"
+                )
+                thread_terminals.append(result)
+            evidence["codex_usage_accounting"] = _codex_usage_evidence(
+                observer, ref.native_session_id, thread_terminals
+            )
         await runtime.close_session(resumed)
 
         structured_session = await runtime.open_session(

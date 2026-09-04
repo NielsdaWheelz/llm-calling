@@ -157,7 +157,9 @@ model-initiated shell/filesystem/network/MCP actions, and bounded, recursively
 redacted native events. Sessions require an already-enrolled subscription
 account; API-key session credentials are rejected, and quota exhaustion ends
 the turn with an `AgentQuotaExhausted` terminal — the lane never overflows
-onto API rates. Child environments are runtime-owned and scrubbed. The full
+onto API rates. `AgentTerminal.usage` is always local to that invocation and
+never replays cumulative native-session history. Child environments are
+runtime-owned and scrubbed. The full
 living contract is [docs/agent-runtime.md](docs/agent-runtime.md).
 
 ## Development

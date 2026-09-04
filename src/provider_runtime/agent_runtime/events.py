@@ -132,7 +132,12 @@ class AgentToolUse:
 
 @dataclass(frozen=True, slots=True)
 class AgentUsage:
-    """One backend usage report, normalized into the provider lane's noun."""
+    """One invocation-to-date usage snapshot, normalized to the provider noun.
+
+    Snapshots within a turn are not additive. Even when a backend reports
+    thread- or session-cumulative state, adapters project only usage attributable
+    to this ``AgentRuntime`` invocation.
+    """
 
     usage: TokenUsage
 
@@ -182,7 +187,12 @@ class AgentNative:
 
 @dataclass(frozen=True, slots=True)
 class AgentTerminal:
-    """The exactly-once terminal value of a started turn."""
+    """The exactly-once terminal value of a started turn.
+
+    ``usage`` is invocation-local on every status. It never includes historical
+    thread/session usage, including when the upstream protocol is cumulative.
+    ``Absent`` means the provider supplied no safely attributable usage.
+    """
 
     status: AgentTerminalStatus
     failure: AgentTerminalFailure | None

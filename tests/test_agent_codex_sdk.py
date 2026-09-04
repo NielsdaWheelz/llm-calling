@@ -8,7 +8,9 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import traceback
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -45,6 +47,8 @@ from provider_runtime.agent_runtime import (
     TextContent,
     TurnRequest,
     UnsafeConfirmation,
+    ref_from_json,
+    ref_to_json,
 )
 from provider_runtime.agent_runtime import codex_sdk as codex_sdk_module
 from provider_runtime.agent_runtime._codex_launcher import ensure_codex_launcher
@@ -96,8 +100,34 @@ def notification(method: str, payload: dict[str, object]) -> SimpleNamespace:
     return SimpleNamespace(method=method, payload=payload)
 
 
+class FakeRouter:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pending_turn_notifications: dict[str, deque[SimpleNamespace]] = {}
+
+
+class Cancel:
+    def __init__(self) -> None:
+        self._event = asyncio.Event()
+
+    def set(self) -> None:
+        self._event.set()
+
+    def is_set(self) -> bool:
+        return self._event.is_set()
+
+    async def wait(self) -> bool:
+        return await self._event.wait()
+
+
 class FakeTurn:
-    def __init__(self, module: ModuleType, thread_id: str, prompt: str, kwargs: dict[str, object]):
+    def __init__(
+        self,
+        module: ModuleType,
+        thread_id: str,
+        prompt: str,
+        kwargs: dict[str, object],
+    ):
         state = sdk_state(module)
         state["turn_counter"] += 1
         self.id = f"turn-{state['turn_counter']}"
@@ -116,12 +146,35 @@ class FakeTurn:
         return {"threadId": self._thread_id, "turnId": self.id, **extra}
 
     def _turn_completed(self, status: str, **extra: object) -> SimpleNamespace:
+        sdk_state(self._module)["thread_last_turn_id"][self._thread_id] = self.id
         return notification(
             "turn/completed",
             {
                 "threadId": self._thread_id,
                 "turn": {"id": self.id, "items": [], "status": status, **extra},
             },
+        )
+
+    def _usage_notification(self, delta: dict[str, int] | None = None) -> SimpleNamespace:
+        state = sdk_state(self._module)
+        totals = cast(dict[str, dict[str, int]], state["thread_usage"])[self._thread_id]
+        last = cast(dict[str, dict[str, int]], state["thread_last_usage"])[self._thread_id]
+        if delta is not None:
+            last = dict(delta)
+            for key, value in delta.items():
+                totals[key] = totals.get(key, 0) + value
+            cast(dict[str, dict[str, int]], state["thread_last_usage"])[self._thread_id] = last
+        return notification(
+            "thread/tokenUsage/updated",
+            self._scoped({"tokenUsage": {"last": dict(last), "total": dict(totals)}}),
+        )
+
+    def _raw_usage_notification(
+        self, *, last: Mapping[str, object], total: Mapping[str, object]
+    ) -> SimpleNamespace:
+        return notification(
+            "thread/tokenUsage/updated",
+            self._scoped({"tokenUsage": {"last": dict(last), "total": dict(total)}}),
         )
 
     async def stream(self):
@@ -137,8 +190,26 @@ class FakeTurn:
                 "turn": {"id": self.id, "items": [], "status": "inProgress"},
             },
         )
+        if self._prompt == "hang with usage":
+            yield self._usage_notification(
+                {
+                    "inputTokens": 8,
+                    "cachedInputTokens": 2,
+                    "cacheWriteInputTokens": 1,
+                    "outputTokens": 3,
+                    "reasoningOutputTokens": 1,
+                    "totalTokens": 11,
+                }
+            )
+            await self._interrupted.wait()
+            yield self._turn_completed("interrupted")
+            return
         if self._prompt == "hang":
             await self._interrupted.wait()
+            yield self._turn_completed("interrupted")
+            return
+        if self._prompt == "interrupted with usage":
+            yield self._usage_notification({"inputTokens": 4, "outputTokens": 2, "totalTokens": 6})
             yield self._turn_completed("interrupted")
             return
         if self._prompt == "interrupted":
@@ -192,6 +263,10 @@ class FakeTurn:
             )
             return
         if self._prompt == "failed turn":
+            yield self._turn_completed("failed", error={"message": "backend fell over"})
+            return
+        if self._prompt == "failed with usage":
+            yield self._usage_notification({"inputTokens": 6, "outputTokens": 1, "totalTokens": 7})
             yield self._turn_completed("failed", error={"message": "backend fell over"})
             return
         if self._prompt.startswith("mcp"):
@@ -285,7 +360,82 @@ class FakeTurn:
             "item/agentMessage/delta",
             self._scoped({"itemId": "message-1", "delta": text}),
         )
-        usage_total: dict[str, object] = (
+        if self._prompt == "no usage":
+            yield self._turn_completed("completed")
+            return
+        if self._prompt == "multiple requests":
+            yield self._usage_notification(
+                {
+                    "inputTokens": 10,
+                    "cachedInputTokens": 3,
+                    "cacheWriteInputTokens": 1,
+                    "outputTokens": 2,
+                    "reasoningOutputTokens": 1,
+                    "totalTokens": 12,
+                }
+            )
+            yield self._usage_notification(
+                {
+                    "inputTokens": 7,
+                    "cachedInputTokens": 2,
+                    "cacheWriteInputTokens": 0,
+                    "outputTokens": 4,
+                    "reasoningOutputTokens": 2,
+                    "totalTokens": 11,
+                }
+            )
+            yield self._turn_completed("completed")
+            return
+        if self._prompt == "duplicate usage":
+            yield self._usage_notification({"inputTokens": 3, "outputTokens": 2, "totalTokens": 5})
+            yield self._usage_notification()
+            yield self._turn_completed("completed")
+            return
+        if self._prompt == "malformed usage":
+            yield self._raw_usage_notification(
+                last={"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+                total={"inputTokens": "five", "outputTokens": 1, "totalTokens": 6},
+            )
+            return
+        if self._prompt == "inconsistent usage":
+            yield self._raw_usage_notification(
+                last={"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+                total={"inputTokens": 5, "outputTokens": 2, "totalTokens": 99},
+            )
+            return
+        if self._prompt in ("decreasing usage", "reset usage", "presence drift"):
+            totals = dict(
+                cast(dict[str, dict[str, int]], sdk_state(self._module)["thread_usage"])[
+                    self._thread_id
+                ]
+            )
+            if self._prompt == "reset usage":
+                totals = {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
+            elif self._prompt == "presence drift":
+                totals = {
+                    **totals,
+                    "inputTokens": totals.get("inputTokens", 0) + 3,
+                    "cachedInputTokens": 1,
+                    "outputTokens": totals.get("outputTokens", 0) + 2,
+                    "totalTokens": totals.get("totalTokens", 0) + 5,
+                }
+            else:
+                totals = {
+                    "inputTokens": totals.get("inputTokens", 0) - 1,
+                    "outputTokens": totals.get("outputTokens", 0),
+                    "totalTokens": totals.get("totalTokens", 0) - 1,
+                }
+            last = (
+                {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
+                if self._prompt == "reset usage"
+                else {"inputTokens": 1, "outputTokens": 0, "totalTokens": 1}
+            )
+            yield self._raw_usage_notification(
+                last=last,
+                total=cast(dict[str, object], totals),
+            )
+            return
+        usage_delta = (
             {
                 "inputTokens": 100,
                 "cachedInputTokens": 40,
@@ -297,10 +447,7 @@ class FakeTurn:
             if self._prompt == "rich"
             else {"inputTokens": 3, "outputTokens": 2, "totalTokens": 5}
         )
-        yield notification(
-            "thread/tokenUsage/updated",
-            self._scoped({"tokenUsage": {"last": dict(usage_total), "total": usage_total}}),
-        )
+        yield self._usage_notification(usage_delta)
         if self._prompt == "rich":
             yield notification("account/rateLimits/updated", {"rateLimits": {"primary": 10}})
             yield notification(
@@ -359,6 +506,9 @@ def fake_sdk(
         "turn_counter": 0,
         "turn_calls": [],
         "interrupts": [],
+        "thread_usage": {},
+        "thread_last_usage": {},
+        "thread_last_turn_id": {},
     }
 
     class FakeAsyncCodex:
@@ -371,6 +521,7 @@ def fake_sdk(
                 "platformOs": "linux",
             }
             self.closed = False
+            self._client = SimpleNamespace(_sync=SimpleNamespace(_router=FakeRouter()))
             sdk_state(module)["clients"].append(self)
 
         async def __aenter__(self):
@@ -406,6 +557,9 @@ def fake_sdk(
                 "cliVersion": "0.144.4",
                 "turns": [],
             }
+            state["thread_usage"][thread_id] = {}
+            state["thread_last_usage"][thread_id] = {}
+            state["thread_last_turn_id"][thread_id] = None
             return FakeThread(module, thread_id)
 
         async def thread_resume(self, thread_id: str, **kwargs: object) -> FakeThread:
@@ -419,6 +573,10 @@ def fake_sdk(
                     "cliVersion": "0.144.4",
                     "turns": [],
                 }
+                state["thread_usage"][thread_id] = {}
+                state["thread_last_usage"][thread_id] = {}
+                state["thread_last_turn_id"][thread_id] = None
+            self._queue_restored_usage(thread_id)
             return FakeThread(module, thread_id)
 
         async def thread_fork(self, thread_id: str, **kwargs: object) -> FakeThread:
@@ -433,7 +591,29 @@ def fake_sdk(
                 "cliVersion": "0.144.4",
                 "turns": [],
             }
+            state["thread_usage"][fork_id] = dict(state["thread_usage"][thread_id])
+            state["thread_last_usage"][fork_id] = dict(state["thread_last_usage"][thread_id])
+            state["thread_last_turn_id"][fork_id] = state["thread_last_turn_id"][thread_id]
+            self._queue_restored_usage(fork_id)
             return FakeThread(module, fork_id)
+
+        def _queue_restored_usage(self, thread_id: str) -> None:
+            state = sdk_state(module)
+            turn_id = state["thread_last_turn_id"].get(thread_id)
+            total = state["thread_usage"].get(thread_id)
+            if not isinstance(turn_id, str) or not total:
+                return
+            last = state["thread_last_usage"][thread_id]
+            replay = notification(
+                "thread/tokenUsage/updated",
+                {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "tokenUsage": {"last": dict(last), "total": dict(total)},
+                },
+            )
+            router = self._client._sync._router
+            router._pending_turn_notifications.setdefault(turn_id, deque()).append(replay)
 
     module.__dict__["AsyncCodex"] = FakeAsyncCodex
     return module
@@ -1007,11 +1187,290 @@ async def test_a_full_turn_streams_the_closed_event_grammar(
             input_tokens=3,
             output_tokens=2,
             total_tokens=5,
+            reasoning_tokens=Present(0),
+            cache_read_input_tokens=Present(0),
+            cache_write_input_tokens=Present(0),
+        )
+    ), "cumulative optional counters remain supported and delta to truthful zeros"
+
+
+async def test_consecutive_turns_report_only_each_invocation_delta(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    expected = Present(
+        TokenUsage(
+            input_tokens=3,
+            output_tokens=2,
+            total_tokens=5,
             reasoning_tokens=Absent(),
             cache_read_input_tokens=Absent(),
             cache_write_input_tokens=Absent(),
         )
-    ), "counts the wire omits must be absent, not zero"
+    )
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(request(tmp_path))
+        results = [
+            await selected.run_turn(session, turn(prompt))
+            for prompt in ("plain", "second", "plain", "second")
+        ]
+
+    assert [result.usage for result in results] == [expected] * 4
+    assert cast(dict[str, dict[str, int]], sdk_state(installed_codex_sdk)["thread_usage"])[
+        session.ref.native_session_id
+    ] == {"inputTokens": 12, "outputTokens": 8, "totalTokens": 20}
+
+
+async def test_multiple_cumulative_updates_aggregate_every_request_in_one_turn(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    first_request = TokenUsage(
+        input_tokens=10,
+        output_tokens=2,
+        total_tokens=12,
+        reasoning_tokens=Present(1),
+        cache_read_input_tokens=Present(3),
+        cache_write_input_tokens=Present(1),
+    )
+    whole_turn = TokenUsage(
+        input_tokens=17,
+        output_tokens=6,
+        total_tokens=23,
+        reasoning_tokens=Present(3),
+        cache_read_input_tokens=Present(5),
+        cache_write_input_tokens=Present(1),
+    )
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(request(tmp_path))
+        events = [event async for event in selected.stream_turn(session, turn("multiple requests"))]
+
+    usage_events = [event.usage for event in events if isinstance(event, AgentUsage)]
+    assert usage_events == [first_request, whole_turn]
+    terminal = events[-1]
+    assert isinstance(terminal, AgentTerminal)
+    assert terminal.usage == Present(whole_turn), (
+        "the terminal is the invocation-to-date delta, not tokenUsage.last"
+    )
+
+
+async def test_duplicate_and_late_preterminal_snapshots_do_not_double_charge(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    async with runtime(tmp_path) as selected:
+        duplicate_session = await selected.open_session(request(tmp_path))
+        duplicate_events = [
+            event
+            async for event in selected.stream_turn(duplicate_session, turn("duplicate usage"))
+        ]
+        late_session = await selected.open_session(request(tmp_path))
+        late_events = [
+            event async for event in selected.stream_turn(late_session, turn("late usage"))
+        ]
+
+    duplicate_usages = [event.usage for event in duplicate_events if isinstance(event, AgentUsage)]
+    assert len(duplicate_usages) == 1
+    late_kinds = [type(event) for event in late_events]
+    assert (
+        late_kinds.index(AgentText) < late_kinds.index(AgentUsage) < late_kinds.index(AgentTerminal)
+    )
+    late_terminal = late_events[-1]
+    assert isinstance(late_terminal, AgentTerminal)
+    assert late_terminal.usage == Present(duplicate_usages[0])
+
+
+async def test_close_reopen_resume_rebases_restored_cumulative_history(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    async with runtime(tmp_path) as selected:
+        original = await selected.open_session(request(tmp_path))
+        first = await selected.run_turn(original, turn("multiple requests"))
+        second = await selected.run_turn(original, turn("second"))
+        ref = original.ref
+        await selected.close_session(original)
+
+        resumed = await selected.open_session(request(tmp_path, open=ResumeSession(ref)))
+        events = [event async for event in selected.stream_turn(resumed, turn("second"))]
+
+    terminal = events[-1]
+    assert isinstance(first.usage, Present) and isinstance(second.usage, Present)
+    assert isinstance(terminal, AgentTerminal)
+    assert terminal.usage == Present(
+        TokenUsage(
+            input_tokens=3,
+            output_tokens=2,
+            total_tokens=5,
+            reasoning_tokens=Present(0),
+            cache_read_input_tokens=Present(0),
+            cache_write_input_tokens=Present(0),
+        )
+    )
+    assert len([event for event in events if isinstance(event, AgentUsage)]) == 1, (
+        "the resume replay is baseline-only and must not surface as historical usage"
+    )
+    cumulative = cast(dict[str, dict[str, int]], sdk_state(installed_codex_sdk)["thread_usage"])[
+        ref.native_session_id
+    ]
+    assert cumulative["totalTokens"] == (
+        first.usage.value.total_tokens + second.usage.value.total_tokens + 5
+    )
+
+
+async def test_serialized_ref_reconstruction_rebases_without_persisting_usage_state(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    async with runtime(tmp_path) as first_runtime:
+        session = await first_runtime.open_session(request(tmp_path))
+        first = await first_runtime.run_turn(session, turn("plain"))
+        serialized = dict(ref_to_json(session.ref))
+
+    reconstructed = ref_from_json(serialized)
+    async with runtime(tmp_path) as second_runtime:
+        resumed = await second_runtime.open_session(
+            request(tmp_path, open=ResumeSession(reconstructed))
+        )
+        second = await second_runtime.run_turn(resumed, turn("second"))
+
+    assert first.usage == second.usage
+    cumulative = cast(dict[str, dict[str, int]], sdk_state(installed_codex_sdk)["thread_usage"])[
+        reconstructed.native_session_id
+    ]
+    assert cumulative == {"inputTokens": 6, "outputTokens": 4, "totalTokens": 10}
+
+
+async def test_resume_without_the_required_usage_replay_surface_fails_before_a_turn(
+    tmp_path: Path,
+    installed_codex_sdk: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with runtime(tmp_path) as first_runtime:
+        session = await first_runtime.open_session(request(tmp_path))
+        await first_runtime.run_turn(session, turn("plain"))
+        ref = session.ref
+
+    original_resume = installed_codex_sdk.AsyncCodex.thread_resume
+
+    async def resume_without_router(self: Any, thread_id: str, **kwargs: object) -> FakeThread:
+        thread = await original_resume(self, thread_id, **kwargs)
+        delattr(self._client._sync, "_router")
+        return thread
+
+    monkeypatch.setattr(installed_codex_sdk.AsyncCodex, "thread_resume", resume_without_router)
+    dispatched_before = len(sdk_state(installed_codex_sdk)["turn_calls"])
+
+    with pytest.raises(SdkUnavailable, match="routed resume usage required for accounting"):
+        async with runtime(tmp_path) as reconstructed_runtime:
+            await reconstructed_runtime.open_session(request(tmp_path, open=ResumeSession(ref)))
+
+    assert len(sdk_state(installed_codex_sdk)["turn_calls"]) == dispatched_before
+
+
+async def test_failed_cancelled_and_runtime_interrupted_turns_keep_supplied_local_usage(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    expected_failed = Present(
+        TokenUsage(
+            input_tokens=6,
+            output_tokens=1,
+            total_tokens=7,
+            reasoning_tokens=Absent(),
+            cache_read_input_tokens=Absent(),
+            cache_write_input_tokens=Absent(),
+        )
+    )
+    expected_cancelled = Present(
+        TokenUsage(
+            input_tokens=4,
+            output_tokens=2,
+            total_tokens=6,
+            reasoning_tokens=Absent(),
+            cache_read_input_tokens=Absent(),
+            cache_write_input_tokens=Absent(),
+        )
+    )
+    expected_interrupted = Present(
+        TokenUsage(
+            input_tokens=8,
+            output_tokens=3,
+            total_tokens=11,
+            reasoning_tokens=Present(1),
+            cache_read_input_tokens=Present(2),
+            cache_write_input_tokens=Present(1),
+        )
+    )
+    async with runtime(tmp_path) as selected:
+        failed_session = await selected.open_session(request(tmp_path))
+        failed = await selected.run_turn(failed_session, turn("failed with usage"))
+
+        cancelled_session = await selected.open_session(request(tmp_path))
+        cancelled = await selected.run_turn(cancelled_session, turn("interrupted with usage"))
+
+        interrupted_session = await selected.open_session(request(tmp_path))
+        signal = Cancel()
+        stream = selected.stream_turn(interrupted_session, turn("hang with usage"), cancel=signal)
+        events = []
+        async for event in stream:
+            events.append(event)
+            if isinstance(event, AgentUsage):
+                signal.set()
+
+    interrupted = events[-1]
+    assert failed.status == "failed" and failed.usage == expected_failed
+    assert cancelled.status == "cancelled" and cancelled.usage == expected_cancelled
+    assert isinstance(interrupted, AgentTerminal)
+    assert interrupted.status == "cancelled" and interrupted.usage == expected_interrupted
+
+
+@pytest.mark.parametrize(
+    ("prompt", "prior_turn", "message"),
+    (
+        ("malformed usage", False, "was not an integer"),
+        ("inconsistent usage", False, "internally inconsistent"),
+        ("decreasing usage", True, "decreased"),
+        ("reset usage", True, "decreased"),
+        ("presence drift", True, "changed field presence"),
+    ),
+)
+async def test_malformed_reset_and_non_monotonic_snapshots_fail_explicitly(
+    tmp_path: Path,
+    installed_codex_sdk: ModuleType,
+    prompt: str,
+    prior_turn: bool,
+    message: str,
+) -> None:
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(request(tmp_path))
+        if prior_turn:
+            await selected.run_turn(session, turn("plain"))
+        with pytest.raises(ProtocolDefect, match=message):
+            await selected.run_turn(session, turn(prompt))
+
+
+async def test_missing_usage_is_absent_and_never_replayed_into_a_later_turn(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(request(tmp_path))
+        missing = await selected.run_turn(session, turn("no usage"))
+        unattributable = await selected.run_turn(session, turn("plain"))
+        ref = session.ref
+        await selected.close_session(session)
+
+        resumed = await selected.open_session(request(tmp_path, open=ResumeSession(ref)))
+        recovered = await selected.run_turn(resumed, turn("plain"))
+
+    assert missing.usage == Absent()
+    assert unattributable.usage == Absent(), (
+        "the first cumulative snapshot after an unknown boundary is baseline-only"
+    )
+    assert recovered.usage == Present(
+        TokenUsage(
+            input_tokens=3,
+            output_tokens=2,
+            total_tokens=5,
+            reasoning_tokens=Absent(),
+            cache_read_input_tokens=Absent(),
+            cache_write_input_tokens=Absent(),
+        )
+    )
 
 
 async def test_structured_output_passes_the_plain_schema_through_natively(
@@ -1330,6 +1789,7 @@ async def test_resume_fork_and_metadata_only_discovery(
         resumed = await selected.open_session(request(tmp_path, open=ResumeSession(session.ref)))
         second = await selected.run_turn(resumed, turn("second"))
         forked = await selected.open_session(request(tmp_path, open=ForkSession(session.ref)))
+        forked_result = await selected.run_turn(forked, turn("plain"))
 
     assert first.status == "succeeded" and first.final_text == "Inspection complete."
     assert second.final_text == "Second turn."
@@ -1348,4 +1808,7 @@ async def test_resume_fork_and_metadata_only_discovery(
     ), "read_session is metadata-only"
     assert forked.ref.native_session_id != session.ref.native_session_id, (
         "a fork must mint a new native thread identity"
+    )
+    assert forked_result.usage == first.usage, (
+        "a fork's restored source history is a baseline, not usage of its first turn"
     )

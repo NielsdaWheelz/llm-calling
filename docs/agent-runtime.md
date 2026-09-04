@@ -54,8 +54,15 @@ A version that drifts from the vetted one is met with **one warning plus a
 behavioral capability probe**, never a hard fail: the adapters verify what the
 backend actually does (account type, effective configuration, sandbox
 capability) instead of trusting a version-keyed table. A missing SDK, missing
-bundled runtime, or unresponsive executable remains a typed availability
-failure (`SdkUnavailable` / `ExecutableUnavailable`).
+bundled runtime, required resume-usage routing seam, or unresponsive executable
+remains a typed availability failure (`SdkUnavailable` /
+`ExecutableUnavailable`). Codex 0.144.4 replays restored cumulative usage before
+`thread/resume` returns but its high-level API leaves that old-turn notification
+in the internal routed queue. The adapter has one behaviorally checked,
+read-only compatibility seam over that queue so resumed and reconstructed turns
+have an exact pre-turn baseline. If a drifted SDK removes the seam, resume/fork
+fails before a billable turn rather than guessing usage; fresh and already-open
+sessions do not depend on it.
 
 `openai-codex` ships a matched Codex runtime, so `AgentRuntimeConfig` has no
 Codex executable setting. Claude Code is still a local executable and may be
@@ -345,6 +352,52 @@ AgentTerminal          exactly-once terminal: status, typed failure value,
                        final text, structured output, usage, session ref
 ```
 
+### Invocation-local usage
+
+`AgentTerminal.usage` is usage attributable only to that `stream_turn` or
+`run_turn` invocation on every terminal status. It never contains usage from an
+earlier native thread/session turn, even when an upstream protocol reports a
+cumulative counter. An `AgentUsage` event is an invocation-to-date snapshot;
+multiple `AgentUsage` events from one turn are progressive and are not values to
+sum. The terminal carries the final safely attributable snapshot.
+
+Codex reports `tokenUsage.total` cumulatively across a native thread. The Codex
+adapter validates both `total` and `last`, but does not use `last` as its
+accounting source because one runtime turn can make multiple model requests. It
+subtracts every cumulative update from one fixed pre-turn baseline, so the last
+delta aggregates all model requests made by the invocation. The baseline is:
+
+- synthetic zero for a fresh native thread;
+- the last validated cumulative end snapshot for consecutive turns; or
+- the cumulative snapshot Codex replays before resume/fork returns for reopened
+  and reconstructed processes/sessions. That restored snapshot is read as a
+  baseline before any new turn starts and emits no `AgentUsage`.
+
+Input, output, total, cached-input, cache-write-input, and reasoning-output
+counters are differenced independently. Optional counter presence must remain
+stable across observed cumulative snapshots; absence is never treated as zero.
+Codex totals and component bounds must be internally consistent.
+
+The accounting boundary fails safe:
+
+- malformed, negative, internally inconsistent, decreasing, reset, or
+  presence-changing snapshots raise `ProtocolDefect`; counts are never clamped;
+- unchanged cumulative snapshots are suppressed, including replay and duplicate
+  rate-limit updates;
+- a usage update arriving late in the turn but before `turn/completed` is still
+  included; `turn/completed` is the Codex SDK's hard stream boundary, so a
+  post-completion update is not attributable and is never assigned to a later
+  terminal;
+- if no advancing usage notification is available, terminal usage is `Absent`
+  and the cumulative boundary becomes untrusted. The next observed cumulative
+  snapshot is baseline-only. Usage remains `Absent` until that invocation also
+  supplies a later monotonic update, or a close/reopen/resume supplies the
+  restored baseline before new usage. This deliberately prefers under-reporting
+  to guessing or charging history twice;
+- cancellation or interruption preserves the latest invocation-local usage
+  already supplied, but invalidates its cumulative end as a baseline if the
+  stream ended before Codex's terminal usage boundary.
+
 `AgentTerminal.failure` is `None`, `AgentQuotaExhausted()`, or
 `AgentFailure(cause)` with causes `backend_failed`, `turn_timeout`,
 `output_limit_exceeded`, `approval_unanswered`, `output_schema_violation`.
@@ -419,7 +472,11 @@ Per route it certifies: one full streamed turn under the route's restrictive
 policy (the defaults, plus the `allowed_tools=("*",)` sentinel Codex requires),
 a resumed second turn on the same native session, and a structured output turn
 — asserting the six-kind grammar, the terminal shape, and normalized
-`TokenUsage` on the way through.
+`TokenUsage` on the way through. Codex runs four more turns after the resume.
+A live-only observer independently captures the raw native cumulative values
+before projection and proves all six invocation-local terminals equal their
+fixed-baseline deltas and sum exactly to the final real cumulative delta; the
+restored resume snapshot must appear as baseline without being charged.
 
 ## References
 
