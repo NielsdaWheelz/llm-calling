@@ -184,12 +184,22 @@ _TURN_SCOPED_METHODS = frozenset(
 )
 
 type FileChangeStatus = Literal["in_progress", "applied", "failed", "declined"]
+type AgentMessagePhase = Literal["commentary", "final_answer"] | None
 _PATCH_APPLY_STATUS: dict[str, FileChangeStatus] = {
     "inProgress": "in_progress",
     "completed": "applied",
     "failed": "failed",
     "declined": "declined",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletedAgentMessage:
+    """One authoritative SDK item, retained in native completion order."""
+
+    item_id: str
+    text: str
+    phase: AgentMessagePhase
 
 
 def _presence_delta(
@@ -342,8 +352,9 @@ class _CodexSessionState:
     turn_id: str | None = None
     message_count: int = 0
     output_bytes: int = 0
-    final_text: str = ""
-    final_text_bytes: int = 0
+    streamed_text_bytes: int = 0
+    completed_agent_messages: list[_CompletedAgentMessage] = field(default_factory=list)
+    completed_item_ids: set[str] = field(default_factory=set)
     diagnostics: list[str] = field(default_factory=list)
     active_mcp_calls: dict[str, tuple[str, str]] = field(default_factory=dict)
     quota_exhausted: bool = False
@@ -593,8 +604,9 @@ class CodexSdkAdapter:
         state.turn_id = turn_id
         state.message_count = 0
         state.output_bytes = 0
-        state.final_text = ""
-        state.final_text_bytes = 0
+        state.streamed_text_bytes = 0
+        state.completed_agent_messages.clear()
+        state.completed_item_ids.clear()
         state.usage_accounting.begin_turn()
         state.diagnostics.clear()
         state.active_mcp_calls.clear()
@@ -620,7 +632,7 @@ class CodexSdkAdapter:
             yield AgentTerminal(
                 status="failed",
                 failure=AgentFailure("output_limit_exceeded"),
-                final_text=state.final_text,
+                final_text=self._selected_final_text(state, required=False),
                 session_ref=state.ref,
                 usage=usage,
                 diagnostics=tuple(state.diagnostics),
@@ -642,7 +654,7 @@ class CodexSdkAdapter:
                 failure=AgentQuotaExhausted()
                 if self._is_quota_error_text(message)
                 else AgentFailure("backend_failed"),
-                final_text=state.final_text,
+                final_text=self._selected_final_text(state, required=False),
                 session_ref=state.ref,
                 usage=usage,
                 diagnostics=tuple(state.diagnostics),
@@ -663,6 +675,10 @@ class CodexSdkAdapter:
             await self._destroy_session(session, state)
             return
         await self._call(state.turn.interrupt(), operation="turn interrupt", failure="session")
+
+    def _interrupted_final_text(self, session: AgentSession) -> str:
+        """Project only an already-completed eligible message on runtime interruption."""
+        return self._selected_final_text(self._state(session), required=False)
 
     async def close_session(self, session: AgentSession) -> None:
         """Idempotently release one SDK client while preserving sibling sessions."""
@@ -956,8 +972,9 @@ class CodexSdkAdapter:
         if method == "turn/started":
             return AgentNative(native_type=method, payload=redact_native_payload(params))
         if method == "item/agentMessage/delta":
+            self._non_empty_string(params, "itemId", method)
             delta = self._string(params, "delta", method)
-            self._append_final_text(state, delta)
+            self._count_streamed_text(state, delta)
             return AgentText(delta)
         if method in ("item/reasoning/summaryTextDelta", "item/reasoning/textDelta"):
             return AgentNative(native_type=method, payload=redact_native_payload(params))
@@ -1088,17 +1105,20 @@ class CodexSdkAdapter:
         method: str,
     ) -> AgentEvent | None:
         item = self._mapping(params.get("item"), "item/completed item")
+        item_id = self._non_empty_string(item, "id", method)
+        if item_id in state.completed_item_ids:
+            raise ProtocolDefect("Codex item identity completed more than once")
+        state.completed_item_ids.add(item_id)
         item_type = item.get("type")
         if item_type == "commandExecution":
             return AgentToolUse(
-                tool_call_id=self._string(item, "id", method),
+                tool_call_id=item_id,
                 name="commandExecution",
                 phase="completed",
                 payload=freeze_native_json_value(item.get("aggregatedOutput")),
                 succeeded=item.get("status") == "completed",
             )
         if item_type == "mcpToolCall":
-            item_id = self._string(item, "id", method)
             identity = state.active_mcp_calls.pop(item_id, None)
             if identity is None:
                 raise ProtocolDefect("MCP tool call completed before its start")
@@ -1124,13 +1144,16 @@ class CodexSdkAdapter:
             # A declined or failed patch is a completed tool action that did not apply.
             status = self._patch_status(item.get("status"), method)
             return AgentToolUse(
-                tool_call_id=self._string(item, "id", method),
+                tool_call_id=item_id,
                 name="fileChange",
                 phase="completed",
                 payload=freeze_native_json_object({"changes": item.get("changes")}),
                 succeeded=status == "applied",
             )
-        if item_type in ("reasoning", "agentMessage"):
+        if item_type == "agentMessage":
+            self._record_completed_agent_message(state, item_id, item, method)
+            return None
+        if item_type == "reasoning":
             return None
         return AgentNative(
             native_type=f"{method}:unknownItem",
@@ -1146,6 +1169,7 @@ class CodexSdkAdapter:
             raise ProtocolDefect("turn completed with active MCP tool calls")
         turn = self._mapping(params.get("turn"), "turn/completed turn")
         status = turn.get("status")
+        final_text = self._selected_final_text(state, required=status == "completed")
         usage = state.usage_accounting.finish_turn()
         diagnostics = tuple(state.diagnostics)
         if status == "completed":
@@ -1153,12 +1177,12 @@ class CodexSdkAdapter:
             if isinstance(state.request.output, JsonSchemaAgentOutput):
                 try:
                     # Strict parse and freeze only; the backend enforced the schema natively.
-                    structured = parse_structured_output(state.final_text)
+                    structured = parse_structured_output(final_text)
                 except OutputSchemaMismatch:
                     return AgentTerminal(
                         status="failed",
                         failure=AgentFailure("output_schema_violation"),
-                        final_text=state.final_text,
+                        final_text=final_text,
                         session_ref=state.ref,
                         usage=usage,
                         diagnostics=diagnostics,
@@ -1166,7 +1190,7 @@ class CodexSdkAdapter:
             return AgentTerminal(
                 status="succeeded",
                 failure=None,
-                final_text=state.final_text,
+                final_text=final_text,
                 session_ref=state.ref,
                 structured_output=structured,
                 usage=usage,
@@ -1176,7 +1200,7 @@ class CodexSdkAdapter:
             return AgentTerminal(
                 status="cancelled",
                 failure=None,
-                final_text=state.final_text,
+                final_text=final_text,
                 session_ref=state.ref,
                 usage=usage,
                 diagnostics=diagnostics,
@@ -1190,7 +1214,7 @@ class CodexSdkAdapter:
             return AgentTerminal(
                 status="failed",
                 failure=failure,
-                final_text=state.final_text,
+                final_text=final_text,
                 session_ref=state.ref,
                 usage=usage,
                 diagnostics=diagnostics,
@@ -1577,14 +1601,49 @@ class CodexSdkAdapter:
         return config
 
     @staticmethod
-    def _append_final_text(state: _CodexSessionState, text: str) -> None:
+    def _count_streamed_text(state: _CodexSessionState, text: str) -> None:
         size = len(text.encode("utf-8"))
         if size > _MAX_EVENT_TEXT_BYTES:
             raise OutputLimitExceeded(_MAX_EVENT_TEXT_BYTES)
-        if state.final_text_bytes + size > _MAX_FINAL_TEXT_BYTES:
+        if state.streamed_text_bytes + size > _MAX_FINAL_TEXT_BYTES:
             raise OutputLimitExceeded(_MAX_FINAL_TEXT_BYTES)
-        state.final_text += text
-        state.final_text_bytes += size
+        state.streamed_text_bytes += size
+
+    def _record_completed_agent_message(
+        self,
+        state: _CodexSessionState,
+        item_id: str,
+        item: Mapping[str, object],
+        method: str,
+    ) -> None:
+        text = self._string(item, "text", method)
+        phase = item.get("phase")
+        if phase not in (None, "commentary", "final_answer"):
+            raise ProtocolDefect("Codex completed agent message carried an unknown phase")
+        if phase in (None, "final_answer") and len(text.encode("utf-8")) > _MAX_FINAL_TEXT_BYTES:
+            raise OutputLimitExceeded(_MAX_FINAL_TEXT_BYTES)
+        state.completed_agent_messages.append(
+            _CompletedAgentMessage(
+                item_id=item_id,
+                text=text,
+                phase=cast(AgentMessagePhase, phase),
+            )
+        )
+
+    @staticmethod
+    def _selected_final_text(state: _CodexSessionState, *, required: bool) -> str:
+        """Match SDK 0.144.4: last final answer, else last unknown-phase message."""
+        last_unknown: _CompletedAgentMessage | None = None
+        for message in reversed(state.completed_agent_messages):
+            if message.phase == "final_answer":
+                return message.text
+            if message.phase is None and last_unknown is None:
+                last_unknown = message
+        if last_unknown is not None:
+            return last_unknown.text
+        if required:
+            raise ProtocolDefect("Codex turn completed without an eligible completed agent message")
+        return ""
 
     @staticmethod
     def _append_diagnostic(state: _CodexSessionState, message: str) -> None:
@@ -1647,6 +1706,13 @@ class CodexSdkAdapter:
         result = value.get(key)
         if not isinstance(result, str):
             raise ProtocolDefect(f"{context}.{key} was not a string")
+        return result
+
+    @staticmethod
+    def _non_empty_string(value: Mapping[str, object], key: str, context: str) -> str:
+        result = value.get(key)
+        if not isinstance(result, str) or not result:
+            raise ProtocolDefect(f"{context}.{key} was not a non-empty identity string")
         return result
 
     @staticmethod

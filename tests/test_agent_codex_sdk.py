@@ -49,6 +49,7 @@ from provider_runtime.agent_runtime import (
     UnsafeConfirmation,
     ref_from_json,
     ref_to_json,
+    thaw_json_value,
 )
 from provider_runtime.agent_runtime import codex_sdk as codex_sdk_module
 from provider_runtime.agent_runtime._codex_launcher import ensure_codex_launcher
@@ -62,6 +63,19 @@ from provider_runtime.agent_runtime.errors import (
     UnsupportedCapability,
 )
 from provider_runtime.types import Absent, Present, TokenUsage
+
+_ASSISTANT_MESSAGE_CASES = cast(
+    dict[str, dict[str, object]],
+    json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "agent_runtime"
+            / "codex"
+            / "assistant_message_cases.json"
+        ).read_text(encoding="utf-8")
+    ),
+)
 
 ANSWER_SCHEMA: dict[str, object] = {
     "type": "object",
@@ -190,6 +204,38 @@ class FakeTurn:
                 "turn": {"id": self.id, "items": [], "status": "inProgress"},
             },
         )
+        if self._prompt.startswith("assistant case:"):
+            name = self._prompt.removeprefix("assistant case:")
+            case = _ASSISTANT_MESSAGE_CASES[name]
+            events = cast(list[dict[str, object]], case["events"])
+            for scripted in events:
+                kind = scripted["kind"]
+                if kind == "agent_message":
+                    item_id = scripted["id"]
+                    deltas = cast(list[str], scripted.get("deltas", [scripted["text"]]))
+                    for delta in deltas:
+                        yield notification(
+                            "item/agentMessage/delta",
+                            self._scoped({"itemId": item_id, "delta": delta}),
+                        )
+                    item = {
+                        key: value
+                        for key, value in scripted.items()
+                        if key in ("id", "phase", "text")
+                    }
+                    item["type"] = "agentMessage"
+                    yield notification("item/completed", self._scoped({"item": item}))
+                elif kind == "native_item":
+                    item = {key: value for key, value in scripted.items() if key != "kind"}
+                    yield notification("item/completed", self._scoped({"item": item}))
+                elif kind == "hang":
+                    sdk_state(self._module)["assistant_case_hanging"].set()
+                    await self._interrupted.wait()
+                else:
+                    raise AssertionError(f"unknown assistant fixture event {kind!r}")
+            yield self._usage_notification({"inputTokens": 3, "outputTokens": 2, "totalTokens": 5})
+            yield self._turn_completed(cast(str, case["status"]))
+            return
         if self._prompt == "hang with usage":
             yield self._usage_notification(
                 {
@@ -290,6 +336,19 @@ class FakeTurn:
                 "item/completed",
                 self._scoped({"item": {**item, "status": "completed", "result": {"hits": 2}}}),
             )
+            yield notification(
+                "item/completed",
+                self._scoped(
+                    {
+                        "item": {
+                            "id": "mcp-final",
+                            "type": "agentMessage",
+                            "text": "",
+                            "phase": "final_answer",
+                        }
+                    }
+                ),
+            )
             yield self._turn_completed("completed")
             return
         if self._prompt == "declined patch":
@@ -304,6 +363,19 @@ class FakeTurn:
             yield notification(
                 "item/completed",
                 self._scoped({"item": {**patch, "status": "declined"}}),
+            )
+            yield notification(
+                "item/completed",
+                self._scoped(
+                    {
+                        "item": {
+                            "id": "patch-final",
+                            "type": "agentMessage",
+                            "text": "",
+                            "phase": "final_answer",
+                        }
+                    }
+                ),
             )
             yield self._turn_completed("completed")
             return
@@ -359,6 +431,19 @@ class FakeTurn:
         yield notification(
             "item/agentMessage/delta",
             self._scoped({"itemId": "message-1", "delta": text}),
+        )
+        yield notification(
+            "item/completed",
+            self._scoped(
+                {
+                    "item": {
+                        "id": "message-1",
+                        "type": "agentMessage",
+                        "text": text,
+                        "phase": "final_answer",
+                    }
+                }
+            ),
         )
         if self._prompt == "no usage":
             yield self._turn_completed("completed")
@@ -509,6 +594,7 @@ def fake_sdk(
         "thread_usage": {},
         "thread_last_usage": {},
         "thread_last_turn_id": {},
+        "assistant_case_hanging": asyncio.Event(),
     }
 
     class FakeAsyncCodex:
@@ -1471,6 +1557,226 @@ async def test_missing_usage_is_absent_and_never_replayed_into_a_later_turn(
             cache_write_input_tokens=Absent(),
         )
     )
+
+
+async def _project_assistant_case(
+    selected: AgentRuntime,
+    session: object,
+    name: str,
+    projection: str,
+) -> tuple[AgentTerminal, list[object]]:
+    request_value = turn(f"assistant case:{name}")
+    if projection == "run_turn":
+        terminal = await selected.run_turn(cast(Any, session), request_value)
+        return terminal, []
+    events = [event async for event in selected.stream_turn(cast(Any, session), request_value)]
+    terminal = events[-1]
+    assert isinstance(terminal, AgentTerminal)
+    return terminal, cast(list[object], events)
+
+
+@pytest.mark.parametrize("projection", ("stream_turn", "run_turn"))
+async def test_r03_dual_phase_selects_only_the_exact_final_answer_document(
+    tmp_path: Path,
+    installed_codex_sdk: ModuleType,
+    projection: str,
+) -> None:
+    case = _ASSISTANT_MESSAGE_CASES["r03_dual_phase"]
+    messages = cast(list[dict[str, object]], case["events"])
+    commentary_text = cast(str, messages[0]["text"])
+    final_text = cast(str, messages[1]["text"])
+    commentary = json.loads(commentary_text)
+    final = json.loads(final_text)
+    assert commentary["type"] == "call_tool"
+    assert final["type"] == "finish"
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(commentary_text + final_text)
+
+    output = JsonSchemaAgentOutput(name="r03", schema={"type": "object"})
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(request(tmp_path, output=output))
+        terminal, events = await _project_assistant_case(
+            selected, session, "r03_dual_phase", projection
+        )
+
+    assert terminal.status == "succeeded"
+    assert terminal.final_text == final_text
+    assert thaw_json_value(cast(Any, terminal.structured_output)) == final
+    if projection == "stream_turn":
+        observed = "".join(event.text for event in events if isinstance(event, AgentText))
+        assert observed == commentary_text + final_text, (
+            "commentary remains observable even though it is not the terminal document"
+        )
+
+
+@pytest.mark.parametrize("projection", ("stream_turn", "run_turn"))
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    (
+        ("final_then_commentary", "authoritative final"),
+        ("multiple_final_answers", "newest final"),
+        ("last_unknown_fallback", "compatible unknown"),
+        ("multiple_unknown", "newest unknown"),
+        ("completed_beats_deltas", "authoritative completed text"),
+    ),
+)
+async def test_completed_agent_message_selection_matches_the_sdk_rule(
+    tmp_path: Path,
+    installed_codex_sdk: ModuleType,
+    projection: str,
+    name: str,
+    expected: str,
+) -> None:
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(request(tmp_path))
+        terminal, events = await _project_assistant_case(selected, session, name, projection)
+
+    assert terminal.status == "succeeded"
+    assert terminal.final_text == expected
+    if name == "completed_beats_deltas" and projection == "stream_turn":
+        assert (
+            "".join(event.text for event in events if isinstance(event, AgentText))
+            == "streamed draft"
+        )
+
+
+@pytest.mark.parametrize("projection", ("stream_turn", "run_turn"))
+@pytest.mark.parametrize("name", ("commentary_only", "two_commentary"))
+async def test_commentary_only_completion_fails_closed(
+    tmp_path: Path,
+    installed_codex_sdk: ModuleType,
+    projection: str,
+    name: str,
+) -> None:
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(request(tmp_path))
+        with pytest.raises(ProtocolDefect, match="eligible completed agent message"):
+            await _project_assistant_case(selected, session, name, projection)
+
+
+@pytest.mark.parametrize("projection", ("stream_turn", "run_turn"))
+@pytest.mark.parametrize(
+    ("name", "message"),
+    (
+        ("duplicate_identity", "completed more than once"),
+        ("malformed_identity", "non-empty identity"),
+    ),
+)
+async def test_duplicate_and_malformed_completed_agent_message_identities_are_defects(
+    tmp_path: Path,
+    installed_codex_sdk: ModuleType,
+    projection: str,
+    name: str,
+    message: str,
+) -> None:
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(request(tmp_path))
+        with pytest.raises(ProtocolDefect, match=message):
+            await _project_assistant_case(selected, session, name, projection)
+
+
+async def test_unrelated_native_items_do_not_change_authoritative_message_selection(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(request(tmp_path))
+        terminal, events = await _project_assistant_case(
+            selected, session, "interleaved_native", "stream_turn"
+        )
+
+    assert terminal.final_text == "selected around native item"
+    assert any(
+        isinstance(event, AgentNative) and event.native_type == "item/completed:unknownItem"
+        for event in events
+    )
+
+
+@pytest.mark.parametrize("projection", ("stream_turn", "run_turn"))
+@pytest.mark.parametrize(
+    ("name", "status", "expected"),
+    (
+        ("failed_with_messages", "failed", "failed authoritative response"),
+        (
+            "interrupted_with_messages",
+            "cancelled",
+            "interrupted authoritative response",
+        ),
+    ),
+)
+async def test_non_success_terminals_preserve_only_the_authoritative_completed_message(
+    tmp_path: Path,
+    installed_codex_sdk: ModuleType,
+    projection: str,
+    name: str,
+    status: str,
+    expected: str,
+) -> None:
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(request(tmp_path))
+        terminal, _events = await _project_assistant_case(selected, session, name, projection)
+
+    assert terminal.status == status
+    assert terminal.final_text == expected
+
+
+@pytest.mark.parametrize("projection", ("stream_turn", "run_turn"))
+async def test_runtime_cancellation_uses_an_already_completed_authoritative_message(
+    tmp_path: Path,
+    installed_codex_sdk: ModuleType,
+    projection: str,
+) -> None:
+    cancel = Cancel()
+
+    async def cancel_after_completion() -> None:
+        await sdk_state(installed_codex_sdk)["assistant_case_hanging"].wait()
+        cancel.set()
+
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(request(tmp_path))
+        cancel_task = asyncio.create_task(cancel_after_completion())
+        if projection == "run_turn":
+            terminal = await selected.run_turn(
+                session,
+                turn("assistant case:runtime_cancel_after_completed"),
+                cancel=cancel,
+            )
+        else:
+            events = [
+                event
+                async for event in selected.stream_turn(
+                    session,
+                    turn("assistant case:runtime_cancel_after_completed"),
+                    cancel=cancel,
+                )
+            ]
+            terminal = cast(AgentTerminal, events[-1])
+        await cancel_task
+
+    assert terminal.status == "cancelled"
+    assert terminal.final_text == "cancel authoritative response"
+
+
+async def test_authoritative_message_and_event_count_bounds_fail_without_concatenation(
+    tmp_path: Path,
+    installed_codex_sdk: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(codex_sdk_module, "_MAX_FINAL_TEXT_BYTES", 32)
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(request(tmp_path))
+        oversized = await selected.run_turn(session, turn("assistant case:oversized_authoritative"))
+    assert oversized.status == "failed"
+    assert oversized.failure == AgentFailure("output_limit_exceeded")
+    assert oversized.final_text == ""
+
+    monkeypatch.setattr(codex_sdk_module, "_MAX_FINAL_TEXT_BYTES", 16 * 1024 * 1024)
+    monkeypatch.setattr(codex_sdk_module, "_MAX_EVENT_COUNT", 4)
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(request(tmp_path))
+        bounded = await selected.run_turn(session, turn("assistant case:final_then_commentary"))
+    assert bounded.status == "failed"
+    assert bounded.failure == AgentFailure("output_limit_exceeded")
+    assert bounded.final_text == "authoritative final"
 
 
 async def test_structured_output_passes_the_plain_schema_through_natively(

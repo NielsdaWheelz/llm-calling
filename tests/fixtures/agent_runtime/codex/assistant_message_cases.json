@@ -1,0 +1,115 @@
+{
+  "r03_dual_phase": {
+    "events": [
+      {
+        "kind": "agent_message",
+        "id": "r03-commentary",
+        "phase": "commentary",
+        "text": "{\"type\":\"call_tool\",\"say\":null,\"call_tool\":{\"tool_id\":\"memory.search\",\"arguments\":\"{\\\"query\\\":\\\"Kintsugi Room location\\\",\\\"lexical_limit\\\":5,\\\"semantic_limit\\\":5}\" },\"finish\":null}"
+      },
+      {
+        "kind": "agent_message",
+        "id": "r03-final",
+        "phase": "final_answer",
+        "text": "{\"type\":\"finish\",\"say\":null,\"call_tool\":null,\"finish\":{\"reason\":\"Unable to access memory search results in this interface.\",\"result\":{\"memories\":[]}}}"
+      }
+    ],
+    "status": "completed"
+  },
+  "two_commentary": {
+    "events": [
+      {"kind": "agent_message", "id": "commentary-1", "phase": "commentary", "text": "first observation"},
+      {"kind": "agent_message", "id": "commentary-2", "phase": "commentary", "text": "second observation"}
+    ],
+    "status": "completed"
+  },
+  "commentary_only": {
+    "events": [
+      {"kind": "agent_message", "id": "commentary-only", "phase": "commentary", "text": "not a final response"}
+    ],
+    "status": "completed"
+  },
+  "final_then_commentary": {
+    "events": [
+      {"kind": "agent_message", "id": "final-before-commentary", "phase": "final_answer", "text": "authoritative final"},
+      {"kind": "agent_message", "id": "late-commentary", "phase": "commentary", "text": "later commentary"}
+    ],
+    "status": "completed"
+  },
+  "multiple_final_answers": {
+    "events": [
+      {"kind": "agent_message", "id": "final-1", "phase": "final_answer", "text": "older final"},
+      {"kind": "agent_message", "id": "final-2", "phase": "final_answer", "text": "newest final"}
+    ],
+    "status": "completed"
+  },
+  "last_unknown_fallback": {
+    "events": [
+      {"kind": "agent_message", "id": "unknown-before-commentary", "text": "compatible unknown"},
+      {"kind": "agent_message", "id": "commentary-after-unknown", "phase": "commentary", "text": "not terminal"}
+    ],
+    "status": "completed"
+  },
+  "multiple_unknown": {
+    "events": [
+      {"kind": "agent_message", "id": "unknown-1", "text": "older unknown"},
+      {"kind": "agent_message", "id": "unknown-2", "text": "newest unknown"}
+    ],
+    "status": "completed"
+  },
+  "completed_beats_deltas": {
+    "events": [
+      {"kind": "agent_message", "id": "completed-wins", "phase": "final_answer", "deltas": ["streamed ", "draft"], "text": "authoritative completed text"}
+    ],
+    "status": "completed"
+  },
+  "duplicate_identity": {
+    "events": [
+      {"kind": "agent_message", "id": "duplicate-message", "phase": "final_answer", "text": "first completion"},
+      {"kind": "agent_message", "id": "duplicate-message", "phase": "final_answer", "text": "second completion"}
+    ],
+    "status": "completed"
+  },
+  "malformed_identity": {
+    "events": [
+      {"kind": "agent_message", "id": "", "phase": "final_answer", "text": "must not be selected"}
+    ],
+    "status": "completed"
+  },
+  "interleaved_native": {
+    "events": [
+      {"kind": "agent_message", "id": "interleaved-commentary", "phase": "commentary", "text": "commentary"},
+      {"kind": "native_item", "id": "web-search-1", "type": "webSearch", "query": "synthetic query"},
+      {"kind": "agent_message", "id": "interleaved-final", "phase": "final_answer", "text": "selected around native item"}
+    ],
+    "status": "completed"
+  },
+  "failed_with_messages": {
+    "events": [
+      {"kind": "agent_message", "id": "failed-commentary", "phase": "commentary", "text": "failed commentary"},
+      {"kind": "agent_message", "id": "failed-final", "phase": "final_answer", "text": "failed authoritative response"}
+    ],
+    "status": "failed"
+  },
+  "interrupted_with_messages": {
+    "events": [
+      {"kind": "agent_message", "id": "interrupted-commentary", "phase": "commentary", "text": "interrupted commentary"},
+      {"kind": "agent_message", "id": "interrupted-final", "phase": "final_answer", "text": "interrupted authoritative response"}
+    ],
+    "status": "interrupted"
+  },
+  "runtime_cancel_after_completed": {
+    "events": [
+      {"kind": "agent_message", "id": "cancel-commentary", "phase": "commentary", "text": "cancel commentary"},
+      {"kind": "agent_message", "id": "cancel-final", "phase": "final_answer", "text": "cancel authoritative response"},
+      {"kind": "hang"}
+    ],
+    "status": "interrupted"
+  },
+  "oversized_authoritative": {
+    "events": [
+      {"kind": "agent_message", "id": "oversized-final", "phase": "final_answer", "deltas": ["short draft"], "text": "authoritative completed response exceeds the selected text bound"}
+    ],
+    "status": "completed"
+  }
+}

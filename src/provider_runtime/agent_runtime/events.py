@@ -189,6 +189,11 @@ class AgentNative:
 class AgentTerminal:
     """The exactly-once terminal value of a started turn.
 
+    ``final_text`` is the provider's authoritative selected assistant response,
+    not a concatenation of every assistant-channel observation. Provider-native
+    commentary may remain visible as ``AgentText`` without becoming terminal text
+    or executable structured output.
+
     ``usage`` is invocation-local on every status. It never includes historical
     thread/session usage, including when the upstream protocol is cumulative.
     ``Absent`` means the provider supplied no safely attributable usage.

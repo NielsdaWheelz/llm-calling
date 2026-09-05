@@ -158,8 +158,11 @@ redacted native events. Sessions require an already-enrolled subscription
 account; API-key session credentials are rejected, and quota exhaustion ends
 the turn with an `AgentQuotaExhausted` terminal — the lane never overflows
 onto API rates. `AgentTerminal.usage` is always local to that invocation and
-never replays cumulative native-session history. Child environments are
-runtime-owned and scrubbed. The full
+never replays cumulative native-session history. `AgentTerminal.final_text` is
+the provider-selected assistant response, not concatenated assistant traffic;
+Codex follows the pinned SDK's last-final-answer/last-unknown rule, while
+commentary remains observable but is never executable structured output. Child
+environments are runtime-owned and scrubbed. The full
 living contract is [docs/agent-runtime.md](docs/agent-runtime.md).
 
 ## Development

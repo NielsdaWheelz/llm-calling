@@ -24,11 +24,13 @@ Per route the matrix certifies, against the real subscription account: one full
 streamed turn under the default restrictive policy (six-kind grammar, exactly
 one terminal, normalized ``TokenUsage``), close/reopen/resume on the same native
 session, and a structured-output turn. Codex additionally runs at least six
-turns on that thread and independently witnesses the raw cumulative snapshots:
-the invocation-local terminal values must sum exactly to the native cumulative
-delta without counting the restored resume snapshot. The matrix never enrolls
-an account or prints credentials; evidence values pass through the package's
-own redaction before they are written.
+turns on that thread and independently witnesses both raw cumulative usage and
+completed assistant-message phases. Invocation-local terminal usage must sum
+exactly to the native cumulative delta without counting restored history; final
+text must match the last-final-answer/last-unknown completed item, including a
+dual commentary/final structured turn. The matrix never enrolls an account or
+prints credentials; evidence values pass through the package's own redaction
+before they are written.
 """
 
 from __future__ import annotations
@@ -107,6 +109,8 @@ class _ObservedCodexSdkAdapter(CodexSdkAdapter):
         super().__init__()
         self.cumulative_by_thread: dict[str, list[tuple[str, TokenUsage]]] = {}
         self.restored_by_thread: dict[str, list[TokenUsage]] = {}
+        self.completed_messages: dict[tuple[str, str], list[tuple[str | None, str]]] = {}
+        self.message_selection_by_thread: dict[str, list[dict[str, object]]] = {}
 
     def _token_usage(self, params: Mapping[str, object]) -> TokenUsage:
         cumulative = super()._token_usage(params)
@@ -121,6 +125,55 @@ class _ObservedCodexSdkAdapter(CodexSdkAdapter):
         if baseline is not None:
             self.restored_by_thread.setdefault(native_session_id, []).append(baseline)
         return baseline
+
+    def _record_completed_agent_message(
+        self,
+        state: Any,
+        item_id: str,
+        item: Mapping[str, object],
+        method: str,
+    ) -> None:
+        super()._record_completed_agent_message(state, item_id, item, method)
+        phase = item.get("phase")
+        text = item.get("text")
+        assert phase in (None, "commentary", "final_answer") and isinstance(text, str)
+        assert isinstance(state.turn_id, str)
+        key = (state.ref.native_session_id, state.turn_id)
+        self.completed_messages.setdefault(key, []).append((phase, text))
+
+    def _turn_terminal(
+        self,
+        state: Any,
+        params: Mapping[str, object],
+    ) -> AgentTerminal:
+        terminal = super()._turn_terminal(state, params)
+        assert isinstance(state.turn_id, str)
+        thread_id = state.ref.native_session_id
+        messages = self.completed_messages.get((thread_id, state.turn_id), [])
+        fallback: str | None = None
+        expected: str | None = None
+        for phase, text in reversed(messages):
+            if phase == "final_answer":
+                expected = text
+                break
+            if phase is None and fallback is None:
+                fallback = text
+        if expected is None:
+            expected = fallback
+        assert expected is not None, "Codex live turn had no eligible completed message"
+        assert terminal.final_text == expected, (
+            "Codex live terminal did not select the witnessed authoritative message"
+        )
+        phases = [phase if phase is not None else "unknown" for phase, _text in messages]
+        self.message_selection_by_thread.setdefault(thread_id, []).append(
+            {
+                "completed_message_count": len(messages),
+                "phases": phases,
+                "last_final_answer_or_unknown_selected": True,
+                "selected_text_sha256": hashlib.sha256(expected.encode()).hexdigest(),
+            }
+        )
+        return terminal
 
 
 # The whole shipped route algebra, derived from the package's own closed table so the release
@@ -416,7 +469,13 @@ async def _certify_route(route: LiveRoute, model: str | None) -> dict[str, objec
         structured = await runtime.run_turn(
             structured_session,
             TurnRequest(
-                input=(TextContent('Answer with JSON: {"ok": true}'),),
+                input=(
+                    TextContent(
+                        "First send a brief progress update on the commentary channel and "
+                        "use a read-only command to inspect the current working directory. "
+                        'Then answer with only JSON matching the schema: {"ok": true}'
+                    ),
+                ),
                 timeout_seconds=_TURN_TIMEOUT_SECONDS,
             ),
         )
@@ -426,7 +485,21 @@ async def _certify_route(route: LiveRoute, model: str | None) -> dict[str, objec
         assert structured.structured_output == {"ok": True}, (
             f"structured output mismatch: {structured.structured_output!r}"
         )
-        evidence["structured_turn"] = {"status": structured.status, "ok": True}
+        structured_evidence: dict[str, object] = {"status": structured.status, "ok": True}
+        if observer is not None:
+            selections = observer.message_selection_by_thread[
+                structured_session.ref.native_session_id
+            ]
+            assert len(selections) == 1
+            phases = selections[0]["phases"]
+            assert isinstance(phases, list)
+            assert "commentary" in phases and "final_answer" in phases, (
+                f"Codex live dual-phase probe did not expose both phases: {phases!r}"
+            )
+            structured_evidence["assistant_message_selection"] = selections[0]
+            structured_evidence["dual_phase_observed"] = True
+            structured_evidence["commentary_excluded_from_structured_output"] = True
+        evidence["structured_turn"] = structured_evidence
         await runtime.close_session(structured_session)
     return evidence
 

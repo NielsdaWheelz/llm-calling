@@ -11,7 +11,7 @@ import weakref
 from collections.abc import AsyncGenerator, Awaitable, Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal, Protocol, assert_never
+from typing import Any, Literal, Protocol, assert_never, runtime_checkable
 
 from provider_runtime.types import Absent, CancelSignal, Presence, Present, TokenUsage
 
@@ -183,6 +183,13 @@ class AgentAdapter(Protocol):
     async def close_session(self, session: AgentSession) -> None: ...
 
     async def close(self) -> None: ...
+
+
+@runtime_checkable
+class _InterruptedFinalTextAdapter(Protocol):
+    """Optional provider-owned projection for a runtime-synthesized terminal."""
+
+    def _interrupted_final_text(self, session: AgentSession) -> str: ...
 
 
 @dataclass(slots=True)
@@ -1039,10 +1046,13 @@ class AgentRuntime:
                     await source.aclose()
                     raise TurnNotStarted("turn_timeout" if cause == "timed_out" else "cancelled")
                 await source.aclose()
+                final_text = "".join(text_parts)
+                if isinstance(binding.adapter, _InterruptedFinalTextAdapter):
+                    final_text = binding.adapter._interrupted_final_text(session)
                 yield self._synthetic_terminal(
                     session,
                     cause,
-                    final_text="".join(text_parts),
+                    final_text=final_text,
                     usage=usage,
                 )
                 return

@@ -352,6 +352,28 @@ AgentTerminal          exactly-once terminal: status, typed failure value,
                        final text, structured output, usage, session ref
 ```
 
+### Authoritative assistant response
+
+`AgentTerminal.final_text` is the provider's authoritative selected assistant
+response. It is not a concatenation of all assistant-channel traffic observed
+during the turn. `AgentText` remains the bounded streaming-observation surface:
+it can include provider-native commentary and drafts, so consumers may display
+it but must not execute it or treat its cross-item concatenation as structured
+output. Both structured and unstructured terminals use the same authoritative
+message selection before strict JSON parsing or downstream schema validation.
+
+For Codex, the adapter retains each completed `agentMessage` item's identity,
+text, phase, and native completion order. At terminal it scans those items in
+reverse order and selects the last `phase=final_answer` item. If none exists, it
+selects the last completed item whose phase is absent, matching the compatibility
+fallback in the pinned `openai-codex` 0.144.4 SDK. Commentary is never eligible,
+even if it is individually valid JSON or arrives after the final answer. Multiple
+eligible messages are not concatenated. A completed turn with no eligible item,
+or a duplicate, empty, malformed, or unknown-phase completed assistant identity,
+is a `ProtocolDefect`; the adapter never guesses from streamed deltas. Failed,
+interrupted, output-limited, or runtime-cancelled turns expose an already-completed
+eligible response when one exists and otherwise use empty final text.
+
 ### Invocation-local usage
 
 `AgentTerminal.usage` is usage attributable only to that `stream_turn` or
@@ -415,8 +437,11 @@ The runtime bounds turn duration, event count, individual message size, final
 text, diagnostics, and cleanup. A caller cancellation signal or timeout invokes
 the SDK's native interrupt operation. Cancellation before the first stream
 event raises `TurnNotStarted`; after it, the stream ends with a cancelled (or
-`turn_timeout`-failed) `AgentTerminal` that preserves the text and usage the
-consumer already received.
+`turn_timeout`-failed) `AgentTerminal` that preserves safely attributable usage.
+Codex final text uses only an eligible assistant item completed before
+interruption; its observed commentary/delta buffer is never promoted into
+terminal text. Other adapters preserve the partial text their own terminal
+contract makes authoritative.
 
 If a stream transport fails or violates its grammar, the Codex SDK client is
 discarded rather than reused with uncertain native state. Claude drains an
@@ -476,7 +501,10 @@ a resumed second turn on the same native session, and a structured output turn
 A live-only observer independently captures the raw native cumulative values
 before projection and proves all six invocation-local terminals equal their
 fixed-baseline deltas and sum exactly to the final real cumulative delta; the
-restored resume snapshot must appear as baseline without being charged.
+restored resume snapshot must appear as baseline without being charged. For
+Codex it also independently records completed assistant-message phases, requires
+a real commentary-plus-final structured turn, and proves the terminal selects
+the final-answer item while excluding commentary from structured parsing.
 
 ## References
 
