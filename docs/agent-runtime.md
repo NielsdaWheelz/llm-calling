@@ -12,23 +12,25 @@ AgentRuntime:    one local SDK session -> streamed turns and durable session ref
 The agent runtime does not pretend a stateful coding agent is a stateless model
 call. Callers own prompts, durable chat history, budgets, orchestration, and
 product policy. The runtime owns route selection, isolated local-account state,
-the authorization model, SDK lifecycle, normalized events, cancellation, and one
-terminal outcome per started turn.
+the authorization model, provider-process lifecycle, normalized events,
+cancellation, and one terminal outcome per started turn.
 
 ## Shipped routes
 
 The routing algebra is closed:
 
 ```text
-(codex, sdk)  -> openai-codex
+(codex, sdk)  -> bundled Codex app-server over owned stdio JSON-RPC
 (claude, sdk) -> claude-agent-sdk
 ```
 
-There is no `cli` transport, direct App Server/JSON-RPC adapter, subprocess
-protocol parser, or automatic fallback. The official SDK is the integration
-boundary for each backend. Codex's SDK owns its matched bundled runtime; the
-Claude SDK owns its protocol and this package supplies the exact vetted Claude
-Code executable through the SDK's public `cli_path` option.
+There is no `cli` route or automatic fallback. The public route name remains
+`sdk` for stored-reference compatibility. On Codex, provider-runtime directly
+owns the documented App Server `stdio://` JSONL connection and uses
+`openai-codex` only for its public option vocabulary/version plus the matched
+`openai-codex-cli-bin` executable. It does not call or patch `AsyncCodex`'s
+opaque request loop. Claude remains on the official SDK and receives the exact
+vetted Claude Code executable through public `cli_path`.
 
 Unknown backend/transport pairs fail as `InvalidAgentRequest`. A missing optional
 SDK fails as `SdkUnavailable`; it never selects another lane.
@@ -50,19 +52,20 @@ lockfile pins the exact resolution. The vetted versions the adapters were
 written against are openai-codex 0.144.4 with its matched runtime, and
 claude-agent-sdk 0.2.130 with Claude Code 2.1.220.
 
-A version that drifts from the vetted one is met with **one warning plus a
-behavioral capability probe**, never a hard fail: the adapters verify what the
-backend actually does (account type, effective configuration, sandbox
-capability) instead of trusting a version-keyed table. A missing SDK, missing
-bundled runtime, required resume-usage routing seam, or unresponsive executable
-remains a typed availability failure (`SdkUnavailable` /
-`ExecutableUnavailable`). Codex 0.144.4 replays restored cumulative usage before
-`thread/resume` returns but its high-level API leaves that old-turn notification
-in the internal routed queue. The adapter has one behaviorally checked,
-read-only compatibility seam over that queue so resumed and reconstructed turns
-have an exact pre-turn baseline. If a drifted SDK removes the seam, resume/fork
-fails before a billable turn rather than guessing usage; fresh and already-open
-sessions do not depend on it.
+A version that drifts from the vetted one normally receives one warning plus a
+behavioral probe. The certified `builtin_tools="disabled"` posture is narrower:
+the public Python package, bundled runtime package, and executable-reported
+version must each be exactly 0.144.4 or session open fails before a turn. A
+missing dependency or unresponsive executable remains `SdkUnavailable` or
+`ExecutableUnavailable`.
+
+Codex 0.144.4 replays cumulative usage around `thread/resume`. The owned
+transport keeps every notification in wire order, validates an explicit
+pre-turn allowlist, and derives the resume/fork baseline without a private SDK
+queue seam. A replay that races behind the response is accepted only as the
+first baseline-only snapshot, with its exact prior-turn identity, after the next
+turn starts. Any later stale identity and every missing identity fail closed.
+Unknown pre-turn messages fail before a billable turn.
 
 `openai-codex` ships a matched Codex runtime, so `AgentRuntimeConfig` has no
 Codex executable setting. Claude Code is still a local executable and may be
@@ -77,6 +80,7 @@ from provider_runtime.agent_runtime import (
     AgentRuntime,
     AgentRuntimeConfig,
     AgentSessionRequest,
+    CodexNativeOptions,
     CredentialRef,
     NewSession,
     PermissionPolicy,
@@ -93,11 +97,10 @@ request = AgentSessionRequest(
     auth=auth,
     open=NewSession(),
     cwd="/absolute/workspace",
-    # Everything else is the restrictive default (read-only, no network, denied
-    # approvals). `allowed_tools` is explicit because Codex's public SDK cannot filter
-    # its built-in tools at all, so this route refuses a policy that claims they are
-    # off; see "Policy and approvals". Claude takes `PermissionPolicy()` unchanged.
+    # The certified containment posture is read-only, offline, deny-all, no MCP,
+    # no copied environment, no additional roots, and exact runtime 0.144.4.
     policy=PermissionPolicy(allowed_tools=("*",)),
+    native=CodexNativeOptions(builtin_tools="disabled"),
 )
 
 async with AgentRuntime(config) as runtime:
@@ -117,15 +120,15 @@ Validation is behavioral, not table-driven: `open_session` fails closed before
 any billable work when the request asks for something the transport cannot
 enforce (an unenforceable tool filter, a sandbox mode the host cannot provide,
 an approval mode the backend does not have). Session instructions and reasoning
-follow the same rule — each is mapped to a real SDK option or refused, never
+follow the same rule — each is mapped to a documented provider option or refused, never
 dropped: Codex takes `system` as `base_instructions` and `developer` as
 `developer_instructions`; Claude has one instruction channel (`system_prompt`),
 so it takes `system` and refuses `developer`, and it maps
 `ReasoningSpec.summary` onto its only summary control, `thinking.display`
 (`none`/`auto`), refusing the `concise`/`detailed` verbosity it has no knob for.
 
-All of that is session-scoped, because neither SDK can reconfigure a live
-client. `TurnRequest` therefore carries exactly one turn's `input`, an optional
+All of that is session-scoped, because neither provider integration can
+reconfigure a live client. `TurnRequest` therefore carries exactly one turn's `input`, an optional
 narrowing `policy` patch, and an optional `timeout_seconds` — there are no
 per-turn instruction, model, reasoning, MCP, or output overrides to pass.
 
@@ -136,15 +139,14 @@ additionally requires `socat`); hosts that cannot are refused during
 
 ## Ownership boundary
 
-The official SDKs own:
+For Codex, this package owns the complete App Server connection: process launch,
+initialize/initialized negotiation, client request ids, response correlation,
+notification ordering, server-request replies, thread/turn operations, and
+shutdown. Only documented public App Server methods are used. For Claude, the
+official SDK continues to own the vendor protocol. Native execution itself and
+already-enrolled subscription authentication remain provider behavior.
 
-- vendor argument construction and protocol negotiation;
-- native session/thread operations;
-- native notifications and tool execution;
-- subscription authentication already enrolled by the user;
-- provider-defined approval behavior exposed by the SDK.
-
-This package owns the retained security kernel and the lifecycle around it:
+The retained security kernel owns:
 
 - one closed `(backend, transport)` selection;
 - an isolated state root and child environment;
@@ -154,14 +156,10 @@ This package owns the retained security kernel and the lifecycle around it:
 - bounded, recursively redacted native event representation;
 - normalized immutable events and the strict terminal grammar;
 - timeout, cancellation, output bounds, and cleanup;
-- transparent environment-replacing/process-group launchers where the public
-  SDK lacks those process controls;
+- direct environment-replacing/process-group launch for Codex and the existing
+  transparent launcher where the Claude SDK lacks those process controls;
 - typed public errors;
 - SDK-neutral session references and test doubles.
-
-The adapters use public SDK surface only. Directly consuming a vendor's internal
-wire protocol would duplicate lifecycle, versioning, and notification behavior
-the maintained SDK already owns.
 
 ## Authentication and state isolation
 
@@ -194,20 +192,18 @@ from a fail-closed allowlist. `HOME`, `PATH`, locale, temp, `CODEX_HOME`, and
 Credential-class, provider-selection, and process-control environment names are
 also rejected.
 
-For Codex, the selected environment is passed through public `CodexConfig.env`
-and the profile root through its configuration. The SDK overlays that mapping on
-the host process environment rather than replacing it, so the adapter points
-public `CodexConfig.codex_bin` at a content-addressed launcher. The launcher
-forwards the SDK-owned arguments unchanged to the matched bundled runtime,
-replaces the environment with the exact selected-name allowlist, and supervises
-one private process group. Ambient API keys and unrelated variables therefore do
-not reach Codex. `client.account()` must report a ChatGPT account.
+For Codex, the owned transport starts the exact bundled executable with
+`app-server --listen stdio:// --strict-config`, an exact replacement
+environment, and one private process group. Ambient API keys and unrelated
+variables never reach the process. The documented `account/read` response must
+report a ChatGPT account. No token-refresh or attestation callback is
+implemented: either request gets a JSON-RPC error and terminates the session.
 
 For Claude, the SDK is pointed at the isolated environment and exact executable.
 Its content-addressed `0700` launcher calls `setsid()` and then `execv()` so
-Claude Code and descendants can be terminated as one process group. Both
-launchers live in runtime-owned backend parent directories outside the child
-profile, contain no credentials, and do not reconstruct SDK arguments.
+Claude Code and descendants can be terminated as one process group. The
+launcher lives in a runtime-owned backend parent directory outside the child
+profile, contains no credentials, and does not reconstruct SDK arguments.
 
 `CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK` must be unset. It is an ambient control
 over the SDK's own compatibility behavior and therefore fails closed.
@@ -279,16 +275,14 @@ shipped SDK routes cannot reconfigure a live client's policy, so they reject
 per-turn patches; the narrowing algebra still gates the request before the
 adapter sees it.
 
-Codex's public SDK does not expose built-in allow/deny filtering at all — not
-specific names, and no way to turn the built-ins off. The route therefore
-accepts exactly one spelling, the sentinel `allowed_tools=("*",)`: naming
-specific tools would claim a filter the SDK cannot apply, and leaving the tuple
-empty would claim the built-ins are disabled when they are not. Every Codex
-session in this package's own examples and live matrix carries that sentinel;
-the sandbox and approval mode, not the tool list, are what confine a Codex
-session. Claude does accept exact tool names, rejects glob patterns and the two
-network-reaching built-ins outright, and verifies the effective tool set the
-backend reports at session start against the set that was requested.
+Codex has no public typed per-name built-in filter. The portable policy therefore
+still requires the sentinel `allowed_tools=("*",)`. The additional
+`CodexNativeOptions(builtin_tools="disabled")` posture writes the complete
+feature-off configuration certified for 0.144.4 and requires read-only
+filesystem, disabled network, denied approvals, empty copied environment, no
+MCP, and no additional roots. Provider review is refused in this posture.
+Claude continues to accept exact tool names, reject glob patterns and its two
+network-reaching built-ins, and verify the reported effective set.
 
 ## MCP
 
@@ -316,9 +310,10 @@ or container for credentialed stdio servers.
 
 `JsonSchemaAgentOutput` carries a plain JSON Schema mapping (pass
 `model_json_schema()` where a pydantic model exists). The adapter passes the
-schema through the SDK's public native output-schema option; the backend
-enforces it. The final value is strict-parsed and frozen — no JSON repair, no
-coercion — and a miss is the `output_schema_violation` terminal failure.
+schema through the App Server's public `turn/start.outputSchema` field; the
+backend enforces it. The final value is strict-parsed and frozen — no JSON
+repair, no coercion — and a miss is the `output_schema_violation` terminal
+failure.
 
 Native extension objects are versioned, backend-specific escape hatches:
 
@@ -328,10 +323,11 @@ Native extension objects are versioned, backend-specific escape hatches:
   integration, and local-context feature set certified for the pinned Codex
   runtime. It also suppresses app, skill, environment, permission, and collaboration
   instructions plus request-user-input.
-  Codex 0.144.4 has no per-thread switch for its always-registered planning,
-  `apply_patch`, or `view_image` tools, so callers needing a strict text-only
-  contract must additionally reject every native tool event and run Codex in an
-  empty, read-only sandbox;
+  This is a certified containment posture, not proof of pre-execution
+  prevention: public controls do not establish that Code Mode/native `exec` is
+  absent before computation. The child is credentialless, read-only, and
+  offline. Its first observable authority event poisons the turn, invalidates
+  the session, and makes every later terminal ineligible;
 - `ClaudeNativeOptions(include_partial_messages=...)` is session-scoped.
 
 Unknown or wrong-backend native options fail before SDK startup.
@@ -346,8 +342,8 @@ AgentToolUse           tool_call_id, name, phase started|updated|completed,
                        owned payload; completed carries succeeded
 AgentUsage             TokenUsage, normalized to the provider lane's noun
 AgentPermissionRequest one answered unsafe-action confirmation (request + decision)
-AgentNative            any native frame without a first-class kind, as a
-                       bounded, recursively redacted payload
+AgentNative            an explicitly allowlisted inert observation, as a bounded,
+                       recursively redacted payload
 AgentTerminal          exactly-once terminal: status, typed failure value,
                        final text, structured output, usage, session ref
 ```
@@ -391,9 +387,11 @@ delta aggregates all model requests made by the invocation. The baseline is:
 
 - synthetic zero for a fresh native thread;
 - the last validated cumulative end snapshot for consecutive turns; or
-- the cumulative snapshot Codex replays before resume/fork returns for reopened
-  and reconstructed processes/sessions. That restored snapshot is read as a
-  baseline before any new turn starts and emits no `AgentUsage`.
+- the cumulative snapshot Codex replays around resume/fork for reopened and
+  reconstructed processes/sessions. A replay already queued at resume is
+  consumed before a new turn. If it races behind the response, exactly the first
+  stale-prior-turn usage identity may establish the unknown baseline after the
+  next turn starts. Either form emits no `AgentUsage`.
 
 Input, output, total, cached-input, cache-write-input, and reasoning-output
 counters are differenced independently. Optional counter presence must remain
@@ -406,8 +404,10 @@ The accounting boundary fails safe:
   presence-changing snapshots raise `ProtocolDefect`; counts are never clamped;
 - unchanged cumulative snapshots are suppressed, including replay and duplicate
   rate-limit updates;
+- a missing usage turn id, or a stale id outside that single first-rebase race,
+  is `ProtocolDefect`;
 - a usage update arriving late in the turn but before `turn/completed` is still
-  included; `turn/completed` is the Codex SDK's hard stream boundary, so a
+  included; `turn/completed` is the App Server's hard stream boundary, so a
   post-completion update is not attributable and is never assigned to a later
   terminal;
 - if no advancing usage notification is available, terminal usage is `Absent`
@@ -425,17 +425,25 @@ The accounting boundary fails safe:
 `output_limit_exceeded`, `approval_unanswered`, `output_schema_violation`.
 Model/backend failures are terminal values; broken runtime invariants raise
 (`ProtocolDefect`, `MissingTerminalEvent`). Exactly one `AgentTerminal` ends
-every started turn, last; post-terminal frames are defects.
+every valid started-turn stream, last; a defect raises without accepting a
+terminal, and post-terminal frames are defects.
 
-Native detail that used to have first-class kinds — reasoning deltas, file
-changes as separate events, diagnostics, retry observations, system frames —
-travels as `AgentNative` with the redacted native payload.
+Known command, file, MCP/app, Web, image, hook, sub-agent, dynamic/custom tool,
+process, approval-review, and Code Mode/custom-exec activity is never
+`AgentNative`: it becomes `AgentToolUse` (or `AgentPermissionRequest` for
+permission requests). Known approvals are answered with their explicit denial
+shape before the event is exposed. Unknown server requests, unknown item types,
+malformed/duplicate/reordered identities, uncorrelated responses, and protocol
+drift raise `ProtocolDefect`. A future item type therefore defaults to forbidden.
+`AgentNative` is reserved for the explicit bounded/redacted allowlist: turn
+lifecycle, reasoning/plan observations, warnings/errors, status/rate-limit/model
+metadata, resolved-request notices, and terminal native evidence.
 
 ## Cancellation, limits, and retries
 
-The runtime bounds turn duration, event count, individual message size, final
+The runtime bounds turn duration, JSONL message size/shape, event count, final
 text, diagnostics, and cleanup. A caller cancellation signal or timeout invokes
-the SDK's native interrupt operation. Cancellation before the first stream
+the provider's native interrupt operation. Cancellation before the first stream
 event raises `TurnNotStarted`; after it, the stream ends with a cancelled (or
 `turn_timeout`-failed) `AgentTerminal` that preserves safely attributable usage.
 Codex final text uses only an eligible assistant item completed before
@@ -443,8 +451,9 @@ interruption; its observed commentary/delta buffer is never promoted into
 terminal text. Other adapters preserve the partial text their own terminal
 contract makes authoritative.
 
-If a stream transport fails or violates its grammar, the Codex SDK client is
-discarded rather than reused with uncertain native state. Claude drains an
+Codex cancellation uses documented `turn/interrupt`. If its process dies or the
+stream violates its grammar, the entire App Server client is discarded rather
+than reused with uncertain native state. Claude drains an
 interrupted turn or invalidates the session before another turn can begin.
 
 The runtime never retries a turn. Replaying a stateful agent turn at this layer
@@ -469,9 +478,10 @@ provider text and must not expose tokens, raw SDK messages, or resolved secrets.
 ## Testing
 
 Application tests should use `ScriptedAgentRuntime` or
-`NoNetworkAgentRuntime`. Deterministic adapter tests replace only the public SDK
-boundary with typed fakes; there are no checked-in Codex wire schemas, JSON-RPC
-fixtures, or executable emulators.
+`NoNetworkAgentRuntime`. Deterministic adapter tests use typed fakes plus
+sanitized JSON-RPC fixtures for every response/request/event family. The
+retained incident fixture contains only item shapes, field names, lengths, and
+hashes; conversation text, prompts, credentials, and tool arguments are absent.
 
 CI proves all of these packaging shapes:
 
@@ -506,9 +516,21 @@ Codex it also independently records completed assistant-message phases, requires
 a real commentary-plus-final structured turn, and proves the terminal selects
 the final-answer item while excluding commentary from structured parsing.
 
+The separate paid Terra containment qualification deliberately asks for native
+`exec`/Code Mode and accepts exactly two outcomes: no authority surface appears,
+or first-class/defect detection invalidates the session with no accepted
+terminal. Both require no sentinel host effect and no credential environment:
+
+```bash
+LLM_RUNTIME_LIVE=1 \
+LLM_RUNTIME_LIVE_CODEX_HOME=/absolute/private/codex-home \
+uv run pytest -m live_provider tests/live/test_codex_containment.py
+```
+
 ## References
 
-- [OpenAI Codex SDK for Python](https://github.com/openai/codex/tree/main/sdk/python)
+- [Codex App Server protocol](https://developers.openai.com/codex/app-server)
+- [OpenAI Codex SDK](https://developers.openai.com/codex/codex-sdk)
 - [Codex authentication](https://developers.openai.com/codex/auth/)
 - [Claude Agent SDK overview](https://code.claude.com/docs/en/agent-sdk/overview)
 - [Claude Agent SDK Python](https://code.claude.com/docs/en/agent-sdk/python)

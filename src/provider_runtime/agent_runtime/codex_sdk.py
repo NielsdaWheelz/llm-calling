@@ -1,11 +1,8 @@
-"""Native Codex Python SDK adapter with a lazy optional dependency boundary.
+"""Codex app-server adapter with a lazy pinned-runtime dependency boundary.
 
-The adapter owns official ``openai-codex`` clients and normalizes their public
-notification stream into the closed six-kind event vocabulary. Validation is
-behavioral: there is no capability table, so every backend fact this transport
-cannot enforce is refused at ``open_session``/``stream_turn`` before billable
-work, and version drift is a warning backed by the behavioral probe
-(``client.account()`` plus the initialize metadata), never a hard failure.
+The adapter uses the public ``openai-codex`` data types but owns the documented
+app-server stdio JSON-RPC transport. Every response, notification, and server
+request therefore crosses this boundary before it can affect a terminal.
 """
 
 from __future__ import annotations
@@ -15,7 +12,6 @@ import importlib
 import importlib.metadata
 import os
 import re
-import sys
 import warnings
 import weakref
 from collections.abc import AsyncGenerator, Mapping
@@ -27,7 +23,6 @@ from typing import Any, Literal, cast
 from provider_runtime.errors import sanitize_provider_text
 from provider_runtime.types import Absent, Presence, Present, TokenUsage
 
-from ._codex_launcher import ensure_codex_launcher
 from ._limits import (
     _MAX_DIAGNOSTICS,
     _MAX_EVENT_COUNT,
@@ -49,6 +44,11 @@ from .auth import (
     redact_native_payload,
     state_root_from_environment,
 )
+from .codex_app_server import (
+    CodexAppServerClient,
+    CodexAppServerConfig,
+    CodexServerRequest,
+)
 from .errors import (
     CredentialRejected,
     CredentialUnavailable,
@@ -66,6 +66,7 @@ from .events import (
     AgentEvent,
     AgentFailure,
     AgentNative,
+    AgentPermissionRequest,
     AgentQuotaExhausted,
     AgentTerminal,
     AgentTerminalFailure,
@@ -90,6 +91,7 @@ from .types import (
     AgentSessionRef,
     AgentSessionRequest,
     ApprovalHandler,
+    ApprovalRequest,
     CodexNativeOptions,
     CredentialRef,
     ForkSession,
@@ -109,6 +111,9 @@ from .types import (
 _CERTIFIED_SDK_VERSION = "0.144.4"
 _RUNTIME_VERSION_PREFIX = re.compile(
     r"(?P<version>[0-9]+(?:\.[0-9]+){2}(?:[-+][0-9A-Za-z.-]+)?)(?:\s|$)"
+)
+_APP_SERVER_USER_AGENT = re.compile(
+    r"^[^/]+/(?P<version>[0-9]+(?:\.[0-9]+){2}(?:[-+][0-9A-Za-z.-]+)?)(?:\s|$)"
 )
 _REQUIRED_MCP_STARTUP_FAILURE = "required MCP servers failed to initialize"
 
@@ -175,11 +180,116 @@ _TURN_SCOPED_METHODS = frozenset(
         "item/completed",
         "item/agentMessage/delta",
         "item/reasoning/summaryTextDelta",
+        "item/reasoning/summaryPartAdded",
         "item/reasoning/textDelta",
+        "item/plan/delta",
         "item/commandExecution/outputDelta",
+        "item/commandExecution/terminalInteraction",
+        "item/autoApprovalReview/started",
+        "item/autoApprovalReview/completed",
         "item/fileChange/patchUpdated",
         "item/fileChange/outputDelta",
         "item/mcpToolCall/progress",
+        "turn/diff/updated",
+        "turn/plan/updated",
+        "hook/started",
+        "hook/completed",
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+        "item/permissions/requestApproval",
+        "item/tool/call",
+        "item/tool/requestUserInput",
+    }
+)
+
+_INERT_NATIVE_METHODS = frozenset(
+    {
+        "turn/started",
+        "item/reasoning/summaryTextDelta",
+        "item/reasoning/summaryPartAdded",
+        "item/reasoning/textDelta",
+        "item/plan/delta",
+        "turn/plan/updated",
+        "thread/status/changed",
+        "account/rateLimits/updated",
+        "model/rerouted",
+        "model/safetyBuffering/updated",
+        "model/verification",
+        "turn/moderationMetadata",
+        "thread/compacted",
+        "thread/goal/cleared",
+        "thread/goal/updated",
+        "thread/name/updated",
+        "serverRequest/resolved",
+        "mcpServer/startupStatus/updated",
+        "remoteControl/status/changed",
+        "deprecationNotice",
+    }
+)
+
+_THREAD_BOUND_INERT_METHODS = frozenset(
+    {
+        "thread/compacted",
+        "thread/goal/cleared",
+        "thread/goal/updated",
+        "thread/name/updated",
+        "thread/status/changed",
+    }
+)
+
+_FORBIDDEN_SESSION_NOTIFICATIONS = frozenset(
+    {
+        "thread/archived",
+        "thread/closed",
+        "thread/deleted",
+        "thread/unarchived",
+    }
+)
+
+_INERT_ITEM_TYPES = frozenset(
+    {
+        "userMessage",
+        "agentMessage",
+        "plan",
+        "reasoning",
+        "enteredReviewMode",
+        "exitedReviewMode",
+        "contextCompaction",
+    }
+)
+
+_PRETURN_INERT_METHODS = frozenset(
+    {
+        "account/updated",
+        "account/rateLimits/updated",
+        "configWarning",
+        "deprecationNotice",
+        "warning",
+        "thread/started",
+        "thread/compacted",
+        "thread/goal/cleared",
+        "thread/goal/updated",
+        "thread/name/updated",
+        "thread/status/changed",
+        "mcpServer/startupStatus/updated",
+        "remoteControl/status/changed",
+    }
+)
+
+_AUTHORITY_ITEM_TYPES = frozenset(
+    {
+        "commandExecution",
+        "fileChange",
+        "mcpToolCall",
+        "dynamicToolCall",
+        "collabAgentToolCall",
+        "subAgentActivity",
+        "webSearch",
+        "imageView",
+        "sleep",
+        "imageGeneration",
+        "functionCallOutput",
+        "hookPrompt",
     }
 )
 
@@ -355,13 +465,18 @@ class _CodexSessionState:
     streamed_text_bytes: int = 0
     completed_agent_messages: list[_CompletedAgentMessage] = field(default_factory=list)
     completed_item_ids: set[str] = field(default_factory=set)
+    started_item_types: dict[str, str] = field(default_factory=dict)
     diagnostics: list[str] = field(default_factory=list)
     active_mcp_calls: dict[str, tuple[str, str]] = field(default_factory=dict)
+    active_tool_calls: dict[str, str] = field(default_factory=dict)
+    custom_item_calls: dict[str, str] = field(default_factory=dict)
+    server_request_ids: set[tuple[type[object], object]] = field(default_factory=set)
+    authority_seen: bool = False
     quota_exhausted: bool = False
 
 
 class CodexSdkAdapter:
-    """Own official Codex SDK clients and normalize their public notification stream."""
+    """Own Codex app-server clients and normalize their complete message stream."""
 
     backend: Literal["codex"] = "codex"
     transport: Literal["sdk"] = "sdk"
@@ -463,6 +578,9 @@ class CodexSdkAdapter:
         validate_mcp_network_policy(request.mcp_servers, request.policy)
         self._validate_mcp_filters(request)
         state_root = state_root_from_environment("codex", environment)
+        native = request.native
+        if isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled":
+            self._validate_strict_native_containment(request)
         if request.policy.filesystem == "workspace_write":
             # Restricted writes ride on bubblewrap network namespaces; a host without
             # them gets a fail-closed refusal before any thread is started.
@@ -472,8 +590,6 @@ class CodexSdkAdapter:
                 raise UnsupportedCapability(
                     "Codex workspace_write requires bubblewrap network namespaces on this host"
                 )
-
-        native = request.native
         sdk, client = await self._open_client(
             cwd=request.cwd,
             environment=environment,
@@ -491,10 +607,10 @@ class CodexSdkAdapter:
             if request.model is not None:
                 kwargs["model"] = request.model
             if request.system:
-                # `base_instructions` is the SDK's system-role channel on thread
-                # start/resume/fork (0.144.4 api.py:135) and *replaces* Codex's built-in base
-                # prompt rather than appending to it, which is what a caller asking for
-                # session system instructions is asking for.
+                # `baseInstructions` is the public App Server system-role field on thread
+                # start/resume/fork and *replaces* Codex's built-in base prompt rather than
+                # appending to it, which is what a caller asking for session system
+                # instructions is asking for.
                 kwargs["base_instructions"] = self._text_only(
                     request.system, "Codex system instructions"
                 )
@@ -535,11 +651,9 @@ class CodexSdkAdapter:
                 native_session_id == request.open.ref.native_session_id
             ):
                 raise ProtocolDefect("Codex SDK fork did not mint a new thread id")
-            restored_usage = (
-                None
-                if isinstance(request.open, NewSession)
-                else self._restored_usage_baseline(client, native_session_id)
-            )
+            restored_usage = self._restored_usage_baseline(client, native_session_id)
+            if isinstance(request.open, NewSession) and restored_usage is not None:
+                raise ProtocolDefect("Codex new thread replayed historical usage")
 
             ref = self._make_ref(
                 native_session_id=native_session_id,
@@ -579,7 +693,7 @@ class CodexSdkAdapter:
             raise UnsupportedCapability("Codex SDK cannot reconfigure policy on a started thread")
 
         policy = state.request.policy
-        inputs = [self._codex_input(state.sdk, part) for part in request.input]
+        inputs = [self._codex_input(part) for part in request.input]
         kwargs: dict[str, object] = {
             "approval_mode": self._approval_mode(state.sdk, policy),
         }
@@ -607,9 +721,14 @@ class CodexSdkAdapter:
         state.streamed_text_bytes = 0
         state.completed_agent_messages.clear()
         state.completed_item_ids.clear()
+        state.started_item_types.clear()
         state.usage_accounting.begin_turn()
         state.diagnostics.clear()
         state.active_mcp_calls.clear()
+        state.active_tool_calls.clear()
+        state.custom_item_calls.clear()
+        state.server_request_ids.clear()
+        state.authority_seen = False
         state.quota_exhausted = False
 
         terminal_seen = False
@@ -681,7 +800,7 @@ class CodexSdkAdapter:
         return self._selected_final_text(self._state(session), required=False)
 
     async def close_session(self, session: AgentSession) -> None:
-        """Idempotently release one SDK client while preserving sibling sessions."""
+        """Idempotently release one App Server client while preserving sibling sessions."""
         if session in self._dead_sessions:
             return
         state = self._sessions.pop(session, None)
@@ -701,7 +820,7 @@ class CodexSdkAdapter:
         )
         if any(isinstance(result, BaseException) for result in (*session_results, *results)):
             raise ProtocolDefect(
-                "Codex SDK client teardown did not complete", code="sdk_teardown_failed"
+                "Codex App Server client teardown did not complete", code="sdk_teardown_failed"
             )
 
     async def _open_client(
@@ -752,22 +871,16 @@ class CodexSdkAdapter:
                 )
             bundled_executable = Path(runtime.bundled_codex_path()).resolve(strict=True)
             state_root = state_root_from_environment("codex", environment)
-            launcher = ensure_codex_launcher(
-                state_root,
-                bundled_executable,
-                tuple(child_environment),
-                interpreter=sys.executable,
-            )
-            config = sdk.CodexConfig(
-                codex_bin=str(launcher),
+            config = CodexAppServerConfig(
+                executable=bundled_executable,
+                cwd=Path(cwd).resolve(strict=True) if cwd is not None else state_root,
+                environment=child_environment,
                 config_overrides=('forced_login_method="chatgpt"',),
-                cwd=cwd,
-                env=child_environment,
                 client_name="provider_runtime",
                 client_title="provider-runtime",
                 client_version="0.1.0",
             )
-            client = sdk.AsyncCodex(config)
+            client = CodexAppServerClient(config)
             async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
                 await client.__aenter__()
             executable_version = self._executable_version(client)
@@ -783,6 +896,10 @@ class CodexSdkAdapter:
                     stacklevel=2,
                 )
         except UnsupportedCapability:
+            if client is not None:
+                await client.close()
+            raise
+        except ProtocolDefect:
             if client is not None:
                 await client.close()
             raise
@@ -804,40 +921,56 @@ class CodexSdkAdapter:
         return sdk, client
 
     def _restored_usage_baseline(self, client: Any, native_session_id: str) -> TokenUsage | None:
-        """Read the cumulative snapshot app-server replayed during resume/fork.
-
-        Codex emits this notification before answering ``thread/resume`` but assigns it
-        the last restored turn id. The high-level SDK therefore leaves it in its routed
-        pending-turn queue rather than exposing it through the next new turn's stream.
-        The certified SDK has no public accessor for an already-pending turn frame, so this
-        is one narrow, behaviorally checked compatibility seam over its router. No queue is
-        mutated: the adapter only snapshots the already-complete replay.
-        """
-        try:
-            async_client = client._client
-            sync_client = async_client._sync
-            router = sync_client._router
-            lock = router._lock
-            pending = router._pending_turn_notifications
-            if not isinstance(pending, Mapping):
-                raise TypeError
-            with lock:
-                notifications = tuple(
-                    notification for routed in pending.values() for notification in tuple(routed)
-                )
-        except (AttributeError, TypeError):
+        """Consume and validate app-server replay emitted before resume/fork responds."""
+        take_pending = getattr(client, "take_pending_messages", None)
+        if not callable(take_pending):
             raise SdkUnavailable(
-                "Codex SDK does not expose the routed resume usage required for accounting"
-            ) from None
+                "Codex app-server transport does not expose its pending message queue"
+            )
+        notifications = cast(tuple[object, ...], take_pending())
 
         snapshots: list[TokenUsage] = []
         replay_bytes = 0
         for notification in notifications:
-            if getattr(notification, "method", None) != "thread/tokenUsage/updated":
+            if isinstance(notification, CodexServerRequest):
+                raise ProtocolDefect("Codex server request arrived outside an active turn")
+            method = getattr(notification, "method", None)
+            if method in _PRETURN_INERT_METHODS:
+                raw_params = getattr(notification, "params", None)
+                if raw_params is None:
+                    payload = getattr(notification, "payload", None)
+                    raw_params = getattr(payload, "params", payload)
+                params = self._mapping(raw_params, f"Codex app-server {method} notification")
+                try:
+                    replay_bytes += bounded_payload_size(
+                        params,
+                        _MAX_MESSAGE_BYTES,
+                        max_items=_MAX_MESSAGE_ITEMS,
+                    )
+                except OutputLimitExceeded:
+                    raise ProtocolDefect(
+                        "Codex app-server pre-turn payload exceeded its ingress bound"
+                    ) from None
+                if replay_bytes > _MAX_TURN_OUTPUT_BYTES:
+                    raise ProtocolDefect(
+                        "Codex app-server pre-turn replay exceeded its ingress bound"
+                    )
+                thread = params.get("thread")
+                observed_id = (
+                    thread.get("id") if isinstance(thread, Mapping) else params.get("threadId")
+                )
+                if method in _THREAD_BOUND_INERT_METHODS and observed_id != native_session_id:
+                    raise ProtocolDefect("Codex replay omitted or changed thread identity")
+                if observed_id is not None and observed_id != native_session_id:
+                    raise ProtocolDefect("Codex replay changed thread identity")
                 continue
-            payload = getattr(notification, "payload", None)
-            raw_params = getattr(payload, "params", payload)
-            bounded_params = getattr(raw_params, "root", raw_params)
+            if method != "thread/tokenUsage/updated":
+                raise ProtocolDefect(f"Codex emitted unexpected pre-turn notification {method}")
+            raw_params = getattr(notification, "params", None)
+            if raw_params is None:
+                payload = getattr(notification, "payload", None)
+                raw_params = getattr(payload, "params", payload)
+            bounded_params = raw_params
             try:
                 replay_bytes += bounded_payload_size(
                     bounded_params,
@@ -850,7 +983,7 @@ class CodexSdkAdapter:
                 ) from None
             if len(snapshots) >= _MAX_EVENT_COUNT or replay_bytes > _MAX_TURN_OUTPUT_BYTES:
                 raise ProtocolDefect("Codex SDK restored usage replay exceeded its ingress bound")
-            params = self._mapping(raw_params, "Codex SDK restored token usage notification")
+            params = self._mapping(raw_params, "Codex app-server restored token usage notification")
             if params.get("threadId") != native_session_id:
                 continue
             snapshots.append(self._decode_token_usage(params))
@@ -905,6 +1038,7 @@ class CodexSdkAdapter:
             CredentialRejected,
             CredentialUnavailable,
             ExecutableUnavailable,
+            ProtocolDefect,
             SessionUnavailable,
         ):
             raise
@@ -921,13 +1055,18 @@ class CodexSdkAdapter:
     def _notification_events(
         self, state: _CodexSessionState, notification: object
     ) -> tuple[AgentEvent, ...]:
+        if isinstance(notification, CodexServerRequest):
+            return (self._server_request_event(state, notification),)
         method = getattr(notification, "method", None)
         if not isinstance(method, str) or not method:
-            raise ProtocolDefect("Codex SDK notification had no method")
+            raise ProtocolDefect("Codex app-server notification had no method")
+        direct_params = getattr(notification, "params", None)
         payload = getattr(notification, "payload", None)
-        if payload is None:
-            raise ProtocolDefect("Codex SDK notification had no payload")
-        raw_params = getattr(payload, "params", payload)
+        if direct_params is None and payload is None:
+            raise ProtocolDefect("Codex app-server notification had no params")
+        raw_params = (
+            direct_params if direct_params is not None else getattr(payload, "params", payload)
+        )
         bounded_params = getattr(raw_params, "root", raw_params)
         try:
             size = bounded_payload_size(
@@ -947,7 +1086,7 @@ class CodexSdkAdapter:
         if state.output_bytes + size > _MAX_TURN_OUTPUT_BYTES:
             raise OutputLimitExceeded(_MAX_TURN_OUTPUT_BYTES)
         state.output_bytes += size
-        params = self._mapping(raw_params, f"Codex SDK {method} notification")
+        params = self._mapping(raw_params, f"Codex app-server {method} notification")
         self._validate_notification_identity(state, method, params)
         if method == "turn/completed":
             # The native completion frame travels first; the owned terminal is last.
@@ -957,6 +1096,100 @@ class CodexSdkAdapter:
             )
         event = self._notification_event(state, method, params)
         return () if event is None else (event,)
+
+    def _server_request_event(
+        self,
+        state: _CodexSessionState,
+        request: CodexServerRequest,
+    ) -> AgentEvent:
+        try:
+            size = bounded_payload_size(
+                request.params,
+                _MAX_MESSAGE_BYTES,
+                max_items=_MAX_MESSAGE_ITEMS,
+            )
+        except OutputLimitExceeded:
+            raise ProtocolDefect("Codex server request exceeded its ingress bound") from None
+        state.message_count += 1
+        if state.message_count > _MAX_EVENT_COUNT:
+            raise OutputLimitExceeded(_MAX_EVENT_COUNT)
+        if state.output_bytes + size > _MAX_TURN_OUTPUT_BYTES:
+            raise OutputLimitExceeded(_MAX_TURN_OUTPUT_BYTES)
+        state.output_bytes += size
+        identity = (type(request.request_id), request.request_id)
+        if identity in state.server_request_ids:
+            raise ProtocolDefect("Codex server request identity repeated within a turn")
+        state.server_request_ids.add(identity)
+        params = request.params
+        if request.method in ("execCommandApproval", "applyPatchApproval"):
+            if params.get("conversationId") != state.ref.native_session_id:
+                raise ProtocolDefect("legacy Codex approval changed thread identity")
+            self._non_empty_string(params, "callId", request.method)
+        elif request.method == "mcpServer/elicitation/request":
+            if params.get("threadId") != state.ref.native_session_id:
+                raise ProtocolDefect("MCP elicitation changed thread identity")
+            turn_id = params.get("turnId")
+            if turn_id is not None and turn_id != state.turn_id:
+                raise ProtocolDefect("MCP elicitation changed turn identity")
+        else:
+            self._validate_notification_identity(state, request.method, params)
+        state.authority_seen = True
+        if request.method == "currentTime/read":
+            if params.get("threadId") != state.ref.native_session_id:
+                raise ProtocolDefect("current-time request changed thread identity")
+            return AgentToolUse(
+                tool_call_id=f"server-request:{request.request_id}",
+                name="currentTime/read",
+                phase="completed",
+                payload=redact_native_payload(params),
+                succeeded=False,
+            )
+        if request.kind == "tool":
+            call_id = self._non_empty_string(params, "callId", request.method)
+            tool = self._non_empty_string(params, "tool", request.method)
+            expected = state.active_tool_calls.get(call_id)
+            name = self._dynamic_tool_name(params, tool)
+            if expected != name:
+                raise ProtocolDefect("dynamic tool request did not match its started item")
+            return AgentToolUse(
+                tool_call_id=call_id,
+                name=name,
+                phase="updated",
+                payload=redact_native_payload(params),
+            )
+
+        operation: Literal["command", "file_change", "tool_use"]
+        tool_name: str | None = None
+        if request.method in (
+            "item/commandExecution/requestApproval",
+            "execCommandApproval",
+        ):
+            operation = "command"
+        elif request.method in ("item/fileChange/requestApproval", "applyPatchApproval"):
+            operation = "file_change"
+        else:
+            operation = "tool_use"
+            tool_name = request.method
+        item_id = params.get("itemId")
+        if isinstance(item_id, str) and item_id:
+            expected = state.active_tool_calls.get(item_id)
+            if expected is None and request.method not in (
+                "item/permissions/requestApproval",
+                "item/tool/requestUserInput",
+            ):
+                raise ProtocolDefect("Codex approval did not match a started authority item")
+        return AgentPermissionRequest(
+            request=ApprovalRequest(
+                operation=operation,
+                summary=sanitize_provider_text(
+                    f"Codex denied {request.method}",
+                    limit=2_000,
+                ),
+                tool_name=tool_name,
+                native_payload=redact_native_payload(params),
+            ),
+            decision="deny",
+        )
 
     def _notification_event(
         self,
@@ -976,18 +1209,56 @@ class CodexSdkAdapter:
             delta = self._string(params, "delta", method)
             self._count_streamed_text(state, delta)
             return AgentText(delta)
-        if method in ("item/reasoning/summaryTextDelta", "item/reasoning/textDelta"):
+        if method in (
+            "item/reasoning/summaryTextDelta",
+            "item/reasoning/summaryPartAdded",
+            "item/reasoning/textDelta",
+            "item/plan/delta",
+            "turn/plan/updated",
+        ):
             return AgentNative(native_type=method, payload=redact_native_payload(params))
         if method in ("item/commandExecution/outputDelta", "item/fileChange/outputDelta"):
-            return AgentToolUse(
-                tool_call_id=self._string(params, "itemId", method),
-                name="commandExecution"
+            item_id = self._string(params, "itemId", method)
+            name = (
+                "commandExecution"
                 if method == "item/commandExecution/outputDelta"
-                else "fileChange",
+                else "fileChange"
+            )
+            self._require_active_tool(state, item_id, name, method)
+            state.authority_seen = True
+            return AgentToolUse(
+                tool_call_id=item_id,
+                name=name,
                 phase="updated",
                 payload=freeze_native_json_object(
                     {"output_delta": self._string(params, "delta", method)}
                 ),
+            )
+        if method in (
+            "item/autoApprovalReview/started",
+            "item/autoApprovalReview/completed",
+        ):
+            review_id = self._non_empty_string(params, "reviewId", method)
+            state.authority_seen = True
+            if method.endswith("/started"):
+                self._start_tool(state, review_id, "autoApprovalReview")
+                return AgentToolUse(
+                    tool_call_id=review_id,
+                    name="autoApprovalReview",
+                    phase="started",
+                    payload=redact_native_payload(params),
+                )
+            review = self._mapping(params.get("review"), f"{method} review")
+            status = review.get("status")
+            if status not in ("approved", "denied", "timedOut", "aborted"):
+                raise ProtocolDefect("completed Codex auto-approval review had an invalid status")
+            self._complete_tool(state, review_id, "autoApprovalReview", method)
+            return AgentToolUse(
+                tool_call_id=review_id,
+                name="autoApprovalReview",
+                phase="completed",
+                payload=redact_native_payload(params),
+                succeeded=status == "approved",
             )
         if method == "item/mcpToolCall/progress":
             item_id = self._string(params, "itemId", method)
@@ -995,6 +1266,8 @@ class CodexSdkAdapter:
             if identity is None:
                 raise ProtocolDefect("MCP tool progress arrived before its start")
             server, tool = identity
+            self._require_active_tool(state, item_id, f"{server}/{tool}", method)
+            state.authority_seen = True
             return AgentToolUse(
                 tool_call_id=item_id,
                 name=f"{server}/{tool}",
@@ -1003,13 +1276,26 @@ class CodexSdkAdapter:
                     {"message": self._string(params, "message", method)}
                 ),
             )
+        if method == "item/commandExecution/terminalInteraction":
+            item_id = self._non_empty_string(params, "itemId", method)
+            self._require_active_tool(state, item_id, "commandExecution", method)
+            state.authority_seen = True
+            return AgentToolUse(
+                tool_call_id=item_id,
+                name="commandExecution",
+                phase="updated",
+                payload=redact_native_payload(params),
+            )
         if method == "item/started":
             return self._item_started(state, params, method)
         if method == "item/completed":
             return self._item_completed(state, params, method)
         if method == "item/fileChange/patchUpdated":
+            item_id = self._string(params, "itemId", method)
+            self._require_active_tool(state, item_id, "fileChange", method)
+            state.authority_seen = True
             return AgentToolUse(
-                tool_call_id=self._string(params, "itemId", method),
+                tool_call_id=item_id,
                 name="fileChange",
                 phase="updated",
                 payload=freeze_native_json_object({"changes": params.get("changes")}),
@@ -1032,16 +1318,76 @@ class CodexSdkAdapter:
             # Retries the backend performs itself are visible here too (willRetry);
             # the bounded native frame is their only representation.
             return AgentNative(native_type=method, payload=redact_native_payload(params))
-        if method in ("configWarning", "warning"):
+        if method in ("configWarning", "warning", "guardianWarning"):
             message = params.get("summary", params.get("message"))
             if not isinstance(message, str) or not message:
                 raise ProtocolDefect(f"{method} carried no message")
+            if (
+                method == "guardianWarning"
+                and params.get("threadId") != state.ref.native_session_id
+            ):
+                raise ProtocolDefect("guardianWarning changed or omitted its thread identity")
             self._append_diagnostic(state, sanitize_provider_text(message))
             return AgentNative(native_type=method, payload=redact_native_payload(params))
-        return AgentNative(
-            native_type=sanitize_provider_text(method, limit=128),
-            payload=redact_native_payload(params),
-        )
+        if method == "serverRequest/resolved":
+            request_id = params.get("requestId")
+            if type(request_id) not in (str, int) or request_id == "":
+                raise ProtocolDefect("serverRequest/resolved had a malformed identity")
+            identity = (type(request_id), request_id)
+            if identity not in state.server_request_ids:
+                raise ProtocolDefect("serverRequest/resolved did not match a server request")
+            state.server_request_ids.remove(identity)
+            return AgentNative(native_type=method, payload=redact_native_payload(params))
+        if method == "turn/diff/updated":
+            state.authority_seen = True
+            return AgentToolUse(
+                tool_call_id=f"{state.turn_id}:file-diff",
+                name="fileChange",
+                phase="updated",
+                payload=redact_native_payload(params),
+            )
+        if method in ("hook/started", "hook/completed"):
+            run = self._mapping(params.get("run"), f"{method} run")
+            run_id = self._non_empty_string(run, "id", method)
+            status = self._non_empty_string(run, "status", method)
+            state.authority_seen = True
+            if method == "hook/started":
+                if status != "running":
+                    raise ProtocolDefect("started Codex hook had an invalid status")
+                self._start_tool(state, run_id, "hook")
+                return AgentToolUse(
+                    tool_call_id=run_id,
+                    name="hook",
+                    phase="started",
+                    payload=redact_native_payload(params),
+                )
+            if status not in ("completed", "failed", "blocked", "stopped"):
+                raise ProtocolDefect("completed Codex hook had an invalid status")
+            self._complete_tool(state, run_id, "hook", method)
+            return AgentToolUse(
+                tool_call_id=run_id,
+                name="hook",
+                phase="completed",
+                payload=redact_native_payload(params),
+                succeeded=status == "completed",
+            )
+        if method in ("command/exec/outputDelta", "process/outputDelta", "process/exited"):
+            item_id = params.get("processId", params.get("processHandle"))
+            if not isinstance(item_id, str) or not item_id:
+                raise ProtocolDefect(f"{method} carried no process identity")
+            state.authority_seen = True
+            return AgentToolUse(
+                tool_call_id=item_id,
+                name="processExecution",
+                phase="completed" if method == "process/exited" else "updated",
+                payload=redact_native_payload(params),
+                succeeded=params.get("exitCode") == 0 if method == "process/exited" else None,
+            )
+        if method in _FORBIDDEN_SESSION_NOTIFICATIONS:
+            raise ProtocolDefect(f"Codex app-server changed session lifecycle via {method}")
+        if method in _INERT_NATIVE_METHODS:
+            return AgentNative(native_type=method, payload=redact_native_payload(params))
+        raise ProtocolDefect(f"Codex app-server emitted unknown notification {method}")
 
     def _item_started(
         self,
@@ -1051,9 +1397,21 @@ class CodexSdkAdapter:
     ) -> AgentEvent | None:
         item = self._mapping(params.get("item"), "item/started item")
         item_type = item.get("type")
+        if not isinstance(item_type, str) or not item_type:
+            raise ProtocolDefect("item/started item had no type")
+        if item_type == "custom_tool_call_output":
+            raise ProtocolDefect("custom tool output started as an independent item")
+        item_id = self._non_empty_string(item, "id", method)
+        if item_id in state.started_item_types or item_id in state.completed_item_ids:
+            raise ProtocolDefect("Codex item identity started more than once")
+        state.started_item_types[item_id] = item_type
+        if item_type in _INERT_ITEM_TYPES:
+            return None
         if item_type == "commandExecution":
+            self._start_tool(state, item_id, "commandExecution")
+            state.authority_seen = True
             return AgentToolUse(
-                tool_call_id=self._string(item, "id", method),
+                tool_call_id=item_id,
                 name="commandExecution",
                 phase="started",
                 payload=freeze_native_json_object(
@@ -1063,7 +1421,6 @@ class CodexSdkAdapter:
         if item_type == "mcpToolCall":
             server = self._string(item, "server", method)
             tool = self._string(item, "tool", method)
-            item_id = self._string(item, "id", method)
             requested = {spec.name: spec for spec in state.request.mcp_servers}
             spec = requested.get(server)
             if spec is None:
@@ -1073,6 +1430,8 @@ class CodexSdkAdapter:
             if item_id in state.active_mcp_calls:
                 raise ProtocolDefect("MCP tool call started more than once")
             state.active_mcp_calls[item_id] = (server, tool)
+            self._start_tool(state, item_id, f"{server}/{tool}")
+            state.authority_seen = True
             return AgentToolUse(
                 tool_call_id=item_id,
                 name=f"{server}/{tool}",
@@ -1080,8 +1439,10 @@ class CodexSdkAdapter:
                 payload=freeze_native_json_value(item.get("arguments")),
             )
         if item_type == "fileChange":
+            self._start_tool(state, item_id, "fileChange")
+            state.authority_seen = True
             return AgentToolUse(
-                tool_call_id=self._string(item, "id", method),
+                tool_call_id=item_id,
                 name="fileChange",
                 phase="started",
                 payload=freeze_native_json_object(
@@ -1091,12 +1452,39 @@ class CodexSdkAdapter:
                     }
                 ),
             )
-        if item_type in ("reasoning", "agentMessage"):
-            return None
-        return AgentNative(
-            native_type=f"{method}:unknownItem",
-            payload=redact_native_payload(params),
-        )
+        if item_type == "custom_tool_call":
+            call_id = self._non_empty_string(item, "call_id", method)
+            name = self._non_empty_string(item, "name", method)
+            state.custom_item_calls[item_id] = call_id
+            self._start_tool(state, call_id, name)
+            state.authority_seen = True
+            return AgentToolUse(
+                tool_call_id=call_id,
+                name=name,
+                phase="started",
+                payload=redact_native_payload(item),
+            )
+        if item_type == "dynamicToolCall":
+            tool = self._non_empty_string(item, "tool", method)
+            name = self._dynamic_tool_name(item, tool)
+            self._start_tool(state, item_id, name)
+            state.authority_seen = True
+            return AgentToolUse(
+                tool_call_id=item_id,
+                name=name,
+                phase="started",
+                payload=redact_native_payload(item),
+            )
+        if item_type in _AUTHORITY_ITEM_TYPES:
+            self._start_tool(state, item_id, item_type)
+            state.authority_seen = True
+            return AgentToolUse(
+                tool_call_id=item_id,
+                name=item_type,
+                phase="started",
+                payload=redact_native_payload(item),
+            )
+        raise ProtocolDefect(f"{method} carried unknown item type {item_type}")
 
     def _item_completed(
         self,
@@ -1105,12 +1493,48 @@ class CodexSdkAdapter:
         method: str,
     ) -> AgentEvent | None:
         item = self._mapping(params.get("item"), "item/completed item")
+        item_type = item.get("type")
+        if not isinstance(item_type, str) or not item_type:
+            raise ProtocolDefect("item/completed item had no type")
+        if item_type == "custom_tool_call_output":
+            call_id = self._non_empty_string(item, "call_id", method)
+            completion_id = f"custom-output:{call_id}"
+            if completion_id in state.completed_item_ids:
+                raise ProtocolDefect("Codex custom tool output completed more than once")
+            state.completed_item_ids.add(completion_id)
+            name = state.active_tool_calls.pop(call_id, None)
+            if name is None:
+                raise ProtocolDefect("custom tool output completed before its call started")
+            state.authority_seen = True
+            return AgentToolUse(
+                tool_call_id=call_id,
+                name=name,
+                phase="completed",
+                payload=redact_native_payload(item),
+                succeeded=True,
+            )
         item_id = self._non_empty_string(item, "id", method)
         if item_id in state.completed_item_ids:
             raise ProtocolDefect("Codex item identity completed more than once")
         state.completed_item_ids.add(item_id)
-        item_type = item.get("type")
+        started_type = state.started_item_types.pop(item_id, None)
+        if (
+            item_type not in _INERT_ITEM_TYPES
+            and item_type not in _AUTHORITY_ITEM_TYPES
+            and item_type not in ("custom_tool_call",)
+        ):
+            raise ProtocolDefect(f"{method} carried unknown item type {item_type}")
+        if started_type is not None and started_type != item_type:
+            raise ProtocolDefect("Codex item changed type during its lifecycle")
+        if item_type in _INERT_ITEM_TYPES:
+            if item_type == "agentMessage":
+                self._record_completed_agent_message(state, item_id, item, method)
+            return None
+        if started_type is None:
+            raise ProtocolDefect("Codex authority item completed before its start")
         if item_type == "commandExecution":
+            self._complete_tool(state, item_id, "commandExecution", method)
+            state.authority_seen = True
             return AgentToolUse(
                 tool_call_id=item_id,
                 name="commandExecution",
@@ -1131,6 +1555,8 @@ class CodexSdkAdapter:
             if status not in ("completed", "failed"):
                 raise ProtocolDefect("completed MCP tool call had an impossible status")
             server, tool = identity
+            self._complete_tool(state, item_id, f"{server}/{tool}", method)
+            state.authority_seen = True
             return AgentToolUse(
                 tool_call_id=item_id,
                 name=f"{server}/{tool}",
@@ -1143,6 +1569,8 @@ class CodexSdkAdapter:
         if item_type == "fileChange":
             # A declined or failed patch is a completed tool action that did not apply.
             status = self._patch_status(item.get("status"), method)
+            self._complete_tool(state, item_id, "fileChange", method)
+            state.authority_seen = True
             return AgentToolUse(
                 tool_call_id=item_id,
                 name="fileChange",
@@ -1150,14 +1578,34 @@ class CodexSdkAdapter:
                 payload=freeze_native_json_object({"changes": item.get("changes")}),
                 succeeded=status == "applied",
             )
-        if item_type == "agentMessage":
-            self._record_completed_agent_message(state, item_id, item, method)
-            return None
-        if item_type == "reasoning":
-            return None
-        return AgentNative(
-            native_type=f"{method}:unknownItem",
-            payload=redact_native_payload(params),
+        if item_type == "custom_tool_call":
+            call_id = self._non_empty_string(item, "call_id", method)
+            if state.custom_item_calls.pop(item_id, None) != call_id:
+                raise ProtocolDefect("custom tool call changed its call identity")
+            name = self._non_empty_string(item, "name", method)
+            self._require_active_tool(state, call_id, name, method)
+            state.authority_seen = True
+            return AgentToolUse(
+                tool_call_id=call_id,
+                name=name,
+                phase="updated",
+                payload=redact_native_payload(item),
+            )
+        if item_type == "dynamicToolCall":
+            tool = self._non_empty_string(item, "tool", method)
+            name = self._dynamic_tool_name(item, tool)
+        else:
+            name = item_type
+        self._complete_tool(state, item_id, name, method)
+        state.authority_seen = True
+        status = item.get("status")
+        succeeded = status not in ("failed", "declined")
+        return AgentToolUse(
+            tool_call_id=item_id,
+            name=name,
+            phase="completed",
+            payload=redact_native_payload(item),
+            succeeded=succeeded,
         )
 
     def _turn_terminal(
@@ -1167,6 +1615,14 @@ class CodexSdkAdapter:
     ) -> AgentTerminal:
         if state.active_mcp_calls:
             raise ProtocolDefect("turn completed with active MCP tool calls")
+        if state.started_item_types:
+            raise ProtocolDefect("turn completed with unfinished Codex item lifecycles")
+        if state.active_tool_calls:
+            raise ProtocolDefect("turn completed with active Codex authority items")
+        if state.server_request_ids:
+            raise ProtocolDefect("turn completed with unresolved Codex server requests")
+        if state.authority_seen and self._strict_native_containment(state):
+            raise ProtocolDefect("turn completed after forbidden Codex native authority activity")
         turn = self._mapping(params.get("turn"), "turn/completed turn")
         status = turn.get("status")
         final_text = self._selected_final_text(state, required=status == "completed")
@@ -1297,6 +1753,47 @@ class CodexSdkAdapter:
     def _presence_value(value: Presence[int]) -> int:
         return value.value if isinstance(value, Present) else 0
 
+    @staticmethod
+    def _start_tool(state: _CodexSessionState, item_id: str, name: str) -> None:
+        if item_id in state.active_tool_calls:
+            raise ProtocolDefect("Codex authority identity started more than once")
+        state.active_tool_calls[item_id] = name
+
+    @staticmethod
+    def _require_active_tool(
+        state: _CodexSessionState,
+        item_id: str,
+        name: str,
+        method: str,
+    ) -> None:
+        if state.active_tool_calls.get(item_id) != name:
+            raise ProtocolDefect(f"{method} did not match an active Codex authority item")
+
+    @classmethod
+    def _complete_tool(
+        cls,
+        state: _CodexSessionState,
+        item_id: str,
+        name: str,
+        method: str,
+    ) -> None:
+        cls._require_active_tool(state, item_id, name, method)
+        del state.active_tool_calls[item_id]
+
+    @staticmethod
+    def _dynamic_tool_name(params: Mapping[str, object], tool: str) -> str:
+        namespace = params.get("namespace")
+        if namespace is None:
+            return tool
+        if not isinstance(namespace, str) or not namespace:
+            raise ProtocolDefect("dynamic tool namespace was malformed")
+        return f"{namespace}/{tool}"
+
+    @staticmethod
+    def _strict_native_containment(state: _CodexSessionState) -> bool:
+        native = state.request.native
+        return isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled"
+
     @classmethod
     def _validate_last_usage(cls, last: TokenUsage, total: TokenUsage) -> None:
         if (
@@ -1317,18 +1814,48 @@ class CodexSdkAdapter:
     def _validate_notification_identity(
         self, state: _CodexSessionState, method: str, params: Mapping[str, object]
     ) -> None:
+        safe_method = sanitize_provider_text(method, limit=200)
         thread_id = params.get("threadId")
         if thread_id is not None and thread_id != state.ref.native_session_id:
-            raise ProtocolDefect("Codex event changed thread identity")
+            raise ProtocolDefect(f"Codex {safe_method} event changed thread identity")
+        if method in _THREAD_BOUND_INERT_METHODS | _FORBIDDEN_SESSION_NOTIFICATIONS:
+            if thread_id != state.ref.native_session_id:
+                raise ProtocolDefect(f"Codex {safe_method} event omitted its thread identity")
         turn_id = params.get("turnId")
         turn = params.get("turn")
         if turn_id is None and isinstance(turn, Mapping):
             turn_id = turn.get("id")
+        if method == "thread/tokenUsage/updated":
+            if thread_id != state.ref.native_session_id:
+                raise ProtocolDefect(
+                    "Codex thread/tokenUsage/updated event omitted its thread identity"
+                )
+            if turn_id == state.turn_id:
+                return
+            # A resume response and its historical cumulative-usage replay are separate
+            # app-server messages. The reader can observe the response first and the
+            # replay only after the next turn has started. A single stale, non-empty
+            # turn id is an unambiguous baseline only while this resumed session still
+            # requires its first rebase; it is never charged to the active invocation.
+            if (
+                isinstance(turn_id, str)
+                and turn_id
+                and state.usage_accounting.turn_requires_rebase
+                and not state.usage_accounting.snapshot_seen
+            ):
+                return
+            if turn_id is None:
+                raise ProtocolDefect(
+                    "Codex thread/tokenUsage/updated event omitted its turn identity"
+                )
+            raise ProtocolDefect("Codex thread/tokenUsage/updated event changed its turn identity")
         if method in _TURN_SCOPED_METHODS:
             if thread_id != state.ref.native_session_id:
-                raise ProtocolDefect("Codex event omitted its thread identity")
+                raise ProtocolDefect(f"Codex {safe_method} event omitted its thread identity")
             if turn_id != state.turn_id:
-                raise ProtocolDefect("Codex event changed or omitted its turn identity")
+                raise ProtocolDefect(
+                    f"Codex {safe_method} event changed or omitted its turn identity"
+                )
 
     def _state(self, session: AgentSession) -> _CodexSessionState:
         if session in self._dead_sessions:
@@ -1433,12 +1960,8 @@ class CodexSdkAdapter:
         if not isinstance(version, str) or not version:
             raise SdkUnavailable("Codex SDK does not report a version")
         for name in (
-            "AsyncCodex",
-            "CodexConfig",
             "ApprovalMode",
             "Sandbox",
-            "TextInput",
-            "LocalImageInput",
         ):
             if not hasattr(sdk, name):
                 raise SdkUnavailable(f"Codex SDK is missing public {name}")
@@ -1447,13 +1970,20 @@ class CodexSdkAdapter:
     @classmethod
     def _executable_version(cls, client: Any) -> str:
         metadata = cls._mapping(client.metadata, "Codex SDK initialize metadata")
-        server = cls._mapping(metadata.get("serverInfo"), "Codex SDK server metadata")
-        version = server.get("version")
-        if not isinstance(version, str) or not version:
-            raise ProtocolDefect("Codex SDK server metadata had no version")
-        match = _RUNTIME_VERSION_PREFIX.match(version)
+        server = metadata.get("serverInfo")
+        if server is not None:
+            server_payload = cls._mapping(server, "Codex SDK server metadata")
+            version = server_payload.get("version")
+            if not isinstance(version, str) or not version:
+                raise ProtocolDefect("Codex SDK server metadata had no version")
+            match = _RUNTIME_VERSION_PREFIX.match(version)
+        else:
+            user_agent = metadata.get("userAgent")
+            if not isinstance(user_agent, str) or not user_agent:
+                raise ProtocolDefect("Codex app-server initialize response had no user agent")
+            match = _APP_SERVER_USER_AGENT.match(user_agent)
         if match is None:
-            raise ProtocolDefect("Codex SDK server metadata had an invalid version")
+            raise ProtocolDefect("Codex app-server reported an invalid executable version")
         return match.group("version")
 
     @staticmethod
@@ -1512,20 +2042,42 @@ class CodexSdkAdapter:
                 raise UnsupportedCapability("Codex SDK MCP filters require exact tool names")
 
     @staticmethod
+    def _validate_strict_native_containment(request: AgentSessionRequest) -> None:
+        policy = request.policy
+        if policy.filesystem != "read_only" or policy.network != "disabled":
+            raise UnsupportedCapability(
+                "Codex disabled built-ins require read-only filesystem and disabled network"
+            )
+        if policy.approval != "deny":
+            raise UnsupportedCapability(
+                "Codex disabled built-ins require unconditional approval denial"
+            )
+        if policy.environment:
+            raise UnsupportedCapability(
+                "Codex disabled built-ins require an empty copied environment"
+            )
+        if request.mcp_servers:
+            raise UnsupportedCapability("Codex disabled built-ins do not permit MCP servers")
+        if request.additional_dirs:
+            raise UnsupportedCapability(
+                "Codex disabled built-ins do not permit additional filesystem roots"
+            )
+
+    @staticmethod
     def _text_only(parts: tuple[object, ...], context: str) -> str:
         if any(not isinstance(part, TextContent) for part in parts):
             raise UnsupportedCapability(f"{context} supports text only")
         return "\n\n".join(part.text for part in parts if isinstance(part, TextContent))
 
     @staticmethod
-    def _codex_input(sdk: ModuleType, part: object) -> object:
+    def _codex_input(part: object) -> object:
         if isinstance(part, TextContent):
-            return sdk.TextInput(text=part.text)
+            return {"type": "text", "text": part.text}
         if isinstance(part, ImageContent):
             # Existence, declared size, and containment under the authorized roots are
             # `AgentRuntime._validate_content_files`'s single check of every turn input, so
             # this only translates the part the SDK accepts.
-            return sdk.LocalImageInput(path=part.path)
+            return {"type": "localImage", "path": part.path}
         raise UnsupportedCapability("Codex SDK input supports text and local images")
 
     def _codex_config(self, request: AgentSessionRequest) -> dict[str, object]:

@@ -7,6 +7,15 @@ Provenance: council synthesis + request-changes review to be checked in under
 `docs/decisions/2026-08-09-pivot-council.md` in WP-0. Until then this document is a proposal,
 not an approval record.
 
+Maintenance addendum (2026-09-07): on the immutable maintenance line rooted at
+`2cfed97ee5b9b8eb11103b0575eb7f29de00a0bd`, the Codex production lane owns the
+documented App Server stdio JSON-RPC transport instead of delegating the opaque
+request loop to `AsyncCodex`. The public `(codex, sdk)` route and session-ref
+schema remain stable. The normative classification, compatibility impact, and
+trade-offs are recorded in
+`docs/decisions/2026-09-07-codex-app-server-containment.md`; that record
+supersedes the Codex-specific SDK-ownership statements below.
+
 v1 → v2 changes: continuation state restored to the contract (blocking finding 1); OpenRouter
 routing/privacy pins preserved (2); §13 is a full migration contract (3); agent security
 kernel retained (4); shared terminal metadata + cache-write usage + typed structured replies
@@ -32,7 +41,8 @@ Design stance (binding):
 3. One retry owner; `max_retries=0` on every SDK client.
 4. No implicit rerouting anywhere — including inside OpenRouter (routing pinned, fallbacks disabled).
 5. Defects raise; expected failures are values with full metadata (`docs/rules/errors.md`).
-6. SDKs own protocol; **we own authorization** (agent lane security kernel).
+6. Provider SDKs and the Claude Agent SDK own their protocols; provider-runtime
+   owns Codex App Server correlation and **all agent authorization**.
 7. Bounded constraints in `pyproject.toml` (library contract); exact pins live in lockfiles (this repo's for CI, the consumer's for prod).
 
 ## 2. Non-goals
@@ -198,21 +208,24 @@ content, no continuation payloads, ever. No-op without a configured tracer provi
 
 ## 10. Agent lane — shrink with a retained security kernel
 
-Keep (ported): `_process.py` process-group ownership, both launchers,
+Keep (ported): `_process.py` process-group ownership, the Claude launcher,
 `build_child_environment` scrub, per-profile state roots, auth isolation (subscription auth
 only; API-key session credentials rejected).
 
 **Security kernel (retained, ~300 lines; replaces v1's 50-line passthrough):** restrictive
 permission defaults; narrowing-only policy changes; unsafe-action confirmation for
 model-initiated shell/filesystem/network/MCP actions; bounded, recursively redacted native
-event representation. SDKs own protocol and native execution; this kernel owns the
-authorization model (`SECURITY.md`, `docs/agent-runtime.md` threat model carried forward).
+event representation. Provider-runtime owns the Codex App Server protocol while
+the provider still owns native execution; this kernel owns the authorization
+model (`SECURITY.md`, `docs/agent-runtime.md` threat model carried forward).
 Deleted: per-version `_KNOWN_FIELDS` capability tables, the version hard-fail gates, and the
 capability matrix — validation is behavioral (capability probe), not version-keyed.
 
 - Events → 6 kinds: `AgentText, AgentToolUse, AgentUsage, AgentPermissionRequest, AgentNative(bounded, redacted), AgentTerminal`. Shares `TokenUsage`/`CallMeta` nouns.
 - Quota: pool exhaustion → `AgentQuotaExhausted` terminal. The lane never enables API-rate overflow and never forwards API-key credentials. Block-and-stop only.
-- Pinning: bounded constraints in `pyproject.toml` extras; exact pins in lockfiles; runtime mismatch → one warning + capability probe.
+- Pinning: bounded constraints in `pyproject.toml` extras; exact pins in
+  lockfiles. The Codex disabled-builtins posture additionally requires exact
+  Python package, runtime package, and executable version 0.144.4 before a turn.
 - Size: deletions measured so far ≈ 860 lines (capabilities + policy algebra) plus taxonomy/test-double/version-gate reductions; target **≤ 8k** (from 9,902), recounted at WP-A merge. The v1 "~3k" claim was unsupported and is withdrawn.
 
 ## 11. Testing

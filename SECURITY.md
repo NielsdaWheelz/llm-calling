@@ -7,12 +7,15 @@ impact, and any suggested fix.
 ## Trust model
 
 `provider_runtime.agent_runtime` is for one trusted user on a local machine. It
-drives an already-enrolled Codex or Claude Code account through the vendor's
-official SDK. It is not a hosted subscription proxy, multi-tenant sandbox, login
-service, or token broker.
+drives an already-enrolled Codex or Claude Code account through documented
+vendor surfaces. Codex uses the public App Server protocol; Claude uses the
+official SDK. It is not a hosted subscription proxy, multi-tenant sandbox,
+login service, or token broker.
 
-The only shipped routes are `codex:sdk` and `claude:sdk`. There is no raw CLI or
-direct protocol fallback. Session authentication is subscription-only: each
+The only shipped routes are `codex:sdk` and `claude:sdk`; the Codex route name
+is retained for stored-reference compatibility even though provider-runtime now
+owns its App Server stdio transport. There is no fallback. Session
+authentication is subscription-only: each
 route rejects named API-key and secret-reference session credentials before any
 secret could be resolved, and the child-environment builder refuses to forward
 them structurally, so no code path exists that places an API key in an agent
@@ -41,12 +44,12 @@ Credential-class is every provider API key the operator may have exported, not
 only the two backends' own auth variables: the agent lane has no use for any of
 them, so none of them reaches a child.
 
-For Codex, the selected environment is passed with public `CodexConfig.env`, but
-the SDK overlays it on `os.environ`. The adapter therefore points public
-`CodexConfig.codex_bin` at a private content-addressed launcher. That launcher
-forwards the SDK-owned arguments to the exact bundled runtime while replacing
-the environment with the selected-name allowlist. The SDK account must report
-ChatGPT subscription auth; ambient API keys do not reach the runtime.
+For Codex, provider-runtime starts the exact bundled executable as
+`app-server --listen stdio:// --strict-config` with the selected environment as
+a complete replacement and owns every JSONL response, notification, and server
+request. The documented account response must report ChatGPT subscription auth;
+ambient API keys do not reach the runtime. Credential-refresh and attestation
+callbacks are refused with JSON-RPC errors and fail the session.
 
 For Claude, a shell router or version-manager shim can overwrite
 `CLAUDE_CONFIG_DIR` and defeat isolation. Point
@@ -74,12 +77,10 @@ and does not recreate or inspect the SDK's arguments.
 A writable launcher directory, content mismatch, or child-controlled launcher
 path is a local privilege-escalation risk and should be reported.
 
-Codex's launcher also calls `setsid()`, then supervises the matched bundled
-runtime in that private group. The SDK holds the supervisor pid and retains
-ownership of stdin/stdout and arguments. On SDK termination, the supervisor
-signals the whole group and escalates to `SIGKILL`, preventing Codex tools or MCP
-descendants from outliving the client. The launcher embeds only the runtime path
-and allowed environment names, never their values.
+Codex no longer needs an SDK shim: the owned App Server process is launched
+directly by the existing process-group supervisor. On close or protocol defect,
+the supervisor signals the group and escalates to `SIGKILL`, preventing Codex
+tools or descendants from outliving the connection.
 
 ## Policy is fail-closed
 
@@ -88,19 +89,20 @@ built-in tools, and no copied environment. Full filesystem access, unrestricted
 network, and unconditional approval each require an exact
 `UnsafeConfirmation`; extra acknowledgements are rejected.
 
-Codex `provider_review` delegates escalation review to the official SDK's
-`auto_review` policy. It is not equivalent to Claude's caller-owned `ask` mode,
-and per-turn narrowing cannot swap one reviewer for the other. A caller should
+Codex `provider_review` delegates escalation review through the App Server's
+`approvalsReviewer="auto_review"` policy. It is not equivalent to Claude's
+caller-owned `ask` mode, and per-turn narrowing cannot swap one reviewer for
+the other. A caller should
 treat provider review as permission for the provider's maintained policy to
 approve actions within the separately selected filesystem/network sandbox.
 
-Codex exposes no built-in tool filter through its public SDK — neither specific
-names nor an off switch. The route rejects both rather than pretending either
-was enforced, so `allowed_tools=("*",)` is the only spelling a Codex session
-may carry: an empty tuple would assert that built-ins are disabled when the SDK
-leaves them on. A Codex session is confined by its sandbox mode and approval
-mode, never by its tool list. Claude accepts exact tool names, rejects glob
-patterns and the two network-reaching built-ins (`WebFetch`, `WebSearch`)
+Codex exposes no typed per-name built-in filter, so `allowed_tools=("*",)` is
+the only portable-policy spelling. `CodexNativeOptions(builtin_tools="disabled")`
+is a separate exact-version containment posture: it sets the public 0.144.4
+feature-off configuration and requires read-only filesystem, disabled network,
+deny approvals, empty copied environment, no MCP, and no additional roots.
+Provider review is rejected in that posture. Claude accepts exact tool names,
+rejects glob patterns and the two network-reaching built-ins (`WebFetch`, `WebSearch`)
 outright, and verifies the effective tool set the backend reports at session
 start against the requested set. It does not reject a name that is simply
 unknown to the CLI; such a name grants nothing, so the effect is a narrower
@@ -149,22 +151,32 @@ SDK messages, event count, text, final output, diagnostics, turn duration, and
 cleanup are bounded. Output-limit failures terminate the turn and discard
 uncertain native session state. The runtime never retries a stateful turn.
 
-Native frames cross the public boundary only as `AgentNative` events whose
-payload passed the bounded, recursive redaction: credential-shaped keys are
-dropped wherever they appear, every retained string is sanitized and
-length-bounded, and a payload exceeding its depth/item/byte bounds is dropped
-whole. There are no per-version field allowlists; redaction is by key shape,
-not by schema table.
+Only explicitly inert native frames cross as `AgentNative`, and only after
+bounded recursive redaction. Known command, file, MCP/app, Web, dynamic/custom
+tool, process, hook, image, sub-agent, and approval-review activity is
+`AgentToolUse`; permission requests are `AgentPermissionRequest` and are denied.
+Unknown server requests, unknown item lifecycle types, malformed identities,
+uncorrelated responses, and protocol drift are `ProtocolDefect` and invalidate
+the session. A future item type is forbidden by default.
 
-Cancellation uses the SDK's native interrupt operation. Claude drains the
-interrupted tail or invalidates the client before reuse. Codex discards the SDK
-client after protocol/transport uncertainty. Runtime close terminates active
-work and closes all clients.
+Code Mode/native `exec` is not proven absent before execution. The accepted
+contract is containment and detection: the process is credentialless,
+read-only, and offline, and its first observable authority event poisons the
+turn so no later terminal can be accepted. This still permits native
+computation before that event and does not make the Codex read-only sandbox a
+host confidentiality boundary.
 
-The public event grammar is six kinds and requires exactly one `AgentTerminal`
-after a started turn. Identity mismatches, events from retired turns, malformed
-known SDK notifications, and post-terminal frames are defects rather than
-tolerated input.
+Codex cancellation uses documented `turn/interrupt`; Claude uses the SDK's
+native interrupt operation. Claude drains the interrupted tail or invalidates
+the client before reuse. Codex discards the entire App Server client after
+protocol/transport uncertainty. Runtime close terminates active work and closes
+all clients.
+
+The public event grammar is six kinds and every valid stream requires exactly one
+`AgentTerminal` after a started turn. Identity mismatches, events from retired turns, malformed
+known notifications, and post-terminal frames are defects rather than tolerated
+input. A protocol defect deliberately ends without a terminal because accepting
+one would conceal uncertainty or forbidden authority.
 
 ## Optional dependency boundary
 

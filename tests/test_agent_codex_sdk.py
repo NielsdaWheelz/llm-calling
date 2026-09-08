@@ -4,13 +4,8 @@ import asyncio
 import importlib
 import importlib.util
 import json
-import os
-import signal
-import subprocess
 import sys
-import threading
 import traceback
-from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -22,6 +17,7 @@ import pytest
 from provider_runtime.agent_runtime import (
     AgentFailure,
     AgentNative,
+    AgentPermissionRequest,
     AgentQuotaExhausted,
     AgentRuntime,
     AgentRuntimeConfig,
@@ -52,7 +48,7 @@ from provider_runtime.agent_runtime import (
     thaw_json_value,
 )
 from provider_runtime.agent_runtime import codex_sdk as codex_sdk_module
-from provider_runtime.agent_runtime._codex_launcher import ensure_codex_launcher
+from provider_runtime.agent_runtime.codex_app_server import CodexServerRequest
 from provider_runtime.agent_runtime.codex_sdk import CodexSdkAdapter
 from provider_runtime.agent_runtime.errors import (
     CredentialRejected,
@@ -73,6 +69,18 @@ _ASSISTANT_MESSAGE_CASES = cast(
             / "agent_runtime"
             / "codex"
             / "assistant_message_cases.json"
+        ).read_text(encoding="utf-8")
+    ),
+)
+_APP_SERVER_CASES = cast(
+    dict[str, object],
+    json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "agent_runtime"
+            / "codex"
+            / "app_server_protocol_cases.json"
         ).read_text(encoding="utf-8")
     ),
 )
@@ -112,12 +120,6 @@ def sdk_state(module: ModuleType) -> dict[str, Any]:
 
 def notification(method: str, payload: dict[str, object]) -> SimpleNamespace:
     return SimpleNamespace(method=method, payload=payload)
-
-
-class FakeRouter:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._pending_turn_notifications: dict[str, deque[SimpleNamespace]] = {}
 
 
 class Cancel:
@@ -204,6 +206,11 @@ class FakeTurn:
                 "turn": {"id": self.id, "items": [], "status": "inProgress"},
             },
         )
+        late_replay = cast(
+            dict[str, SimpleNamespace], sdk_state(self._module)["late_restored_usage"]
+        ).pop(self._thread_id, None)
+        if late_replay is not None:
+            yield late_replay
         if self._prompt.startswith("assistant case:"):
             name = self._prompt.removeprefix("assistant case:")
             case = _ASSISTANT_MESSAGE_CASES[name]
@@ -272,6 +279,258 @@ class FakeTurn:
                 },
             )
             return
+        if self._prompt in ("usage identity drift", "usage identity missing"):
+            params: dict[str, object] = {
+                "threadId": self._thread_id,
+                "tokenUsage": {
+                    "last": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+                    "total": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+                },
+            }
+            if self._prompt == "usage identity drift":
+                params["turnId"] = "turn-stale"
+            yield notification("thread/tokenUsage/updated", params)
+            return
+        if self._prompt == "custom exec":
+            lifecycle = cast(list[dict[str, object]], _APP_SERVER_CASES["custom_exec_lifecycle"])
+            for message in lifecycle:
+                params = cast(dict[str, object], message["params"])
+                yield notification(
+                    cast(str, message["method"]),
+                    self._scoped({"item": params["item"]}),
+                )
+        if self._prompt == "dynamic tool":
+            item = {
+                "id": "dynamic-synthetic",
+                "type": "dynamicToolCall",
+                "tool": "synthetic_tool",
+                "namespace": None,
+                "status": "inProgress",
+                "arguments": {"synthetic": True},
+            }
+            yield notification("item/started", self._scoped({"item": item}))
+            request = cast(dict[str, object], _APP_SERVER_CASES["dynamic_tool_request"])
+            request_params = cast(dict[str, object], request["params"])
+            yield CodexServerRequest(
+                request_id=cast(str, request["id"]),
+                method=cast(str, request["method"]),
+                params=self._scoped(
+                    {
+                        key: value
+                        for key, value in request_params.items()
+                        if key not in ("threadId", "turnId")
+                    }
+                ),
+                kind="tool",
+            )
+            yield notification(
+                "serverRequest/resolved",
+                self._scoped({"requestId": request["id"]}),
+            )
+            yield notification(
+                "item/completed",
+                self._scoped(
+                    {
+                        "item": {
+                            **item,
+                            "status": "failed",
+                            "success": False,
+                            "contentItems": [],
+                        }
+                    }
+                ),
+            )
+        if self._prompt == "command approval":
+            item = {
+                "id": "command-synthetic",
+                "type": "commandExecution",
+                "command": "synthetic-command",
+                "cwd": "/private/synthetic",
+                "status": "inProgress",
+            }
+            yield notification("item/started", self._scoped({"item": item}))
+            request = cast(dict[str, object], _APP_SERVER_CASES["command_approval"])
+            request_params = cast(dict[str, object], request["params"])
+            yield CodexServerRequest(
+                request_id=cast(str, request["id"]),
+                method=cast(str, request["method"]),
+                params=self._scoped(
+                    {
+                        key: value
+                        for key, value in request_params.items()
+                        if key not in ("threadId", "turnId")
+                    }
+                ),
+                kind="permission",
+            )
+            yield notification(
+                "serverRequest/resolved",
+                self._scoped({"requestId": request["id"]}),
+            )
+            yield notification(
+                "item/completed",
+                self._scoped({"item": {**item, "status": "declined"}}),
+            )
+        if self._prompt == "current time request":
+            request = cast(dict[str, object], _APP_SERVER_CASES["current_time_request"])
+            request_params = cast(dict[str, object], request["params"])
+            yield CodexServerRequest(
+                request_id=cast(str, request["id"]),
+                method=cast(str, request["method"]),
+                params={**request_params, "threadId": self._thread_id},
+                kind="tool",
+            )
+            yield notification(
+                "serverRequest/resolved",
+                self._scoped({"requestId": request["id"]}),
+            )
+        if self._prompt == "auto approval review":
+            review_id = "review-synthetic"
+            yield notification(
+                "item/autoApprovalReview/started",
+                self._scoped(
+                    {
+                        "reviewId": review_id,
+                        "startedAtMs": 1,
+                        "action": {"type": "synthetic"},
+                        "review": {"status": "inProgress"},
+                    }
+                ),
+            )
+            yield notification(
+                "item/autoApprovalReview/completed",
+                self._scoped(
+                    {
+                        "reviewId": review_id,
+                        "startedAtMs": 1,
+                        "completedAtMs": 2,
+                        "decisionSource": "agent",
+                        "action": {"type": "synthetic"},
+                        "review": {"status": "approved"},
+                    }
+                ),
+            )
+        if self._prompt in ("hook lifecycle", "hook completion first"):
+            hook_id = "hook-synthetic"
+            if self._prompt == "hook lifecycle":
+                yield notification(
+                    "hook/started",
+                    self._scoped({"run": {"id": hook_id, "status": "running"}}),
+                )
+            yield notification(
+                "hook/completed",
+                self._scoped({"run": {"id": hook_id, "status": "completed"}}),
+            )
+            if self._prompt == "hook completion first":
+                return
+        if self._prompt.startswith("authority item:"):
+            item_type = self._prompt.removeprefix("authority item:")
+            item = {
+                "id": f"{item_type}-synthetic",
+                "type": item_type,
+                "status": "inProgress",
+            }
+            yield notification("item/started", self._scoped({"item": item}))
+            yield notification(
+                "item/completed",
+                self._scoped({"item": {**item, "status": "failed"}}),
+            )
+        if self._prompt == "tool-shaped commentary":
+            commentary = {
+                "id": "commentary-synthetic",
+                "type": "agentMessage",
+                "text": '{"type":"custom_tool_call","name":"exec"}',
+                "phase": "commentary",
+            }
+            yield notification("item/started", self._scoped({"item": commentary}))
+            yield notification("item/completed", self._scoped({"item": commentary}))
+        if self._prompt == "harmless observations":
+            reasoning = {"id": "reasoning-synthetic", "type": "reasoning"}
+            yield notification("item/started", self._scoped({"item": reasoning}))
+            yield notification(
+                "item/reasoning/summaryPartAdded",
+                self._scoped({"itemId": reasoning["id"], "summaryIndex": 0}),
+            )
+            yield notification(
+                "item/reasoning/summaryTextDelta",
+                self._scoped({"itemId": reasoning["id"], "summaryIndex": 0, "delta": "synthetic"}),
+            )
+            yield notification("item/completed", self._scoped({"item": reasoning}))
+            plan = {"id": "plan-synthetic", "type": "plan", "text": "synthetic"}
+            yield notification("item/started", self._scoped({"item": plan}))
+            yield notification(
+                "item/plan/delta",
+                self._scoped({"itemId": plan["id"], "delta": "synthetic"}),
+            )
+            yield notification("item/completed", self._scoped({"item": plan}))
+        if self._prompt == "inert thread metadata":
+            goal = cast(dict[str, object], _APP_SERVER_CASES["inert_thread_goal_cleared"])
+            yield notification(
+                cast(str, goal["method"]),
+                {"threadId": self._thread_id},
+            )
+        if self._prompt == "malformed inert thread metadata":
+            yield notification("thread/goal/cleared", {})
+            return
+        if self._prompt == "forbidden session lifecycle":
+            yield notification("thread/closed", {"threadId": self._thread_id})
+            return
+        if self._prompt == "unknown notification":
+            yield notification("item/future/event", self._scoped({"synthetic": True}))
+            return
+        if self._prompt == "unknown item started":
+            message = cast(dict[str, object], _APP_SERVER_CASES["unknown_item_started"])
+            params = cast(dict[str, object], message["params"])
+            yield notification(cast(str, message["method"]), self._scoped({"item": params["item"]}))
+            return
+        if self._prompt == "unknown item completed":
+            message = cast(dict[str, object], _APP_SERVER_CASES["unknown_item_completed"])
+            params = cast(dict[str, object], message["params"])
+            yield notification(cast(str, message["method"]), self._scoped({"item": params["item"]}))
+            return
+        if self._prompt.startswith("bad authority:"):
+            problem = self._prompt.removeprefix("bad authority:")
+            command = {
+                "id": "bad-command",
+                "type": "commandExecution",
+                "command": "synthetic-command",
+                "cwd": "/private/synthetic",
+                "status": "inProgress",
+            }
+            if problem == "missing id":
+                yield notification("item/started", self._scoped({"item": {**command, "id": ""}}))
+                return
+            if problem == "completion first":
+                yield notification(
+                    "item/completed",
+                    self._scoped({"item": {**command, "status": "completed"}}),
+                )
+                return
+            if problem == "output first":
+                yield notification(
+                    "item/commandExecution/outputDelta",
+                    self._scoped({"itemId": "bad-command", "delta": "synthetic"}),
+                )
+                return
+            yield notification("item/started", self._scoped({"item": command}))
+            if problem == "duplicate start":
+                yield notification("item/started", self._scoped({"item": command}))
+                return
+            if problem == "type drift":
+                yield notification(
+                    "item/completed",
+                    self._scoped(
+                        {
+                            "item": {
+                                "id": "bad-command",
+                                "type": "fileChange",
+                                "changes": [],
+                                "status": "completed",
+                            }
+                        }
+                    ),
+                )
+                return
         if self._prompt == "oversized tool output":
             yield notification(
                 "item/completed",
@@ -547,7 +806,11 @@ class FakeThread:
         self.id = thread_id
 
     async def turn(self, inputs: list[object], **kwargs: object) -> FakeTurn:
-        prompt = "\n".join(item.text for item in inputs if isinstance(item, FakeTextInput))
+        prompt = "\n".join(
+            cast(str, item["text"])
+            for item in inputs
+            if isinstance(item, Mapping) and item.get("type") == "text"
+        )
         sdk_state(self._module)["turn_calls"].append(
             {"thread_id": self.id, "inputs": inputs, "kwargs": kwargs}
         )
@@ -594,11 +857,13 @@ def fake_sdk(
         "thread_usage": {},
         "thread_last_usage": {},
         "thread_last_turn_id": {},
+        "defer_restored_usage": False,
+        "late_restored_usage": {},
         "assistant_case_hanging": asyncio.Event(),
     }
 
     class FakeAsyncCodex:
-        def __init__(self, config: FakeConfig):
+        def __init__(self, config: Any):
             self.config = config
             self.metadata = {
                 "serverInfo": {"name": "codex", "version": sdk_state(module)["server_version"]},
@@ -607,7 +872,7 @@ def fake_sdk(
                 "platformOs": "linux",
             }
             self.closed = False
-            self._client = SimpleNamespace(_sync=SimpleNamespace(_router=FakeRouter()))
+            self._pending_messages: list[SimpleNamespace] = []
             sdk_state(module)["clients"].append(self)
 
         async def __aenter__(self):
@@ -615,6 +880,11 @@ def fake_sdk(
 
         async def close(self) -> None:
             self.closed = True
+
+        def take_pending_messages(self) -> tuple[SimpleNamespace, ...]:
+            pending = tuple(self._pending_messages)
+            self._pending_messages.clear()
+            return pending
 
         async def account(self) -> dict[str, object]:
             kind = sdk_state(module)["account_type"]
@@ -698,8 +968,10 @@ def fake_sdk(
                     "tokenUsage": {"last": dict(last), "total": dict(total)},
                 },
             )
-            router = self._client._sync._router
-            router._pending_turn_notifications.setdefault(turn_id, deque()).append(replay)
+            if state["defer_restored_usage"]:
+                cast(dict[str, SimpleNamespace], state["late_restored_usage"])[thread_id] = replay
+            else:
+                self._pending_messages.append(replay)
 
     module.__dict__["AsyncCodex"] = FakeAsyncCodex
     return module
@@ -733,6 +1005,7 @@ def install_codex_modules(
         return original(name, package)
 
     monkeypatch.setattr(importlib, "import_module", load)
+    monkeypatch.setattr(codex_sdk_module, "CodexAppServerClient", module.AsyncCodex)
 
 
 @pytest.fixture
@@ -802,47 +1075,6 @@ def payload_dict(event: AgentToolUse) -> dict[str, object]:
     return dict(payload)
 
 
-def test_codex_launcher_replaces_the_sdk_merged_environment(tmp_path: Path) -> None:
-    backend_root = tmp_path / "codex"
-    backend_root.mkdir(mode=0o700)
-    state_root = backend_root / "personal"
-    state_root.mkdir(mode=0o700)
-    target = tmp_path / "target"
-    target.write_text(
-        f"#!{sys.executable} -I\n"
-        "import json, os, pathlib, sys\n"
-        "parent_env = pathlib.Path(f'/proc/{os.getppid()}/environ').read_bytes().decode(errors='replace')\n"
-        "print(json.dumps({'env': dict(os.environ), 'parent_env': parent_env, "
-        "'args': sys.argv[1:]}), flush=True)\n",
-        encoding="utf-8",
-    )
-    target.chmod(0o700)
-    launcher = ensure_codex_launcher(
-        state_root,
-        target,
-        ("KEEP",),
-        interpreter=sys.executable,
-    )
-    environment = dict(os.environ)
-    environment.update({"KEEP": "selected", "MUST_NOT_LEAK": "ambient-secret"})
-
-    completed = subprocess.run(
-        (str(launcher), "owned-argument"),
-        env=environment,
-        capture_output=True,
-        text=True,
-        timeout=5.0,
-        check=False,
-    )
-
-    payload = json.loads(completed.stdout)
-    assert payload["env"]["KEEP"] == "selected"
-    assert "MUST_NOT_LEAK" not in payload["env"]
-    assert "ambient-secret" not in payload["parent_env"]
-    assert payload["args"] == ["owned-argument"]
-    assert completed.returncode == -signal.SIGKILL
-
-
 @pytest.mark.skipif(
     importlib.util.find_spec("openai_codex") is not None,
     reason="the codex-sdk extra is installed; the no-extras CI job runs this by node id",
@@ -853,23 +1085,23 @@ async def test_absent_sdk_extra_is_sdk_unavailable(tmp_path: Path) -> None:
             await selected.open_session(request(tmp_path))
 
 
-async def test_open_session_points_the_sdk_at_the_owned_launcher(
+async def test_open_session_points_owned_transport_at_the_pinned_executable(
     tmp_path: Path, installed_codex_sdk: ModuleType
 ) -> None:
     async with runtime(tmp_path) as selected:
         session = await selected.open_session(request(tmp_path))
         assert session.ref.native_session_id == "thread-1"
 
-    config = cast(FakeConfig, sdk_state(installed_codex_sdk)["clients"][0].config)
-    assert config.cwd == str(tmp_path.resolve())
-    assert config.codex_bin is not None, "the SDK must be pointed at the owned launcher"
-    launcher = Path(config.codex_bin)
-    assert launcher.name.startswith("codex-launcher-"), f"unexpected codex_bin {launcher}"
-    source = launcher.read_text(encoding="utf-8")
-    assert config.env is not None
-    for name in config.env:
-        assert f"'{name}'" in source, f"launcher must embed the child environment name {name}"
-    assert config.env["CODEX_HOME"].endswith("codex/personal")
+    config = sdk_state(installed_codex_sdk)["clients"][0].config
+    assert config.cwd == tmp_path.resolve()
+    assert config.executable == Path(sys.executable).resolve()
+    assert config.environment["CODEX_HOME"].endswith("codex/personal")
+    assert not set(config.environment) & {
+        "OPENAI_API_KEY",
+        "OPENAI_ORG_ID",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+    }
 
 
 async def test_disabled_builtin_tools_emit_the_complete_certified_codex_policy(
@@ -1200,14 +1432,14 @@ async def test_a_full_turn_streams_the_closed_event_grammar(
         "AgentToolUse",  # fileChange completed
         "AgentText",
         "AgentUsage",
-        "AgentNative",  # unknown method passthrough
+        "AgentNative",  # explicitly inert account/rateLimits/updated
         "AgentNative",  # thread/status/changed
         "AgentNative",  # turn/completed
         "AgentTerminal",
     ], f"unexpected event sequence: {kinds}"
 
-    # Every native frame without a first-class kind travels, with no per-method noise filter:
-    # a method this adapter has no opinion about is exactly what AgentNative is for.
+    # Only methods in the explicit inert allowlist can remain AgentNative; an
+    # unclassified method is a ProtocolDefect.
     natives = [event for event in events if isinstance(event, AgentNative)]
     assert [native.native_type for native in natives] == [
         "turn/started",
@@ -1400,6 +1632,28 @@ async def test_close_reopen_resume_rebases_restored_cumulative_history(
     )
 
 
+async def test_late_resume_usage_replay_is_baseline_only_and_identity_correlated(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    async with runtime(tmp_path) as selected:
+        original = await selected.open_session(request(tmp_path))
+        first = await selected.run_turn(original, turn("plain"))
+        ref = original.ref
+        await selected.close_session(original)
+
+        sdk_state(installed_codex_sdk)["defer_restored_usage"] = True
+        resumed = await selected.open_session(request(tmp_path, open=ResumeSession(ref)))
+        events = [event async for event in selected.stream_turn(resumed, turn("second"))]
+
+    assert isinstance(first.usage, Present)
+    terminal = events[-1]
+    assert isinstance(terminal, AgentTerminal)
+    assert terminal.usage == first.usage
+    assert len([event for event in events if isinstance(event, AgentUsage)]) == 1, (
+        "a late historical replay establishes the baseline but is never charged"
+    )
+
+
 async def test_serialized_ref_reconstruction_rebases_without_persisting_usage_state(
     tmp_path: Path, installed_codex_sdk: ModuleType
 ) -> None:
@@ -1434,15 +1688,15 @@ async def test_resume_without_the_required_usage_replay_surface_fails_before_a_t
 
     original_resume = installed_codex_sdk.AsyncCodex.thread_resume
 
-    async def resume_without_router(self: Any, thread_id: str, **kwargs: object) -> FakeThread:
+    async def resume_without_queue(self: Any, thread_id: str, **kwargs: object) -> FakeThread:
         thread = await original_resume(self, thread_id, **kwargs)
-        delattr(self._client._sync, "_router")
+        self.take_pending_messages = None
         return thread
 
-    monkeypatch.setattr(installed_codex_sdk.AsyncCodex, "thread_resume", resume_without_router)
+    monkeypatch.setattr(installed_codex_sdk.AsyncCodex, "thread_resume", resume_without_queue)
     dispatched_before = len(sdk_state(installed_codex_sdk)["turn_calls"])
 
-    with pytest.raises(SdkUnavailable, match="routed resume usage required for accounting"):
+    with pytest.raises(SdkUnavailable, match="pending message queue"):
         async with runtime(tmp_path) as reconstructed_runtime:
             await reconstructed_runtime.open_session(request(tmp_path, open=ResumeSession(ref)))
 
@@ -1675,20 +1929,290 @@ async def test_duplicate_and_malformed_completed_agent_message_identities_are_de
             await _project_assistant_case(selected, session, name, projection)
 
 
-async def test_unrelated_native_items_do_not_change_authoritative_message_selection(
+async def test_unknown_native_items_fail_closed_and_invalidate_the_session(
     tmp_path: Path, installed_codex_sdk: ModuleType
 ) -> None:
     async with runtime(tmp_path) as selected:
         session = await selected.open_session(request(tmp_path))
-        terminal, events = await _project_assistant_case(
-            selected, session, "interleaved_native", "stream_turn"
-        )
+        with pytest.raises(ProtocolDefect, match="authority item completed before its start"):
+            await _project_assistant_case(selected, session, "interleaved_native", "stream_turn")
+        with pytest.raises(SessionUnavailable):
+            await selected.run_turn(session, turn("plain"))
 
-    assert terminal.final_text == "selected around native item"
+
+@pytest.mark.parametrize(
+    ("prompt", "phases", "names"),
+    (
+        ("custom exec", ["started", "updated", "completed"], ["exec", "exec", "exec"]),
+        (
+            "dynamic tool",
+            ["started", "updated", "completed"],
+            ["synthetic_tool", "synthetic_tool", "synthetic_tool"],
+        ),
+    ),
+)
+async def test_strict_native_authority_is_first_class_then_poisoned_before_terminal(
+    tmp_path: Path,
+    installed_codex_sdk: ModuleType,
+    prompt: str,
+    phases: list[str],
+    names: list[str],
+) -> None:
+    observed: list[object] = []
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(
+            request(tmp_path, native=CodexNativeOptions(builtin_tools="disabled"))
+        )
+        with pytest.raises(ProtocolDefect, match="forbidden Codex native authority"):
+            async for event in selected.stream_turn(session, turn(prompt)):
+                observed.append(event)
+        with pytest.raises(SessionUnavailable):
+            await selected.run_turn(session, turn("plain"))
+
+    tools = [event for event in observed if isinstance(event, AgentToolUse)]
+    assert [event.phase for event in tools] == phases
+    assert [event.name for event in tools] == names
+    assert not any(isinstance(event, AgentTerminal) for event in observed)
+
+
+@pytest.mark.parametrize(
+    "item_type",
+    (
+        "collabAgentToolCall",
+        "hookPrompt",
+        "imageGeneration",
+        "imageView",
+        "sleep",
+        "subAgentActivity",
+        "webSearch",
+    ),
+)
+async def test_every_generic_native_authority_item_is_first_class_and_poisoned(
+    tmp_path: Path,
+    installed_codex_sdk: ModuleType,
+    item_type: str,
+) -> None:
+    observed: list[object] = []
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(
+            request(tmp_path, native=CodexNativeOptions(builtin_tools="disabled"))
+        )
+        with pytest.raises(ProtocolDefect, match="forbidden Codex native authority"):
+            async for event in selected.stream_turn(session, turn(f"authority item:{item_type}")):
+                observed.append(event)
+
+    tools = [event for event in observed if isinstance(event, AgentToolUse)]
+    assert [(event.name, event.phase) for event in tools] == [
+        (item_type, "started"),
+        (item_type, "completed"),
+    ]
+    assert not any(isinstance(event, AgentTerminal) for event in observed)
+
+
+async def test_experimental_current_time_authority_is_first_class_and_poisoned(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    observed: list[object] = []
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(
+            request(tmp_path, native=CodexNativeOptions(builtin_tools="disabled"))
+        )
+        with pytest.raises(ProtocolDefect, match="forbidden Codex native authority"):
+            async for event in selected.stream_turn(session, turn("current time request")):
+                observed.append(event)
+
+    tools = [event for event in observed if isinstance(event, AgentToolUse)]
+    assert len(tools) == 1
+    assert tools[0].name == "currentTime/read"
+    assert tools[0].phase == "completed"
+    assert tools[0].succeeded is False
+    assert not any(isinstance(event, AgentTerminal) for event in observed)
+
+
+async def test_provider_auto_approval_activity_is_first_class_and_poisoned(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    observed: list[object] = []
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(
+            request(tmp_path, native=CodexNativeOptions(builtin_tools="disabled"))
+        )
+        with pytest.raises(ProtocolDefect, match="forbidden Codex native authority"):
+            async for event in selected.stream_turn(session, turn("auto approval review")):
+                observed.append(event)
+
+    tools = [event for event in observed if isinstance(event, AgentToolUse)]
+    assert [(event.name, event.phase, event.succeeded) for event in tools] == [
+        ("autoApprovalReview", "started", None),
+        ("autoApprovalReview", "completed", True),
+    ]
+    assert not any(isinstance(event, AgentTerminal) for event in observed)
+
+
+async def test_hook_authority_is_correlated_and_poisoned_before_terminal(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    observed: list[object] = []
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(
+            request(tmp_path, native=CodexNativeOptions(builtin_tools="disabled"))
+        )
+        with pytest.raises(ProtocolDefect, match="forbidden Codex native authority"):
+            async for event in selected.stream_turn(session, turn("hook lifecycle")):
+                observed.append(event)
+
+    tools = [event for event in observed if isinstance(event, AgentToolUse)]
+    assert [(event.name, event.phase, event.succeeded) for event in tools] == [
+        ("hook", "started", None),
+        ("hook", "completed", True),
+    ]
+    assert not any(isinstance(event, AgentTerminal) for event in observed)
+
+
+async def test_hook_completion_without_start_is_a_protocol_defect(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(request(tmp_path))
+        with pytest.raises(ProtocolDefect, match="did not match an active"):
+            await selected.run_turn(session, turn("hook completion first"))
+
+
+async def test_approval_is_explicitly_denied_and_cannot_survive_as_a_terminal(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    observed: list[object] = []
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(
+            request(tmp_path, native=CodexNativeOptions(builtin_tools="disabled"))
+        )
+        with pytest.raises(ProtocolDefect, match="forbidden Codex native authority"):
+            async for event in selected.stream_turn(session, turn("command approval")):
+                observed.append(event)
+
+    permissions = [event for event in observed if isinstance(event, AgentPermissionRequest)]
+    assert len(permissions) == 1
+    assert permissions[0].decision == "deny"
+    assert permissions[0].request.operation == "command"
+    assert not any(isinstance(event, AgentTerminal) for event in observed)
+
+
+async def test_strict_mode_keeps_reasoning_plan_text_and_usage_observations_inert(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(
+            request(tmp_path, native=CodexNativeOptions(builtin_tools="disabled"))
+        )
+        events = [
+            event async for event in selected.stream_turn(session, turn("harmless observations"))
+        ]
+
+    assert isinstance(events[-1], AgentTerminal)
+    assert events[-1].status == "succeeded"
+    assert any(isinstance(event, AgentText) for event in events)
+    assert any(isinstance(event, AgentUsage) for event in events)
+    assert not any(isinstance(event, AgentToolUse | AgentPermissionRequest) for event in events)
+
+
+async def test_documented_thread_metadata_observation_is_explicitly_inert(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(
+            request(tmp_path, native=CodexNativeOptions(builtin_tools="disabled"))
+        )
+        events = [
+            event async for event in selected.stream_turn(session, turn("inert thread metadata"))
+        ]
+
+    assert isinstance(events[-1], AgentTerminal)
     assert any(
-        isinstance(event, AgentNative) and event.native_type == "item/completed:unknownItem"
+        isinstance(event, AgentNative) and event.native_type == "thread/goal/cleared"
         for event in events
     )
+    assert not any(isinstance(event, AgentToolUse | AgentPermissionRequest) for event in events)
+
+
+@pytest.mark.parametrize(
+    ("prompt", "message"),
+    (
+        ("malformed inert thread metadata", "omitted its thread identity"),
+        ("forbidden session lifecycle", "changed session lifecycle"),
+    ),
+)
+async def test_thread_metadata_identity_and_session_lifecycle_fail_closed(
+    tmp_path: Path,
+    installed_codex_sdk: ModuleType,
+    prompt: str,
+    message: str,
+) -> None:
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(request(tmp_path))
+        with pytest.raises(ProtocolDefect, match=message):
+            await selected.run_turn(session, turn(prompt))
+        with pytest.raises(SessionUnavailable):
+            await selected.run_turn(session, turn("plain"))
+
+
+async def test_tool_shaped_native_commentary_never_becomes_authority(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(
+            request(tmp_path, native=CodexNativeOptions(builtin_tools="disabled"))
+        )
+        events = [
+            event async for event in selected.stream_turn(session, turn("tool-shaped commentary"))
+        ]
+
+    assert isinstance(events[-1], AgentTerminal)
+    assert events[-1].status == "succeeded"
+    assert not any(isinstance(event, AgentToolUse | AgentPermissionRequest) for event in events)
+
+
+@pytest.mark.parametrize(
+    ("prompt", "message"),
+    (
+        ("unknown notification", "unknown notification"),
+        ("unknown item started", "unknown item type"),
+        ("unknown item completed", "unknown item type"),
+    ),
+)
+async def test_future_notifications_and_item_lifecycles_default_to_protocol_defect(
+    tmp_path: Path,
+    installed_codex_sdk: ModuleType,
+    prompt: str,
+    message: str,
+) -> None:
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(request(tmp_path))
+        with pytest.raises(ProtocolDefect, match=message):
+            await selected.run_turn(session, turn(prompt))
+        with pytest.raises(SessionUnavailable):
+            await selected.run_turn(session, turn("plain"))
+
+
+@pytest.mark.parametrize(
+    ("problem", "message"),
+    (
+        ("missing id", "non-empty identity"),
+        ("completion first", "completed before its start"),
+        ("output first", "did not match an active"),
+        ("duplicate start", "started more than once"),
+        ("type drift", "changed type"),
+    ),
+)
+async def test_authority_lifecycle_identity_is_complete_unique_and_ordered(
+    tmp_path: Path,
+    installed_codex_sdk: ModuleType,
+    problem: str,
+    message: str,
+) -> None:
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(request(tmp_path))
+        with pytest.raises(ProtocolDefect, match=message):
+            await selected.run_turn(session, turn(f"bad authority:{problem}"))
 
 
 @pytest.mark.parametrize("projection", ("stream_turn", "run_turn"))
@@ -1829,6 +2353,59 @@ async def test_provider_review_maps_to_the_public_auto_reviewer(
     assert start_call(installed_codex_sdk)["approval_mode"] == "auto_review"
 
 
+async def test_disabled_builtins_require_unconditional_approval_denial(
+    tmp_path: Path, installed_codex_sdk: ModuleType
+) -> None:
+    policy = PermissionPolicy(approval="provider_review", allowed_tools=("*",))
+    async with runtime(tmp_path) as selected:
+        with pytest.raises(UnsupportedCapability, match="unconditional approval denial"):
+            await selected.open_session(
+                request(
+                    tmp_path,
+                    policy=policy,
+                    native=CodexNativeOptions(builtin_tools="disabled"),
+                )
+            )
+
+    assert sdk_state(installed_codex_sdk)["clients"] == []
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    (
+        (
+            {"policy": PermissionPolicy(filesystem="workspace_write", allowed_tools=("*",))},
+            "read-only filesystem",
+        ),
+        (
+            {"policy": PermissionPolicy(allowed_tools=("*",), environment=("TERM",))},
+            "empty copied environment",
+        ),
+        ({"mcp_servers": (docs_server(),), "policy": mcp_policy()}, "read-only filesystem"),
+        ({"additional_dirs": ("/private/synthetic",)}, "additional filesystem roots"),
+    ),
+)
+async def test_disabled_builtins_require_the_complete_certified_containment_posture(
+    tmp_path: Path,
+    installed_codex_sdk: ModuleType,
+    changes: dict[str, object],
+    message: str,
+) -> None:
+    if "additional_dirs" in changes:
+        changes = {**changes, "additional_dirs": (str(tmp_path),)}
+    async with runtime(tmp_path) as selected:
+        with pytest.raises(UnsupportedCapability, match=message):
+            await selected.open_session(
+                request(
+                    tmp_path,
+                    native=CodexNativeOptions(builtin_tools="disabled"),
+                    **changes,
+                )
+            )
+
+    assert sdk_state(installed_codex_sdk)["clients"] == []
+
+
 async def test_quota_exhaustion_latches_from_error_notifications(
     tmp_path: Path, installed_codex_sdk: ModuleType
 ) -> None:
@@ -1940,6 +2517,25 @@ async def test_thread_identity_drift_is_a_protocol_defect(
         session = await selected.open_session(request(tmp_path))
         with pytest.raises(ProtocolDefect, match="thread identity"):
             await selected.run_turn(session, turn("identity drift"))
+
+
+@pytest.mark.parametrize(
+    ("prompt", "message"),
+    (
+        ("usage identity drift", "changed its turn identity"),
+        ("usage identity missing", "omitted its turn identity"),
+    ),
+)
+async def test_non_replay_usage_requires_the_active_turn_identity(
+    tmp_path: Path,
+    installed_codex_sdk: ModuleType,
+    prompt: str,
+    message: str,
+) -> None:
+    async with runtime(tmp_path) as selected:
+        session = await selected.open_session(request(tmp_path))
+        with pytest.raises(ProtocolDefect, match=message):
+            await selected.run_turn(session, turn(prompt))
 
 
 async def test_mcp_tool_calls_carry_their_registered_identity(
