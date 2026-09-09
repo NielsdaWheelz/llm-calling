@@ -396,9 +396,16 @@ class CodexAppServerClient:
         self._route_response(message)
 
     async def _route_method(self, message: dict[str, object]) -> None:
-        allowed = {"method", "params", "id"}
+        allowed = {"method", "params", "id" if "id" in message else "emittedAtMs"}
+        # justify-defect: admit exactly the pinned server envelope. Its optional
+        # i64 emission timestamp is transport metadata, never owned event state.
         if set(message) - allowed:
             raise ProtocolDefect("Codex app-server method message had unknown fields")
+        emitted_at_ms = message.get("emittedAtMs")
+        if emitted_at_ms is not None and (
+            type(emitted_at_ms) is not int or not -(1 << 63) <= emitted_at_ms < 1 << 63
+        ):
+            raise ProtocolDefect("Codex app-server notification timestamp was malformed")
         method = message.get("method")
         self._require_method(method)
         method = cast(str, method)

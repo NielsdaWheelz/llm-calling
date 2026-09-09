@@ -34,6 +34,11 @@ from provider_runtime.agent_runtime import (
     UnsafeConfirmation,
     UnsupportedCapability,
 )
+from provider_runtime.agent_runtime.codex_app_server import (
+    CodexAppServerClient,
+    CodexAppServerConfig,
+    CodexNotification,
+)
 from provider_runtime.agent_runtime.codex_control import (
     CodexBounded,
     CodexControlError,
@@ -80,6 +85,11 @@ class ProtocolPeer:
         self.hold_method: str | None = None
         self.received = asyncio.Event()
         self.release = asyncio.Event()
+        self.startup_message: dict[str, object] = {
+            "method": "account/updated",
+            "params": {"authMode": None, "planType": None},
+            "emittedAtMs": 1234,
+        }
 
     async def handle(self, connection: ServerConnection) -> None:
         try:
@@ -115,6 +125,7 @@ class ProtocolPeer:
                     )
                     continue
                 if method == "initialize":
+                    await connection.send(json.dumps(self.startup_message))
                     result = {"userAgent": f"codex_cli_rs/{self.version} (Linux synthetic; x86_64)"}
                 elif method == "account/read":
                     result = {"account": {"type": "chatgpt"}}
@@ -335,6 +346,40 @@ async def peer(tmp_path: Path) -> AsyncIterator[ProtocolPeer]:
         value = ProtocolPeer(Path(directory) / "peer.sock")
         async with await unix_serve(value.handle, str(value.socket)):
             yield value
+
+
+async def test_timestamped_startup_notification_preserves_correlated_protocol(
+    peer: ProtocolPeer,
+) -> None:
+    async with CodexAppServerClient(CodexAppServerConfig(peer.socket)) as client:
+        assert await client.next_message() == CodexNotification(
+            "account/updated", {"authMode": None, "planType": None}
+        )
+        assert await client.account() == {"account": {"type": "chatgpt"}}
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"emittedAtMs": True},
+        {"emittedAtMs": 1.5},
+        {"emittedAtMs": "1234"},
+        {"emittedAtMs": -(1 << 63) - 1},
+        {"emittedAtMs": 1 << 63},
+        {"trace": {}},
+        {"unknown": None},
+        {"id": 1},
+    ],
+)
+async def test_observer_rejects_malformed_startup_envelopes(
+    peer: ProtocolPeer, fields: dict[str, object]
+) -> None:
+    peer.startup_message.update(fields)
+    with pytest.raises(ProtocolDefect):
+        async with CodexAppServerClient(
+            CodexAppServerConfig(peer.socket, request_policy="observe_only")
+        ):
+            pytest.fail("malformed startup envelope was accepted")
 
 
 async def test_public_control_creates_unsubscribes_then_submits_and_closes_only_connections(
