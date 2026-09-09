@@ -6,6 +6,7 @@ This module is excluded from the default suite (``addopts`` deselects
     LLM_RUNTIME_LIVE=1 \\
     LLM_RUNTIME_LIVE_AGENT_STATE_ROOT_BASE=/absolute/existing/private/root \\
     LLM_RUNTIME_LIVE_AGENT_PROFILE=live-local \\
+    LLM_RUNTIME_LIVE_CODEX_ENDPOINT=/run/codex-shared-personal/app-server.sock \\
     uv run pytest -m live_provider tests/live/test_agent_matrix.py
 
 Rules:
@@ -13,7 +14,9 @@ Rules:
 - ``LLM_RUNTIME_LIVE=1`` is required — anything else fails, never skips;
 - an omitted ``LLM_RUNTIME_LIVE_AGENT_ROUTES`` is the release run and covers
   both shipped routes; a narrowed run certifies nothing;
-- ``LLM_RUNTIME_LIVE_CODEX_SDK_MODELS`` / ``LLM_RUNTIME_LIVE_CLAUDE_SDK_MODELS``
+- ``LLM_RUNTIME_LIVE_CODEX_ENDPOINT`` names the already-running pinned shared
+  App Server; the client never starts or owns a Codex process;
+- ``LLM_RUNTIME_LIVE_CODEX_MODELS`` / ``LLM_RUNTIME_LIVE_CLAUDE_SDK_MODELS``
   optionally widen a route beyond the backend's default model;
 - ``LLM_RUNTIME_LIVE_CLAUDE_EXECUTABLE`` optionally pins the exact CLI binary under
   test when ambient ``claude`` resolves to a dispatch wrapper;
@@ -65,10 +68,15 @@ from provider_runtime.agent_runtime import (
     TextContent,
     TurnRequest,
 )
+from provider_runtime.agent_runtime.codex_app_server import CODEX_VERSION
 from provider_runtime.agent_runtime.codex_sdk import CodexSdkAdapter
 from provider_runtime.agent_runtime.types import AGENT_ROUTES
 from provider_runtime.types import Absent, Presence, Present, TokenUsage
-from tests.live.agent_matrix import parse_model_list
+from tests.live.agent_matrix import (
+    MatrixSelectionError,
+    parse_codex_endpoint,
+    parse_model_list,
+)
 
 pytestmark = pytest.mark.live_provider
 
@@ -102,7 +110,7 @@ class LiveRoute:
         return self.name
 
 
-class _ObservedCodexSdkAdapter(CodexSdkAdapter):
+class _ObservedCodexAdapter(CodexSdkAdapter):
     """Live-only witness for the native cumulative values before projection."""
 
     def __init__(self) -> None:
@@ -218,8 +226,22 @@ def _profile() -> str:
     return profile
 
 
+def _codex_endpoint() -> Path:
+    try:
+        endpoint = parse_codex_endpoint(os.environ.get("LLM_RUNTIME_LIVE_CODEX_ENDPOINT"))
+    except MatrixSelectionError as error:
+        _fail(str(error))
+    if not endpoint.is_socket():
+        _fail("LLM_RUNTIME_LIVE_CODEX_ENDPOINT must identify a Unix socket")
+    return endpoint
+
+
 def _route_models(route: LiveRoute) -> tuple[str | None, ...]:
-    name = f"LLM_RUNTIME_LIVE_{route.backend.upper()}_SDK_MODELS"
+    name = (
+        "LLM_RUNTIME_LIVE_CODEX_MODELS"
+        if route.backend == "codex"
+        else "LLM_RUNTIME_LIVE_CLAUDE_SDK_MODELS"
+    )
     models = parse_model_list(os.environ.get(name))
     return models if models else (None,)
 
@@ -316,7 +338,7 @@ def _usage_difference(current: TokenUsage, baseline: TokenUsage) -> dict[str, in
 
 
 def _codex_usage_evidence(
-    observer: _ObservedCodexSdkAdapter,
+    observer: _ObservedCodexAdapter,
     thread_id: str,
     terminals: list[AgentTerminal],
 ) -> dict[str, object]:
@@ -369,14 +391,18 @@ def _codex_usage_evidence(
 
 
 async def _certify_route(route: LiveRoute, model: str | None) -> dict[str, object]:
+    state_root_base = _state_root_base()
+    profile = _profile()
     config = AgentRuntimeConfig(
-        state_root_base=_state_root_base(), claude_executable=_claude_executable()
+        state_root_base=state_root_base,
+        codex_endpoints={profile: _codex_endpoint()} if route.backend == "codex" else {},
+        claude_executable=_claude_executable(),
     )
-    auth = CredentialRef(kind="local_account", profile_key=_profile())
-    workspace = _state_root_base() / "live-workspace"
+    auth = CredentialRef(kind="local_account", profile_key=profile)
+    workspace = state_root_base / "live-workspace"
     workspace.mkdir(mode=0o700, exist_ok=True)
     evidence: dict[str, object] = {"route": route.name, "model": model or "backend-default"}
-    observer = _ObservedCodexSdkAdapter() if route.backend == "codex" else None
+    observer = _ObservedCodexAdapter() if route.backend == "codex" else None
     adapters = (observer,) if observer is not None else None
     async with AgentRuntime(config, adapters=adapters) as runtime:
         request = AgentSessionRequest(
@@ -515,12 +541,15 @@ def _route_policy(route: LiveRoute) -> PermissionPolicy:
 def _write_evidence(route: LiveRoute, cases: list[dict[str, object]]) -> None:
     _EVIDENCE_DIR.mkdir(exist_ok=True)
     payload: dict[str, object] = {
-        "schema_version": "agent-runtime-live-evidence.v2",
+        "schema_version": "agent-runtime-live-evidence.v3",
         "route": route.name,
         "auth": "local_account",
         "recorded_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "cases": cases,
     }
+    if route.backend == "codex":
+        payload["transport_boundary"] = "shared_websocket_unix"
+        payload["codex_version"] = CODEX_VERSION
     canonical = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     revision = hashlib.sha256(canonical.encode()).hexdigest()[:12]
     payload["evidence_revision"] = revision
