@@ -1,24 +1,14 @@
-"""Codex app-server adapter with a lazy pinned-runtime dependency boundary.
-
-The adapter uses the public ``openai-codex`` data types but owns the documented
-app-server stdio JSON-RPC transport. Every response, notification, and server
-request therefore crosses this boundary before it can affect a terminal.
-"""
+"""Strict managed cognition on the pinned shared Codex protocol."""
 
 from __future__ import annotations
 
 import asyncio
-import importlib
-import importlib.metadata
-import os
-import re
-import warnings
 import weakref
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from types import ModuleType
 from typing import Any, Literal, cast
+from uuid import uuid4
 
 from provider_runtime.errors import sanitize_provider_text
 from provider_runtime.types import Absent, Presence, Present, TokenUsage
@@ -35,14 +25,11 @@ from ._limits import (
     OutputLimitExceeded,
     bounded_payload_size,
 )
-from ._sandbox import bubblewrap_network_namespace_available
 from ._structured_output import OutputSchemaMismatch, parse_structured_output
 from .auth import (
     freeze_native_json_object,
     freeze_native_json_value,
-    mcp_header_environment_name,
     redact_native_payload,
-    state_root_from_environment,
 )
 from .codex_app_server import (
     CodexAppServerClient,
@@ -105,20 +92,10 @@ from .types import (
     validate_mcp_network_policy,
 )
 
-# The one version the adapter was certified against. Drift from it is reported as a
-# RuntimeWarning and the behavioral probe decides fitness; a missing required surface,
-# including the routed resume-usage seam, remains a hard `SdkUnavailable`.
-_CERTIFIED_SDK_VERSION = "0.144.4"
-_RUNTIME_VERSION_PREFIX = re.compile(
-    r"(?P<version>[0-9]+(?:\.[0-9]+){2}(?:[-+][0-9A-Za-z.-]+)?)(?:\s|$)"
-)
-_APP_SERVER_USER_AGENT = re.compile(
-    r"^[^/]+/(?P<version>[0-9]+(?:\.[0-9]+){2}(?:[-+][0-9A-Za-z.-]+)?)(?:\s|$)"
-)
 _REQUIRED_MCP_STARTUP_FAILURE = "required MCP servers failed to initialize"
 
 # The configurable execution, integration, and local-context features in the
-# certified Codex 0.144.4 runtime. Keep this as one closed vendor mapping behind
+# pinned Codex runtime. Keep this as one closed vendor mapping behind
 # `CodexNativeOptions.builtin_tools`; callers must not depend on Codex feature names.
 _DISABLED_BUILTIN_FEATURES = (
     "apply_patch_streaming_events",
@@ -452,7 +429,6 @@ class _CodexUsageAccounting:
 
 @dataclass(slots=True)
 class _CodexSessionState:
-    sdk: ModuleType
     client: Any
     thread: Any
     request: AgentSessionRequest
@@ -473,6 +449,7 @@ class _CodexSessionState:
     server_request_ids: set[tuple[type[object], object]] = field(default_factory=set)
     authority_seen: bool = False
     quota_exhausted: bool = False
+    user_message_id: str | None = None
 
 
 class CodexSdkAdapter:
@@ -500,7 +477,7 @@ class CodexSdkAdapter:
         if query.backend != self.backend or query.transport != self.transport:
             raise InvalidAgentRequest("CodexSdkAdapter received a different route")
         self._require_local_auth(query.auth.kind)
-        _sdk, client = await self._open_client(cwd=None, environment=environment)
+        client = await self._open_client(environment=environment)
         try:
             await self._verify_auth(client)
             response = await self._call(
@@ -512,7 +489,7 @@ class CodexSdkAdapter:
             data = payload.get("data")
             if not isinstance(data, list):
                 raise ProtocolDefect("Codex SDK thread_list data was not an array")
-            state_root = state_root_from_environment("codex", environment)
+            state_root = self._endpoint(environment)
             sessions = tuple(
                 self._session_summary(
                     self._mapping(item, "Codex SDK thread_list thread"),
@@ -539,20 +516,17 @@ class CodexSdkAdapter:
             raise SessionMismatch("Codex SDK cannot read a different route")
         validate_read_session_auth(ref, options)
         self._require_local_auth(options.auth.kind)
-        if ref.state_root_fingerprint != fingerprint_path(
-            state_root_from_environment("codex", environment)
-        ):
+        if ref.state_root_fingerprint != fingerprint_path(self._endpoint(environment)):
             raise SessionMismatch("session state root does not match the supplied environment")
-        _sdk, client = await self._open_client(cwd=None, environment=environment)
+        client = await self._open_client(environment=environment)
         try:
             await self._verify_auth(client)
-            thread = await self._call(
-                client.thread_resume(ref.native_session_id),
-                operation="thread resume for read",
-                failure="session",
-            )
             response = await self._call(
-                thread.read(include_turns=False), operation="thread read", failure="session"
+                client.request(
+                    "thread/read", {"threadId": ref.native_session_id, "includeTurns": False}
+                ),
+                operation="thread read",
+                failure="session",
             )
             payload = self._mapping(response, "Codex SDK thread read response")
             native_thread = self._mapping(payload.get("thread"), "Codex SDK thread read thread")
@@ -577,32 +551,18 @@ class CodexSdkAdapter:
         self._validate_policy_mapping(request.policy)
         validate_mcp_network_policy(request.mcp_servers, request.policy)
         self._validate_mcp_filters(request)
-        state_root = state_root_from_environment("codex", environment)
+        state_root = self._endpoint(environment)
         native = request.native
         if isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled":
             self._validate_strict_native_containment(request)
-        if request.policy.filesystem == "workspace_write":
-            # Restricted writes ride on bubblewrap network namespaces; a host without
-            # them gets a fail-closed refusal before any thread is started.
-            if not await bubblewrap_network_namespace_available(
-                cwd=state_root, environment=environment
-            ):
-                raise UnsupportedCapability(
-                    "Codex workspace_write requires bubblewrap network namespaces on this host"
-                )
-        sdk, client = await self._open_client(
-            cwd=request.cwd,
-            environment=environment,
-            require_certified_builtin_policy=isinstance(native, CodexNativeOptions)
-            and native.builtin_tools == "disabled",
-        )
+        client = await self._open_client(environment=environment)
         try:
             await self._verify_auth(client)
             kwargs: dict[str, object] = {
-                "approval_mode": self._approval_mode(sdk, request.policy),
+                "approval_mode": self._approval_mode(request.policy),
                 "config": self._codex_config(request),
                 "cwd": request.cwd,
-                "sandbox": self._sandbox(sdk, request.policy),
+                "sandbox": self._sandbox(request.policy),
             }
             if request.model is not None:
                 kwargs["model"] = request.model
@@ -663,7 +623,6 @@ class CodexSdkAdapter:
             )
             session = AgentSession(ref)
             self._sessions[session] = _CodexSessionState(
-                sdk=sdk,
                 client=client,
                 thread=thread,
                 request=request,
@@ -695,8 +654,16 @@ class CodexSdkAdapter:
         policy = state.request.policy
         inputs = [self._codex_input(part) for part in request.input]
         kwargs: dict[str, object] = {
-            "approval_mode": self._approval_mode(state.sdk, policy),
+            "approval_mode": self._approval_mode(policy),
         }
+        if self._strict_native_containment(state):
+            try:
+                self._restored_usage_baseline(state.client, state.ref.native_session_id)
+            except ProtocolDefect:
+                await self._destroy_session(session, state)
+                raise
+            state.user_message_id = str(uuid4())
+            kwargs["clientUserMessageId"] = state.user_message_id
         reasoning = state.request.reasoning
         if reasoning is not None:
             kwargs["effort"] = reasoning.effort
@@ -823,102 +790,23 @@ class CodexSdkAdapter:
                 "Codex App Server client teardown did not complete", code="sdk_teardown_failed"
             )
 
-    async def _open_client(
-        self,
-        *,
-        cwd: str | None,
-        environment: Mapping[str, str],
-        require_certified_builtin_policy: bool = False,
-    ) -> tuple[ModuleType, Any]:
-        sdk = self._load_sdk()
-        sdk_version = self._sdk_version(sdk)
-        if require_certified_builtin_policy and sdk_version != _CERTIFIED_SDK_VERSION:
-            raise UnsupportedCapability(
-                "Codex builtin tool policy is not certified for this SDK version"
-            )
-        if sdk_version != _CERTIFIED_SDK_VERSION:
-            warnings.warn(
-                f"Codex SDK {sdk_version} differs from the certified "
-                f"{_CERTIFIED_SDK_VERSION}; continuing on the behavioral probe",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        runtime = self._load_runtime_package()
-        runtime_version = self._runtime_version(runtime)
-        if require_certified_builtin_policy and runtime_version != _CERTIFIED_SDK_VERSION:
-            raise UnsupportedCapability(
-                "Codex builtin tool policy is not certified for this bundled runtime version"
-            )
-        if runtime_version != sdk_version:
-            warnings.warn(
-                f"Codex bundled runtime {runtime_version} differs from SDK "
-                f"{sdk_version}; continuing on the behavioral probe",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        client: Any = None
+    async def _open_client(self, *, environment: Mapping[str, str]) -> CodexAppServerClient:
+        client = CodexAppServerClient(CodexAppServerConfig(socket_path=self._endpoint(environment)))
         try:
-            child_environment = dict(environment)
-            bundled_path_dir = runtime.bundled_path_dir()
-            if bundled_path_dir is not None:
-                path_dir = Path(bundled_path_dir).resolve(strict=True)
-                if not path_dir.is_dir():
-                    raise ExecutableUnavailable("the bundled Codex PATH directory is invalid")
-                existing_path = child_environment.get("PATH", "")
-                entries = tuple(entry for entry in existing_path.split(os.pathsep) if entry)
-                child_environment["PATH"] = os.pathsep.join(
-                    (str(path_dir), *(entry for entry in entries if entry != str(path_dir)))
-                )
-            bundled_executable = Path(runtime.bundled_codex_path()).resolve(strict=True)
-            state_root = state_root_from_environment("codex", environment)
-            config = CodexAppServerConfig(
-                executable=bundled_executable,
-                cwd=Path(cwd).resolve(strict=True) if cwd is not None else state_root,
-                environment=child_environment,
-                config_overrides=('forced_login_method="chatgpt"',),
-                client_name="provider_runtime",
-                client_title="provider-runtime",
-                client_version="0.1.0",
-            )
-            client = CodexAppServerClient(config)
             async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
                 await client.__aenter__()
-            executable_version = self._executable_version(client)
-            if require_certified_builtin_policy and executable_version != _CERTIFIED_SDK_VERSION:
-                raise UnsupportedCapability(
-                    "Codex builtin tool policy is not certified for this executable version"
-                )
-            if executable_version != runtime_version:
-                warnings.warn(
-                    f"Codex server reported version {executable_version}, the bundled "
-                    f"runtime is {runtime_version}; continuing on the behavioral probe",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-        except UnsupportedCapability:
-            if client is not None:
-                await client.close()
+        except BaseException:
+            await client.close()
             raise
-        except ProtocolDefect:
-            if client is not None:
-                await client.close()
-            raise
-        except TimeoutError:
-            if client is not None:
-                await client.close()
-            raise ExecutableUnavailable("Codex SDK initialization timed out") from None
-        except CredentialUnavailable:
-            if client is not None:
-                await client.close()
-            raise
-        except Exception as error:
-            if client is not None:
-                await client.close()
-            raise ExecutableUnavailable(
-                f"Codex SDK initialization failed: {sanitize_provider_text(str(error))}"
-            ) from None
         self._clients.add(client)
-        return sdk, client
+        return client
+
+    @staticmethod
+    def _endpoint(environment: Mapping[str, str]) -> Path:
+        value = environment.get("CODEX_APP_SERVER_SOCKET")
+        if not value or not Path(value).is_absolute():
+            raise CredentialUnavailable("Codex profile has no configured external endpoint")
+        return Path(value)
 
     def _restored_usage_baseline(self, client: Any, native_session_id: str) -> TokenUsage | None:
         """Consume and validate app-server replay emitted before resume/fork responds."""
@@ -1088,6 +976,10 @@ class CodexSdkAdapter:
         state.output_bytes += size
         params = self._mapping(raw_params, f"Codex app-server {method} notification")
         self._validate_notification_identity(state, method, params)
+        if self._strict_native_containment(state) and method in ("item/started", "item/completed"):
+            item = self._mapping(params.get("item"), "Codex item")
+            if item.get("type") == "userMessage" and item.get("clientId") != state.user_message_id:
+                raise ProtocolDefect("Codex cognition observed foreign user input")
         if method == "turn/completed":
             # The native completion frame travels first; the owned terminal is last.
             return (
@@ -1876,9 +1768,7 @@ class CodexSdkAdapter:
             backend=self.backend,
             transport=self.transport,
             profile_key=request.auth.profile_key,
-            state_root_fingerprint=fingerprint_path(
-                state_root_from_environment("codex", environment)
-            ),
+            state_root_fingerprint=fingerprint_path(self._endpoint(environment)),
             cwd=request.cwd,
             cwd_scopes_sessions=self.cwd_scopes_sessions,
         )
@@ -1915,98 +1805,26 @@ class CodexSdkAdapter:
         )
 
     @staticmethod
-    def _load_sdk() -> ModuleType:
-        try:
-            return importlib.import_module("openai_codex")
-        except ModuleNotFoundError as error:
-            if error.name == "openai_codex":
-                raise SdkUnavailable(
-                    "Codex SDK is not installed; install the 'codex-sdk' extra"
-                ) from error
-            raise
-
-    @staticmethod
-    def _load_runtime_package() -> ModuleType:
-        try:
-            return importlib.import_module("codex_cli_bin")
-        except ModuleNotFoundError as error:
-            if error.name == "codex_cli_bin":
-                raise SdkUnavailable(
-                    "Codex bundled runtime is not installed; install the 'codex-sdk' extra"
-                ) from error
-            raise
-
-    @staticmethod
-    def _runtime_version(runtime: ModuleType) -> str:
-        for name in ("bundled_codex_path", "bundled_path_dir"):
-            if not callable(getattr(runtime, name, None)):
-                raise SdkUnavailable(f"Codex bundled runtime is missing public {name}")
-        version = getattr(runtime, "__version__", None)
-        if version is None:
-            package_name = getattr(runtime, "PACKAGE_NAME", None)
-            if not isinstance(package_name, str) or not package_name:
-                raise SdkUnavailable("Codex bundled runtime does not report its package name")
-            try:
-                version = importlib.metadata.version(package_name)
-            except importlib.metadata.PackageNotFoundError as error:
-                raise SdkUnavailable("Codex bundled runtime does not report a version") from error
-        if not isinstance(version, str) or not version:
-            raise SdkUnavailable("Codex bundled runtime does not report a version")
-        return version
-
-    @staticmethod
-    def _sdk_version(sdk: ModuleType) -> str:
-        version = getattr(sdk, "__version__", None)
-        if not isinstance(version, str) or not version:
-            raise SdkUnavailable("Codex SDK does not report a version")
-        for name in (
-            "ApprovalMode",
-            "Sandbox",
-        ):
-            if not hasattr(sdk, name):
-                raise SdkUnavailable(f"Codex SDK is missing public {name}")
-        return version
-
-    @classmethod
-    def _executable_version(cls, client: Any) -> str:
-        metadata = cls._mapping(client.metadata, "Codex SDK initialize metadata")
-        server = metadata.get("serverInfo")
-        if server is not None:
-            server_payload = cls._mapping(server, "Codex SDK server metadata")
-            version = server_payload.get("version")
-            if not isinstance(version, str) or not version:
-                raise ProtocolDefect("Codex SDK server metadata had no version")
-            match = _RUNTIME_VERSION_PREFIX.match(version)
-        else:
-            user_agent = metadata.get("userAgent")
-            if not isinstance(user_agent, str) or not user_agent:
-                raise ProtocolDefect("Codex app-server initialize response had no user agent")
-            match = _APP_SERVER_USER_AGENT.match(user_agent)
-        if match is None:
-            raise ProtocolDefect("Codex app-server reported an invalid executable version")
-        return match.group("version")
-
-    @staticmethod
     def _require_local_auth(kind: str) -> None:
         if kind != "local_account":
             raise UnsupportedCapability("Codex SDK agent sessions require local ChatGPT auth")
 
     @staticmethod
-    def _approval_mode(sdk: ModuleType, policy: PermissionPolicy) -> object:
+    def _approval_mode(policy: PermissionPolicy) -> str:
         if policy.approval == "deny":
-            return sdk.ApprovalMode.deny_all
+            return "deny_all"
         if policy.approval == "provider_review":
-            return sdk.ApprovalMode.auto_review
+            return "auto_review"
         raise UnsupportedCapability(
             "Codex SDK supports deny or provider_review approvals, not caller ask/allow"
         )
 
     @staticmethod
-    def _sandbox(sdk: ModuleType, policy: PermissionPolicy) -> object:
+    def _sandbox(policy: PermissionPolicy) -> str:
         return {
-            "read_only": sdk.Sandbox.read_only,
-            "workspace_write": sdk.Sandbox.workspace_write,
-            "full_access": sdk.Sandbox.full_access,
+            "read_only": "read-only",
+            "workspace_write": "workspace-write",
+            "full_access": "danger-full-access",
         }[policy.filesystem]
 
     @staticmethod
@@ -2018,10 +1836,8 @@ class CodexSdkAdapter:
                 "Codex full_access cannot preserve restricted network policy"
             )
         if policy.filesystem == "read_only" and policy.network != "disabled":
-            # `thread_start` selects the sandbox by mode name and carries the rest in `config`
-            # (0.144.4 api.py:372-384), and that config's only network toggle is
-            # `sandbox_workspace_write.network_access` (generated/v2_all.py:7877-7878, 3511-3518).
-            # There is no read-only counterpart section, so a read-only sandbox stays offline.
+            # The typed network toggle belongs to sandbox_workspace_write; no
+            # corresponding read-only toggle can preserve this request's policy.
             raise UnsupportedCapability(
                 "Codex read_only sandbox has no network toggle; use workspace_write"
             )
@@ -2118,18 +1934,8 @@ class CodexSdkAdapter:
                         "command": server.command,
                         "args": list(server.args),
                     }
-                    if server.environment_refs:
-                        entry["env_vars"] = [
-                            reference.name for reference in server.environment_refs
-                        ]
                 else:
                     entry = {"url": server.url}
-                    headers = {
-                        reference.name: mcp_header_environment_name("codex", reference.source)
-                        for reference in server.header_refs
-                    }
-                    if headers:
-                        entry["env_http_headers"] = headers
                 entry["required"] = server.required
                 if server.allowed_tools:
                     entry["enabled_tools"] = list(server.allowed_tools)
@@ -2137,19 +1943,6 @@ class CodexSdkAdapter:
                     entry["disabled_tools"] = list(server.denied_tools)
                 servers[server.name] = entry
             config["mcp_servers"] = servers
-            excluded = sorted(
-                {
-                    reference.name
-                    for server in request.mcp_servers
-                    for reference in server.environment_refs
-                }
-                | {
-                    mcp_header_environment_name("codex", reference.source)
-                    for server in request.mcp_servers
-                    for reference in server.header_refs
-                }
-            )
-            config["shell_environment_policy"] = {"inherit": "core", "exclude": excluded}
         return config
 
     @staticmethod
@@ -2184,7 +1977,7 @@ class CodexSdkAdapter:
 
     @staticmethod
     def _selected_final_text(state: _CodexSessionState, *, required: bool) -> str:
-        """Match SDK 0.144.4: last final answer, else last unknown-phase message."""
+        """Select the last final answer, else the last unknown-phase message."""
         last_unknown: _CompletedAgentMessage | None = None
         for message in reversed(state.completed_agent_messages):
             if message.phase == "final_answer":

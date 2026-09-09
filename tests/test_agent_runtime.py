@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import AsyncGenerator, Mapping
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from provider_runtime.agent_runtime.errors import (
     InvalidAgentRequest,
     McpConfigurationError,
     ProtocolDefect,
+    SdkUnavailable,
     SessionMismatch,
     SessionUnavailable,
     TurnNotStarted,
@@ -75,7 +77,7 @@ def usage() -> TokenUsage:
 
 
 def session_ref(
-    backend: Backend = "codex",
+    backend: Backend = "claude",
     transport: AgentTransport = "sdk",
     profile: str = "personal",
     *,
@@ -96,7 +98,7 @@ def session_ref(
 def request(
     tmp_path: Path,
     *,
-    backend: Backend = "codex",
+    backend: Backend = "claude",
     transport: AgentTransport = "sdk",
 ) -> AgentSessionRequest:
     return AgentSessionRequest(
@@ -143,7 +145,7 @@ class ScriptedAdapter:
     def __init__(
         self,
         *,
-        backend: Backend = "codex",
+        backend: Backend = "claude",
         transport: AgentTransport = "sdk",
         lazy_ref: bool = False,
         incomplete_ref: bool = False,
@@ -237,7 +239,9 @@ class ScriptedAdapter:
         self.last_environment = dict(environment)
         if self.fail_open:
             raise ExecutableUnavailable("scripted selected adapter is unavailable")
-        state_root_name = "CODEX_HOME" if self.backend == "codex" else "CLAUDE_CONFIG_DIR"
+        state_root_name = (
+            "CODEX_APP_SERVER_SOCKET" if self.backend == "codex" else "CLAUDE_CONFIG_DIR"
+        )
         ref = session_ref(
             self.backend,
             self.transport,
@@ -353,7 +357,11 @@ def runtime_for(
     tmp_path: Path, *adapters: ScriptedAdapter, max_turn_seconds: float = 5.0
 ) -> AgentRuntime:
     return AgentRuntime(
-        AgentRuntimeConfig(state_root_base=tmp_path, max_turn_seconds=max_turn_seconds),
+        AgentRuntimeConfig(
+            state_root_base=tmp_path,
+            codex_endpoints={"personal": tmp_path / "codex.sock"},
+            max_turn_seconds=max_turn_seconds,
+        ),
         adapters=adapters,
     )
 
@@ -515,7 +523,7 @@ async def test_selected_adapter_failure_never_invokes_another_transport(tmp_path
 async def test_ask_without_handler_is_rejected_before_adapter_stream(tmp_path: Path) -> None:
     adapter = ScriptedAdapter()
     ask_request = AgentSessionRequest(
-        backend="codex",
+        backend="claude",
         transport="sdk",
         auth=CredentialRef(kind="local_account", profile_key="personal"),
         open=NewSession(),
@@ -547,7 +555,7 @@ async def test_turn_policy_patch_may_only_narrow(tmp_path: Path) -> None:
 async def test_approval_handler_exception_becomes_typed_failure(tmp_path: Path) -> None:
     adapter = ScriptedAdapter(request_approval=True)
     ask_request = AgentSessionRequest(
-        backend="codex",
+        backend="claude",
         transport="sdk",
         auth=CredentialRef(kind="local_account", profile_key="personal"),
         open=NewSession(),
@@ -580,7 +588,7 @@ async def test_approval_handler_exception_becomes_typed_failure(tmp_path: Path) 
 async def test_missing_cwd_is_rejected_before_adapter_open(tmp_path: Path) -> None:
     adapter = ScriptedAdapter()
     missing = AgentSessionRequest(
-        backend="codex",
+        backend="claude",
         transport="sdk",
         auth=CredentialRef(kind="local_account", profile_key="personal"),
         open=NewSession(),
@@ -721,12 +729,12 @@ async def test_profile_state_root_is_created_private(tmp_path: Path) -> None:
     async with runtime_for(tmp_path, adapter) as runtime:
         await runtime.open_session(request(tmp_path))
 
-    state_root = tmp_path / "codex" / "personal"
+    state_root = tmp_path / "claude" / "personal"
     assert state_root.is_dir()
     assert (state_root.stat().st_mode & 0o777) == 0o700
-    assert ((tmp_path / "codex").stat().st_mode & 0o777) == 0o700
+    assert ((tmp_path / "claude").stat().st_mode & 0o777) == 0o700
     assert ((state_root / "home").stat().st_mode & 0o777) == 0o700
-    assert adapter.last_environment["CODEX_HOME"] == str(state_root.resolve())
+    assert adapter.last_environment["CLAUDE_CONFIG_DIR"] == str(state_root.resolve())
 
 
 async def test_adapter_session_ref_mismatch_is_a_defect(tmp_path: Path) -> None:
@@ -763,7 +771,7 @@ async def test_auth_validation_precedes_environment_and_adapter_effects(tmp_path
 
     assert adapter.auth_calls == 1
     assert adapter.open_calls == 0
-    assert not (tmp_path / "codex").exists(), (
+    assert not (tmp_path / "claude").exists(), (
         "a rejected credential must not create profile state on disk"
     )
 
@@ -787,15 +795,15 @@ async def test_list_sessions_builds_the_scrubbed_child_environment(tmp_path: Pat
     async with runtime_for(tmp_path, adapter) as runtime:
         page = await runtime.list_sessions(
             SessionQuery(
-                backend="codex",
+                backend="claude",
                 transport="sdk",
                 auth=CredentialRef(kind="local_account", profile_key="personal"),
             )
         )
 
     assert page == SessionPage(sessions=())
-    assert adapter.last_environment["CODEX_HOME"].endswith("codex/personal")
-    assert "OPENAI_API_KEY" not in adapter.last_environment
+    assert adapter.last_environment["CLAUDE_CONFIG_DIR"].endswith("claude/personal")
+    assert "ANTHROPIC_API_KEY" not in adapter.last_environment
 
 
 async def test_mcp_references_are_materialized_only_at_safe_child_aliases(
@@ -818,7 +826,7 @@ async def test_mcp_references_are_materialized_only_at_safe_child_aliases(
         header_refs=(HeaderReference(name="Authorization", source=source),),
     )
     mcp_request = AgentSessionRequest(
-        backend="codex",
+        backend="claude",
         transport="sdk",
         auth=CredentialRef(kind="local_account", profile_key="personal"),
         open=NewSession(),
@@ -859,10 +867,10 @@ async def test_mcp_rejects_primary_credential_destination_before_resolution(
         name="tool",
         transport="stdio",
         command="python3",
-        environment_refs=(EnvironmentReference(name="OPENAI_API_KEY", source=source),),
+        environment_refs=(EnvironmentReference(name="ANTHROPIC_API_KEY", source=source),),
     )
     bad_request = AgentSessionRequest(
-        backend="codex",
+        backend="claude",
         transport="sdk",
         auth=CredentialRef(kind="local_account", profile_key="personal"),
         open=NewSession(),
@@ -878,7 +886,7 @@ async def test_mcp_rejects_primary_credential_destination_before_resolution(
     assert adapter.open_calls == 0
 
 
-@pytest.mark.parametrize("destination", ["CODEX_HOME", "PATH", "LD_PRELOAD", "HOME"])
+@pytest.mark.parametrize("destination", ["CLAUDE_CONFIG_DIR", "PATH", "LD_PRELOAD", "HOME"])
 async def test_mcp_rejects_state_root_and_process_control_destinations(
     tmp_path: Path, destination: str
 ) -> None:
@@ -891,7 +899,7 @@ async def test_mcp_rejects_state_root_and_process_control_destinations(
         environment_refs=(EnvironmentReference(name=destination, source=source),),
     )
     bad_request = AgentSessionRequest(
-        backend="codex",
+        backend="claude",
         transport="sdk",
         auth=CredentialRef(kind="local_account", profile_key="personal"),
         open=NewSession(),
@@ -929,7 +937,7 @@ async def test_mcp_rejects_cross_server_destination_collision(tmp_path: Path) ->
         ),
     )
     bad_request = AgentSessionRequest(
-        backend="codex",
+        backend="claude",
         transport="sdk",
         auth=CredentialRef(kind="local_account", profile_key="personal"),
         open=NewSession(),
@@ -946,7 +954,7 @@ async def test_stdio_mcp_requires_the_unsafe_policy_pair(tmp_path: Path) -> None
     adapter = ScriptedAdapter()
     spec = McpServerSpec(name="tool", transport="stdio", command="python3")
     confined_request = AgentSessionRequest(
-        backend="codex",
+        backend="claude",
         transport="sdk",
         auth=CredentialRef(kind="local_account", profile_key="personal"),
         open=NewSession(),
@@ -971,7 +979,7 @@ async def test_missing_secret_resolver_is_typed_before_adapter_effect(tmp_path: 
         header_refs=(HeaderReference(name="Authorization", source=source),),
     )
     mcp_request = AgentSessionRequest(
-        backend="codex",
+        backend="claude",
         transport="sdk",
         auth=CredentialRef(kind="local_account", profile_key="personal"),
         open=NewSession(),
@@ -1006,7 +1014,7 @@ async def test_secret_resolver_exception_is_mapped_without_leaking_detail(tmp_pa
         header_refs=(HeaderReference(name="Authorization", source=source),),
     )
     mcp_request = AgentSessionRequest(
-        backend="codex",
+        backend="claude",
         transport="sdk",
         auth=CredentialRef(kind="local_account", profile_key="personal"),
         open=NewSession(),
@@ -1037,4 +1045,18 @@ async def test_a_state_root_base_reached_through_a_symlink_is_usable(tmp_path: P
         result = await runtime.run_turn(session, turn())
 
     assert result.status == "succeeded"
-    assert (real / "codex" / "personal").is_dir()
+    assert (real / "claude" / "personal").is_dir()
+
+
+async def test_absent_codex_transport_extra_is_sdk_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(sys.modules, "websockets.asyncio.client", None)
+    async with AgentRuntime(
+        AgentRuntimeConfig(tmp_path, {"lab": tmp_path / "absent.sock"})
+    ) as runtime:
+        with pytest.raises(SdkUnavailable, match="codex-sdk"):
+            await runtime.list_sessions(
+                SessionQuery("codex", "sdk", CredentialRef("local_account", "lab"))
+            )
+    assert tuple(tmp_path.iterdir()) == ()

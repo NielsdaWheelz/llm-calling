@@ -135,18 +135,16 @@ _PROCESS_CONTROL_NAMES = frozenset(
 )
 _PROCESS_CONTROL_PREFIXES = ("DYLD_", "LC_", "LD_", "PYTHON")
 _STATE_ROOT_ENVIRONMENT: dict[Backend, str] = {
-    "codex": "CODEX_HOME",
     "claude": "CLAUDE_CONFIG_DIR",
 }
 # The child's HOME is a runtime-owned directory *inside* the profile state root, never the
-# state root itself: both agents treat their state root as a config directory they own and
-# rewrite, so pointing HOME at it would let unrelated tooling write into provider config.
+# state root itself: Claude treats it as a config directory it owns and rewrites,
+# so pointing HOME at it would let unrelated tooling write into provider config.
 _CHILD_HOME_DIRECTORY = "home"
 # A vetted absolute PATH, not `os.environ["PATH"]`: inheriting the operator's PATH would hand
 # the sandboxed child every shim, version manager, and project-local `node_modules/.bin` on it.
-# It must also be present rather than merely safe: with PATH unset a child `bash` falls back to
-# its compiled-in default and Codex's `shell_environment_policy.inherit = "core"` has no PATH to
-# inherit at all.
+# It must also be present rather than merely safe: with PATH unset a child `bash`
+# falls back to its compiled-in default.
 _CHILD_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # One deterministic UTF-8 locale so native output the adapters parse never changes shape with
 # the operator's locale, and the system temporary directory both sandboxes already allow.
