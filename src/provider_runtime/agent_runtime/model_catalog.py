@@ -1,4 +1,4 @@
-"""Authenticated Codex model discovery through the SDK's generic async RPC."""
+"""Authenticated Codex model discovery through the owned App Server transport."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import hashlib
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal, Protocol
+from typing import Literal, Protocol
 
 from provider_runtime.types import (
     Absent,
@@ -94,8 +94,6 @@ class GenericAsyncRpc(Protocol):
         self,
         method: str,
         params: Mapping[str, object],
-        *,
-        response_model: type[Any],
     ) -> Awaitable[object]: ...
 
 
@@ -114,7 +112,6 @@ class _ObservedModel:
 
 async def read_codex_model_catalog(
     client: GenericAsyncRpc,
-    response_model: type[Any],
     *,
     now: Callable[[], datetime] | None = None,
 ) -> AgentModelCatalog:
@@ -127,7 +124,6 @@ async def read_codex_model_catalog(
         response = await client.request(
             "model/list",
             {"includeHidden": False, "cursor": cursor},
-            response_model=response_model,
         )
         payload = _object_mapping(response, "Codex model/list response")
         data = payload.get("data")

@@ -1,0 +1,332 @@
+{
+  "response_success": {
+    "id": 1,
+    "result": {
+      "thread": {
+        "id": "thread-synthetic"
+      }
+    }
+  },
+  "response_error": {
+    "id": 2,
+    "error": {
+      "code": -32602,
+      "message": "synthetic invalid params"
+    }
+  },
+  "notification": {
+    "method": "turn/started",
+    "params": {
+      "threadId": "thread-synthetic",
+      "turn": {
+        "id": "turn-synthetic",
+        "items": [],
+        "status": "inProgress"
+      }
+    }
+  },
+  "command_approval": {
+    "id": "approval-command",
+    "method": "item/commandExecution/requestApproval",
+    "params": {
+      "itemId": "command-synthetic",
+      "startedAtMs": 1,
+      "threadId": "thread-synthetic",
+      "turnId": "turn-synthetic"
+    }
+  },
+  "file_approval": {
+    "id": "approval-file",
+    "method": "item/fileChange/requestApproval",
+    "params": {
+      "itemId": "patch-synthetic",
+      "startedAtMs": 2,
+      "threadId": "thread-synthetic",
+      "turnId": "turn-synthetic"
+    }
+  },
+  "permission_approval": {
+    "id": "approval-permissions",
+    "method": "item/permissions/requestApproval",
+    "params": {
+      "cwd": "/private/synthetic",
+      "itemId": "permission-synthetic",
+      "permissions": {
+        "network": {
+          "enabled": true
+        }
+      },
+      "startedAtMs": 3,
+      "threadId": "thread-synthetic",
+      "turnId": "turn-synthetic"
+    }
+  },
+  "legacy_command_approval": {
+    "id": "approval-legacy-command",
+    "method": "execCommandApproval",
+    "params": {
+      "callId": "legacy-command-synthetic",
+      "conversationId": "thread-synthetic",
+      "command": ["synthetic-command"]
+    }
+  },
+  "legacy_file_approval": {
+    "id": "approval-legacy-file",
+    "method": "applyPatchApproval",
+    "params": {
+      "callId": "legacy-file-synthetic",
+      "conversationId": "thread-synthetic",
+      "fileChanges": {}
+    }
+  },
+  "dynamic_tool_request": {
+    "id": "dynamic-request",
+    "method": "item/tool/call",
+    "params": {
+      "arguments": {
+        "synthetic": true
+      },
+      "callId": "dynamic-synthetic",
+      "threadId": "thread-synthetic",
+      "tool": "synthetic_tool",
+      "turnId": "turn-synthetic"
+    }
+  },
+  "user_input_request": {
+    "id": "input-request",
+    "method": "item/tool/requestUserInput",
+    "params": {
+      "itemId": "input-synthetic",
+      "questions": [],
+      "threadId": "thread-synthetic",
+      "turnId": "turn-synthetic"
+    }
+  },
+  "mcp_elicitation_request": {
+    "id": "mcp-request",
+    "method": "mcpServer/elicitation/request",
+    "params": {
+      "serverName": "synthetic-server",
+      "threadId": "thread-synthetic",
+      "turnId": "turn-synthetic"
+    }
+  },
+  "auth_refresh_request": {
+    "id": "auth-refresh-request",
+    "method": "account/chatgptAuthTokens/refresh",
+    "params": {
+      "previousAccountId": null,
+      "reason": "unauthorized"
+    }
+  },
+  "attestation_request": {
+    "id": "attestation-request",
+    "method": "attestation/generate",
+    "params": {}
+  },
+  "current_time_request": {
+    "id": "current-time-request",
+    "method": "currentTime/read",
+    "params": {
+      "threadId": "thread-synthetic"
+    }
+  },
+  "unknown_request": {
+    "id": "future-request",
+    "method": "item/futureAuthority/request",
+    "params": {
+      "threadId": "thread-synthetic",
+      "turnId": "turn-synthetic"
+    }
+  },
+  "custom_exec_lifecycle": [
+    {
+      "method": "item/started",
+      "params": {
+        "item": {
+          "call_id": "custom-call-synthetic",
+          "id": "custom-item-synthetic",
+          "input": "synthetic input",
+          "name": "exec",
+          "status": "in_progress",
+          "type": "custom_tool_call"
+        },
+        "threadId": "thread-synthetic",
+        "turnId": "turn-synthetic"
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "item": {
+          "call_id": "custom-call-synthetic",
+          "id": "custom-item-synthetic",
+          "input": "synthetic input",
+          "name": "exec",
+          "status": "completed",
+          "type": "custom_tool_call"
+        },
+        "threadId": "thread-synthetic",
+        "turnId": "turn-synthetic"
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "item": {
+          "call_id": "custom-call-synthetic",
+          "output": [
+            {
+              "text": "synthetic output",
+              "type": "output_text"
+            }
+          ],
+          "type": "custom_tool_call_output"
+        },
+        "threadId": "thread-synthetic",
+        "turnId": "turn-synthetic"
+      }
+    }
+  ],
+  "unknown_item_started": {
+    "method": "item/started",
+    "params": {
+      "item": {
+        "id": "future-item",
+        "type": "futureAuthority"
+      },
+      "threadId": "thread-synthetic",
+      "turnId": "turn-synthetic"
+    }
+  },
+  "unknown_item_completed": {
+    "method": "item/completed",
+    "params": {
+      "item": {
+        "id": "future-item",
+        "type": "futureAuthority"
+      },
+      "threadId": "thread-synthetic",
+      "turnId": "turn-synthetic"
+    }
+  },
+  "inert_thread_goal_cleared": {
+    "method": "thread/goal/cleared",
+    "params": {
+      "threadId": "thread-synthetic"
+    }
+  },
+  "protocol_classification": {
+    "inert_item_types": [
+      "agentMessage",
+      "contextCompaction",
+      "enteredReviewMode",
+      "exitedReviewMode",
+      "plan",
+      "reasoning",
+      "userMessage"
+    ],
+    "authority_item_types": [
+      "collabAgentToolCall",
+      "commandExecution",
+      "custom_tool_call",
+      "custom_tool_call_output",
+      "dynamicToolCall",
+      "fileChange",
+      "functionCallOutput",
+      "hookPrompt",
+      "imageGeneration",
+      "imageView",
+      "mcpToolCall",
+      "sleep",
+      "subAgentActivity",
+      "webSearch"
+    ],
+    "inert_notification_methods": [
+      "account/rateLimits/updated",
+      "deprecationNotice",
+      "mcpServer/startupStatus/updated",
+      "model/rerouted",
+      "model/safetyBuffering/updated",
+      "model/verification",
+      "remoteControl/status/changed",
+      "serverRequest/resolved",
+      "thread/compacted",
+      "thread/goal/cleared",
+      "thread/goal/updated",
+      "thread/name/updated",
+      "thread/status/changed",
+      "turn/moderationMetadata",
+      "turn/plan/updated",
+      "turn/started",
+      "item/plan/delta",
+      "item/reasoning/summaryPartAdded",
+      "item/reasoning/summaryTextDelta",
+      "item/reasoning/textDelta"
+    ],
+    "forbidden_session_notifications": [
+      "thread/archived",
+      "thread/closed",
+      "thread/deleted",
+      "thread/unarchived"
+    ],
+    "denied_server_requests": [
+      "applyPatchApproval",
+      "execCommandApproval",
+      "item/commandExecution/requestApproval",
+      "item/fileChange/requestApproval",
+      "item/permissions/requestApproval",
+      "item/tool/call",
+      "item/tool/requestUserInput",
+      "mcpServer/elicitation/request"
+    ],
+    "forbidden_server_requests": [
+      "account/chatgptAuthTokens/refresh",
+      "attestation/generate",
+      "currentTime/read"
+    ]
+  },
+  "retained_incident_shape": {
+    "source_record_indices": [
+      15,
+      16
+    ],
+    "items": [
+      {
+        "type": "custom_tool_call",
+        "keys": [
+          "call_id",
+          "id",
+          "input",
+          "internal_chat_message_metadata_passthrough",
+          "name",
+          "status",
+          "type"
+        ],
+        "call_id_json_sha256": "0758e3651039d9c2cebb300b3c2b3755bd51abc736bcfa977372321dc8b4b234",
+        "id_json_sha256": "a1c0e53bac39ea8af2da84891d71cc43b22792848bdcb16372e832d519260790",
+        "input_json_bytes": 224,
+        "input_sha256": "6b26bd6308d88304c900d255b667034ce15fc18d26c533cb4821711104d715cb",
+        "name_json_sha256": "37c9a5bba64484ff1971b80862a96916501e4624e59e717e16e7686f6f41be73",
+        "status_json_sha256": "7093fda846e50b267da144f7b3683ee1dd8838506939f6052b7370dd01fa2ad0"
+      },
+      {
+        "type": "custom_tool_call_output",
+        "keys": [
+          "call_id",
+          "internal_chat_message_metadata_passthrough",
+          "output",
+          "type"
+        ],
+        "call_id_json_sha256": "0758e3651039d9c2cebb300b3c2b3755bd51abc736bcfa977372321dc8b4b234",
+        "output_element_kinds": [
+          "object",
+          "object"
+        ],
+        "output_json_bytes": 209,
+        "output_length": 2,
+        "output_sha256": "ae116f52d490d0a88894a27878bc9e9ad0fad95ee969b39577d7e8b1a6a7ad22"
+      }
+    ]
+  }
+}

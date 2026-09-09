@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Any
 
 import pytest
 
@@ -21,23 +20,17 @@ from provider_runtime.registry import api_model_catalog
 from provider_runtime.types import Absent, Present
 
 
-class _ResponseModel:
-    """Identity token proving the reader uses the generated response model argument."""
-
-
 class _GenericClient:
     def __init__(self, pages: list[Mapping[str, object]]) -> None:
         self.pages = list(pages)
-        self.calls: list[tuple[str, Mapping[str, object], type[Any]]] = []
+        self.calls: list[tuple[str, Mapping[str, object]]] = []
 
     async def request(
         self,
         method: str,
         params: Mapping[str, object],
-        *,
-        response_model: type[Any],
     ) -> object:
-        self.calls.append((method, dict(params), response_model))
+        self.calls.append((method, dict(params)))
         if not self.pages:
             raise AssertionError("model reader requested an unscripted page")
         return self.pages.pop(0)
@@ -90,7 +83,6 @@ async def test_codex_catalog_reads_every_page_and_normalizes_only_public_facts()
 
     catalog = await read_codex_model_catalog(
         client,
-        _ResponseModel,
         now=lambda: datetime(2026, 8, 31, 12, tzinfo=UTC),
     )
 
@@ -98,12 +90,10 @@ async def test_codex_catalog_reads_every_page_and_normalizes_only_public_facts()
         (
             "model/list",
             {"includeHidden": False, "cursor": None},
-            _ResponseModel,
         ),
         (
             "model/list",
             {"includeHidden": False, "cursor": "page-2"},
-            _ResponseModel,
         ),
     ]
     assert catalog.backend_contract_revision == AGENT_BACKEND_CONTRACT_REVISION
@@ -121,17 +111,14 @@ async def test_codex_catalog_reads_every_page_and_normalizes_only_public_facts()
 async def test_codex_definition_hash_excludes_observation_provenance() -> None:
     first = await read_codex_model_catalog(
         _GenericClient([{"data": [_row("one", "one-wire")], "revision": "native-a"}]),
-        _ResponseModel,
         now=lambda: datetime(2026, 8, 30, tzinfo=UTC),
     )
     second = await read_codex_model_catalog(
         _GenericClient([{"data": [_row("one", "one-wire")], "revision": "native-b"}]),
-        _ResponseModel,
         now=lambda: datetime(2026, 8, 31, tzinfo=UTC),
     )
     changed = await read_codex_model_catalog(
         _GenericClient([{"data": [_row("one", "changed-wire")]}]),
-        _ResponseModel,
     )
 
     assert first.definition_revision == second.definition_revision
@@ -177,7 +164,7 @@ async def test_codex_catalog_rejects_repeated_or_incomplete_source_facts(
     pages: list[Mapping[str, object]], message: str
 ) -> None:
     with pytest.raises(ProtocolDefect, match=message):
-        await read_codex_model_catalog(_GenericClient(pages), _ResponseModel)
+        await read_codex_model_catalog(_GenericClient(pages))
 
 
 async def test_codex_catalog_refuses_more_than_64_pages_without_truncation() -> None:
@@ -188,14 +175,13 @@ async def test_codex_catalog_refuses_more_than_64_pages_without_truncation() -> 
     client = _GenericClient(pages)
 
     with pytest.raises(ProtocolDefect, match="exceeded 64 pages"):
-        await read_codex_model_catalog(client, _ResponseModel)
+        await read_codex_model_catalog(client)
     assert len(client.calls) == 64
 
 
 async def test_codex_upgrade_diagnostics_are_typed_and_never_guess() -> None:
     unresolved = await read_codex_model_catalog(
         _GenericClient([{"data": [_row("one", "one-wire", upgrade="missing")]}]),
-        _ResponseModel,
     )
     assert unresolved.models[0].upgrade == Absent()
     assert unresolved.diagnostics == (
@@ -214,7 +200,6 @@ async def test_codex_upgrade_diagnostics_are_typed_and_never_guess() -> None:
                 }
             ]
         ),
-        _ResponseModel,
     )
     assert ambiguous.models[0].upgrade == Absent()
     assert ambiguous.diagnostics == (
