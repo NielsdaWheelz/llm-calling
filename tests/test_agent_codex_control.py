@@ -715,3 +715,18 @@ async def test_unconfigured_codex_profile_never_enrolls_a_private_home(tmp_path:
     finally:
         await runtime.close()
         assert tuple(tmp_path.iterdir()) == (), "Codex attachment must not enroll a private home"
+
+
+async def test_create_delegates_cwd_existence_to_the_external_server(
+    tmp_path: Path, peer: ProtocolPeer
+) -> None:
+    server_cwd = tmp_path / "exists-only-in-server-filesystem"
+    assert not server_cwd.exists()
+    async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"lab": peer.socket})) as runtime:
+        target = await runtime.codex.create(CodexCreateRequest("lab", server_cwd))
+        assert target == CodexThreadTarget("lab", THREAD)
+    created = [message for message in peer.messages if message.get("method") == "thread/start"]
+    assert len(created) == 1
+    params = created[0]["params"]
+    assert isinstance(params, dict) and params["cwd"] == str(server_cwd)
+    assert any(message.get("method") == "thread/unsubscribe" for message in peer.messages)

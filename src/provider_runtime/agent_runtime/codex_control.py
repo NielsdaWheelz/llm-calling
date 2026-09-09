@@ -265,19 +265,15 @@ class CodexControl:
             return await self._read(client, target)
 
     async def create(self, request: CodexCreateRequest) -> CodexThreadTarget:
-        try:
-            cwd = request.cwd.resolve(strict=True)
-        except OSError:
-            raise CodexControlError("invalid", "NotSent") from None
-        if cwd != request.cwd or not cwd.is_dir():
-            raise CodexControlError("invalid", "NotSent")
+        # The external server may have a different filesystem view or UID.
+        # CodexCreateRequest validates syntax; the server owns existence checks.
         async with self._client(request.profile_key) as client:
             result = _object(
                 await self._request(
                     client,
                     "thread/start",
                     {
-                        "cwd": str(cwd),
+                        "cwd": str(request.cwd),
                         "sandbox": "workspace-write",
                         "approvalPolicy": "on-request",
                         "approvalsReviewer": "user",
