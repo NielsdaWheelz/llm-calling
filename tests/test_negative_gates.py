@@ -99,26 +99,22 @@ def test_provider_sdk_imports_are_confined_to_engines_and_embeddings() -> None:
     assert not hits, f"provider SDK import outside engines/ (or embeddings.py):\n{_fmt(hits)}"
 
 
-# One allowlist per SDK name, never a shared one: a file audited for one vendor's SDK is
-# not thereby audited for another's. The scan matches the bare module name anywhere, not
-# just an import statement, because an audited adapter may resolve its SDK through
-# importlib.import_module("...") — a name in a string is a real dependency here.
-_AGENT_SDK_ALLOWLIST: dict[str, frozenset[Path]] = {
+# One allowlist per optional dependency, never a shared one. The scan matches the bare
+# module name anywhere, not just an import statement, because a name in a string can still
+# be a real lazy dependency.
+_AGENT_DEPENDENCY_ALLOWLIST: dict[str, frozenset[Path]] = {
     # The Claude Agent SDK is the pinned optional extra; only its adapter may name it.
     "claude_agent_sdk": frozenset({AGENT_RUNTIME / "claude_sdk.py"}),
-    # The pinned optional Codex SDK belongs only to its audited adapter.
-    "openai_codex": frozenset({AGENT_RUNTIME / "codex_sdk.py"}),
-    # The SDK's public runtime package resolves the exact bundled executable used only by
-    # the Codex adapter's environment-replacing launcher.
-    "codex_cli_bin": frozenset({AGENT_RUNTIME / "codex_sdk.py"}),
+    # The shared Codex client imports its WebSocket transport lazily at the wire boundary.
+    "websockets": frozenset({AGENT_RUNTIME / "codex_app_server.py"}),
 }
 
 
-def test_agent_sdk_names_are_confined_to_their_audited_adapters() -> None:
+def test_agent_dependency_names_are_confined_to_their_audited_adapters() -> None:
     hits: list[Hit] = []
-    for module, allowed in _AGENT_SDK_ALLOWLIST.items():
+    for module, allowed in _AGENT_DEPENDENCY_ALLOWLIST.items():
         hits.extend(hit for hit in _scan(rf"\b{module}\b") if hit.path not in allowed)
-    assert not hits, f"agent SDK name outside its audited adapter:\n{_fmt(hits)}"
+    assert not hits, f"agent dependency outside its audited adapter:\n{_fmt(hits)}"
 
 
 # ---------------------------------------------------------------------------

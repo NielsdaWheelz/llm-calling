@@ -1048,14 +1048,14 @@ async def test_a_state_root_base_reached_through_a_symlink_is_usable(tmp_path: P
     assert (real / "claude" / "personal").is_dir()
 
 
-async def test_absent_codex_transport_extra_is_sdk_unavailable(
+async def test_absent_codex_transport_dependency_is_sdk_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setitem(sys.modules, "websockets.asyncio.client", None)
     async with AgentRuntime(
         AgentRuntimeConfig(tmp_path, {"lab": tmp_path / "absent.sock"})
     ) as runtime:
-        with pytest.raises(SdkUnavailable, match="codex-sdk"):
+        with pytest.raises(SdkUnavailable, match="websockets dependency"):
             await runtime.list_sessions(
                 SessionQuery("codex", "sdk", CredentialRef("local_account", "lab"))
             )

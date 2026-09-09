@@ -4,31 +4,16 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from provider_runtime.agent_runtime._claude_launcher import ensure_claude_launcher
-from provider_runtime.agent_runtime._codex_launcher import ensure_codex_launcher
 from provider_runtime.agent_runtime._private_files import publish_launcher
 from provider_runtime.agent_runtime.errors import ExecutableUnavailable
 
 
-def _routes(state_root: Path, executable: Path) -> dict[str, Callable[[str], Path]]:
-    return {
-        "Codex launcher": lambda interpreter: ensure_codex_launcher(
-            state_root, executable, ("KEEP",), interpreter=interpreter
-        ),
-        "Claude Code launcher": lambda interpreter: ensure_claude_launcher(
-            state_root, str(executable), interpreter=interpreter
-        ),
-    }
-
-
-@pytest.mark.parametrize("label", ("Codex launcher", "Claude Code launcher"))
-def test_both_launchers_answer_to_one_interpreter_preamble_rule(tmp_path: Path, label: str) -> None:
-    """An interpreter rule that held on one route and not the other would be a hazard."""
+def test_claude_launcher_rejects_an_invalid_interpreter_preamble(tmp_path: Path) -> None:
     backend_root = tmp_path / "backend"
     backend_root.mkdir(mode=0o700)
     state_root = backend_root / "personal"
@@ -36,9 +21,13 @@ def test_both_launchers_answer_to_one_interpreter_preamble_rule(tmp_path: Path, 
     executable = tmp_path / "runtime"
     executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     executable.chmod(0o700)
-    publish = _routes(state_root, executable)[label]
 
-    with pytest.raises(ExecutableUnavailable, match=f"no usable path to build a {label}"):
+    def publish(interpreter: str) -> Path:
+        return ensure_claude_launcher(state_root, str(executable), interpreter=interpreter)
+
+    with pytest.raises(
+        ExecutableUnavailable, match="no usable path to build a Claude Code launcher"
+    ):
         publish("/usr/bin/python3\nexec /bin/sh")
 
     published = publish("/" + "d" * 180 + "/python3")

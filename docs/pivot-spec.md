@@ -7,14 +7,13 @@ Provenance: council synthesis + request-changes review to be checked in under
 `docs/decisions/2026-08-09-pivot-council.md` in WP-0. Until then this document is a proposal,
 not an approval record.
 
-Maintenance addendum (2026-09-07): on the immutable maintenance line rooted at
-`2cfed97ee5b9b8eb11103b0575eb7f29de00a0bd`, the Codex production lane owns the
-documented App Server stdio JSON-RPC transport instead of delegating the opaque
-request loop to `AsyncCodex`. The public `(codex, sdk)` route and session-ref
-schema remain stable. The normative classification, compatibility impact, and
-trade-offs are recorded in
-`docs/decisions/2026-09-07-codex-app-server-containment.md`; that record
-supersedes the Codex-specific SDK-ownership statements below.
+Maintenance addendum (2026-09-09): the Codex production lane attaches to the
+host-owned Codex 0.153.4 App Server through WebSocket frames over a configured
+Unix socket. It never starts a private App Server or imports a Codex Python SDK.
+The public `(codex, sdk)` route and session-ref schema remain stable. The
+normative ownership, compatibility impact, and trade-offs are recorded in
+`docs/decisions/2026-09-09-shared-codex-app-server.md`; that record supersedes
+the Codex-specific process-ownership statements below.
 
 v1 → v2 changes: continuation state restored to the contract (blocking finding 1); OpenRouter
 routing/privacy pins preserved (2); §13 is a full migration contract (3); agent security
@@ -26,8 +25,10 @@ native lane moved to Responses API; accuracy corrections folded in throughout.
 
 One Python library, one standardized contract, calling seven providers — OpenAI, Anthropic,
 Gemini, Grok (xAI), DeepSeek, Kimi (Moonshot), OpenRouter — plus two subscription agent
-backends (Claude Code via `claude-agent-sdk`, Codex via `openai-codex`). Wire handling is
-**rented** from three SDK packages behind **four owned protocol adapters**; the contract,
+backends (Claude Code via `claude-agent-sdk`, Codex via its host-owned App
+Server). Provider wire handling is **rented** from three SDK packages behind
+**four owned protocol adapters**; Codex's documented client protocol is owned;
+the contract,
 error taxonomy, model registry, retry policy, security kernel, and observability are owned.
 
 This is a maintainability pivot, not a rescue: the current lane is green (1,083 deterministic
@@ -224,8 +225,8 @@ capability matrix — validation is behavioral (capability probe), not version-k
 - Events → 6 kinds: `AgentText, AgentToolUse, AgentUsage, AgentPermissionRequest, AgentNative(bounded, redacted), AgentTerminal`. Shares `TokenUsage`/`CallMeta` nouns.
 - Quota: pool exhaustion → `AgentQuotaExhausted` terminal. The lane never enables API-rate overflow and never forwards API-key credentials. Block-and-stop only.
 - Pinning: bounded constraints in `pyproject.toml` extras; exact pins in
-  lockfiles. The Codex disabled-builtins posture additionally requires exact
-  Python package, runtime package, and executable version 0.144.4 before a turn.
+  lockfiles. The Codex disabled-builtins posture additionally requires the
+  host-pinned App Server/TUI version 0.153.4 before a turn.
 - Size: deletions measured so far ≈ 860 lines (capabilities + policy algebra) plus taxonomy/test-double/version-gate reductions; target **≤ 8k** (from 9,902), recounted at WP-A merge. The v1 "~3k" claim was unsupported and is withdrawn.
 
 ## 11. Testing

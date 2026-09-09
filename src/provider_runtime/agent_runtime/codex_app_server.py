@@ -156,7 +156,7 @@ class CodexAppServerClient:
             from websockets.asyncio.client import unix_connect
             from websockets.exceptions import InvalidHandshake
         except ModuleNotFoundError:
-            raise SdkUnavailable("shared Codex requires the 'codex-sdk' extra") from None
+            raise SdkUnavailable("shared Codex requires the websockets dependency") from None
         if self._connection is not None or self._closed:
             raise ProtocolDefect("Codex app-server client was started more than once")
         try:

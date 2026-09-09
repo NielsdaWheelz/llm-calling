@@ -31,29 +31,16 @@ jobs:
           uv venv --python 3.12 /tmp/provider-runtime-base-wheel
           agent_runtime_wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
           uv pip install --python /tmp/provider-runtime-base-wheel/bin/python "$agent_runtime_wheel"
-          /tmp/provider-runtime-base-wheel/bin/python -c "import importlib.util; import provider_runtime.agent_runtime; assert importlib.util.find_spec('openai_codex') is None; assert importlib.util.find_spec('claude_agent_sdk') is None"
-      - name: Verify the Codex SDK extra from the wheel
-        run: |
-          uv venv --python 3.12 /tmp/provider-runtime-codex-sdk-wheel
-          agent_runtime_wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
-          uv pip install --python /tmp/provider-runtime-codex-sdk-wheel/bin/python "${agent_runtime_wheel}[codex-sdk]"
-          /tmp/provider-runtime-codex-sdk-wheel/bin/python -c "import openai_codex; import provider_runtime.agent_runtime"
+          /tmp/provider-runtime-base-wheel/bin/python -c "import importlib.util; import provider_runtime.agent_runtime; assert importlib.util.find_spec('websockets') is not None; assert importlib.util.find_spec('claude_agent_sdk') is None"
       - name: Verify the Claude SDK extra from the wheel
         run: |
           uv venv --python 3.12 /tmp/provider-runtime-claude-sdk-wheel
           agent_runtime_wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
           uv pip install --python /tmp/provider-runtime-claude-sdk-wheel/bin/python "${agent_runtime_wheel}[claude-sdk]"
           /tmp/provider-runtime-claude-sdk-wheel/bin/python -c "import claude_agent_sdk; import provider_runtime.agent_runtime"
-      - name: Verify the combined agent SDK extra from the wheel
-        run: |
-          uv venv --python 3.12 /tmp/provider-runtime-agent-sdks-wheel
-          agent_runtime_wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
-          uv pip install --python /tmp/provider-runtime-agent-sdks-wheel/bin/python "${agent_runtime_wheel}[agent-sdks]"
-          /tmp/provider-runtime-agent-sdks-wheel/bin/python -c "import openai_codex; import claude_agent_sdk; import provider_runtime.agent_runtime"
 
-  # Both official agent SDKs stay optional so the base provider-only wheel imports neither.
-  # With no raw CLI or protocol fallback, selecting either lane without its extra must fail as
-  # typed SdkUnavailable rather than leaking ImportError from an adapter.
+  # Claude stays optional. Selecting that lane without its SDK must fail as typed
+  # SdkUnavailable rather than leaking ImportError from the adapter.
   test-without-optional-sdk:
     runs-on: ubuntu-latest
     steps:
@@ -65,18 +52,16 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --locked --extra llm-tools
-      - name: Prove both agent SDK extras are absent
+      - name: Prove the Claude SDK extra is absent
         run: >-
           uv run python -c
           "import importlib.util;
-          assert importlib.util.find_spec('openai_codex') is None;
           assert importlib.util.find_spec('claude_agent_sdk') is None"
-      - name: Prove both SdkUnavailable paths really ran
+      - name: Prove the SdkUnavailable path really ran
         env:
           ABSENT_SDK_REPORT: ${{ runner.temp }}/absent-sdk-extra.xml
         run: |
           uv run pytest \
-            'tests/test_agent_codex_sdk.py::test_absent_sdk_extra_is_sdk_unavailable' \
             'tests/test_agent_claude_sdk.py::test_absent_sdk_extra_is_sdk_unavailable' \
             --junitxml="$ABSENT_SDK_REPORT"
           uv run python - <<'PY'
@@ -86,8 +71,8 @@ jobs:
 
           report = ElementTree.parse(os.environ["ABSENT_SDK_REPORT"]).getroot()
           cases = list(report.iter("testcase"))
-          if len(cases) != 2:
-              sys.exit(f"expected exactly two testcases, collected {len(cases)}")
+          if len(cases) != 1:
+              sys.exit(f"expected exactly one testcase, collected {len(cases)}")
           skipped = [case for case in cases if case.findall("skipped")]
           if skipped:
               sys.exit(
