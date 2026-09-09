@@ -14,8 +14,8 @@ The package ships two execution contracts:
   terminal `CallOutcome` (or one sequenced event stream), dispatched through a
   pinned registry row.
 - `provider_runtime.agent_runtime.AgentRuntime` controls one explicitly chosen
-  local agent session — Codex SDK or Claude Agent SDK — and exposes normalized
-  events plus one terminal result.
+  local agent session — owned Codex App Server transport or Claude Agent SDK —
+  and exposes normalized events plus one terminal result.
 
 Callers own prompts, credential resolution, durable history, budgets, and
 orchestration. There is no fallback between providers, models, backends, or
@@ -106,8 +106,9 @@ engines/       the four protocol adapters (Engine protocol; one attempt each)
 embeddings.py  OpenAI-only embedding port on the openai SDK
 testing.py     FakeEngine + ScriptedRuntime test doubles
 tool_adapter.py request-scoped llm-tools lowering and canonical name decode
-agent_runtime/ agent lane: authenticated model catalog, tagged session
-               requests, MCP projection, security kernel, SDK adapters
+agent_runtime/ agent lane: authenticated model catalog, tagged session requests,
+               MCP projection, security kernel, owned Codex App Server transport,
+               and the Claude SDK adapter
 ```
 
 | Engine | SDK | Serves |
@@ -164,9 +165,10 @@ itself never fetches.
 ## Agent lane
 
 Exactly two routes ship: `(codex, sdk)` and `(claude, sdk)`, on the pinned
-optional extras `openai-codex` and `claude-agent-sdk`. The official SDKs own
-their vendor protocols and native sessions; this package owns the
-authorization model — a retained security kernel with restrictive permission
+optional extras `openai-codex` and `claude-agent-sdk`. The Codex route retains
+the `sdk` name for reference compatibility but owns the documented App Server
+stdio JSON-RPC connection; Claude remains on its official SDK. This package
+owns the authorization model — a retained security kernel with restrictive permission
 defaults, narrowing-only policy changes, unsafe-action confirmation for
 model-initiated shell/filesystem/network/MCP actions, and bounded, recursively
 redacted native events. Sessions require an already-enrolled subscription
@@ -175,9 +177,13 @@ the turn with an `AgentQuotaExhausted` terminal — the lane never overflows
 onto API rates. `AgentTerminal.usage` is always local to that invocation and
 never replays cumulative native-session history. `AgentTerminal.final_text` is
 the provider-selected assistant response, not concatenated assistant traffic;
-Codex follows the pinned SDK's last-final-answer/last-unknown rule, while
+Codex follows the pinned App Server's last-final-answer/last-unknown rule, while
 commentary remains observable but is never executable structured output. Child
-environments are runtime-owned and scrubbed. The full
+environments are runtime-owned and scrubbed. Under
+`CodexNativeOptions(builtin_tools="disabled")`, every known native authority
+event is first-class and poisons the turn; unknown protocol messages fail closed.
+This contains/detects Code Mode but does not prove it absent before execution.
+The full
 living contract is [docs/agent-runtime.md](docs/agent-runtime.md).
 
 Codex selection is catalog-bound: query
@@ -225,7 +231,9 @@ The `LLM_RUNTIME_LIVE*` variables are read by the opt-in live matrices only,
 never by the package. A missing provider key skips that provider's rows with a
 recorded reason; the release run is unfiltered with all seven keys set. The
 agent lane has its own matrix (`tests/live/test_agent_matrix.py`) with the
-same opt-in flag and evidence conventions.
+same opt-in flag and evidence conventions. Its dedicated paid Terra containment
+probe is `tests/live/test_codex_containment.py` and requires an explicit private
+`LLM_RUNTIME_LIVE_CODEX_HOME`.
 
 The spec for the current architecture is
 [docs/pivot-spec.md](docs/pivot-spec.md); the engineering rules the code is
