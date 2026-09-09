@@ -919,6 +919,92 @@ async def test_open_session_points_the_sdk_at_the_owned_launcher(
     assert config.env["CODEX_HOME"].endswith("codex/personal")
 
 
+async def test_model_catalog_accepts_initialize_user_agent_without_server_info(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise the public low-level SDK shape emitted by Codex 0.144.4."""
+
+    class InitializeResponse:
+        def model_dump(self, *, mode: str, by_alias: bool, exclude_none: bool) -> dict[str, object]:
+            assert (mode, by_alias, exclude_none) == ("json", True, True)
+            return {
+                "userAgent": (
+                    "provider_runtime/0.144.4 (Ubuntu 24.4.0; x86_64) unknown "
+                    "(provider_runtime; 0.1.0)"
+                )
+            }
+
+    class ModelListResponse:
+        pass
+
+    clients: list[CatalogClient] = []
+
+    class CatalogClient:
+        def __init__(self, config: FakeConfig) -> None:
+            self.config = config
+            self.closed = False
+            clients.append(self)
+
+        async def start(self) -> None:
+            pass
+
+        async def initialize(self) -> InitializeResponse:
+            return InitializeResponse()
+
+        async def account_read(self) -> dict[str, object]:
+            return {"account": {"type": "chatgpt"}}
+
+        async def request(
+            self,
+            method: str,
+            params: Mapping[str, object],
+            *,
+            response_model: type[object],
+        ) -> dict[str, object]:
+            assert (method, params, response_model) == (
+                "model/list",
+                {"includeHidden": False, "cursor": None},
+                ModelListResponse,
+            )
+            return {
+                "data": [
+                    {
+                        "id": "gpt-test",
+                        "model": "gpt-test",
+                        "displayName": "GPT Test",
+                        "hidden": False,
+                        "inputModalities": ["text"],
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": "medium", "description": "Medium"}
+                        ],
+                        "defaultReasoningEffort": "medium",
+                    }
+                ],
+                "nextCursor": None,
+            }
+
+        async def close(self) -> None:
+            self.closed = True
+
+    sdk = fake_sdk()
+    install_codex_modules(monkeypatch, sdk, fake_runtime_package())
+    async_client = ModuleType("openai_codex.async_client")
+    async_client.AsyncCodexClient = CatalogClient  # type: ignore[attr-defined]
+    generated = ModuleType("openai_codex.generated.v2_all")
+    generated.ModelListResponse = ModelListResponse  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "openai_codex.async_client", async_client)
+    monkeypatch.setitem(sys.modules, "openai_codex.generated.v2_all", generated)
+    state_root = tmp_path / "codex-state"
+    state_root.mkdir(mode=0o700)
+
+    observed = await CodexSdkAdapter().model_catalog(
+        environment={"CODEX_HOME": str(state_root.resolve())}
+    )
+
+    assert tuple(row.key for row in observed.models) == ("gpt-test",)
+    assert clients and all(client.closed for client in clients)
+
+
 async def test_disabled_builtin_tools_emit_the_complete_certified_codex_policy(
     tmp_path: Path, installed_codex_sdk: ModuleType
 ) -> None:

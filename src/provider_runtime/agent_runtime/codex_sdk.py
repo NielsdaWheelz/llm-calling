@@ -1542,13 +1542,29 @@ class CodexSdkAdapter:
     @classmethod
     def _metadata_version(cls, value: object) -> str:
         metadata = cls._mapping(value, "Codex SDK initialize metadata")
-        server = cls._mapping(metadata.get("serverInfo"), "Codex SDK server metadata")
-        version = server.get("version")
-        if not isinstance(version, str) or not version:
-            raise ProtocolDefect("Codex SDK server metadata had no version")
+        server_value = metadata.get("serverInfo")
+        version: object = None
+        if server_value is not None:
+            server = cls._mapping(server_value, "Codex SDK server metadata")
+            version = server.get("version")
+            if isinstance(version, str):
+                version = version.strip() or None
+            elif version is not None:
+                raise ProtocolDefect("Codex SDK server metadata version was not a string")
+        if version is None:
+            # Model discovery needs the low-level client for its paginated generic RPC.
+            # Its public initialize model leaves optional serverInfo absent in 0.144.4,
+            # while the required userAgent carries the same executable version.
+            user_agent = metadata.get("userAgent")
+            if not isinstance(user_agent, str):
+                raise ProtocolDefect("Codex SDK initialize metadata had no runtime version")
+            client, separator, version = user_agent.strip().partition("/")
+            version = version.strip()
+            if not client.strip() or not separator or not version:
+                raise ProtocolDefect("Codex SDK initialize metadata had no runtime version")
         match = _RUNTIME_VERSION_PREFIX.match(version)
         if match is None:
-            raise ProtocolDefect("Codex SDK server metadata had an invalid version")
+            raise ProtocolDefect("Codex SDK initialize metadata had an invalid runtime version")
         return match.group("version")
 
     @staticmethod
