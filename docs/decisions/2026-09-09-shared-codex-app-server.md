@@ -30,6 +30,15 @@ outcome. Full native thread and turn handles are required. Process-local state
 is disposable and closing a client never closes a native thread or shared
 service.
 
+Read fetches turn metadata without items, then at most 50 newest items from
+that exact turn. Omitted pages or oversized items produce explicit `Bounded`
+coverage. When the pinned server reports item paging unsupported for a native
+history, return the known metadata with `Bounded` and no answer; never retry
+with full history or read private storage. Interrupt uses metadata only.
+Local byte/structural overflow is `output_limit` for controls (a sent write
+remains `Unknown`), and fatal `ProtocolDefect` for contained cognition. The
+transport ingress ceiling is unchanged.
+
 Managed cognition continues to answer every native approval with denial and
 poisons the contained turn on authority activity. Generic worker control never
 answers approval requests. Its create path unsubscribes so the later stock TUI
@@ -52,5 +61,5 @@ The shared service reduces private process isolation and makes account-local
 clients a trust/failure/version boundary. In return it unifies manual and
 programmatic native history and removes duplicate server lifecycle machinery.
 Fail-closed protocol classification and exact host pinning sacrifice forward
-compatibility. `websockets` is a direct Codex-extra dependency because the
+compatibility. `websockets` is a direct core dependency because the
 transport must not rely on another provider's transitive dependency.
