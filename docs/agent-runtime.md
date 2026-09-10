@@ -425,10 +425,16 @@ multiple `AgentUsage` events from one turn are progressive and are not values to
 sum. The terminal carries the final safely attributable snapshot.
 
 Codex reports `tokenUsage.total` cumulatively across a native thread. The Codex
-adapter validates both `total` and `last`, but does not use `last` as its
-accounting source because one runtime turn can make multiple model requests. It
-subtracts every cumulative update from one fixed pre-turn baseline, so the last
-delta aggregates all model requests made by the invocation. The baseline is:
+adapter validates `total` and classifies `last`, but does not use `last` as its
+accounting source because one runtime turn can make multiple model requests.
+After native compaction, `last` can instead carry a context estimate: all five
+input/output/cache/reasoning components are integer zero and `totalTokens` is
+a positive integer estimate. This exact native shape is not billing usage and
+may exceed cumulative consumption. Ordinary `last` snapshots retain their
+arithmetic and cumulative-bound validation; cumulative `total` is always
+validated unchanged. Actual reported compaction consumption remains chargeable.
+The adapter subtracts every cumulative update from one fixed pre-turn baseline,
+so the last delta aggregates all model requests made by the invocation. The baseline is:
 
 - synthetic zero for a fresh native thread;
 - the last validated cumulative end snapshot for consecutive turns; or
