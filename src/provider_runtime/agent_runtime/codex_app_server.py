@@ -16,8 +16,10 @@ if TYPE_CHECKING:
 from provider_runtime.errors import sanitize_provider_text
 
 from ._limits import (
+    _MAX_EVENT_COUNT,
     _MAX_MESSAGE_BYTES,
     _MAX_MESSAGE_ITEMS,
+    _MAX_TURN_OUTPUT_BYTES,
     _OPERATION_TIMEOUT_SECONDS,
     OutputLimitExceeded,
     bounded_payload_size,
@@ -150,7 +152,10 @@ class CodexAppServerClient:
         self._reader_task: asyncio.Task[None] | None = None
         self._write_lock = asyncio.Lock()
         self._pending: dict[int, tuple[str, asyncio.Future[object]]] = {}
-        self._messages: asyncio.Queue[CodexServerMessage | _TransportFailure] = asyncio.Queue(128)
+        self._messages: asyncio.Queue[tuple[CodexServerMessage | _TransportFailure, int]] = (
+            asyncio.Queue()
+        )
+        self._queued_bytes = 0
         self._next_request_id = 1
         self._server_request_ids: set[tuple[type[object], object]] = set()
         self._failure: ProtocolDefect | CodexConnectionUnavailable | None = None
@@ -262,15 +267,23 @@ class CodexAppServerClient:
     async def next_message(self) -> CodexServerMessage:
         if self._failure is not None and self._messages.empty():
             raise self._failure
-        message = await self._messages.get()
+        message, size = await self._messages.get()
+        self._queued_bytes -= size
         if isinstance(message, _TransportFailure):
             raise message.error
+        if (
+            self._failure is not None
+            and isinstance(message, CodexNotification)
+            and message.method == "turn/completed"
+        ):
+            raise self._failure
         return message
 
     def take_pending_messages(self) -> tuple[CodexServerMessage, ...]:
         values: list[CodexServerMessage] = []
         while not self._messages.empty():
-            message = self._messages.get_nowait()
+            message, size = self._messages.get_nowait()
+            self._queued_bytes -= size
             if isinstance(message, _TransportFailure):
                 raise message.error
             values.append(message)
@@ -338,10 +351,16 @@ class CodexAppServerClient:
 
     def _select_thread(self, thread_id: str) -> CodexThread:
         self._thread_id = thread_id
-        retained = self.take_pending_messages()
-        for message in retained:
+        if self._failure is not None:
+            raise self._failure
+        for _ in range(self._messages.qsize()):
+            message, size = self._messages.get_nowait()
+            if isinstance(message, _TransportFailure):
+                raise message.error
             if self._belongs_to_thread(message.params):
-                self._enqueue(message)
+                self._messages.put_nowait((message, size))
+            else:
+                self._queued_bytes -= size
         return CodexThread(self, thread_id)
 
     def _belongs_to_thread(self, params: Mapping[str, object]) -> bool:
@@ -370,6 +389,7 @@ class CodexAppServerClient:
             raise
         except ProtocolDefect as error:
             self._fail(error)
+            await connection.close()
         except ConnectionClosed as error:
             if not self._closing:
                 self._fail(
@@ -404,11 +424,11 @@ class CodexAppServerClient:
         if "method" in message:
             if "result" in message or "error" in message:
                 raise ProtocolDefect("Codex app-server method message mixed response fields")
-            await self._route_method(message)
+            await self._route_method(message, size=len(line))
             return
         self._route_response(message)
 
-    async def _route_method(self, message: dict[str, object]) -> None:
+    async def _route_method(self, message: dict[str, object], *, size: int) -> None:
         allowed = {"method", "params", "id" if "id" in message else "emittedAtMs"}
         # justify-defect: admit exactly the pinned server envelope. Its optional
         # i64 emission timestamp is transport metadata, never owned event state.
@@ -430,7 +450,7 @@ class CodexAppServerClient:
         if not self._belongs_to_thread(params):
             return
         if "id" not in message:
-            self._enqueue(CodexNotification(method=method, params=params))
+            self._enqueue(CodexNotification(method=method, params=params), size=size)
             return
         if self._thread_id is None or params.get("threadId") != self._thread_id:
             raise ProtocolDefect("Codex server request omitted its managed thread identity")
@@ -452,7 +472,8 @@ class CodexAppServerClient:
                     method=method,
                     params=params,
                     kind=kind,
-                )
+                ),
+                size=size,
             )
             return
         forbidden_authority = _FORBIDDEN_AUTHORITY_REQUESTS.get(method)
@@ -470,7 +491,8 @@ class CodexAppServerClient:
                     method=method,
                     params=params,
                     kind=kind,
-                )
+                ),
+                size=size,
             )
             raise ProtocolDefect(f"Codex app-server requested forbidden authority {method}")
         forbidden = _FORBIDDEN_SERVER_REQUESTS.get(method)
@@ -539,11 +561,14 @@ class CodexAppServerClient:
                 self._fail(error)
                 raise error from None
 
-    def _enqueue(self, message: CodexServerMessage) -> None:
-        try:
-            self._messages.put_nowait(message)
-        except asyncio.QueueFull:
-            raise ProtocolDefect("Codex app-server event queue exceeded its bound") from None
+    def _enqueue(self, message: CodexServerMessage, *, size: int) -> None:
+        if (
+            self._messages.qsize() >= _MAX_EVENT_COUNT
+            or self._queued_bytes + size > _MAX_TURN_OUTPUT_BYTES
+        ):
+            raise ProtocolDefect("Codex app-server pending message queue exceeded its bound")
+        self._queued_bytes += size
+        self._messages.put_nowait((message, size))
 
     def _fail(self, error: ProtocolDefect | CodexConnectionUnavailable) -> None:
         if self._failure is not None:
@@ -554,9 +579,7 @@ class CodexAppServerClient:
                 future.set_exception(error)
                 future.add_done_callback(self._consume_future)
         self._pending.clear()
-        if self._messages.full():
-            self._messages.get_nowait()
-        self._messages.put_nowait(_TransportFailure(error))
+        self._messages.put_nowait((_TransportFailure(error), 0))
 
     def _require_live(self) -> None:
         if self._failure is not None:

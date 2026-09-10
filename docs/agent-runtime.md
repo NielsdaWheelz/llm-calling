@@ -58,6 +58,13 @@ first baseline-only snapshot, with its exact prior-turn identity, after the next
 turn starts. Any later stale identity and every missing identity fail closed.
 Unknown pre-turn messages fail before a billable turn.
 
+The transport bounds queued notifications independently of per-message and
+per-turn limits: at most 100,000 events and 64 MiB of wire data. Overflow
+fails pending RPCs and disconnects this client, never the shared service.
+Earlier authority events remain observable; a queued terminal cannot survive
+a known transport failure. Malformed responses and RPC timeouts fail the
+same connection before another request can start.
+
 `AgentRuntimeConfig.codex_endpoints` maps caller-owned opaque profile keys to
 absolute Unix-socket paths. The runtime has no Codex executable setting. Claude
 Code remains a local executable selected with
@@ -71,7 +78,7 @@ from pathlib import Path
 from provider_runtime.agent_runtime import (
     AgentRuntime,
     AgentRuntimeConfig,
-    AgentSessionRequest,
+    CodexCatalogSessionRequest,
     CodexNativeOptions,
     CredentialRef,
     NewSession,
@@ -86,19 +93,23 @@ config = AgentRuntimeConfig(
 )
 auth = CredentialRef(kind="local_account", profile_key="personal")
 
-request = AgentSessionRequest(
-    backend="codex",
-    transport="sdk",
-    auth=auth,
-    open=NewSession(),
-    cwd="/absolute/workspace",
-    # The certified cognition posture is read-only, offline, deny-all, no MCP,
-    # no copied environment, no additional roots, and host Codex 0.153.4.
-    policy=PermissionPolicy(allowed_tools=("*",)),
-    native=CodexNativeOptions(builtin_tools="disabled"),
-)
-
 async with AgentRuntime(config) as runtime:
+    catalog = await runtime.model_catalog("codex", auth)
+    model = catalog.models[0]  # Application selection, never a library default.
+    reasoning = model.reasoning[0]
+    request = CodexCatalogSessionRequest(
+        auth=auth,
+        open=NewSession(),
+        cwd="/absolute/workspace",
+        model_key=model.key,
+        reasoning=reasoning.key,
+        agent_definition_revision=catalog.definition_revision,
+        row_fingerprint=model.row_fingerprint,
+        # Certified containment: read-only, offline, deny-all, no MCP,
+        # copied environment, or additional roots; host Codex 0.153.4 is required.
+        policy=PermissionPolicy(allowed_tools=("*",)),
+        native=CodexNativeOptions(builtin_tools="disabled"),
+    )
     session = await runtime.open_session(request)
     terminal = await runtime.run_turn(
         session,
@@ -106,6 +117,26 @@ async with AgentRuntime(config) as runtime:
     )
     await runtime.close_session(session)
 ```
+
+## Model catalog and tagged requests
+
+`AgentRuntime.model_catalog("codex", auth)` drives the authenticated public
+App Server RPC `model/list` through every page and returns every visible row in native
+order. `AgentModelCatalog` carries a content-derived definition revision;
+each `AgentModelFacts` carries exact model/dispatch identity, ordered reasoning
+facts, modalities, lifecycle/upgrade facts, and a content-derived row
+fingerprint. The pinned public App Server reports neither context-window nor
+max-output capacity, so both source-capacity fields are honestly `Absent` and
+do not make a row unusable. Product request budgets remain caller-owned.
+
+The session request is the closed union
+`CodexCatalogSessionRequest | ClaudeNativeSessionRequest`. The Codex arm must
+carry the selected catalog revision and row fingerprint; `open_session`
+re-reads the catalog, rejects stale or unsupported selections, and resolves
+the server-only dispatch model and reasoning wire value before billable work.
+There is no free-form Codex model path or compatibility constructor. Claude's
+native arm remains separate because that SDK exposes no equivalent public
+catalog; asking the Claude route for one raises `UnsupportedCapability`.
 
 For streamed UI or telemetry, iterate `runtime.stream_turn(...)` instead of
 calling `run_turn(...)`. `run_turn` is the terminal projection of that same
@@ -145,6 +176,7 @@ already-enrolled subscription authentication remain provider behavior.
 The retained security kernel owns:
 
 - one closed `(backend, transport)` selection;
+- authenticated Codex catalog discovery and exact catalog-bound selection;
 - an isolated Claude state root/environment and explicit Codex endpoint map;
 - restrictive permission defaults and narrowing-only policy changes;
 - unsafe-action confirmation for model-initiated shell/filesystem/network/MCP
@@ -297,6 +329,20 @@ named environment source, placed only in opaque child-environment aliases, and
 never copied into public values. Stdio MCP under full access is not a credential
 boundary: a same-uid command can inspect peer processes. Use a dedicated OS user
 or container for credentialed stdio servers.
+
+Applications with a canonical `llm-tools` plan use
+`lower_mcp_tools(McpToolPublication(...))`. It projects exactly that frozen
+plan into one authenticated HTTPS MCP server plus an immutable reverse index;
+`PublishedMcpTools.observe` maps Codex `AgentToolUse` observations back to
+canonical tool ids and rejects names outside the publication without retaining
+their payload. The existing provider function-tool adapter and this MCP
+adapter share the same exposure/alias owner.
+
+Applications may configure `AgentRuntimeConfig.codex_sandbox` with
+`CodexSandboxControls(exclude_slash_tmp, exclude_tmpdir_env_var)`. Both native
+workspace-write exclusions apply on new, resumed, and forked Codex sessions.
+The shared service's TMPDIR is host-owned; the private-child `child_tmpdir`
+option is removed, not silently ignored or translated into another process.
 
 ## Structured output and native options
 

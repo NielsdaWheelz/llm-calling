@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import provider_runtime
-from provider_runtime.registry import ROWS
+from provider_runtime.registry import _ROWS as ROWS
 from provider_runtime.types import (
     ContinuationArtifact,
     ContinuationDelta,

@@ -1,4 +1,4 @@
-"""The launcher publication preamble both routes share has exactly one owner."""
+"""The remaining Claude launcher uses the shared publication preamble."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from provider_runtime.agent_runtime._private_files import publish_launcher
 from provider_runtime.agent_runtime.errors import ExecutableUnavailable
 
 
-def test_claude_launcher_rejects_an_invalid_interpreter_preamble(tmp_path: Path) -> None:
+def test_claude_launcher_uses_the_shared_interpreter_preamble(tmp_path: Path) -> None:
     backend_root = tmp_path / "backend"
     backend_root.mkdir(mode=0o700)
     state_root = backend_root / "personal"
@@ -22,15 +22,16 @@ def test_claude_launcher_rejects_an_invalid_interpreter_preamble(tmp_path: Path)
     executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     executable.chmod(0o700)
 
-    def publish(interpreter: str) -> Path:
-        return ensure_claude_launcher(state_root, str(executable), interpreter=interpreter)
-
     with pytest.raises(
         ExecutableUnavailable, match="no usable path to build a Claude Code launcher"
     ):
-        publish("/usr/bin/python3\nexec /bin/sh")
+        ensure_claude_launcher(
+            state_root, str(executable), interpreter="/usr/bin/python3\nexec /bin/sh"
+        )
 
-    published = publish("/" + "d" * 180 + "/python3")
+    published = ensure_claude_launcher(
+        state_root, str(executable), interpreter="/" + "d" * 180 + "/python3"
+    )
 
     assert published.parent == backend_root
     assert published.read_bytes().startswith(b"#!/bin/sh\n'''exec' ")

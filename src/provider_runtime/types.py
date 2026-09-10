@@ -11,8 +11,9 @@ constructor fields.
 
 from __future__ import annotations
 
+import json
 import math
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Literal, Protocol, assert_never
@@ -34,6 +35,7 @@ class ProviderTarget:
 # Closed superset of per-model reasoning levels; no "default" — provider defaults
 # are registry facts, not selectable behavior.
 type ReasoningLevel = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+type EngineId = Literal["openai_responses", "openai_chat", "anthropic_messages", "gemini_generate"]
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +58,283 @@ type Presence[T] = Present[T] | Absent
 def presence_of[T](value: T | None) -> Presence[T]:
     """Normalize a nullable boundary value into owned absence (engine ingress)."""
     return Absent() if value is None else Present(value)
+
+
+# ---------------------------------------------------------------------------
+# Frozen JSON
+
+
+class JsonValueError(ValueError):
+    """A caller supplied a value outside the bounded canonical JSON domain."""
+
+
+_MAX_JSON_DEPTH = 64
+_MIN_JSON_INTEGER = -(2**63)
+_MAX_JSON_INTEGER = 2**63 - 1
+
+
+class FrozenJsonDict(Mapping[str, object]):
+    """An immutable mapping containing recursively frozen JSON values."""
+
+    __slots__ = ("__items",)
+
+    def __init__(self, value: Mapping[str, object] | None = None) -> None:
+        source = {} if value is None else value
+        if not isinstance(source, Mapping):
+            raise JsonValueError("frozen JSON objects require a mapping")
+        self.__items = _freeze_mapping_items(source, context="value", active=set(), depth=0)
+
+    @classmethod
+    def _of_frozen_items(cls, items: tuple[tuple[str, JsonValue], ...]) -> FrozenJsonDict:
+        instance = object.__new__(cls)
+        instance.__items = items
+        return instance
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_FrozenJsonDict__items" and not hasattr(self, name):
+            super().__setattr__(name, value)
+            return
+        raise AttributeError("FrozenJsonDict is immutable")
+
+    def __getitem__(self, key: str) -> object:
+        if not isinstance(key, str):
+            raise TypeError("frozen JSON object keys must be strings")
+        for candidate, value in self.__items:
+            if candidate == key:
+                return value
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return (key for key, _value in self.__items)
+
+    def __len__(self) -> int:
+        return len(self.__items)
+
+    def __repr__(self) -> str:
+        return f"FrozenJsonDict({dict(self.items())!r})"
+
+    def __hash__(self) -> int:
+        return hash(frozenset(self.__items))
+
+
+type JsonScalar = None | bool | int | float | str
+type JsonValue = JsonScalar | tuple[JsonValue, ...] | FrozenJsonDict
+type JsonObject = FrozenJsonDict
+
+
+def freeze_json_value(value: object, *, context: str = "value") -> JsonValue:
+    """Validate and recursively freeze one JSON value in linear time."""
+    return _freeze_json_value(value, context=context, active=set(), depth=0)
+
+
+def freeze_json_object(value: Mapping[str, object], *, context: str = "value") -> JsonObject:
+    frozen = freeze_json_value(value, context=context)
+    if not isinstance(frozen, FrozenJsonDict):
+        raise JsonValueError(f"{context} must be a JSON object")
+    return frozen
+
+
+def thaw_json_value(value: object) -> object:
+    """Return ordinary dict/list JSON data for serializers and wire encoders."""
+    if isinstance(value, FrozenJsonDict):
+        return {key: thaw_json_value(child) for key, child in value.items()}
+    if isinstance(value, tuple):
+        return [thaw_json_value(child) for child in value]
+    return value
+
+
+def canonical_json_bytes(value: JsonValue) -> bytes:
+    """Encode an already-frozen JSON value deterministically."""
+    return json.dumps(
+        thaw_json_value(value),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Public provider catalog facts
+
+
+@dataclass(frozen=True, slots=True)
+class SourceCitation:
+    url: str
+    verified_on: date
+
+    def __post_init__(self) -> None:
+        if not self.url.startswith("https://"):
+            raise ValueError("SourceCitation.url must be https")
+        if not isinstance(self.verified_on, date):
+            raise ValueError("SourceCitation.verified_on must be date")
+
+
+@dataclass(frozen=True, slots=True)
+class UpgradeFacts:
+    target_key: str
+    source: SourceCitation
+
+
+@dataclass(frozen=True, slots=True)
+class RetirementFacts:
+    retires_at: str
+    source: SourceCitation
+
+
+@dataclass(frozen=True, slots=True)
+class ApiRoutingFacts:
+    only: tuple[str, ...]
+    order: tuple[str, ...]
+    quantizations: tuple[str, ...]
+    allow_fallbacks: Literal[False] = False
+    require_parameters: Literal[True] = True
+    data_collection: Literal["deny"] = "deny"
+    zdr: Literal[True] = True
+
+
+@dataclass(frozen=True, slots=True)
+class ApiDispatchFacts:
+    model_id: str
+    engine: EngineId
+    base_url: Presence[str]
+    correlation: Literal["header", "in_band", "none"]
+    routing: Presence[ApiRoutingFacts]
+
+
+@dataclass(frozen=True, slots=True)
+class NativeStructuredOutput:
+    kind: Literal["native"] = field(default="native", init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class JsonModeStructuredOutput:
+    kind: Literal["json_mode"] = field(default="json_mode", init=False)
+
+
+type ApiStructuredOutput = NativeStructuredOutput | JsonModeStructuredOutput
+
+
+@dataclass(frozen=True, slots=True)
+class ApiReasoningFacts:
+    key: ReasoningLevel
+    native_wire_fragment: JsonObject
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "native_wire_fragment",
+            freeze_json_object(
+                self.native_wire_fragment,
+                context="ApiReasoningFacts.native_wire_fragment",
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ApiModelFacts:
+    model_ref: str
+    provider: ProviderName
+    dispatch: ApiDispatchFacts
+    upgrade: Presence[UpgradeFacts]
+    retirement: Presence[RetirementFacts]
+    context_window: int
+    max_output_tokens: int
+    input_modalities: tuple[Literal["text", "image"], ...]
+    tools: bool
+    streaming: bool
+    structured: ApiStructuredOutput
+    reasoning: tuple[ApiReasoningFacts, ...]
+    source_default_reasoning: Presence[ReasoningLevel]
+    continuation_codec: str
+    row_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class ApiModelCatalog:
+    backend_contract_revision: str
+    registry_revision: str
+    definition_revision: str
+    models: tuple[ApiModelFacts, ...]
+
+
+def _freeze_json_value(
+    value: object,
+    *,
+    context: str,
+    active: set[int],
+    depth: int,
+) -> JsonValue:
+    if depth > _MAX_JSON_DEPTH:
+        raise JsonValueError(f"{context} exceeds the maximum JSON nesting depth")
+    if value is None:
+        return None
+    if type(value) is bool:
+        return bool(value)
+    if type(value) is int:
+        if not _MIN_JSON_INTEGER <= value <= _MAX_JSON_INTEGER:
+            raise JsonValueError(f"{context} integers must fit in signed 64 bits")
+        return int(value)
+    if type(value) is str:
+        return str(value)
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise JsonValueError(f"{context} numbers must be finite")
+        return value
+    if isinstance(value, Mapping):
+        return FrozenJsonDict._of_frozen_items(
+            _freeze_mapping_items(value, context=context, active=active, depth=depth)
+        )
+    if isinstance(value, tuple | list):
+        identity = id(value)
+        if identity in active:
+            raise JsonValueError(f"{context} must not contain a reference cycle")
+        active.add(identity)
+        try:
+            return tuple(
+                _freeze_json_value(
+                    child,
+                    context=f"{context}[{index}]",
+                    active=active,
+                    depth=depth + 1,
+                )
+                for index, child in enumerate(value)
+            )
+        finally:
+            active.remove(identity)
+    raise JsonValueError(f"{context} must contain JSON-safe values; got {type(value).__name__}")
+
+
+def _freeze_mapping_items(
+    source: Mapping[str, object],
+    *,
+    context: str,
+    active: set[int],
+    depth: int,
+) -> tuple[tuple[str, JsonValue], ...]:
+    identity = id(source)
+    if identity in active:
+        raise JsonValueError(f"{context} must not contain a reference cycle")
+    active.add(identity)
+    try:
+        items: list[tuple[str, JsonValue]] = []
+        for key, child in source.items():
+            if type(key) is not str:
+                raise JsonValueError(f"{context} object keys must be strings")
+            items.append(
+                (
+                    key,
+                    _freeze_json_value(
+                        child,
+                        context=f"{context}.{key}",
+                        active=active,
+                        depth=depth + 1,
+                    ),
+                )
+            )
+    finally:
+        active.remove(identity)
+    return tuple(items)
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +395,7 @@ type OutputSpec = TextOutput | StrictJsonOutput
 # Messages and continuation
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class ContinuationArtifact:
     """Opaque native replay material.
 
@@ -126,7 +405,27 @@ class ContinuationArtifact:
 
     target: ProviderTarget
     codec_id: str
-    opaque_payload: Mapping[str, object] = field(repr=False)
+    opaque_payload: JsonObject = field(repr=False)
+
+    def __init__(
+        self,
+        target: ProviderTarget,
+        codec_id: str,
+        opaque_payload: Mapping[str, object],
+    ) -> None:
+        if not isinstance(target, ProviderTarget):
+            raise ValueError("ContinuationArtifact.target must be ProviderTarget")
+        if type(codec_id) is not str or not codec_id:
+            raise ValueError("ContinuationArtifact.codec_id must be a non-empty string")
+        frozen = freeze_json_object(
+            opaque_payload,
+            context="ContinuationArtifact.opaque_payload",
+        )
+        if len(canonical_json_bytes(frozen)) > 16 * 1024 * 1024:
+            raise ValueError("ContinuationArtifact.opaque_payload exceeds 16 MiB")
+        object.__setattr__(self, "target", target)
+        object.__setattr__(self, "codec_id", codec_id)
+        object.__setattr__(self, "opaque_payload", frozen)
 
 
 @dataclass(frozen=True, slots=True)

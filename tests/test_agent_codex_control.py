@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -17,13 +18,15 @@ from provider_runtime.agent_runtime import (
     AgentPermissionRequest,
     AgentRuntime,
     AgentRuntimeConfig,
-    AgentSessionRequest,
     AgentTerminal,
     AgentText,
+    CodexCatalogSessionRequest,
     CodexNativeOptions,
+    CodexSandboxControls,
     CredentialRef,
     CredentialUnavailable,
     HeaderReference,
+    InvalidAgentRequest,
     McpServerSpec,
     NewSession,
     PermissionPolicy,
@@ -54,6 +57,7 @@ from provider_runtime.agent_runtime.codex_control import (
     CodexTurnTarget,
     CodexUnknown,
 )
+from provider_runtime.types import Absent, Present
 
 THREAD = "01992818-9220-714c-9c91-e39d3f006e64"
 TURN = "01992818-9221-714c-9c91-e39d3f006e64"
@@ -67,6 +71,19 @@ class ProtocolPeer:
         self.messages: list[dict[str, object]] = []
         self.closed_connections = 0
         self.version = "0.153.4"
+        self.models = [
+            {
+                "id": "fixture-model",
+                "model": "fixture-native-model",
+                "displayName": "Fixture Model",
+                "hidden": False,
+                "inputModalities": ["text", "image"],
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "high", "description": "High"},
+                ],
+                "defaultReasoningEffort": "high",
+            }
+        ]
         self.emit_managed = False
         self.emit_approval = False
         self.foreign_noise = False
@@ -133,6 +150,8 @@ class ProtocolPeer:
                     result = {"userAgent": f"codex_cli_rs/{self.version} (Linux synthetic; x86_64)"}
                 elif method == "account/read":
                     result = {"account": {"type": "chatgpt"}}
+                elif method == "model/list":
+                    result = {"data": self.models, "nextCursor": None}
                 elif method == "thread/list":
                     result = {"data": [self.thread()], "nextCursor": None}
                 elif method == "thread/start":
@@ -380,6 +399,134 @@ async def test_timestamped_startup_notification_preserves_correlated_protocol(
         assert await client.account() == {"account": {"type": "chatgpt"}}
 
 
+async def test_shared_catalog_preserves_exact_generation_and_resolves_native_dispatch(
+    tmp_path: Path, peer: ProtocolPeer
+) -> None:
+    peer.emit_managed = True
+    auth = CredentialRef(kind="local_account", profile_key="personal")
+    async with AgentRuntime(
+        AgentRuntimeConfig(state_root_base=tmp_path, codex_endpoints={"personal": peer.socket})
+    ) as runtime:
+        catalog = await runtime.model_catalog("codex", auth)
+        (row,) = catalog.models
+        assert row.key == "fixture-model"
+        assert row.dispatch_model == "fixture-native-model"
+        assert row.source_context_window == Absent()
+        assert row.source_max_output_tokens == Absent()
+        assert row.source_default_reasoning == Present("high")
+        assert row.input_modalities == ("text", "image")
+        assert len(row.row_fingerprint) == 64
+        assert catalog.observed_at.tzinfo is not None
+        assert not tmp_path.joinpath("codex").exists()
+        assert not any(
+            str(message.get("method", "")).startswith("thread/") for message in peer.messages
+        )
+        request = CodexCatalogSessionRequest(
+            auth=auth,
+            open=NewSession(),
+            cwd=str(tmp_path),
+            policy=PermissionPolicy(allowed_tools=("*",)),
+            native=CodexNativeOptions(builtin_tools="disabled"),
+            model_key=row.key,
+            reasoning="high",
+            agent_definition_revision=catalog.definition_revision,
+            row_fingerprint=row.row_fingerprint,
+        )
+        session = await runtime.open_session(request)
+        result = await runtime.run_turn(session, TurnRequest(input=(TextContent("synthetic"),)))
+        assert result.final_text == "synthetic answer"
+        start = next(
+            message for message in peer.messages if message.get("method") == "thread/start"
+        )
+        turn = next(message for message in peer.messages if message.get("method") == "turn/start")
+        start_params, turn_params = start["params"], turn["params"]
+        assert isinstance(start_params, dict) and start_params["model"] == row.dispatch_model
+        assert isinstance(turn_params, dict) and turn_params["effort"] == "high"
+        await runtime.close_session(session)
+        before = sum(message.get("method") == "thread/start" for message in peer.messages)
+        for invalid in (
+            replace(request, agent_definition_revision="stale"),
+            replace(request, row_fingerprint="0" * 64),
+            replace(request, reasoning="absent"),
+        ):
+            with pytest.raises(InvalidAgentRequest):
+                await runtime.open_session(invalid)
+        peer.models[0]["model"] = "changed-wire-model"
+        with pytest.raises(InvalidAgentRequest):
+            await runtime.open_session(request)
+        assert sum(message.get("method") == "thread/start" for message in peer.messages) == before
+    assert peer.socket.is_socket()
+
+
+async def managed_request(runtime: AgentRuntime, cwd: Path) -> CodexCatalogSessionRequest:
+    auth = CredentialRef("local_account", "lab")
+    catalog = await runtime.model_catalog("codex", auth)
+    (row,) = catalog.models
+    return CodexCatalogSessionRequest(
+        auth=auth,
+        cwd=str(cwd),
+        open=NewSession(),
+        policy=PermissionPolicy(allowed_tools=("*",)),
+        native=CodexNativeOptions(builtin_tools="disabled"),
+        model_key=row.key,
+        reasoning="high",
+        agent_definition_revision=catalog.definition_revision,
+        row_fingerprint=row.row_fingerprint,
+    )
+
+
+@pytest.mark.parametrize("cancel_owner", ["caller", "runtime"])
+async def test_catalog_discovery_cancellation_closes_only_its_owned_connection(
+    tmp_path: Path, peer: ProtocolPeer, cancel_owner: str
+) -> None:
+    peer.hold_method = "model/list"
+    async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"lab": peer.socket})) as runtime:
+        pending = asyncio.create_task(
+            runtime.model_catalog("codex", CredentialRef("local_account", "lab"))
+        )
+        await peer.received.wait()
+        if cancel_owner == "caller":
+            pending.cancel()
+        else:
+            await runtime.close()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        peer.release.set()
+    assert peer.socket.is_socket()
+    assert not tmp_path.joinpath("codex").exists()
+    assert not any(
+        str(message.get("method", "")).startswith("thread/") for message in peer.messages
+    )
+
+
+async def test_shared_workspace_sandbox_retains_native_tmp_exclusions(
+    tmp_path: Path, peer: ProtocolPeer
+) -> None:
+    controls = CodexSandboxControls(exclude_slash_tmp=True, exclude_tmpdir_env_var=True)
+    async with AgentRuntime(
+        AgentRuntimeConfig(tmp_path, {"lab": peer.socket}, codex_sandbox=controls)
+    ) as runtime:
+        request = await managed_request(runtime, tmp_path)
+        session = await runtime.open_session(
+            replace(
+                request,
+                policy=PermissionPolicy(filesystem="workspace_write", allowed_tools=("*",)),
+                native=None,
+            )
+        )
+        await runtime.close_session(session)
+    start = next(message for message in peer.messages if message.get("method") == "thread/start")
+    params = start["params"]
+    assert isinstance(params, dict)
+    assert params["config"]["sandbox_workspace_write"] == {
+        "writable_roots": [str(tmp_path)],
+        "network_access": False,
+        "exclude_slash_tmp": True,
+        "exclude_tmpdir_env_var": True,
+    }
+    assert "TMPDIR" not in json.dumps(peer.messages)
+
+
 @pytest.mark.parametrize(
     "fields",
     [
@@ -511,17 +658,7 @@ async def test_managed_cognition_filters_foreign_events_and_remains_protected(
 ) -> None:
     peer.emit_managed = peer.foreign_noise = True
     async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"lab": peer.socket})) as runtime:
-        session = await runtime.open_session(
-            AgentSessionRequest(
-                backend="codex",
-                transport="sdk",
-                auth=CredentialRef("local_account", "lab"),
-                cwd=str(tmp_path),
-                open=NewSession(),
-                policy=PermissionPolicy(allowed_tools=("*",)),
-                native=CodexNativeOptions(builtin_tools="disabled"),
-            )
-        )
+        session = await runtime.open_session(await managed_request(runtime, tmp_path))
         target = CodexThreadTarget("lab", session.ref.native_session_id)
         with pytest.raises(CodexControlError, match="unauthorized"):
             await runtime.codex.prompt(CodexPromptRequest(target, CodexSubmit("synthetic")))
@@ -545,17 +682,7 @@ async def test_managed_native_approval_is_denied_and_poisons_the_session(
 ) -> None:
     peer.emit_managed = peer.emit_approval = True
     async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"lab": peer.socket})) as runtime:
-        session = await runtime.open_session(
-            AgentSessionRequest(
-                backend="codex",
-                transport="sdk",
-                auth=CredentialRef("local_account", "lab"),
-                cwd=str(tmp_path),
-                open=NewSession(),
-                policy=PermissionPolicy(allowed_tools=("*",)),
-                native=CodexNativeOptions(builtin_tools="disabled"),
-            )
-        )
+        session = await runtime.open_session(await managed_request(runtime, tmp_path))
         events = []
         with pytest.raises(ProtocolDefect) as failure:
             async for event in runtime.stream_turn(
@@ -576,17 +703,7 @@ async def test_observed_foreign_user_input_invalidates_cognition_before_terminal
 ) -> None:
     peer.emit_managed = peer.intervene = True
     async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"lab": peer.socket})) as runtime:
-        session = await runtime.open_session(
-            AgentSessionRequest(
-                backend="codex",
-                transport="sdk",
-                auth=CredentialRef("local_account", "lab"),
-                cwd=str(tmp_path),
-                open=NewSession(),
-                policy=PermissionPolicy(allowed_tools=("*",)),
-                native=CodexNativeOptions(builtin_tools="disabled"),
-            )
-        )
+        session = await runtime.open_session(await managed_request(runtime, tmp_path))
         with pytest.raises(ProtocolDefect, match="foreign user input"):
             await runtime.run_turn(session, TurnRequest(input=(TextContent("synthetic"),)))
 
@@ -673,17 +790,7 @@ async def test_oversized_managed_frame_remains_a_fatal_protocol_defect(
     peer.emit_managed = True
     peer.answer = "x" * (5 * 1024 * 1024)
     async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"lab": peer.socket})) as runtime:
-        session = await runtime.open_session(
-            AgentSessionRequest(
-                backend="codex",
-                transport="sdk",
-                auth=CredentialRef("local_account", "lab"),
-                cwd=str(tmp_path),
-                open=NewSession(),
-                policy=PermissionPolicy(allowed_tools=("*",)),
-                native=CodexNativeOptions(builtin_tools="disabled"),
-            )
-        )
+        session = await runtime.open_session(await managed_request(runtime, tmp_path))
         observed = []
         with pytest.raises(ProtocolDefect):
             async for event in runtime.stream_turn(
@@ -813,9 +920,11 @@ async def test_shared_codex_rejects_client_secret_environment_before_resolution(
     ) as runtime:
         with pytest.raises(UnsupportedCapability, match="client environment"):
             await runtime.open_session(
-                AgentSessionRequest(
-                    backend="codex",
-                    transport="sdk",
+                CodexCatalogSessionRequest(
+                    model_key="fixture-model",
+                    reasoning="high",
+                    agent_definition_revision="not-read",
+                    row_fingerprint="0" * 64,
                     auth=CredentialRef("local_account", "lab"),
                     cwd=str(tmp_path),
                     open=NewSession(),
@@ -852,17 +961,7 @@ async def test_queued_intervention_rejects_next_managed_submit_before_dispatch(
 ) -> None:
     peer.emit_managed = peer.between_turns = True
     async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"lab": peer.socket})) as runtime:
-        session = await runtime.open_session(
-            AgentSessionRequest(
-                backend="codex",
-                transport="sdk",
-                auth=CredentialRef("local_account", "lab"),
-                cwd=str(tmp_path),
-                open=NewSession(),
-                policy=PermissionPolicy(allowed_tools=("*",)),
-                native=CodexNativeOptions(builtin_tools="disabled"),
-            )
-        )
+        session = await runtime.open_session(await managed_request(runtime, tmp_path))
         assert (
             await runtime.run_turn(session, TurnRequest(input=(TextContent("synthetic"),)))
         ).status == "succeeded"
@@ -894,17 +993,7 @@ async def test_completed_message_projection_preserves_the_existing_structured_bo
     )
     peer.scripted = cases[case]
     async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"lab": peer.socket})) as runtime:
-        session = await runtime.open_session(
-            AgentSessionRequest(
-                backend="codex",
-                transport="sdk",
-                auth=CredentialRef("local_account", "lab"),
-                cwd=str(tmp_path),
-                open=NewSession(),
-                policy=PermissionPolicy(allowed_tools=("*",)),
-                native=CodexNativeOptions(builtin_tools="disabled"),
-            )
-        )
+        session = await runtime.open_session(await managed_request(runtime, tmp_path))
         if expected is None:
             with pytest.raises(ProtocolDefect):
                 await runtime.run_turn(session, TurnRequest(input=(TextContent("synthetic"),)))

@@ -23,7 +23,9 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from typing import Any, assert_never
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import pydantic
@@ -46,10 +48,15 @@ from provider_runtime.otel import as_current, call_span, record_outcome
 from provider_runtime.prices import estimate_cost
 from provider_runtime.registry import (
     REGISTRY_REVISION,
-    EngineId,
-    ModelRow,
-    resolve,
-    resolve_target,
+)
+from provider_runtime.registry import (
+    _ModelRow as ModelRow,
+)
+from provider_runtime.registry import (
+    _resolve as resolve,
+)
+from provider_runtime.registry import (
+    _resolve_target as resolve_target,
 )
 from provider_runtime.retry import DEFAULT_RETRY, attempts
 from provider_runtime.types import (
@@ -65,6 +72,7 @@ from provider_runtime.types import (
     ConfirmedNonBillable,
     EmbeddingCall,
     EmbeddingResponse,
+    EngineId,
     Failed,
     FinalAttempt,
     GenerateIntent,
@@ -296,6 +304,64 @@ def _invalid_structured_detail(
 # Runtime
 
 
+_PROVIDERS = frozenset(
+    {"openai", "anthropic", "gemini", "moonshot", "openrouter", "deepseek", "xai"}
+)
+
+
+def _endpoint_overrides(
+    values: Mapping[ProviderName, str],
+) -> Mapping[ProviderName, str]:
+    """Freeze canonical HTTPS origins supplied by the embedding application."""
+
+    unknown = set(values) - _PROVIDERS
+    if unknown:
+        raise ValueError(f"endpoint overrides name unknown providers: {sorted(unknown)!r}")
+    checked: dict[ProviderName, str] = {}
+    for provider, value in values.items():
+        try:
+            parsed = urlsplit(value)
+            port = parsed.port
+        except ValueError as error:
+            raise ValueError(f"{provider} endpoint override has an invalid port") from error
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(f"{provider} endpoint override must be one HTTPS origin")
+        default_port = port in {None, 443}
+        authority = parsed.hostname if default_port else f"{parsed.hostname}:{port}"
+        if parsed.netloc != authority:
+            raise ValueError(f"{provider} endpoint override is not canonical")
+        checked[provider] = f"https://{authority}"
+    return MappingProxyType(checked)
+
+
+def _dispatch_row(
+    row: ModelRow,
+    overrides: Mapping[ProviderName, str],
+) -> ModelRow:
+    """Apply an explicit origin after registry resolution, preserving API path."""
+
+    origin = overrides.get(row.provider)
+    if origin is None:
+        return row
+    if isinstance(row.base_url, Present):
+        path = urlsplit(row.base_url.value).path.rstrip("/")
+    elif row.engine == "openai_responses":
+        path = "/v1"
+    else:
+        path = ""
+    parsed = urlsplit(origin)
+    base_url = urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+    return replace(row, base_url=Present(base_url))
+
+
 class ProviderRuntime:
     """Engines + credentials wired once; every call dispatches through a row."""
 
@@ -306,6 +372,7 @@ class ProviderRuntime:
         retry: RetryPolicy = DEFAULT_RETRY,
         http_client: httpx.AsyncClient | None = None,
         engines: Mapping[EngineId, Engine] | None = None,
+        endpoint_overrides: Mapping[ProviderName, str] | None = None,
         tracer_provider: TracerProvider | None = None,
     ) -> None:
         # `engines` is the deterministic-test seam (spec §11: facade tests run
@@ -316,6 +383,7 @@ class ProviderRuntime:
         self._retry = retry
         self._http_client = http_client
         self._tracer_provider = tracer_provider
+        self._endpoint_overrides = _endpoint_overrides(endpoint_overrides or {})
         self._engines: Mapping[EngineId, Engine] = (
             engines
             if engines is not None
@@ -354,10 +422,11 @@ class ProviderRuntime:
     async def generate(
         self, intent: GenerateIntent, *, cancel: CancelSignal | None = None
     ) -> CallOutcome:
-        row = resolve_target(intent.target)
-        _validate_intent(row, intent, streaming=False)
-        credential = self._credential(row.provider)
-        engine = self._engines[row.engine]
+        source_row = resolve_target(intent.target)
+        _validate_intent(source_row, intent, streaming=False)
+        row = _dispatch_row(source_row, self._endpoint_overrides)
+        credential = self._credential(source_row.provider)
+        engine = self._engines[source_row.engine]
         with call_span(
             "chat",
             provider=row.provider,
@@ -429,10 +498,11 @@ class ProviderRuntime:
     def stream(
         self, intent: GenerateIntent, *, cancel: CancelSignal | None = None
     ) -> AsyncIterator[RuntimeStreamEvent]:
-        row = resolve_target(intent.target)
-        _validate_intent(row, intent, streaming=True)
-        credential = self._credential(row.provider)
-        engine = self._engines[row.engine]
+        source_row = resolve_target(intent.target)
+        _validate_intent(source_row, intent, streaming=True)
+        row = _dispatch_row(source_row, self._endpoint_overrides)
+        credential = self._credential(source_row.provider)
+        engine = self._engines[source_row.engine]
         return self._stream_events(row, intent, credential, engine, cancel)
 
     async def _stream_events(

@@ -9,5 +9,8 @@ The corpus models `item/agentMessage/delta`, `item/completed`, and
 `turn/completed` shapes exposed by the pinned Codex 0.153.4 App Server. All
 identities and content are synthetic.
 
-The active WebSocket-over-UDS protocol fixtures live beside their focused tests;
-the retired private-process stdio corpus is not retained.
+The active WebSocket-over-UDS fixtures live beside their focused tests and reuse
+`app_server_protocol_cases.json` for native message classification. Its retained
+incident shape contains only record indices, item types, field-name sets,
+lengths, and SHA-256 values, never private payloads. No private-process launcher
+or stdio execution path is retained.

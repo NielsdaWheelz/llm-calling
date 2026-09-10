@@ -61,6 +61,7 @@ from .events import (
     AgentToolUse,
     AgentUsage,
 )
+from .model_catalog import AgentModelCatalog, read_codex_model_catalog
 from .policy import PermissionPolicy
 from .sessions import (
     AgentSession,
@@ -80,6 +81,7 @@ from .types import (
     ApprovalHandler,
     ApprovalRequest,
     CodexNativeOptions,
+    CodexSandboxControls,
     CredentialRef,
     ForkSession,
     ImageContent,
@@ -88,6 +90,7 @@ from .types import (
     ResumeSession,
     TextContent,
     TurnRequest,
+    _ResolvedCodexSessionRequest,
     thaw_json_value,
     validate_mcp_network_policy,
 )
@@ -431,7 +434,7 @@ class _CodexUsageAccounting:
 class _CodexSessionState:
     client: Any
     thread: Any
-    request: AgentSessionRequest
+    request: _ResolvedCodexSessionRequest
     ref: AgentSessionRef
     usage_accounting: _CodexUsageAccounting
     turn: Any | None = None
@@ -460,13 +463,28 @@ class CodexSdkAdapter:
     # Codex threads resume from any directory; the ref keeps cwd as provenance only.
     cwd_scopes_sessions: Literal[False] = False
 
-    def __init__(self) -> None:
+    def __init__(self, *, sandbox_controls: CodexSandboxControls | None = None) -> None:
+        if sandbox_controls is not None and not isinstance(sandbox_controls, CodexSandboxControls):
+            raise InvalidAgentRequest(
+                "sandbox_controls must be CodexSandboxControls when configured"
+            )
+        self._sandbox_controls = sandbox_controls
         self._sessions: dict[AgentSession, _CodexSessionState] = {}
         self._dead_sessions: weakref.WeakSet[AgentSession] = weakref.WeakSet()
         self._clients: set[Any] = set()
 
     def validate_auth(self, credential: CredentialRef) -> None:
         self._require_local_auth(credential.kind)
+
+    async def model_catalog(self, *, environment: Mapping[str, str]) -> AgentModelCatalog:
+        client = await self._open_client(environment=environment)
+        try:
+            await self._verify_auth(client)
+            return await self._call(
+                read_codex_model_catalog(client), operation="model catalog", failure="executable"
+            )
+        finally:
+            await self._close_client(client)
 
     async def list_sessions(
         self,
@@ -545,8 +563,8 @@ class CodexSdkAdapter:
         *,
         environment: Mapping[str, str],
     ) -> AgentSession:
-        if request.backend != self.backend or request.transport != self.transport:
-            raise InvalidAgentRequest("CodexSdkAdapter received a different route")
+        if not isinstance(request, _ResolvedCodexSessionRequest):
+            raise InvalidAgentRequest("CodexSdkAdapter requires a catalog-resolved request")
         self._require_local_auth(request.auth.kind)
         self._validate_policy_mapping(request.policy)
         validate_mcp_network_policy(request.mcp_servers, request.policy)
@@ -564,8 +582,7 @@ class CodexSdkAdapter:
                 "cwd": request.cwd,
                 "sandbox": self._sandbox(request.policy),
             }
-            if request.model is not None:
-                kwargs["model"] = request.model
+            kwargs["model"] = request.dispatch_model
             if request.system:
                 # `baseInstructions` is the public App Server system-role field on thread
                 # start/resume/fork and *replaces* Codex's built-in base prompt rather than
@@ -664,11 +681,7 @@ class CodexSdkAdapter:
                 raise
             state.user_message_id = str(uuid4())
             kwargs["clientUserMessageId"] = state.user_message_id
-        reasoning = state.request.reasoning
-        if reasoning is not None:
-            kwargs["effort"] = reasoning.effort
-            if reasoning.summary is not None:
-                kwargs["summary"] = reasoning.summary
+        kwargs["effort"] = state.request.native_reasoning
         output = state.request.output
         if isinstance(output, JsonSchemaAgentOutput):
             # The schema is a plain frozen JSON mapping; the backend enforces it natively.
@@ -1922,10 +1935,16 @@ class CodexSdkAdapter:
                 }
             )
         if request.policy.filesystem == "workspace_write":
-            config["sandbox_workspace_write"] = {
+            workspace: dict[str, object] = {
                 "writable_roots": [request.cwd, *request.additional_dirs],
                 "network_access": request.policy.network == "unrestricted",
             }
+            if self._sandbox_controls is not None:
+                workspace.update(
+                    exclude_slash_tmp=self._sandbox_controls.exclude_slash_tmp,
+                    exclude_tmpdir_env_var=self._sandbox_controls.exclude_tmpdir_env_var,
+                )
+            config["sandbox_workspace_write"] = workspace
         if request.mcp_servers:
             servers: dict[str, object] = {}
             for server in request.mcp_servers:

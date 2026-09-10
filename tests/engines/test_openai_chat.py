@@ -27,7 +27,15 @@ from provider_runtime.errors import (
     ProtocolDefect,
     RuntimeDefect,
 )
-from provider_runtime.registry import REGISTRY_REVISION, ModelRow, OpenRouterRouting
+from provider_runtime.registry import (
+    REGISTRY_REVISION,
+)
+from provider_runtime.registry import (
+    _ModelRow as ModelRow,
+)
+from provider_runtime.registry import (
+    _OpenRouterRouting as OpenRouterRouting,
+)
 from provider_runtime.types import (
     Absent,
     AssistantMessage,
@@ -72,6 +80,7 @@ from provider_runtime.types import (
     ToolResultMessage,
     TransportUnavailable,
     UserMessage,
+    thaw_json_value,
 )
 
 # ---------------------------------------------------------------------------
@@ -116,6 +125,9 @@ DEEPSEEK_ROW = ModelRow(
     streaming=True,
     structured="json_mode",
     reasoning=Present(DEEPSEEK_REASONING),
+    source_default_reasoning=Absent(),
+    upgrade=Absent(),
+    retirement=Absent(),
     continuation_codec="deepseek.v1",
     correlation="in_band",
     routing=Absent(),
@@ -134,6 +146,9 @@ MOONSHOT_ROW = ModelRow(
     streaming=True,
     structured="json_mode",
     reasoning=Present(MOONSHOT_REASONING),
+    source_default_reasoning=Absent(),
+    upgrade=Absent(),
+    retirement=Absent(),
     continuation_codec="moonshot.v1",
     correlation="in_band",
     routing=Absent(),
@@ -152,6 +167,9 @@ XAI_ROW = ModelRow(
     streaming=True,
     structured="native",
     reasoning=Present(XAI_REASONING),
+    source_default_reasoning=Absent(),
+    upgrade=Absent(),
+    retirement=Absent(),
     continuation_codec="xai.v1",
     correlation="in_band",
     routing=Absent(),
@@ -170,6 +188,9 @@ OPENROUTER_ROW = ModelRow(
     streaming=True,
     structured="json_mode",
     reasoning=Present(OPENROUTER_REASONING),
+    source_default_reasoning=Absent(),
+    upgrade=Absent(),
+    retirement=Absent(),
     continuation_codec="openrouter.v1",
     correlation="in_band",
     routing=Present(
@@ -191,6 +212,9 @@ KNOBLESS_ROW = ModelRow(
     streaming=True,
     structured="json_mode",
     reasoning=Absent(),
+    source_default_reasoning=Absent(),
+    upgrade=Absent(),
+    retirement=Absent(),
     continuation_codec="deepseek.v1",
     correlation="in_band",
     routing=Absent(),
@@ -1278,7 +1302,7 @@ async def test_openrouter_reasoning_details_round_trip_verbatim(engine: OpenAICh
     assert isinstance(first, Succeeded)
     continuation = first.response.continuation
     assert isinstance(continuation, Present)
-    assert continuation.value.opaque_payload == {"reasoning_details": details}, (
+    assert thaw_json_value(continuation.value.opaque_payload) == {"reasoning_details": details}, (
         f"ordered reasoning_details must be preserved verbatim; got {continuation.value.opaque_payload}"
     )
 
@@ -1498,7 +1522,7 @@ async def test_stream_tool_calls_accumulate_by_index_and_strict_parse(
     assert done.tool_call == ToolCall(id="call-7", name="search", arguments={"query": "dogs"})
     continuation_event = events[5]
     assert isinstance(continuation_event, ContinuationDelta)
-    native_calls = continuation_event.artifact.opaque_payload.get("tool_calls")
+    native_calls = thaw_json_value(continuation_event.artifact.opaque_payload)["tool_calls"]  # type: ignore[index]
     assert native_calls == [
         {
             "id": "call-7",
@@ -1782,7 +1806,7 @@ async def test_openrouter_stream_collects_reasoning_details_and_upstream(
 
     continuation_events = [event for event in events if isinstance(event, ContinuationDelta)]
     assert len(continuation_events) == 1, f"events: {[type(e).__name__ for e in events]}"
-    assert continuation_events[0].artifact.opaque_payload == {
+    assert thaw_json_value(continuation_events[0].artifact.opaque_payload) == {
         "reasoning_details": [
             {"type": "reasoning.encrypted", "data": "a"},
             {"type": "reasoning.text", "text": "b"},

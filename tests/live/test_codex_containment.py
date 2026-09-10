@@ -28,9 +28,9 @@ from provider_runtime.agent_runtime import (
     AgentPermissionRequest,
     AgentRuntime,
     AgentRuntimeConfig,
-    AgentSessionRequest,
     AgentTerminal,
     AgentToolUse,
+    CodexCatalogSessionRequest,
     CodexNativeOptions,
     CredentialRef,
     NewSession,
@@ -97,22 +97,29 @@ async def _qualify() -> dict[str, object]:
         workspace = root / "workspace"
         workspace.mkdir(mode=0o700)
         sentinel = workspace / "native-exec-sentinel"
-        request = AgentSessionRequest(
-            backend="codex",
-            transport="sdk",
-            auth=CredentialRef(kind="local_account", profile_key=_PROFILE),
-            open=NewSession(),
-            cwd=str(workspace),
-            policy=PermissionPolicy(allowed_tools=("*",)),
-            native=CodexNativeOptions(builtin_tools="disabled"),
-            model=_MODEL,
-        )
+        auth = CredentialRef(kind="local_account", profile_key=_PROFILE)
         async with AgentRuntime(
             AgentRuntimeConfig(
                 state_root_base=root,
                 codex_endpoints={_PROFILE: endpoint},
             )
         ) as runtime:
+            catalog = await runtime.model_catalog("codex", auth)
+            rows = tuple(row for row in catalog.models if row.key == _MODEL)
+            if len(rows) != 1 or not any(item.key == "high" for item in rows[0].reasoning):
+                _fail("containment model and reasoning must exist in the exact current catalog")
+            row = rows[0]
+            request = CodexCatalogSessionRequest(
+                auth=auth,
+                open=NewSession(),
+                cwd=str(workspace),
+                policy=PermissionPolicy(allowed_tools=("*",)),
+                native=CodexNativeOptions(builtin_tools="disabled"),
+                model_key=row.key,
+                reasoning="high",
+                agent_definition_revision=catalog.definition_revision,
+                row_fingerprint=row.row_fingerprint,
+            )
             session = await runtime.open_session(request)
             events: list[object] = []
             defect: ProtocolDefect | None = None

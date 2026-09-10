@@ -7,13 +7,14 @@ Provenance: council synthesis + request-changes review to be checked in under
 `docs/decisions/2026-08-09-pivot-council.md` in WP-0. Until then this document is a proposal,
 not an approval record.
 
-Maintenance addendum (2026-09-09): the Codex production lane attaches to the
-host-owned Codex 0.153.4 App Server through WebSocket frames over a configured
-Unix socket. It never starts a private App Server or imports a Codex Python SDK.
-The public `(codex, sdk)` route and session-ref schema remain stable. The
-normative ownership, compatibility impact, and trade-offs are recorded in
-`docs/decisions/2026-09-09-shared-codex-app-server.md`; that record supersedes
-the Codex-specific process-ownership statements below.
+Integration addendum (2026-09-09): current generation catalogs, authenticated
+Codex selection, and endpoint routing remain supported. The Codex production
+lane attaches to the host-owned Codex 0.153.4 App Server through WebSocket
+frames over a configured Unix socket. It never starts a private App Server or
+imports a Codex Python SDK. The public `(codex, sdk)` route and session-ref
+schema remain stable. `docs/decisions/2026-09-09-shared-codex-app-server.md`
+supersedes the Codex process-ownership portion of the earlier same-day
+App Server integration decision, not its catalog or generation contracts.
 
 v1 → v2 changes: continuation state restored to the contract (blocking finding 1); OpenRouter
 routing/privacy pins preserved (2); §13 is a full migration contract (3); agent security
@@ -64,7 +65,8 @@ Design stance (binding):
 | `src/provider_runtime/__init__.py` | Facade + `__all__` (≤ 40 names) | rewritten |
 | `src/provider_runtime/types.py` | The contract (§4) — **trimmed in place**, not replaced | keep name; Nexus continuity |
 | `src/provider_runtime/errors.py` | `RuntimeDefect` hierarchy + secret redaction | ported, trimmed |
-| `src/provider_runtime/registry.py` | `ModelRow` capability table + `resolve()` + `REGISTRY_REVISION` | ex-`catalog.py` contract-facts |
+| `src/provider_runtime/registry.py` | private capability rows/resolution + public immutable `api_model_catalog()` | ex-`catalog.py` contract-facts |
+| `src/provider_runtime/continuation.py` | bounded canonical continuation encode/decode | public persistence boundary |
 | `src/provider_runtime/prices.py` | `estimate_cost(meta) -> Presence[CostEstimate]` over vendored snapshot | indicative, never authoritative |
 | `src/provider_runtime/prices_snapshot.json` | Vendored `pydantic/genai-prices` data | refreshed by script, manually |
 | `src/provider_runtime/retry.py` | Single retry owner (owned explicit loop) | `RetryPolicy(` in one module |
@@ -161,7 +163,9 @@ the shared taxonomy. `CallMeta` is populated on every path, including failures.
 
 ## 7. Registry
 
-`ModelRow` (hand-curated, one screen per provider):
+The public `ApiModelCatalog` is the only consumer catalog. Its immutable rows
+project the following facts from a private hand-curated `_ModelRow` owner (one
+screen per provider); only `ProviderRuntime` may resolve private rows:
 
 ```
 ref, provider, model_id, engine, base_url,
@@ -268,7 +272,7 @@ What Nexus consumes and what v2 guarantees:
 | `EmbeddingCall` → `runtime.embed` (`semantic_chunks.py`) | port kept, same shape |
 | `ScriptedRuntime` (tests), `nexus_test_control` wire-level SSE scripting | IR-level `ScriptedRuntime`/`FakeEngine`; wire scripting has no replacement (by design) |
 | `CATALOG`, `ChatModelContract` imports | replaced by `registry` rows; mostly mechanical, semantic edits called out below |
-| `DirectCertification` startup gate (`llm_profiles.py`) | **deleted** — `ModelRow` has no certification field; the gate is re-founded on live-matrix evidence (out-of-band), or removed |
+| `DirectCertification` startup gate (`llm_profiles.py`) | **deleted** — public `ApiModelFacts` has no certification field; the gate is re-founded on live-matrix evidence (out-of-band), or removed |
 | `contract.reasoning.levels` (`llm_profiles.py`) | `row.reasoning` mapping keys; `Absent` = model has no reasoning knob |
 | `contract.output_limit`, `contract.pricing.reasoning_reserve_tokens` (`chat_runs.py`) | `row.max_output_tokens`; v2 has **no reserve-tokens fact** — Nexus owns its reserve policy locally |
 | `plan.request_fingerprint` (`llm_ledger.py`) | **deleted, no replacement** — the `llm_calls.request_fingerprint` column is retired at pin bump |

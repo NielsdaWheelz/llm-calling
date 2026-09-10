@@ -5,7 +5,9 @@ Status: accepted for the Jarvis/devserver integration
 Date: 2026-09-09
 
 Supersedes for Codex: the process, private-home, environment, and shutdown
-ownership in `2026-09-07-codex-app-server-containment.md`
+ownership in `2026-09-07-codex-app-server-containment.md` and
+`2026-09-09-codex-app-server-integration.md`. Preserve the latter's generation
+catalog, authenticated selection, endpoint routing, and containment contracts.
 
 ## Decision
 
@@ -21,6 +23,12 @@ Profile keys are arbitrary opaque application choices mapped by configuration
 to absolute Unix-socket paths. The library does not know Jarvis's three-profile
 catalog. Authentication remains the already-enrolled local ChatGPT account at
 the host service; API keys and automatic account substitution remain forbidden.
+
+Catalog discovery uses this same shared transport and retains exact tagged
+session requests, model/reasoning selection, revision and row-fingerprint
+checks. Server process environment, including TMPDIR, is host-owned. Remove
+the private-child `child_tmpdir` setting; retain the native per-thread sandbox
+exclusion controls. No environment substitution is simulated through a client.
 
 The public Codex control surface lists and reads native threads, creates one
 prompt-free native thread and unsubscribes the control connection before
