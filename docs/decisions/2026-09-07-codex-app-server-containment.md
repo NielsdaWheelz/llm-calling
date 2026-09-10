@@ -9,6 +9,11 @@ Base: `2cfed97ee5b9b8eb11103b0575eb7f29de00a0bd`
 Publication: branch `maintenance/codex-app-server-containment`, tag
 `codex-app-server-containment-2cfed97-v1`
 
+Historical maintenance record only. The current
+[shared-service decision](2026-09-09-shared-codex-app-server.md) supersedes its
+private-process ownership and native-version admission. The recorded build's
+qualification is not evidence for a newer native release.
+
 ## Decision
 
 The public `(codex, sdk)` route keeps its name and session-reference schema, but

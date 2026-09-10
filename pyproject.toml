@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 # Claude's SDK remains optional. Codex is a core WebSocket client of a
-# separately pinned host service; it carries no Python SDK or executable.
+# host-owned service; it carries no Python SDK or executable.
 [project.optional-dependencies]
 claude-sdk = [
     "claude-agent-sdk>=0.2.130,<1",

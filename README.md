@@ -165,7 +165,10 @@ itself never fetches.
 ## Agent lane
 
 Exactly two routes ship: `(codex, sdk)` and `(claude, sdk)`. The core package
-declares `websockets`; the host separately pins and supervises Codex 0.153.4.
+declares `websockets`; the host separately installs the latest stable Codex and
+supervises its shared service. Native version metadata is diagnostic, not an
+admission gate; protocol validation, subscription auth, and containment remain
+fail-closed. Installing a newer version does not certify its live behavior.
 The Codex route retains the `sdk` name and owns the documented
 WebSocket-over-Unix-socket App Server client; Claude remains on its official
 SDK. This package
@@ -178,7 +181,7 @@ the turn with an `AgentQuotaExhausted` terminal — the lane never overflows
 onto API rates. `AgentTerminal.usage` is always local to that invocation and
 never replays cumulative native-session history. `AgentTerminal.final_text` is
 the provider-selected assistant response, not concatenated assistant traffic;
-Codex follows the pinned App Server's last-final-answer/last-unknown rule, while
+Codex follows the App Server's last-final-answer/last-unknown rule, while
 commentary remains observable but is never executable structured output. Child
 environments are runtime-owned and scrubbed. Under
 `CodexNativeOptions(builtin_tools="disabled")`, every known native authority

@@ -1,4 +1,4 @@
-"""Strict managed cognition on the pinned shared Codex protocol."""
+"""Strict managed cognition on the shared Codex protocol."""
 
 from __future__ import annotations
 
@@ -98,7 +98,7 @@ from .types import (
 _REQUIRED_MCP_STARTUP_FAILURE = "required MCP servers failed to initialize"
 
 # The configurable execution, integration, and local-context features in the
-# pinned Codex runtime. Keep this as one closed vendor mapping behind
+# Codex runtime. Keep this as one closed vendor mapping behind
 # `CodexNativeOptions.builtin_tools`; callers must not depend on Codex feature names.
 _DISABLED_BUILTIN_FEATURES = (
     "apply_patch_streaming_events",

@@ -24,6 +24,7 @@ from provider_runtime.agent_runtime import (
     CodexNativeOptions,
     CodexSandboxControls,
     CredentialRef,
+    CredentialRejected,
     CredentialUnavailable,
     HeaderReference,
     InvalidAgentRequest,
@@ -70,7 +71,8 @@ class ProtocolPeer:
         self.socket = socket
         self.messages: list[dict[str, object]] = []
         self.closed_connections = 0
-        self.version = "0.153.4"
+        self.initialize: object = {"userAgent": "codex_cli_rs/0.154.0 (Linux synthetic; x86_64)"}
+        self.account: object = {"type": "chatgpt"}
         self.models = [
             {
                 "id": "fixture-model",
@@ -147,9 +149,9 @@ class ProtocolPeer:
                     continue
                 if method == "initialize":
                     await connection.send(json.dumps(self.startup_message))
-                    result = {"userAgent": f"codex_cli_rs/{self.version} (Linux synthetic; x86_64)"}
+                    result = self.initialize
                 elif method == "account/read":
-                    result = {"account": {"type": "chatgpt"}}
+                    result = {"account": self.account}
                 elif method == "model/list":
                     result = {"data": self.models, "nextCursor": None}
                 elif method == "thread/list":
@@ -397,6 +399,60 @@ async def test_timestamped_startup_notification_preserves_correlated_protocol(
             "account/updated", {"authMode": None, "planType": None}
         )
         assert await client.account() == {"account": {"type": "chatgpt"}}
+
+
+@pytest.mark.parametrize(
+    ("metadata", "valid"),
+    [
+        ({"userAgent": "codex_cli_rs/0.154.0 (Linux synthetic; x86_64)"}, True),
+        ({"userAgent": "codex_cli_rs/0.144.4 (Linux synthetic; x86_64)"}, True),
+        ({"userAgent": "native build identification"}, True),
+        ({"userAgent": 154}, False),
+        ({}, False),
+        ([], False),
+    ],
+)
+async def test_initialize_metadata_is_not_version_authority(
+    peer: ProtocolPeer, metadata: object, valid: bool
+) -> None:
+    peer.initialize = metadata
+    client = CodexAppServerClient(CodexAppServerConfig(peer.socket))
+    if valid:
+        async with client:
+            assert client.metadata == metadata
+            assert await client.account() == {"account": {"type": "chatgpt"}}
+        assert [message.get("method") for message in peer.messages] == [
+            "initialize",
+            "initialized",
+            "account/read",
+        ]
+    else:
+        with pytest.raises(ProtocolDefect):
+            async with client:
+                pytest.fail("malformed initialization admitted a client")
+        assert [message.get("method") for message in peer.messages] == ["initialize"]
+    assert peer.socket.is_socket()
+
+
+@pytest.mark.parametrize("account", [None, {"type": "apiKey"}])
+async def test_native_metadata_does_not_substitute_subscription_auth(
+    tmp_path: Path, peer: ProtocolPeer, account: object
+) -> None:
+    peer.account = account
+    async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"lab": peer.socket})) as runtime:
+        with pytest.raises(CodexControlError) as failure:
+            await runtime.codex.create(CodexCreateRequest("lab", tmp_path))
+        assert (failure.value.code, failure.value.dispatch) == ("auth", "NotSent")
+        with pytest.raises(CredentialUnavailable if account is None else CredentialRejected):
+            await runtime.model_catalog("codex", CredentialRef("local_account", "lab"))
+    assert [message.get("method") for message in peer.messages] == [
+        "initialize",
+        "initialized",
+        "account/read",
+        "initialize",
+        "initialized",
+        "account/read",
+    ]
 
 
 async def test_shared_catalog_preserves_exact_generation_and_resolves_native_dispatch(
@@ -873,7 +929,7 @@ async def test_malformed_correlated_protocol_is_a_defect_not_empty_inventory(
             await runtime.codex.list(CodexListRequest("lab"))
 
 
-async def test_pin_failure_and_one_unavailable_profile_do_not_fall_back(
+async def test_one_unavailable_profile_does_not_fall_back(
     tmp_path: Path, peer: ProtocolPeer
 ) -> None:
     async with AgentRuntime(
@@ -886,9 +942,6 @@ async def test_pin_failure_and_one_unavailable_profile_do_not_fall_back(
         assert failure.value.code == "unavailable"
         assert peer.messages == []
         assert (await runtime.codex.list(CodexListRequest("lab"))).threads
-        peer.version = "0.144.4"
-        with pytest.raises(ProtocolDefect, match="pin"):
-            await runtime.codex.list(CodexListRequest("lab"))
 
 
 async def test_cancelled_create_disconnects_without_resending_or_server_cleanup(
