@@ -40,7 +40,6 @@ from provider_runtime.agent_runtime import (
     TextContent,
     TurnRequest,
 )
-from provider_runtime.agent_runtime.codex_app_server import CODEX_VERSION
 from tests.live.agent_matrix import MatrixSelectionError, parse_codex_endpoint
 
 pytestmark = pytest.mark.live_provider
@@ -69,11 +68,10 @@ def _codex_endpoint() -> Path:
 
 def _write_evidence(evidence: dict[str, object]) -> None:
     payload: dict[str, object] = {
-        "schema_version": "codex-native-containment-live-evidence.v2",
+        "schema_version": "codex-native-containment-live-evidence.v3",
         "route": "codex:sdk",
         "auth": "local_account",
         "model": _MODEL,
-        "codex_version": CODEX_VERSION,
         "recorded_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         **evidence,
     }

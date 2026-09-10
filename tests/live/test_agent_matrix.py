@@ -14,7 +14,7 @@ Rules:
 - ``LLM_RUNTIME_LIVE=1`` is required — anything else fails, never skips;
 - an omitted ``LLM_RUNTIME_LIVE_AGENT_ROUTES`` is the release run and covers
   both shipped routes; a narrowed run certifies nothing;
-- ``LLM_RUNTIME_LIVE_CODEX_ENDPOINT`` names the already-running pinned shared
+- ``LLM_RUNTIME_LIVE_CODEX_ENDPOINT`` names the already-running host-owned shared
   App Server; the client never starts or owns a Codex process;
 - ``LLM_RUNTIME_LIVE_CODEX_MODELS`` / ``LLM_RUNTIME_LIVE_CLAUDE_SDK_MODELS``
   optionally widen a route beyond the backend's default model;
@@ -71,7 +71,6 @@ from provider_runtime.agent_runtime import (
     TextContent,
     TurnRequest,
 )
-from provider_runtime.agent_runtime.codex_app_server import CODEX_VERSION
 from provider_runtime.agent_runtime.codex_sdk import CodexSdkAdapter
 from provider_runtime.agent_runtime.types import AGENT_ROUTES
 from provider_runtime.types import Absent, Presence, Present, TokenUsage
@@ -558,7 +557,7 @@ def _route_policy(route: LiveRoute) -> PermissionPolicy:
 def _write_evidence(route: LiveRoute, cases: list[dict[str, object]]) -> None:
     _EVIDENCE_DIR.mkdir(exist_ok=True)
     payload: dict[str, object] = {
-        "schema_version": "agent-runtime-live-evidence.v3",
+        "schema_version": "agent-runtime-live-evidence.v4",
         "route": route.name,
         "auth": "local_account",
         "recorded_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -566,7 +565,6 @@ def _write_evidence(route: LiveRoute, cases: list[dict[str, object]]) -> None:
     }
     if route.backend == "codex":
         payload["transport_boundary"] = "shared_websocket_unix"
-        payload["codex_version"] = CODEX_VERSION
     canonical = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     revision = hashlib.sha256(canonical.encode()).hexdigest()[:12]
     payload["evidence_revision"] = revision

@@ -29,7 +29,6 @@ from .errors import AgentRuntimeError, ProtocolDefect, SdkUnavailable
 type CodexRequestId = str | int
 type CodexServerRequestKind = Literal["permission", "tool"]
 
-CODEX_VERSION = "0.153.4"
 CODEX_THREAD_SOURCES = (
     "cli",
     "vscode",
@@ -185,9 +184,7 @@ class CodexAppServerClient:
         except (OSError, TimeoutError):
             raise CodexConnectionUnavailable() from None
         except InvalidHandshake:
-            raise ProtocolDefect(
-                "Codex socket did not provide the pinned WebSocket protocol"
-            ) from None
+            raise ProtocolDefect("Codex socket did not provide the WebSocket protocol") from None
         if self._closed:
             await self._connection.close()
             raise CodexConnectionUnavailable()
@@ -205,13 +202,8 @@ class CodexAppServerClient:
                 },
             )
             self.metadata = self._mapping(initialized, "initialize response")
-            user_agent = self.metadata.get("userAgent")
-            if (
-                not isinstance(user_agent, str)
-                or not user_agent.split(" ", 1)[0].partition("/")[0]
-                or user_agent.split(" ", 1)[0].partition("/")[2] != CODEX_VERSION
-            ):
-                raise ProtocolDefect("Codex server version does not match the qualified pin")
+            if not isinstance(self.metadata.get("userAgent"), str):
+                raise ProtocolDefect("Codex initialize userAgent was not a string")
             await self.notify("initialized", None)
         except BaseException:
             await self.close()

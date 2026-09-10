@@ -6,8 +6,9 @@ terminal-status cases. The R03 strings are deliberately preserved byte-for-byte:
 each is valid JSON, while their old adjacent concatenation is not.
 
 The corpus models `item/agentMessage/delta`, `item/completed`, and
-`turn/completed` shapes exposed by the pinned Codex 0.153.4 App Server. All
-identities and content are synthetic.
+`turn/completed` shapes exposed by the historically inspected Codex 0.153.4
+App Server. This is protocol regression coverage, not native-version admission
+or evidence for a newer build. All identities and content are synthetic.
 
 The active WebSocket-over-UDS fixtures live beside their focused tests and reuse
 `app_server_protocol_cases.json` for native message classification. Its retained

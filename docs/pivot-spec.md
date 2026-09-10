@@ -9,12 +9,15 @@ not an approval record.
 
 Integration addendum (2026-09-09): current generation catalogs, authenticated
 Codex selection, and endpoint routing remain supported. The Codex production
-lane attaches to the host-owned Codex 0.153.4 App Server through WebSocket
+lane attaches to the host-owned latest-stable Codex App Server through WebSocket
 frames over a configured Unix socket. It never starts a private App Server or
 imports a Codex Python SDK. The public `(codex, sdk)` route and session-ref
 schema remain stable. `docs/decisions/2026-09-09-shared-codex-app-server.md`
 supersedes the Codex process-ownership portion of the earlier same-day
 App Server integration decision, not its catalog or generation contracts.
+Native version metadata is diagnostic, never admission authority. Protocol,
+subscription-auth, and containment checks remain fail-closed; routine tests
+do not qualify a new native binary's live behavior.
 
 v1 → v2 changes: continuation state restored to the contract (blocking finding 1); OpenRouter
 routing/privacy pins preserved (2); §13 is a full migration contract (3); agent security
@@ -228,9 +231,10 @@ capability matrix — validation is behavioral (capability probe), not version-k
 
 - Events → 6 kinds: `AgentText, AgentToolUse, AgentUsage, AgentPermissionRequest, AgentNative(bounded, redacted), AgentTerminal`. Shares `TokenUsage`/`CallMeta` nouns.
 - Quota: pool exhaustion → `AgentQuotaExhausted` terminal. The lane never enables API-rate overflow and never forwards API-key credentials. Block-and-stop only.
-- Pinning: bounded constraints in `pyproject.toml` extras; exact pins in
-  lockfiles. The Codex disabled-builtins posture additionally requires the
-  host-pinned App Server/TUI version 0.153.4 before a turn.
+- Dependencies: bounded constraints in `pyproject.toml` extras; exact pins in
+  lockfiles. The host installs the latest stable Codex App Server/TUI. The
+  disabled-builtins posture enforces native controls and authority
+  classification, not a native version-string gate.
 - Size: deletions measured so far ≈ 860 lines (capabilities + policy algebra) plus taxonomy/test-double/version-gate reductions; target **≤ 8k** (from 9,902), recounted at WP-A merge. The v1 "~3k" claim was unsupported and is withdrawn.
 
 ## 11. Testing

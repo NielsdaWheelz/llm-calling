@@ -34,7 +34,7 @@ vetted Claude Code executable through public `cli_path`.
 Unknown backend/transport pairs fail as `InvalidAgentRequest`. A missing optional
 SDK fails as `SdkUnavailable`; it never selects another lane.
 
-## Installation and pins
+## Installation and native version policy
 
 The base package imports neither agent SDK. Install the route or routes an
 application actually uses:
@@ -44,13 +44,21 @@ uv sync --extra claude-sdk
 ```
 
 The base package directly constrains `websockets>=16,<17`; the lockfile pins its
-exact resolution. The host independently pins the qualified App Server/TUI at Codex
-0.153.4. The Claude extra carries `claude-agent-sdk>=0.2.130,<1` with its exact
-lock resolution. A missing transport dependency raises `SdkUnavailable`; a
-missing or unreachable configured Codex endpoint is a typed credential/profile
+exact resolution. The host independently installs and supervises the latest
+stable Codex App Server/TUI. Native `userAgent` is string metadata, not a
+version-based admission rule. The Claude extra carries
+`claude-agent-sdk>=0.2.130,<1` with its exact lock resolution. A missing transport
+dependency raises `SdkUnavailable`; a missing or unreachable configured Codex
+endpoint is a typed credential/profile
 availability failure, never a private-runtime fallback.
 
-Codex 0.153.4 replays cumulative usage around `thread/resume`. The owned
+Initialize response shape, correlation, account routing, and authority
+classification remain strict. New native behavior is not implicitly certified:
+protocol drift fails closed and live qualification is separate from routine
+fixture coverage. No version parser, compatibility fallback, or private server
+is selected when the shared endpoint is incompatible.
+
+Codex replays cumulative usage around `thread/resume`. The owned
 transport keeps every notification in wire order, validates an explicit
 pre-turn allowlist, and derives the resume/fork baseline without a private SDK
 queue seam. A replay that races behind the response is accepted only as the
@@ -105,8 +113,8 @@ async with AgentRuntime(config) as runtime:
         reasoning=reasoning.key,
         agent_definition_revision=catalog.definition_revision,
         row_fingerprint=model.row_fingerprint,
-        # Certified containment: read-only, offline, deny-all, no MCP,
-        # copied environment, or additional roots; host Codex 0.153.4 is required.
+        # Contained cognition: read-only, offline, deny-all, no MCP,
+        # copied environment, or additional roots; native behavior is separately qualified.
         policy=PermissionPolicy(allowed_tools=("*",)),
         native=CodexNativeOptions(builtin_tools="disabled"),
     )
@@ -125,7 +133,7 @@ App Server RPC `model/list` through every page and returns every visible row in 
 order. `AgentModelCatalog` carries a content-derived definition revision;
 each `AgentModelFacts` carries exact model/dispatch identity, ordered reasoning
 facts, modalities, lifecycle/upgrade facts, and a content-derived row
-fingerprint. The pinned public App Server reports neither context-window nor
+fingerprint. The public App Server catalog reports neither context-window nor
 max-output capacity, so both source-capacity fields are honestly `Absent` and
 do not make a row unusable. Product request budgets remain caller-owned.
 
@@ -301,8 +309,7 @@ adapter sees it.
 Codex has no public typed per-name built-in filter. The portable policy therefore
 still requires the sentinel `allowed_tools=("*",)`. The additional
 `CodexNativeOptions(builtin_tools="disabled")` posture writes the complete
-feature-off configuration certified for the host-pinned Codex 0.153.4 service
-and requires read-only
+supported feature-off configuration and requires read-only
 filesystem, disabled network, denied approvals, empty copied environment, no
 MCP, and no additional roots. Provider review is refused in this posture.
 Claude continues to accept exact tool names, reject glob patterns and its two
@@ -358,10 +365,10 @@ Native extension objects are versioned, backend-specific escape hatches:
 - `CodexNativeOptions(web_search=...)` is session-scoped and requires
   unrestricted network when enabled;
 - `CodexNativeOptions(builtin_tools="disabled")` disables the execution,
-  integration, and local-context feature set certified for the pinned Codex
-  runtime. It also suppresses app, skill, environment, permission, and collaboration
+  integration, and local-context feature set through explicit native controls.
+  It also suppresses app, skill, environment, permission, and collaboration
   instructions plus request-user-input.
-  This is a certified containment posture, not proof of pre-execution
+  This is a containment posture, not proof of pre-execution
   prevention: public controls do not establish that Code Mode/native `exec` is
   absent before computation. The child is credentialless, read-only, and
   offline. Its first observable authority event poisons the turn, invalidates
@@ -399,8 +406,8 @@ message selection before strict JSON parsing or downstream schema validation.
 For Codex, the adapter retains each completed `agentMessage` item's identity,
 text, phase, and native completion order. At terminal it scans those items in
 reverse order and selects the last `phase=final_answer` item. If none exists, it
-selects the last completed item whose phase is absent, matching the pinned
-Codex 0.153.4 App Server behavior. Commentary is never eligible,
+selects the last completed item whose phase is absent, matching the supported
+App Server behavior. Commentary is never eligible,
 even if it is individually valid JSON or arrives after the final answer. Multiple
 eligible messages are not concatenated. A completed turn with no eligible item,
 or a duplicate, empty, malformed, or unknown-phase completed assistant identity,

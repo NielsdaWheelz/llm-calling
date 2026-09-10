@@ -52,6 +52,12 @@ subscription auth. Unknown server requests are rejected, worker approval
 requests are deliberately left unanswered for the attached TUI, and managed
 cognition denies its own approval requests.
 
+The host owns the latest-stable native Codex installation. Initialize metadata
+must have the documented shape; its version string grants no authority and is
+not a compatibility gate. Protocol drift still fails closed. Routine fixtures
+do not certify an upgraded native binary; live containment remains a separate
+qualification.
+
 For Claude, a shell router or version-manager shim can overwrite
 `CLAUDE_CONFIG_DIR` and defeat isolation. Point
 `AgentRuntimeConfig.claude_executable` at the real executable. The runtime
@@ -98,8 +104,8 @@ approve actions within the separately selected filesystem/network sandbox.
 
 Codex exposes no typed per-name built-in filter, so `allowed_tools=("*",)` is
 the only portable-policy spelling. `CodexNativeOptions(builtin_tools="disabled")`
-is a separate exact-version containment posture: it sets the public 0.153.4
-feature-off configuration and requires read-only filesystem, disabled network,
+is a separate containment posture: it sets the public feature-off
+configuration and requires read-only filesystem, disabled network,
 deny approvals, empty copied environment, no MCP, and no additional roots.
 Provider review is rejected in that posture. Claude accepts exact tool names,
 rejects glob patterns and the two network-reaching built-ins (`WebFetch`, `WebSearch`)
