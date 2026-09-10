@@ -1,0 +1,69 @@
+{
+  "auth": "local_account",
+  "cases": [
+    {
+      "codex_usage_accounting": {
+        "cumulative_delta": {
+          "cache_read_input_tokens": 77312,
+          "cache_write_input_tokens": 0,
+          "input_tokens": 106131,
+          "output_tokens": 30,
+          "reasoning_tokens": 0,
+          "total_tokens": 106161
+        },
+        "invocation_sum": {
+          "cache_read_input_tokens": 77312,
+          "cache_write_input_tokens": 0,
+          "input_tokens": 106131,
+          "output_tokens": 30,
+          "reasoning_tokens": 0,
+          "total_tokens": 106161
+        },
+        "local_sum_matches_cumulative_delta": true,
+        "resume_history_excluded": true,
+        "resume_replay_observed": true,
+        "turn_count": 6
+      },
+      "model": "gpt-5.6-terra",
+      "resume_turn": {
+        "same_native_session": true,
+        "status": "succeeded"
+      },
+      "route": "codex:sdk",
+      "stream_turn": {
+        "event_count": 11,
+        "event_kinds": [
+          "AgentNative",
+          "AgentTerminal",
+          "AgentText",
+          "AgentToolUse",
+          "AgentUsage"
+        ],
+        "final_text_sha256": "9795c5ff8937f23526ccb207a5684c1fc94a7854e19c021b39d944e51f5baef2",
+        "status": "succeeded",
+        "usage_reported": true
+      },
+      "structured_turn": {
+        "assistant_message_selection": {
+          "completed_message_count": 3,
+          "last_final_answer_or_unknown_selected": true,
+          "phases": [
+            "commentary",
+            "commentary",
+            "final_answer"
+          ],
+          "selected_text_sha256": "4062edaf750fb8074e7e83e0c9028c94e32468a8b6f1614774328ef045150f93"
+        },
+        "commentary_excluded_from_structured_output": true,
+        "dual_phase_observed": true,
+        "ok": true,
+        "status": "succeeded"
+      }
+    }
+  ],
+  "evidence_revision": "32ae5545775c",
+  "recorded_at": "2026-09-10T20:02:14Z",
+  "route": "codex:sdk",
+  "schema_version": "agent-runtime-live-evidence.v4",
+  "transport_boundary": "shared_websocket_unix"
+}

@@ -1587,14 +1587,31 @@ class CodexSdkAdapter:
 
         ``inputTokens`` is already cache-inclusive (OpenAI wire semantics), so it maps
         straight onto ``TokenUsage.input_tokens`` without re-adding cache components. The
-        ``last`` member is validated as a consistency witness, never used as the accounting
-        source: one AgentRuntime turn can contain several upstream requests.
+        ``last`` is a request-usage witness or a non-billing context estimate after
+        compaction, never the accounting source: one turn can contain several requests.
         """
         return self._decode_token_usage(params)
 
     def _decode_token_usage(self, params: Mapping[str, object]) -> TokenUsage:
         token_usage = self._mapping(params.get("tokenUsage"), "token usage")
         total = self._usage_member(token_usage, "total")
+        last_member = self._mapping(token_usage.get("last"), "token usage last")
+        # Native recompute_token_usage replaces only last with an estimated context
+        # size and zero billing components. That estimate can exceed cumulative usage.
+        if (
+            all(
+                type(last_member.get(key)) is int and last_member[key] == 0
+                for key in (
+                    "inputTokens",
+                    "outputTokens",
+                    "cachedInputTokens",
+                    "cacheWriteInputTokens",
+                    "reasoningOutputTokens",
+                )
+            )
+            and self._usage_count(last_member, "last", "totalTokens") > 0
+        ):
+            return total
         last = self._usage_member(token_usage, "last")
         self._validate_last_usage(last, total)
         return total
