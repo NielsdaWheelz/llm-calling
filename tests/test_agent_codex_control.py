@@ -72,8 +72,12 @@ class ProtocolPeer:
         self.foreign_noise = False
         self.turn_status = "inProgress"
         self.drop_method: str | None = None
+        self.close_code = 1000
         self.errors: dict[str, str] = {}
+        self.error_code = -32600
         self.answer = "synthetic answer"
+        self.answer_phase = "final_answer"
+        self.older_items: list[dict[str, object]] = []
         self.interrupt_settles = True
         self.status = "idle"
         self.intervene = False
@@ -109,7 +113,7 @@ class ProtocolPeer:
                     await connection.send(self.raw_reply)
                     continue
                 if method == self.drop_method:
-                    await connection.close()
+                    await connection.close(code=self.close_code)
                     return
                 if method in self.errors:
                     await connection.send(
@@ -117,7 +121,7 @@ class ProtocolPeer:
                             {
                                 "id": message["id"],
                                 "error": {
-                                    "code": -32600,
+                                    "code": self.error_code,
                                     "message": self.errors[method],
                                 },
                             }
@@ -136,23 +140,30 @@ class ProtocolPeer:
                 elif method == "thread/read":
                     result = {"thread": self.thread()}
                 elif method == "thread/turns/list":
+                    view = message["params"].get("itemsView", "summary")
                     result = {
                         "data": [
                             {
                                 "id": TURN,
                                 "status": self.turn_status,
-                                "itemsView": "full",
-                                "items": [
-                                    {
-                                        "id": "answer",
-                                        "type": "agentMessage",
-                                        "text": self.answer,
-                                        "phase": "final_answer",
-                                    }
-                                ],
+                                "itemsView": view,
+                                "items": [] if view == "notLoaded" else self.turn_items(),
                             }
                         ],
                         "nextCursor": None,
+                    }
+                elif method == "thread/items/list":
+                    params = message["params"]
+                    assert params["threadId"] == THREAD and params["turnId"] == TURN
+                    assert params["sortDirection"] == "desc"
+                    assert params.get("cursor") is None
+                    items = self.turn_items()
+                    limit = params["limit"]
+                    result = {
+                        "data": [
+                            {"turnId": TURN, "item": item} for item in reversed(items[-limit:])
+                        ],
+                        "nextCursor": "older-items" if len(items) > limit else None,
                     }
                 elif method == "thread/unsubscribe":
                     result = {"status": "unsubscribed"}
@@ -182,6 +193,17 @@ class ProtocolPeer:
             "status": {"type": self.status},
             "turns": [],
         }
+
+    def turn_items(self) -> list[dict[str, object]]:
+        return [
+            *self.older_items,
+            {
+                "id": "answer",
+                "type": "agentMessage",
+                "text": self.answer,
+                "phase": self.answer_phase,
+            },
+        ]
 
     async def turn_events(self, connection: ServerConnection) -> None:
         scope = {"threadId": THREAD, "turnId": TURN}
@@ -579,6 +601,151 @@ async def test_oversized_metadata_has_honest_list_error_and_bounded_read(
         assert (failure.value.code, failure.value.dispatch) == ("output_limit", "NotSent")
         read = await runtime.codex.read(CodexThreadTarget("lab", THREAD))
         assert read.thread.name is None and isinstance(read.coverage, CodexBounded)
+
+
+async def test_bounded_native_item_page_preserves_latest_final_and_interrupt_is_metadata_only(
+    tmp_path: Path, peer: ProtocolPeer
+) -> None:
+    peer.older_items = [
+        {
+            "id": "large-output",
+            "type": "commandExecution",
+            "aggregatedOutput": "x" * (5 * 1024 * 1024),
+        },
+        *(
+            {
+                "id": f"answer-{index}",
+                "type": "agentMessage",
+                "text": f"final-{index}",
+                "phase": "final_answer",
+            }
+            for index in range(60)
+        ),
+    ]
+    peer.answer_phase = "commentary"
+    target = CodexThreadTarget("lab", THREAD)
+    async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"lab": peer.socket})) as runtime:
+        read = await runtime.codex.read(target)
+        assert read.last_answer == "final-59"
+        assert isinstance(read.coverage, CodexBounded)
+        peer.answer = "x" * (5 * 1024 * 1024)
+        bounded = await runtime.codex.read(target)
+        assert bounded.last_answer is None and isinstance(bounded.coverage, CodexBounded)
+        assert bounded.turn is not None and bounded.turn.target == CodexTurnTarget(target, TURN)
+        before = len(peer.messages)
+        assert isinstance(
+            await runtime.codex.interrupt(CodexTurnTarget(target, TURN)), CodexInterrupted
+        )
+        assert not any(
+            message.get("method") == "thread/items/list" for message in peer.messages[before:]
+        )
+    pages = [message for message in peer.messages if message.get("method") == "thread/items/list"]
+    assert len(pages) == 2
+    for message in pages:
+        assert isinstance(message["params"], dict) and message["params"]["limit"] == 50
+    turns = [message for message in peer.messages if message.get("method") == "thread/turns/list"]
+    for message in turns:
+        assert isinstance(message["params"], dict) and message["params"]["itemsView"] == "notLoaded"
+
+
+@pytest.mark.parametrize("mutation", [False, True])
+async def test_oversized_native_frame_reports_output_limit_without_replaying_mutation(
+    tmp_path: Path, peer: ProtocolPeer, mutation: bool
+) -> None:
+    peer.name = "x" * (5 * 1024 * 1024)
+    async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"lab": peer.socket})) as runtime:
+        with pytest.raises(CodexControlError) as failure:
+            if mutation:
+                await runtime.codex.create(CodexCreateRequest("lab", tmp_path))
+            else:
+                await runtime.codex.list(CodexListRequest("lab"))
+        assert (failure.value.code, failure.value.dispatch) == (
+            "output_limit",
+            "Unknown" if mutation else "NotSent",
+        )
+    method = "thread/start" if mutation else "thread/list"
+    assert sum(message.get("method") == method for message in peer.messages) == 1
+
+
+async def test_oversized_managed_frame_remains_a_fatal_protocol_defect(
+    tmp_path: Path, peer: ProtocolPeer
+) -> None:
+    peer.emit_managed = True
+    peer.answer = "x" * (5 * 1024 * 1024)
+    async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"lab": peer.socket})) as runtime:
+        session = await runtime.open_session(
+            AgentSessionRequest(
+                backend="codex",
+                transport="sdk",
+                auth=CredentialRef("local_account", "lab"),
+                cwd=str(tmp_path),
+                open=NewSession(),
+                policy=PermissionPolicy(allowed_tools=("*",)),
+                native=CodexNativeOptions(builtin_tools="disabled"),
+            )
+        )
+        observed = []
+        with pytest.raises(ProtocolDefect):
+            async for event in runtime.stream_turn(
+                session, TurnRequest(input=(TextContent("synthetic"),))
+            ):
+                observed.append(event)
+        assert not any(isinstance(event, AgentTerminal) for event in observed)
+
+
+async def test_peer_initiated_size_close_is_not_a_locally_observed_output_limit(
+    tmp_path: Path, peer: ProtocolPeer
+) -> None:
+    peer.drop_method = "thread/list"
+    peer.close_code = 1009
+    async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"lab": peer.socket})) as runtime:
+        with pytest.raises(CodexControlError) as failure:
+            await runtime.codex.list(CodexListRequest("lab"))
+        assert (failure.value.code, failure.value.dispatch) == ("unavailable", "NotSent")
+
+
+async def test_structurally_oversized_native_page_retains_bounded_thread_metadata(
+    tmp_path: Path, peer: ProtocolPeer
+) -> None:
+    peer.older_items = [
+        {
+            "id": "many-parts",
+            "type": "userMessage",
+            "content": [{"type": "text", "text": "synthetic"} for _ in range(30_000)],
+        }
+    ]
+    assert len(json.dumps(peer.turn_items()).encode()) < 4 * 1024 * 1024
+    async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"lab": peer.socket})) as runtime:
+        result = await runtime.codex.read(CodexThreadTarget("lab", THREAD))
+        assert result.turn is not None and result.turn.target.turn_handle == TURN
+        assert result.last_answer is None and isinstance(result.coverage, CodexBounded)
+
+
+@pytest.mark.parametrize(
+    "method,detail,bounded",
+    [
+        ("thread/items/list", "thread/items/list is not supported yet", True),
+        ("thread/items/list", "unknown method", False),
+        ("thread/turns/list", "thread/items/list is not supported yet", False),
+    ],
+)
+async def test_only_exact_native_item_paging_refusal_preserves_bounded_metadata(
+    tmp_path: Path, peer: ProtocolPeer, method: str, detail: str, bounded: bool
+) -> None:
+    peer.errors[method] = detail
+    peer.error_code = -32601
+    async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"lab": peer.socket})) as runtime:
+        target = CodexThreadTarget("lab", THREAD)
+        if bounded:
+            result = await runtime.codex.read(target)
+            assert result.turn is not None and result.turn.target.turn_handle == TURN
+            assert result.last_answer is None and isinstance(result.coverage, CodexBounded)
+        else:
+            with pytest.raises(ProtocolDefect):
+                await runtime.codex.read(target)
+    methods = [message.get("method") for message in peer.messages]
+    assert methods.count("thread/items/list") <= 1
+    assert methods.count("thread/turns/list") == 1
 
 
 @pytest.mark.parametrize(

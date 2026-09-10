@@ -18,6 +18,7 @@ from .codex_app_server import (
     CodexAppServerConfig,
     CodexAppServerResponseError,
     CodexConnectionUnavailable,
+    CodexOutputLimit,
 )
 from .errors import AgentRuntimeError, InvalidAgentRequest, ProtocolDefect
 from .types import CredentialRef
@@ -221,6 +222,10 @@ class CodexControlError(AgentRuntimeError):
         self.known_thread = known_thread
 
 
+class _ItemPagingUnavailable(Exception):
+    """Pinned native history cannot provide an item page for this thread."""
+
+
 class CodexControl:
     """One native control boundary; it owns connections, never servers or workers."""
 
@@ -262,7 +267,7 @@ class CodexControl:
 
     async def read(self, target: CodexThreadTarget) -> CodexThreadRead:
         async with self._client(target.profile_key) as client:
-            return await self._read(client, target)
+            return await self._read(client, target, include_items=True)
 
     async def create(self, request: CodexCreateRequest) -> CodexThreadTarget:
         # The external server may have a different filesystem view or UID.
@@ -333,7 +338,7 @@ class CodexControl:
     async def interrupt(self, target: CodexTurnTarget) -> CodexInterruptOutcome:
         self._guard(target.thread)
         async with self._client(target.thread.profile_key) as client:
-            observed = await self._read(client, target.thread)
+            observed = await self._read(client, target.thread, include_items=False)
             settled = _interrupt_outcome(target, observed)
             if settled is not None:
                 return settled
@@ -355,7 +360,7 @@ class CodexControl:
                 if error.code != "stale":
                     raise
             try:
-                observed = await self._read(client, target.thread)
+                observed = await self._read(client, target.thread, include_items=False)
             except CodexControlError:
                 return CodexUnknown()
             return _interrupt_outcome(target, observed) or CodexUnknown()
@@ -406,17 +411,28 @@ class CodexControl:
             raise CodexControlError("invalid", "NotSent", known_thread)
         try:
             return await client.request(method, params)
+        except CodexOutputLimit:
+            raise CodexControlError(
+                "output_limit", "Unknown" if mutation else "NotSent", known_thread
+            ) from None
         except CodexConnectionUnavailable:
             raise CodexControlError(
                 "unavailable", "Unknown" if mutation else "NotSent", known_thread
             ) from None
         except CodexAppServerResponseError as error:
+            if (
+                method == "thread/items/list"
+                and error.code == -32601
+                and error.detail == "thread/items/list is not supported yet"
+                and error.data is None
+            ):
+                raise _ItemPagingUnavailable() from None
             raise CodexControlError(
                 _error_code(error), "Rejected" if mutation else "NotSent", known_thread
             ) from None
 
     async def _read(
-        self, client: CodexAppServerClient, target: CodexThreadTarget
+        self, client: CodexAppServerClient, target: CodexThreadTarget, *, include_items: bool
     ) -> CodexThreadRead:
         result = _object(
             await self._request(
@@ -444,7 +460,7 @@ class CodexControl:
                     "threadId": target.thread_handle,
                     "limit": 1,
                     "sortDirection": "desc",
-                    "itemsView": "full",
+                    "itemsView": "notLoaded",
                 },
             )
         )
@@ -467,37 +483,68 @@ class CodexControl:
         snapshot = CodexTurnSnapshot(
             _turn_target(target, turn.get("id")), cast(CodexTurnStatus, status)
         )
+        if turn.get("itemsView") != "notLoaded" or turn.get("items") != []:
+            raise ProtocolDefect("Codex turn metadata unexpectedly included items")
+        if not include_items:
+            return CodexThreadRead(summary, snapshot, None, CodexBounded("turn metadata only"))
         coverage: CodexComplete | CodexBounded = (
             CodexBounded("latest turn only") if result.get("nextCursor") else CodexComplete()
         )
         if metadata_bounded:
             coverage = CodexBounded("metadata exceeds output bound")
+        try:
+            result = _object(
+                await self._request(
+                    client,
+                    "thread/items/list",
+                    {
+                        "threadId": target.thread_handle,
+                        "turnId": snapshot.target.turn_handle,
+                        "limit": 50,
+                        "sortDirection": "desc",
+                    },
+                )
+            )
+        except _ItemPagingUnavailable:
+            return CodexThreadRead(
+                summary, snapshot, None, CodexBounded("native item paging unavailable")
+            )
+        except CodexControlError as error:
+            if error.code != "output_limit":
+                raise
+            return CodexThreadRead(
+                summary, snapshot, None, CodexBounded("items exceed output bound")
+            )
+        items = result.get("data")
+        if not isinstance(items, list) or len(items) > 50:
+            raise ProtocolDefect("Codex item list exceeded its page contract")
+        cursor = result.get("nextCursor")
+        if cursor is not None and (not isinstance(cursor, str) or not cursor):
+            raise ProtocolDefect("Codex item list returned a malformed cursor")
+        if cursor is not None:
+            coverage = CodexBounded("latest turn item page only")
         if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > 48 * 1024:
             return CodexThreadRead(
-                summary, snapshot, None, CodexBounded("turn exceeds output bound")
+                summary, snapshot, None, CodexBounded("items exceed output bound")
             )
-        if turn.get("itemsView") != "full":
-            return CodexThreadRead(
-                summary, snapshot, None, CodexBounded("native items are not complete")
-            )
-        items = turn.get("items")
-        if not isinstance(items, list):
-            raise ProtocolDefect("Codex turn items were not an array")
         answer = None
         unknown_phase = None
-        for item in items:
-            item = _object(item)
+        for entry in items:
+            entry = _object(entry)
+            if entry.get("turnId") != snapshot.target.turn_handle:
+                raise ProtocolDefect("Codex item page changed the requested turn identity")
+            item = _object(entry.get("item"))
             if item.get("type") == "agentMessage":
                 text = item.get("text")
                 if not isinstance(text, str):
                     raise ProtocolDefect("Codex agent message has no text")
-                if item.get("phase") == "final_answer":
+                if item.get("phase") == "final_answer" and answer is None:
                     answer = text
-                elif item.get("phase") is None:
+                elif item.get("phase") is None and unknown_phase is None:
                     unknown_phase = text
-        return CodexThreadRead(
-            summary, snapshot, answer if answer is not None else unknown_phase, coverage
-        )
+        if answer is None and cursor is None:
+            answer = unknown_phase
+        return CodexThreadRead(summary, snapshot, answer, coverage)
 
 
 def _object(value: object) -> dict[str, object]:

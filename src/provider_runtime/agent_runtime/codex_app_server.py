@@ -132,6 +132,13 @@ class CodexConnectionUnavailable(AgentRuntimeError):
         super().__init__("Codex connection is unavailable", code="codex_unavailable")
 
 
+class CodexOutputLimit(ProtocolDefect):
+    """Native output exceeded the local byte or structural ingress bound."""
+
+    def __init__(self) -> None:
+        super().__init__("Codex app-server output exceeded its ingress bound")
+
+
 class CodexAppServerClient:
     """One direct connection; disconnecting never terminates its external server."""
 
@@ -363,9 +370,15 @@ class CodexAppServerClient:
             raise
         except ProtocolDefect as error:
             self._fail(error)
-        except ConnectionClosed:
+        except ConnectionClosed as error:
             if not self._closing:
-                self._fail(CodexConnectionUnavailable())
+                self._fail(
+                    CodexOutputLimit()
+                    if error.sent is not None
+                    and error.sent.code == 1009
+                    and error.rcvd_then_sent is not True
+                    else CodexConnectionUnavailable()
+                )
         except (OSError, UnicodeError, ValueError, RecursionError):
             self._fail(ProtocolDefect("Codex app-server emitted malformed protocol data"))
 
@@ -385,7 +398,7 @@ class CodexAppServerClient:
                 max_items=_MAX_MESSAGE_ITEMS,
             )
         except OutputLimitExceeded:
-            raise ProtocolDefect("Codex app-server message exceeded its structural bound") from None
+            raise CodexOutputLimit() from None
         if not isinstance(message, dict):
             raise ProtocolDefect("Codex app-server message was not an object")
         if "method" in message:
