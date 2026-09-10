@@ -411,14 +411,12 @@ class CodexNativeOptions:
 
 @dataclass(frozen=True, slots=True)
 class CodexSandboxControls:
-    """Explicit child temporary root and Codex workspace-write /tmp policy."""
+    """Per-thread exclusions for the shared server's workspace-write sandbox."""
 
-    child_tmpdir: str
     exclude_slash_tmp: bool
     exclude_tmpdir_env_var: bool
 
     def __post_init__(self) -> None:
-        _require_absolute_path(self.child_tmpdir, "CodexSandboxControls.child_tmpdir")
         if type(self.exclude_slash_tmp) is not bool:
             raise InvalidAgentRequest("CodexSandboxControls.exclude_slash_tmp must be bool")
         if type(self.exclude_tmpdir_env_var) is not bool:

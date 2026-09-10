@@ -30,9 +30,9 @@ def _profile(profile_key: str) -> CredentialRef:
 
 
 def test_profile_state_roots_are_isolated_and_cannot_escape(tmp_path: Path) -> None:
-    root = resolve_state_root(tmp_path, "codex", _profile("personal"))
+    root = resolve_state_root(tmp_path, "claude", _profile("personal"))
 
-    assert root == (tmp_path / "codex" / "personal").resolve()
+    assert root == (tmp_path / "claude" / "personal").resolve()
     # `resolve_state_root` takes the constructed credential, so a traversing key has no way
     # to reach it: `CredentialRef` is the only place the key rule is enforced.
     with pytest.raises(InvalidAgentRequest, match="profile_key"):
@@ -40,7 +40,7 @@ def test_profile_state_roots_are_isolated_and_cannot_escape(tmp_path: Path) -> N
 
 
 def test_profile_state_roots_reject_symlink_aliases_and_escapes(tmp_path: Path) -> None:
-    codex = tmp_path / "codex"
+    codex = tmp_path / "claude"
     codex.mkdir()
     actual = codex / "actual"
     actual.mkdir()
@@ -50,9 +50,9 @@ def test_profile_state_roots_reject_symlink_aliases_and_escapes(tmp_path: Path) 
     (codex / "escape").symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(InvalidAgentRequest, match="symlink"):
-        resolve_state_root(tmp_path, "codex", _profile("alias"))
+        resolve_state_root(tmp_path, "claude", _profile("alias"))
     with pytest.raises(InvalidAgentRequest, match="symlink"):
-        resolve_state_root(tmp_path, "codex", _profile("escape"))
+        resolve_state_root(tmp_path, "claude", _profile("escape"))
 
 
 def test_local_account_environment_scrubs_every_credential_class_variable(tmp_path: Path) -> None:
@@ -64,10 +64,10 @@ def test_local_account_environment_scrubs_every_credential_class_variable(tmp_pa
         "ANTHROPIC_API_KEY": "anthropic-secret",
         "CLAUDE_CODE_OAUTH_TOKEN": "oauth-secret",
     }
-    state_root = tmp_path / "codex" / "personal"
+    state_root = tmp_path / "claude" / "personal"
     child = build_child_environment(
         AuthEnvironmentRequest(
-            backend="codex",
+            backend="claude",
             credential=CredentialRef(kind="local_account", profile_key="personal"),
             inherited_environment=inherited,
             allowed_environment=("TERM",),
@@ -76,7 +76,7 @@ def test_local_account_environment_scrubs_every_credential_class_variable(tmp_pa
     )
 
     assert child == {
-        "CODEX_HOME": str(state_root.resolve()),
+        "CLAUDE_CONFIG_DIR": str(state_root.resolve()),
         "HOME": str(child_home_directory(state_root.resolve())),
         "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "LANG": "C.UTF-8",
@@ -99,11 +99,11 @@ def test_the_runtime_owned_base_environment_is_never_caller_settable(
     with pytest.raises(InvalidAgentRequest, match="process-control"):
         build_child_environment(
             AuthEnvironmentRequest(
-                backend="codex",
+                backend="claude",
                 credential=CredentialRef(kind="local_account", profile_key="personal"),
                 inherited_environment={name: "caller-supplied"},
                 allowed_environment=(name,),
-                state_root=tmp_path / "codex" / "personal",
+                state_root=tmp_path / "claude" / "personal",
             )
         )
 
@@ -205,11 +205,11 @@ def test_no_provider_api_key_can_be_copied_into_an_agent_child(tmp_path: Path, n
     with pytest.raises(InvalidAgentRequest, match="credential-class"):
         build_child_environment(
             AuthEnvironmentRequest(
-                backend="codex",
+                backend="claude",
                 credential=CredentialRef(kind="local_account", profile_key="personal"),
                 inherited_environment={name: "must-never-cross"},
                 allowed_environment=(name,),
-                state_root=tmp_path / "codex" / "personal",
+                state_root=tmp_path / "claude" / "personal",
             )
         )
 
@@ -418,7 +418,7 @@ def test_a_non_finite_native_number_drops_the_payload_like_any_other_malformed_v
     }
 
 
-def test_state_root_read_back_is_strict_and_identical_for_every_backend(
+def test_claude_state_root_read_back_is_strict(
     tmp_path: Path,
 ) -> None:
     """One profile must not mean two different state roots on the two shipped backends.
@@ -429,25 +429,25 @@ def test_state_root_read_back_is_strict_and_identical_for_every_backend(
     relative, or empty value is a credential failure, never a silent redirect to the link's
     target.
     """
-    real = tmp_path / "codex" / "personal"
+    real = tmp_path / "claude" / "personal"
     real.mkdir(parents=True)
     child = build_child_environment(
         AuthEnvironmentRequest(
-            backend="codex",
+            backend="claude",
             credential=CredentialRef(kind="local_account", profile_key="personal"),
             inherited_environment={},
             allowed_environment=(),
             state_root=real,
         )
     )
-    assert state_root_from_environment("codex", child) == real
+    assert state_root_from_environment("claude", child) == real
 
-    link = tmp_path / "codex" / "alias"
+    link = tmp_path / "claude" / "alias"
     link.symlink_to(real, target_is_directory=True)
-    missing = tmp_path / "codex" / "absent"
+    missing = tmp_path / "claude" / "absent"
     for value in (str(link), str(missing), "relative/path", ""):
-        with pytest.raises(CredentialUnavailable, match="CODEX_HOME"):
-            state_root_from_environment("codex", {"CODEX_HOME": value})
+        with pytest.raises(CredentialUnavailable, match="CLAUDE_CONFIG_DIR"):
+            state_root_from_environment("claude", {"CLAUDE_CONFIG_DIR": value})
     with pytest.raises(CredentialUnavailable, match="CLAUDE_CONFIG_DIR"):
         state_root_from_environment("claude", {})
 

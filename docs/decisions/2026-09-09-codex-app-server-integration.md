@@ -2,6 +2,11 @@
 
 Status: implemented; live qualification remains separate.
 
+The later [shared-service decision](2026-09-09-shared-codex-app-server.md)
+supersedes this record's private-process, environment, SDK-package and stdio
+ownership. Its generation/catalog, typed selection, and containment requirements
+remain binding. Verification below describes this historical revision only.
+
 ## Problem
 
 The shared kernel and Jarvis pinned containment commit

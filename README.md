@@ -14,7 +14,7 @@ The package ships two execution contracts:
   terminal `CallOutcome` (or one sequenced event stream), dispatched through a
   pinned registry row.
 - `provider_runtime.agent_runtime.AgentRuntime` controls one explicitly chosen
-  local agent session — owned Codex App Server transport or Claude Agent SDK —
+  local agent session — shared Codex App Server client or Claude Agent SDK —
   and exposes normalized events plus one terminal result.
 
 Callers own prompts, credential resolution, durable history, budgets, and
@@ -107,7 +107,7 @@ embeddings.py  OpenAI-only embedding port on the openai SDK
 testing.py     FakeEngine + ScriptedRuntime test doubles
 tool_adapter.py request-scoped llm-tools lowering and canonical name decode
 agent_runtime/ agent lane: authenticated model catalog, tagged session requests,
-               MCP projection, security kernel, owned Codex App Server transport,
+               MCP projection, security kernel, shared Codex App Server control,
                and the Claude SDK adapter
 ```
 
@@ -164,10 +164,11 @@ itself never fetches.
 
 ## Agent lane
 
-Exactly two routes ship: `(codex, sdk)` and `(claude, sdk)`, on the pinned
-optional extras `openai-codex` and `claude-agent-sdk`. The Codex route retains
-the `sdk` name for reference compatibility but owns the documented App Server
-stdio JSON-RPC connection; Claude remains on its official SDK. This package
+Exactly two routes ship: `(codex, sdk)` and `(claude, sdk)`. The core package
+declares `websockets`; the host separately pins and supervises Codex 0.153.4.
+The Codex route retains the `sdk` name and owns the documented
+WebSocket-over-Unix-socket App Server client; Claude remains on its official
+SDK. This package
 owns the authorization model — a retained security kernel with restrictive permission
 defaults, narrowing-only policy changes, unsafe-action confirmation for
 model-initiated shell/filesystem/network/MCP actions, and bounded, recursively
@@ -204,9 +205,9 @@ uv run ruff format --check .
 uv run pyright
 ```
 
-Both agent SDKs are optional extras (`--extra codex-sdk`, `--extra
-claude-sdk`, `--extra agent-sdks`); a base install is provider-only and
-selecting an agent route without its extra raises the typed `SdkUnavailable`.
+Codex App Server transport is a core dependency. Claude is available through
+the optional `--extra claude-sdk`; selecting it without that extra raises the
+typed `SdkUnavailable`.
 
 Application tests use `FakeEngine` / `ScriptedRuntime` from
 `provider_runtime.testing` (and the doubles in
@@ -232,8 +233,9 @@ never by the package. A missing provider key skips that provider's rows with a
 recorded reason; the release run is unfiltered with all seven keys set. The
 agent lane has its own matrix (`tests/live/test_agent_matrix.py`) with the
 same opt-in flag and evidence conventions. Its dedicated paid Terra containment
-probe is `tests/live/test_codex_containment.py` and requires an explicit private
-`LLM_RUNTIME_LIVE_CODEX_HOME`.
+probe is `tests/live/test_codex_containment.py` and requires an explicit
+test-owned Codex endpoint. Shared worker/TUI control has its own separately
+approved live qualification; deterministic fixtures do not substitute for it.
 
 The spec for the current architecture is
 [docs/pivot-spec.md](docs/pivot-spec.md); the engineering rules the code is

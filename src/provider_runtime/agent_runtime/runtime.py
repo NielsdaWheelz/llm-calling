@@ -11,6 +11,7 @@ import weakref
 from collections.abc import AsyncGenerator, Awaitable, Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal, Protocol, assert_never, runtime_checkable
 
 from provider_runtime.types import Absent, CancelSignal, Presence, Present, TokenUsage
@@ -24,6 +25,7 @@ from .auth import (
     mcp_header_environment_name,
     resolve_state_root,
 )
+from .codex_control import CodexControl, CodexThreadTarget
 from .errors import (
     CredentialUnavailable,
     InvalidAgentRequest,
@@ -93,12 +95,18 @@ _STATE_ROOT_MODE = 0o700
 @dataclass(frozen=True, slots=True)
 class AgentRuntimeConfig:
     state_root_base: Path
+    codex_endpoints: Mapping[str, Path] = field(default_factory=dict)
     claude_executable: str = "claude"
     max_turn_seconds: float = 3_600.0
     codex_sandbox: CodexSandboxControls | None = None
     secret_resolver: SecretResolver | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        for profile, endpoint in self.codex_endpoints.items():
+            CredentialRef(kind="local_account", profile_key=profile)
+            if not isinstance(endpoint, Path) or not endpoint.is_absolute():
+                raise InvalidAgentRequest("Codex endpoints must be absolute Unix socket paths")
+        object.__setattr__(self, "codex_endpoints", MappingProxyType(dict(self.codex_endpoints)))
         if not isinstance(self.state_root_base, Path):
             raise InvalidAgentRequest("state_root_base must be a Path")
         # Lexical only, exactly as `types._require_absolute_path` validates caller paths:
@@ -239,6 +247,7 @@ class AgentRuntime:
                 raise InvalidAgentRequest(f"duplicate adapter route {route!r}")
             routes[route] = adapter
         self._config = config
+        self.codex = CodexControl(config.codex_endpoints, self._is_managed_codex)
         self._adapters = routes
         self._sessions: dict[AgentSession, _SessionBinding] = {}
         self._closed_sessions: weakref.WeakSet[AgentSession] = weakref.WeakSet()
@@ -251,6 +260,16 @@ class AgentRuntime:
     @property
     def config(self) -> AgentRuntimeConfig:
         return self._config
+
+    def _is_managed_codex(self, target: CodexThreadTarget) -> bool:
+        self._require_open()
+        return any(
+            session.ref_is_complete
+            and session.ref.backend == "codex"
+            and session.ref.profile_key == target.profile_key
+            and session.ref.native_session_id == target.thread_handle
+            for session in self._sessions
+        )
 
     async def __aenter__(self) -> AgentRuntime:
         self._require_open()
@@ -347,6 +366,12 @@ class AgentRuntime:
             request.policy,
         )
         validate_mcp_network_policy(request.mcp_servers, request.policy)
+        if request.backend == "codex" and any(
+            server.environment_refs or server.header_refs for server in request.mcp_servers
+        ):
+            raise UnsupportedCapability(
+                "shared Codex cannot deliver MCP client environment references"
+            )
         adapter = self._adapter(request.backend, request.transport)
         adapter.validate_auth(request.auth)
         environment, state_root = await self._environment(
@@ -763,6 +788,10 @@ class AgentRuntime:
     async def _close_owned(self, caller: asyncio.Task[Any] | None) -> tuple[BaseException, ...]:
         operations = tuple(self._operation_tasks)
         cleanup_errors: list[BaseException] = []
+        try:
+            await self.codex.close()
+        except BaseException as error:
+            cleanup_errors.append(error)
         if operations:
             _, pending = await asyncio.wait(
                 operations,
@@ -919,6 +948,13 @@ class AgentRuntime:
         credential: CredentialRef,
         allowed_environment: tuple[str, ...],
     ) -> tuple[dict[str, str], Path]:
+        if backend == "codex":
+            endpoint = self._config.codex_endpoints.get(credential.profile_key)
+            if endpoint is None:
+                raise CredentialUnavailable("Codex profile has no configured external endpoint")
+            if allowed_environment:
+                raise UnsupportedCapability("shared Codex does not inherit client environment")
+            return {"CODEX_APP_SERVER_SOCKET": str(endpoint)}, endpoint
         try:
             state_root = resolve_state_root(self._config.state_root_base, backend, credential)
         except OSError:

@@ -12,9 +12,9 @@ vendor surfaces. Codex uses the public App Server protocol; Claude uses the
 official SDK. It is not a hosted subscription proxy, multi-tenant sandbox,
 login service, or token broker.
 
-The only shipped routes are `codex:sdk` and `claude:sdk`; the Codex route name
-selects the matched runtime distribution; provider-runtime owns its App Server
-stdio transport. There is no fallback. Session
+The only shipped routes are `codex:sdk` and `claude:sdk`; `sdk` is the closed
+agent-transport discriminator, while Codex attaches only to the configured
+shared App Server over WebSocket/UDS. There is no private-process fallback. Session
 authentication is subscription-only: each
 route rejects named API-key and secret-reference session credentials before any
 secret could be resolved, and the child-environment builder refuses to forward
@@ -28,7 +28,7 @@ reference, generated file, or child command line as a vulnerability.
 
 ## State and environment isolation
 
-Each local account profile is isolated at:
+Runtime-owned Claude state is isolated at:
 
 ```text
 <state_root_base>/<backend>/<profile_key>
@@ -44,12 +44,13 @@ Credential-class is every provider API key the operator may have exported, not
 only the two backends' own auth variables: the agent lane has no use for any of
 them, so none of them reaches a child.
 
-For Codex, provider-runtime starts the exact bundled executable as
-`app-server --listen stdio:// --strict-config` with the selected environment as
-a complete replacement and owns every JSONL response, notification, and server
-request. The documented account response must report ChatGPT subscription auth;
-ambient API keys do not reach the runtime. Credential-refresh and attestation
-callbacks are refused with JSON-RPC errors and fail the session.
+For Codex, the caller supplies one normalized absolute Unix-socket endpoint per
+profile. Provider-runtime opens a WebSocket-over-UDS client and owns only that
+connection and its protocol state; it never starts, signals, or authenticates
+the shared App Server. The documented account response must report ChatGPT
+subscription auth. Unknown server requests are rejected, worker approval
+requests are deliberately left unanswered for the attached TUI, and managed
+cognition denies its own approval requests.
 
 For Claude, a shell router or version-manager shim can overwrite
 `CLAUDE_CONFIG_DIR` and defeat isolation. Point
@@ -77,10 +78,9 @@ and does not recreate or inspect the SDK's arguments.
 A writable launcher directory, content mismatch, or child-controlled launcher
 path is a local privilege-escalation risk and should be reported.
 
-Codex no longer needs an SDK shim: the owned App Server process is launched
-directly by the existing process-group supervisor. On close or protocol defect,
-the supervisor signals the group and escalates to `SIGKILL`, preventing Codex
-tools or descendants from outliving the connection.
+Codex has no SDK shim or child-process supervisor in this package. Closing a
+session or client disconnects only that client; the host-owned shared App Server
+and unrelated threads remain alive.
 
 ## Policy is fail-closed
 
@@ -98,7 +98,7 @@ approve actions within the separately selected filesystem/network sandbox.
 
 Codex exposes no typed per-name built-in filter, so `allowed_tools=("*",)` is
 the only portable-policy spelling. `CodexNativeOptions(builtin_tools="disabled")`
-is a separate exact-version containment posture: it sets the public 0.144.4
+is a separate exact-version containment posture: it sets the public 0.153.4
 feature-off configuration and requires read-only filesystem, disabled network,
 deny approvals, empty copied environment, no MCP, and no additional roots.
 Provider review is rejected in that posture. Claude accepts exact tool names,
@@ -168,9 +168,9 @@ host confidentiality boundary.
 
 Codex cancellation uses documented `turn/interrupt`; Claude uses the SDK's
 native interrupt operation. Claude drains the interrupted tail or invalidates
-the client before reuse. Codex discards the entire App Server client after
-protocol/transport uncertainty. Runtime close terminates active work and closes
-all clients.
+the client before reuse. Codex discards the client connection after
+protocol/transport uncertainty without stopping the shared server. Runtime
+close terminates work it owns and closes all of its clients.
 
 The public event grammar is six kinds and every valid stream requires exactly one
 `AgentTerminal` after a started turn. Identity mismatches, events from retired turns, malformed
@@ -180,7 +180,8 @@ one would conceal uncertainty or forbidden authority.
 
 ## Optional dependency boundary
 
-The base wheel imports neither `openai_codex` nor `claude_agent_sdk`. Missing
-extras fail as typed `SdkUnavailable`; arbitrary import errors are not exposed.
+The base wheel carries no Codex SDK and does not import `claude_agent_sdk`.
+WebSocket transport is a direct dependency; a missing transport module or
+optional Claude SDK fails as typed `SdkUnavailable`, not a raw import error.
 CI installs each extra independently, installs both together, and exercises both
 real absent-module paths in a no-extras environment.

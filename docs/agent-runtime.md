@@ -11,25 +11,24 @@ AgentRuntime:    one local SDK session -> streamed turns and durable session ref
 
 The agent runtime does not pretend a stateful coding agent is a stateless model
 call. Callers own prompts, durable chat history, budgets, orchestration, and
-product policy. The runtime owns route selection, isolated local-account state,
-the authorization model, provider-process lifecycle, normalized events,
-cancellation, and one terminal outcome per started turn.
+product policy. The runtime owns route selection, Codex connection lifecycle or
+Claude process lifecycle, authorization, normalized events, cancellation, and
+one terminal outcome per started turn.
 
 ## Shipped routes
 
 The routing algebra is closed:
 
 ```text
-(codex, sdk)  -> bundled Codex app-server over owned stdio JSON-RPC
+(codex, sdk)  -> host-owned Codex app-server over WebSocket on a Unix socket
 (claude, sdk) -> claude-agent-sdk
 ```
 
-There is no `cli` route or automatic fallback. The public route name `sdk` selects the matched runtime distribution and
-its public option vocabulary. On Codex, provider-runtime directly
-owns the documented App Server `stdio://` JSONL connection and uses
-`openai-codex` only for its public option vocabulary/version plus the matched
-`openai-codex-cli-bin` executable. It does not call or patch `AsyncCodex`'s
-opaque request loop. Claude remains on the official SDK and receives the exact
+There is no `cli` route or automatic fallback. The public route name remains
+`sdk` for stored-reference compatibility. On Codex, provider-runtime owns the
+documented WebSocket client protocol over an externally configured Unix socket.
+It has no Python Codex SDK, bundled executable, private App Server, or
+`AsyncCodex` path. Claude remains on the official SDK and receives the exact
 vetted Claude Code executable through public `cli_path`.
 
 Unknown backend/transport pairs fail as `InvalidAgentRequest`. A missing optional
@@ -41,25 +40,17 @@ The base package imports neither agent SDK. Install the route or routes an
 application actually uses:
 
 ```bash
-uv sync --extra codex-sdk
 uv sync --extra claude-sdk
-uv sync --extra agent-sdks
 ```
 
-The extras carry bounded constraints (`openai-codex>=0.144.4,<1`,
-`openai-codex-cli-bin>=0.144.4,<1`, `claude-agent-sdk>=0.2.130,<1`); the
-lockfile pins the exact resolution. The vetted versions the adapters were
-written against are openai-codex 0.144.4 with its matched runtime, and
-claude-agent-sdk 0.2.130 with Claude Code 2.1.220.
+The base package directly constrains `websockets>=16,<17`; the lockfile pins its
+exact resolution. The host independently pins the qualified App Server/TUI at Codex
+0.153.4. The Claude extra carries `claude-agent-sdk>=0.2.130,<1` with its exact
+lock resolution. A missing transport dependency raises `SdkUnavailable`; a
+missing or unreachable configured Codex endpoint is a typed credential/profile
+availability failure, never a private-runtime fallback.
 
-A version that drifts from the vetted one normally receives one warning plus a
-behavioral probe. The certified `builtin_tools="disabled"` posture is narrower:
-the public Python package, bundled runtime package, and executable-reported
-version must each be exactly 0.144.4 or session open fails before a turn. A
-missing dependency or unresponsive executable remains `SdkUnavailable` or
-`ExecutableUnavailable`.
-
-Codex 0.144.4 replays cumulative usage around `thread/resume`. The owned
+Codex 0.153.4 replays cumulative usage around `thread/resume`. The owned
 transport keeps every notification in wire order, validates an explicit
 pre-turn allowlist, and derives the resume/fork baseline without a private SDK
 queue seam. A replay that races behind the response is accepted only as the
@@ -67,16 +58,17 @@ first baseline-only snapshot, with its exact prior-turn identity, after the next
 turn starts. Any later stale identity and every missing identity fail closed.
 Unknown pre-turn messages fail before a billable turn.
 
-The transport also bounds messages waiting for a paused consumer: at most
-100,000 events and 64 MiB of wire data, independent of the per-message and
-per-turn limits. Overflow fails pending RPCs and terminates the child. Earlier
-queued authority events remain observable; a queued terminal cannot survive a
-known transport failure. Malformed responses and RPC timeouts fail the same
-connection before another request can start.
+The transport bounds queued notifications independently of per-message and
+per-turn limits: at most 100,000 events and 64 MiB of wire data. Overflow
+fails pending RPCs and disconnects this client, never the shared service.
+Earlier authority events remain observable; a queued terminal cannot survive
+a known transport failure. Malformed responses and RPC timeouts fail the
+same connection before another request can start.
 
-`openai-codex` ships a matched Codex runtime, so `AgentRuntimeConfig` has no
-Codex executable setting. Claude Code is still a local executable and may be
-selected with `AgentRuntimeConfig.claude_executable`.
+`AgentRuntimeConfig.codex_endpoints` maps caller-owned opaque profile keys to
+absolute Unix-socket paths. The runtime has no Codex executable setting. Claude
+Code remains a local executable selected with
+`AgentRuntimeConfig.claude_executable`.
 
 ## Minimal use
 
@@ -95,7 +87,10 @@ from provider_runtime.agent_runtime import (
     TurnRequest,
 )
 
-config = AgentRuntimeConfig(state_root_base=Path("/private/agent-state"))
+config = AgentRuntimeConfig(
+    state_root_base=Path("/private/agent-state"),
+    codex_endpoints={"personal": Path("/run/codex-shared-personal/app-server.sock")},
+)
 auth = CredentialRef(kind="local_account", profile_key="personal")
 
 async with AgentRuntime(config) as runtime:
@@ -111,7 +106,7 @@ async with AgentRuntime(config) as runtime:
         agent_definition_revision=catalog.definition_revision,
         row_fingerprint=model.row_fingerprint,
         # Certified containment: read-only, offline, deny-all, no MCP,
-        # copied environment, or additional roots; runtime 0.144.4 is required.
+        # copied environment, or additional roots; host Codex 0.153.4 is required.
         policy=PermissionPolicy(allowed_tools=("*",)),
         native=CodexNativeOptions(builtin_tools="disabled"),
     )
@@ -130,7 +125,7 @@ App Server RPC `model/list` through every page and returns every visible row in 
 order. `AgentModelCatalog` carries a content-derived definition revision;
 each `AgentModelFacts` carries exact model/dispatch identity, ordered reasoning
 facts, modalities, lifecycle/upgrade facts, and a content-derived row
-fingerprint. The pinned public SDK reports neither context-window nor
+fingerprint. The pinned public App Server reports neither context-window nor
 max-output capacity, so both source-capacity fields are honestly `Absent` and
 do not make a row unusable. Product request budgets remain caller-owned.
 
@@ -170,10 +165,11 @@ additionally requires `socat`); hosts that cannot are refused during
 
 ## Ownership boundary
 
-For Codex, this package owns the complete App Server connection: process launch,
-initialize/initialized negotiation, client request ids, response correlation,
-notification ordering, server-request replies, thread/turn operations, and
-shutdown. Only documented public App Server methods are used. For Claude, the
+For Codex, this package owns the complete client connection: initialize/initialized
+negotiation, client request ids, response correlation, notification ordering,
+server-request policy, thread/turn operations, and disconnect. The host owns
+service process and account lifecycle. Only documented public App Server methods
+are used. For Claude, the
 official SDK continues to own the vendor protocol. Native execution itself and
 already-enrolled subscription authentication remain provider behavior.
 
@@ -181,15 +177,14 @@ The retained security kernel owns:
 
 - one closed `(backend, transport)` selection;
 - authenticated Codex catalog discovery and exact catalog-bound selection;
-- an isolated state root and child environment;
+- an isolated Claude state root/environment and explicit Codex endpoint map;
 - restrictive permission defaults and narrowing-only policy changes;
 - unsafe-action confirmation for model-initiated shell/filesystem/network/MCP
   actions;
 - bounded, recursively redacted native event representation;
 - normalized immutable events and the strict terminal grammar;
 - timeout, cancellation, output bounds, and cleanup;
-- direct environment-replacing/process-group launch for Codex and the existing
-  transparent launcher where the Claude SDK lacks those process controls;
+- the existing transparent launcher where the Claude SDK lacks process controls;
 - typed public errors;
 - SDK-neutral session references and test doubles.
 
@@ -212,24 +207,20 @@ failure is the `AgentQuotaExhausted` value. Block-and-stop only: the lane never
 overflows onto API-rate credentials.
 
 `state_root_base` must be an existing normalized absolute directory that is not
-group- or world-writable. A profile lives at:
+group- or world-writable. Only a process-owning backend stores a profile there:
 
 ```text
-<state_root_base>/<backend>/<profile_key>
+<state_root_base>/claude/<profile_key>
 ```
 
-Runtime-created directories are mode `0700`. The child environment is rebuilt
-from a fail-closed allowlist. `HOME`, `PATH`, locale, temp, `CODEX_HOME`, and
-`CLAUDE_CONFIG_DIR` are runtime-owned; caller policy cannot override them.
-Credential-class, provider-selection, and process-control environment names are
-also rejected.
-
-For Codex, the owned transport starts the exact bundled executable with
-`app-server --listen stdio:// --strict-config`, an exact replacement
-environment, and one private process group. Ambient API keys and unrelated
-variables never reach the process. The documented `account/read` response must
-report a ChatGPT account. No token-refresh or attestation callback is
-implemented: either request gets a JSON-RPC error and terminates the session.
+Codex never creates a profile directory. Runtime-created Claude directories are
+mode `0700`; its child environment is
+rebuilt from a fail-closed allowlist. `HOME`, `PATH`, locale, temp, and
+`CLAUDE_CONFIG_DIR` are runtime-owned there. Codex starts no child and consumes
+no caller environment. Its configured endpoint must be an absolute Unix-socket
+path and the documented `account/read` response must report a ChatGPT account.
+No token-refresh or attestation callback is implemented: either request gets a
+JSON-RPC error and terminates the connection.
 
 For Claude, the SDK is pointed at the isolated environment and exact executable.
 Its content-addressed `0700` launcher calls `setsid()` and then `execv()` so
@@ -310,7 +301,8 @@ adapter sees it.
 Codex has no public typed per-name built-in filter. The portable policy therefore
 still requires the sentinel `allowed_tools=("*",)`. The additional
 `CodexNativeOptions(builtin_tools="disabled")` posture writes the complete
-feature-off configuration certified for 0.144.4 and requires read-only
+feature-off configuration certified for the host-pinned Codex 0.153.4 service
+and requires read-only
 filesystem, disabled network, denied approvals, empty copied environment, no
 MCP, and no additional roots. Provider review is refused in this posture.
 Claude continues to accept exact tool names, reject glob patterns and its two
@@ -346,11 +338,11 @@ canonical tool ids and rejects names outside the publication without retaining
 their payload. The existing provider function-tool adapter and this MCP
 adapter share the same exposure/alias owner.
 
-Nexus-style confined launches may configure `AgentRuntimeConfig.codex_sandbox`
-with `CodexSandboxControls(child_tmpdir, exclude_slash_tmp,
-exclude_tmpdir_env_var)`. The child `TMPDIR` and both workspace-write sandbox
-flags are applied on new, resumed, and forked Codex sessions. The application
-still owns directory creation, mode, and no-symlink policy.
+Applications may configure `AgentRuntimeConfig.codex_sandbox` with
+`CodexSandboxControls(exclude_slash_tmp, exclude_tmpdir_env_var)`. Both native
+workspace-write exclusions apply on new, resumed, and forked Codex sessions.
+The shared service's TMPDIR is host-owned; the private-child `child_tmpdir`
+option is removed, not silently ignored or translated into another process.
 
 ## Structured output and native options
 
@@ -407,8 +399,8 @@ message selection before strict JSON parsing or downstream schema validation.
 For Codex, the adapter retains each completed `agentMessage` item's identity,
 text, phase, and native completion order. At terminal it scans those items in
 reverse order and selects the last `phase=final_answer` item. If none exists, it
-selects the last completed item whose phase is absent, matching the compatibility
-fallback in the pinned `openai-codex` 0.144.4 SDK. Commentary is never eligible,
+selects the last completed item whose phase is absent, matching the pinned
+Codex 0.153.4 App Server behavior. Commentary is never eligible,
 even if it is individually valid JSON or arrives after the final answer. Multiple
 eligible messages are not concatenated. A completed turn with no eligible item,
 or a duplicate, empty, malformed, or unknown-phase completed assistant identity,
@@ -532,10 +524,9 @@ hashes; conversation text, prompts, credentials, and tool arguments are absent.
 CI proves all of these packaging shapes:
 
 - base wheel imports neither optional SDK;
-- `codex-sdk` wheel extra imports Codex only;
+- the base wheel installs the shared Codex WebSocket transport;
 - `claude-sdk` wheel extra imports Claude only;
-- `agent-sdks` installs both;
-- a no-extras environment exercises both typed `SdkUnavailable` paths.
+- a no-extras environment exercises the Claude `SdkUnavailable` path.
 
 The paid local-account matrix is opt-in:
 
@@ -569,14 +560,14 @@ terminal. Both require no sentinel host effect and no credential environment:
 
 ```bash
 LLM_RUNTIME_LIVE=1 \
-LLM_RUNTIME_LIVE_CODEX_HOME=/absolute/private/codex-home \
+LLM_RUNTIME_LIVE_CODEX_ENDPOINT=/run/codex-shared-personal/app-server.sock \
 uv run pytest -m live_provider tests/live/test_codex_containment.py
 ```
 
 ## References
 
 - [Codex App Server protocol](https://developers.openai.com/codex/app-server)
-- [OpenAI Codex SDK](https://developers.openai.com/codex/codex-sdk)
+- [OpenAI Codex App Server](https://learn.chatgpt.com/docs/app-server)
 - [Codex authentication](https://developers.openai.com/codex/auth/)
 - [Claude Agent SDK overview](https://code.claude.com/docs/en/agent-sdk/overview)
 - [Claude Agent SDK Python](https://code.claude.com/docs/en/agent-sdk/python)

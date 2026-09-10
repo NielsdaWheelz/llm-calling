@@ -1,11 +1,4 @@
-"""Owned Codex app-server stdio transport.
-
-The public app-server protocol is newline-delimited JSON-RPC over stdio.  This module
-owns that byte stream directly: every client response is correlated, every notification
-is queued in wire order, and every server-initiated request receives one explicit denial
-or closes the transport as a protocol defect.  It deliberately does not import or reach
-through the Python SDK's request loop.
-"""
+"""Correlated Codex JSON-RPC over WebSocket/UDS; owns only its connection."""
 
 from __future__ import annotations
 
@@ -15,7 +8,10 @@ from collections.abc import AsyncGenerator, Mapping
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
+
+if TYPE_CHECKING:
+    from websockets.asyncio.client import ClientConnection
 
 from provider_runtime.errors import sanitize_provider_text
 
@@ -28,13 +24,24 @@ from ._limits import (
     OutputLimitExceeded,
     bounded_payload_size,
 )
-from ._process import ManagedProcess, ProcessLimits
-from .errors import ProtocolDefect
+from .errors import AgentRuntimeError, ProtocolDefect, SdkUnavailable
 
 type CodexRequestId = str | int
 type CodexServerRequestKind = Literal["permission", "tool"]
 
-_PROCESS_LIMITS = ProcessLimits(max_stderr_bytes=64 * 1024, termination_grace_seconds=0.25)
+CODEX_VERSION = "0.153.4"
+CODEX_THREAD_SOURCES = (
+    "cli",
+    "vscode",
+    "exec",
+    "appServer",
+    "subAgent",
+    "subAgentReview",
+    "subAgentCompact",
+    "subAgentThreadSpawn",
+    "subAgentOther",
+    "unknown",
+)
 _SERVER_REQUEST_DENIALS: dict[str, tuple[CodexServerRequestKind, dict[str, object]]] = {
     "item/commandExecution/requestApproval": ("permission", {"decision": "decline"}),
     "item/fileChange/requestApproval": ("permission", {"decision": "decline"}),
@@ -68,39 +75,26 @@ _FORBIDDEN_AUTHORITY_REQUESTS: dict[str, tuple[CodexServerRequestKind, str]] = {
 
 @dataclass(frozen=True, slots=True)
 class CodexAppServerConfig:
-    executable: Path
-    cwd: Path
-    environment: Mapping[str, str]
-    config_overrides: tuple[str, ...] = ()
+    socket_path: Path
+    request_policy: Literal["deny_owned", "observe_only"] = "deny_owned"
     client_name: str = "provider_runtime"
     client_title: str = "provider-runtime"
     client_version: str = "0.1.0"
 
     def __post_init__(self) -> None:
-        if not self.executable.is_absolute():
-            raise ValueError("Codex app-server executable must be absolute")
-        if not self.cwd.is_absolute():
-            raise ValueError("Codex app-server cwd must be absolute")
+        if not self.socket_path.is_absolute():
+            raise ValueError("Codex app-server socket must be absolute")
+        if self.request_policy not in ("deny_owned", "observe_only"):
+            raise ValueError("Codex app-server request policy is invalid")
         if any(
             type(value) is not str or not value or "\0" in value or "\n" in value
             for value in (
                 self.client_name,
                 self.client_title,
                 self.client_version,
-                *self.config_overrides,
             )
         ):
             raise ValueError("Codex app-server configuration contains an invalid string")
-        if any(
-            type(key) is not str
-            or type(value) is not str
-            or not key
-            or "=" in key
-            or "\0" in key
-            or "\0" in value
-            for key, value in self.environment.items()
-        ):
-            raise ValueError("Codex app-server environment is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,7 +113,7 @@ class CodexServerRequest:
 
 @dataclass(frozen=True, slots=True)
 class _TransportFailure:
-    error: ProtocolDefect
+    error: ProtocolDefect | CodexConnectionUnavailable
 
 
 type CodexServerMessage = CodexNotification | CodexServerRequest
@@ -128,14 +122,33 @@ type CodexServerMessage = CodexNotification | CodexServerRequest
 class CodexAppServerResponseError(Exception):
     """One valid, correlated JSON-RPC error response with sanitized detail."""
 
+    def __init__(self, method: str, code: int, detail: str, data: object = None) -> None:
+        super().__init__(f"Codex app-server {method} request failed ({code}): {detail}")
+        self.code = code
+        self.detail = detail
+        self.data = data
+
+
+class CodexConnectionUnavailable(AgentRuntimeError):
+    def __init__(self) -> None:
+        super().__init__("Codex connection is unavailable", code="codex_unavailable")
+
+
+class CodexOutputLimit(ProtocolDefect):
+    """Native output exceeded the local byte or structural ingress bound."""
+
+    def __init__(self) -> None:
+        super().__init__("Codex app-server output exceeded its ingress bound")
+
 
 class CodexAppServerClient:
-    """One direct, correlated app-server connection and its owned process group."""
+    """One direct connection; disconnecting never terminates its external server."""
 
     def __init__(self, config: CodexAppServerConfig) -> None:
         self.config = config
         self.metadata: dict[str, object] = {}
-        self._process: ManagedProcess | None = None
+        self._connection: ClientConnection | None = None
+        self._thread_id: str | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._write_lock = asyncio.Lock()
         self._pending: dict[int, tuple[str, asyncio.Future[object]]] = {}
@@ -145,23 +158,39 @@ class CodexAppServerClient:
         self._queued_bytes = 0
         self._next_request_id = 1
         self._server_request_ids: set[tuple[type[object], object]] = set()
-        self._failure: ProtocolDefect | None = None
+        self._failure: ProtocolDefect | CodexConnectionUnavailable | None = None
         self._closing = False
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
 
     async def __aenter__(self) -> CodexAppServerClient:
-        if self._process is not None or self._closed:
+        try:
+            from websockets.asyncio.client import unix_connect
+            from websockets.exceptions import InvalidHandshake
+        except ModuleNotFoundError:
+            raise SdkUnavailable("shared Codex requires the websockets dependency") from None
+        if self._connection is not None or self._closed:
             raise ProtocolDefect("Codex app-server client was started more than once")
-        argv: list[str] = [str(self.config.executable)]
-        for override in self.config.config_overrides:
-            argv.extend(("--config", override))
-        argv.extend(("app-server", "--listen", "stdio://", "--strict-config"))
-        self._process = await ManagedProcess.spawn(
-            argv,
-            cwd=self.config.cwd,
-            environment=self.config.environment,
-            limits=_PROCESS_LIMITS,
-        )
+        try:
+            self._connection = await unix_connect(
+                str(self.config.socket_path),
+                uri="ws://localhost",
+                open_timeout=_OPERATION_TIMEOUT_SECONDS,
+                close_timeout=2,
+                max_size=_MAX_MESSAGE_BYTES,
+                max_queue=16,
+                compression=None,
+                proxy=None,
+            )
+        except (OSError, TimeoutError):
+            raise CodexConnectionUnavailable() from None
+        except InvalidHandshake:
+            raise ProtocolDefect(
+                "Codex socket did not provide the pinned WebSocket protocol"
+            ) from None
+        if self._closed:
+            await self._connection.close()
+            raise CodexConnectionUnavailable()
         self._reader_task = asyncio.create_task(self._reader_loop())
         try:
             initialized = await self.request(
@@ -176,6 +205,13 @@ class CodexAppServerClient:
                 },
             )
             self.metadata = self._mapping(initialized, "initialize response")
+            user_agent = self.metadata.get("userAgent")
+            if (
+                not isinstance(user_agent, str)
+                or not user_agent.split(" ", 1)[0].partition("/")[0]
+                or user_agent.split(" ", 1)[0].partition("/")[2] != CODEX_VERSION
+            ):
+                raise ProtocolDefect("Codex server version does not match the qualified pin")
             await self.notify("initialized", None)
         except BaseException:
             await self.close()
@@ -188,19 +224,26 @@ class CodexAppServerClient:
     async def request(self, method: str, params: Mapping[str, object] | None) -> object:
         self._require_method(method)
         self._require_live()
+        if len(self._pending) >= 128:
+            raise ProtocolDefect("Codex app-server pending request count exceeded its bound")
         loop = asyncio.get_running_loop()
         future: asyncio.Future[object] = loop.create_future()
         request_id = self._next_request_id
         self._next_request_id += 1
         self._pending[request_id] = (method, future)
         try:
-            await self._write(
-                {
-                    "id": request_id,
-                    "method": method,
-                    **({} if params is None else {"params": params}),
-                }
-            )
+            async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
+                await self._write(
+                    {
+                        "id": request_id,
+                        "method": method,
+                        **({} if params is None else {"params": params}),
+                    }
+                )
+        except TimeoutError:
+            self._pending.pop(request_id, None)
+            future.cancel()
+            raise CodexConnectionUnavailable() from None
         except BaseException:
             self._pending.pop(request_id, None)
             if not future.done():
@@ -210,10 +253,8 @@ class CodexAppServerClient:
             async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
                 return await asyncio.shield(future)
         except TimeoutError:
-            error = ProtocolDefect(f"Codex app-server {method} request timed out")
-            self._fail(error)
-            await self.close()
-            raise error from None
+            future.add_done_callback(self._consume_future)
+            raise CodexConnectionUnavailable() from None
         except asyncio.CancelledError:
             future.add_done_callback(self._consume_future)
             raise
@@ -251,17 +292,24 @@ class CodexAppServerClient:
         return tuple(values)
 
     async def close(self) -> None:
-        if self._closed:
-            return
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close_connection())
+        try:
+            await asyncio.shield(self._close_task)
+        except asyncio.CancelledError:
+            await asyncio.shield(self._close_task)
+            raise
+
+    async def _close_connection(self) -> None:
         self._closed = True
         self._closing = True
-        process = self._process
-        if process is not None:
-            await process.close()
+        connection = self._connection
+        if connection is not None:
+            await connection.close()
         reader = self._reader_task
         if reader is not None:
             await asyncio.gather(reader, return_exceptions=True)
-        closed = ProtocolDefect("Codex app-server connection closed")
+        closed = CodexConnectionUnavailable()
         for _method, future in self._pending.values():
             if not future.done():
                 future.set_exception(closed)
@@ -272,6 +320,7 @@ class CodexAppServerClient:
         return await self.request("account/read", {"refreshToken": False})
 
     async def thread_list(self, **kwargs: object) -> object:
+        kwargs["sourceKinds"] = list(CODEX_THREAD_SOURCES)
         return await self.request("thread/list", self._camel_params(kwargs))
 
     async def thread_start(self, **kwargs: object) -> CodexThread:
@@ -279,16 +328,17 @@ class CodexAppServerClient:
             await self.request("thread/start", self._thread_params(kwargs)),
             "thread/start response",
         )
-        return CodexThread(self, self._response_thread_id(response, "thread/start"))
+        return self._select_thread(self._response_thread_id(response, "thread/start"))
 
     async def thread_resume(self, thread_id: str, **kwargs: object) -> CodexThread:
+        self._thread_id = thread_id
         response = self._mapping(
             await self.request(
                 "thread/resume", {"threadId": thread_id, **self._thread_params(kwargs)}
             ),
             "thread/resume response",
         )
-        return CodexThread(self, self._response_thread_id(response, "thread/resume"))
+        return self._select_thread(self._response_thread_id(response, "thread/resume"))
 
     async def thread_fork(self, thread_id: str, **kwargs: object) -> CodexThread:
         response = self._mapping(
@@ -297,47 +347,60 @@ class CodexAppServerClient:
             ),
             "thread/fork response",
         )
-        return CodexThread(self, self._response_thread_id(response, "thread/fork"))
+        return self._select_thread(self._response_thread_id(response, "thread/fork"))
+
+    def _select_thread(self, thread_id: str) -> CodexThread:
+        self._thread_id = thread_id
+        if self._failure is not None:
+            raise self._failure
+        for _ in range(self._messages.qsize()):
+            message, size = self._messages.get_nowait()
+            if isinstance(message, _TransportFailure):
+                raise message.error
+            if self._belongs_to_thread(message.params):
+                self._messages.put_nowait((message, size))
+            else:
+                self._queued_bytes -= size
+        return CodexThread(self, thread_id)
+
+    def _belongs_to_thread(self, params: Mapping[str, object]) -> bool:
+        thread_id = params.get("threadId")
+        thread = params.get("thread")
+        if thread_id is None and isinstance(thread, Mapping):
+            thread_id = thread.get("id")
+        return self._thread_id is None or thread_id in (None, self._thread_id)
 
     async def _reader_loop(self) -> None:
-        process = self._process
-        if process is None:
+        from websockets.exceptions import ConnectionClosed
+
+        connection = self._connection
+        if connection is None:
             return
-        buffer = bytearray()
         try:
-            while True:
-                chunk = await process.stdout.read(8192)
-                if not chunk:
-                    if buffer:
-                        raise ProtocolDefect("Codex app-server ended with a partial JSON message")
-                    if not self._closing:
-                        raise ProtocolDefect("Codex app-server exited before clean shutdown")
-                    return
-                buffer.extend(chunk)
-                if len(buffer) > _MAX_MESSAGE_BYTES and b"\n" not in buffer:
-                    raise ProtocolDefect("Codex app-server message exceeded its byte bound")
-                while True:
-                    newline = buffer.find(b"\n")
-                    if newline < 0:
-                        break
-                    line = bytes(buffer[:newline])
-                    del buffer[: newline + 1]
-                    if not line:
-                        raise ProtocolDefect("Codex app-server emitted an empty JSON line")
-                    if len(line) > _MAX_MESSAGE_BYTES:
-                        raise ProtocolDefect("Codex app-server message exceeded its byte bound")
-                    await self._route_line(line)
+            async for frame in connection:
+                if not isinstance(frame, str):
+                    raise ProtocolDefect("Codex app-server emitted a non-text WebSocket frame")
+                await self._route_line(frame.encode("utf-8"))
+            if not self._closing:
+                self._fail(CodexConnectionUnavailable())
         except asyncio.CancelledError:
             if not self._closing:
                 self._fail(ProtocolDefect("Codex app-server reader was cancelled"))
             raise
         except ProtocolDefect as error:
             self._fail(error)
+            await connection.close()
+        except ConnectionClosed as error:
+            if not self._closing:
+                self._fail(
+                    CodexOutputLimit()
+                    if error.sent is not None
+                    and error.sent.code == 1009
+                    and error.rcvd_then_sent is not True
+                    else CodexConnectionUnavailable()
+                )
         except (OSError, UnicodeError, ValueError, RecursionError):
             self._fail(ProtocolDefect("Codex app-server emitted malformed protocol data"))
-        finally:
-            if self._failure is not None:
-                await process.close()
 
     async def _route_line(self, line: bytes) -> None:
         try:
@@ -355,7 +418,7 @@ class CodexAppServerClient:
                 max_items=_MAX_MESSAGE_ITEMS,
             )
         except OutputLimitExceeded:
-            raise ProtocolDefect("Codex app-server message exceeded its structural bound") from None
+            raise CodexOutputLimit() from None
         if not isinstance(message, dict):
             raise ProtocolDefect("Codex app-server message was not an object")
         if "method" in message:
@@ -366,16 +429,31 @@ class CodexAppServerClient:
         self._route_response(message)
 
     async def _route_method(self, message: dict[str, object], *, size: int) -> None:
-        allowed = {"method", "params", "id"}
+        allowed = {"method", "params", "id" if "id" in message else "emittedAtMs"}
+        # justify-defect: admit exactly the pinned server envelope. Its optional
+        # i64 emission timestamp is transport metadata, never owned event state.
         if set(message) - allowed:
             raise ProtocolDefect("Codex app-server method message had unknown fields")
+        emitted_at_ms = message.get("emittedAtMs")
+        if emitted_at_ms is not None and (
+            type(emitted_at_ms) is not int or not -(1 << 63) <= emitted_at_ms < 1 << 63
+        ):
+            raise ProtocolDefect("Codex app-server notification timestamp was malformed")
         method = message.get("method")
         self._require_method(method)
         method = cast(str, method)
         params = self._mapping(message.get("params"), f"{method} params")
-        if "id" not in message:
-            self._enqueue_message(CodexNotification(method=method, params=params), size=size)
+        if self.config.request_policy == "observe_only":
+            # Worker requests are intentionally left pending for a native TUI. Never
+            # turn a subscription race into a competing approval response.
             return
+        if not self._belongs_to_thread(params):
+            return
+        if "id" not in message:
+            self._enqueue(CodexNotification(method=method, params=params), size=size)
+            return
+        if self._thread_id is None or params.get("threadId") != self._thread_id:
+            raise ProtocolDefect("Codex server request omitted its managed thread identity")
         request_id = message["id"]
         self._require_request_id(request_id)
         identity = (type(request_id), request_id)
@@ -388,7 +466,7 @@ class CodexAppServerClient:
         if denial is not None:
             kind, result = denial
             await self._write({"id": request_id, "result": result})
-            self._enqueue_message(
+            self._enqueue(
                 CodexServerRequest(
                     request_id=cast(CodexRequestId, request_id),
                     method=method,
@@ -407,7 +485,7 @@ class CodexAppServerClient:
                     "error": {"code": -32601, "message": denial_message},
                 }
             )
-            self._enqueue_message(
+            self._enqueue(
                 CodexServerRequest(
                     request_id=cast(CodexRequestId, request_id),
                     method=method,
@@ -450,40 +528,40 @@ class CodexAppServerClient:
             if type(code) is not int or not isinstance(text, str) or not text:
                 raise ProtocolDefect("Codex app-server error response was malformed")
             detail = sanitize_provider_text(text, limit=512)
-            del self._pending[request_id]
             future.set_exception(
-                CodexAppServerResponseError(
-                    f"Codex app-server {method} request failed ({code}): {detail}"
-                )
+                CodexAppServerResponseError(method, code, detail, error.get("data"))
             )
+            self._pending.pop(request_id)
             return
-        del self._pending[request_id]
+        if method in ("thread/start", "thread/resume", "thread/fork"):
+            result = self._mapping(message["result"], "thread response")
+            self._thread_id = self._response_thread_id(result, method)
         future.set_result(message["result"])
+        self._pending.pop(request_id)
 
     async def _write(self, message: Mapping[str, object]) -> None:
-        process = self._process
-        if process is None:
-            raise ProtocolDefect("Codex app-server process is not live")
+        from websockets.exceptions import ConnectionClosed
+
+        connection = self._connection
+        if connection is None:
+            raise ProtocolDefect("Codex app-server connection is not live")
         try:
-            encoded = (
-                json.dumps(
-                    dict(message), separators=(",", ":"), ensure_ascii=False, allow_nan=False
-                ).encode("utf-8")
-                + b"\n"
-            )
+            encoded = json.dumps(
+                dict(message), separators=(",", ":"), ensure_ascii=False, allow_nan=False
+            ).encode("utf-8")
         except (TypeError, ValueError, RecursionError):
             raise ProtocolDefect("Codex app-server outbound message was not JSON") from None
         if len(encoded) > _MAX_MESSAGE_BYTES:
             raise ProtocolDefect("Codex app-server outbound message exceeded its byte bound")
         async with self._write_lock:
             try:
-                await process.send(encoded)
-            except (OSError, RuntimeError):
-                error = ProtocolDefect("Codex app-server stdin closed unexpectedly")
+                await connection.send(encoded.decode("utf-8"))
+            except (OSError, ConnectionClosed):
+                error = CodexConnectionUnavailable()
                 self._fail(error)
                 raise error from None
 
-    def _enqueue_message(self, message: CodexServerMessage, *, size: int) -> None:
+    def _enqueue(self, message: CodexServerMessage, *, size: int) -> None:
         if (
             self._messages.qsize() >= _MAX_EVENT_COUNT
             or self._queued_bytes + size > _MAX_TURN_OUTPUT_BYTES
@@ -492,7 +570,7 @@ class CodexAppServerClient:
         self._queued_bytes += size
         self._messages.put_nowait((message, size))
 
-    def _fail(self, error: ProtocolDefect) -> None:
+    def _fail(self, error: ProtocolDefect | CodexConnectionUnavailable) -> None:
         if self._failure is not None:
             return
         self._failure = error
@@ -506,7 +584,7 @@ class CodexAppServerClient:
     def _require_live(self) -> None:
         if self._failure is not None:
             raise self._failure
-        if self._process is None or self._closed:
+        if self._connection is None or self._closed:
             raise ProtocolDefect("Codex app-server connection is not live")
 
     @staticmethod
