@@ -2,13 +2,25 @@
 
 from __future__ import annotations
 
+import os
 import re
+from pathlib import Path
 
 _MODEL_NAME = re.compile(r"[^\x00-\x20\x7f,]{1,256}\Z")
 
 
 class MatrixSelectionError(ValueError):
     """The operator input cannot prove the coverage it claims."""
+
+
+def parse_codex_endpoint(raw: str | None) -> Path:
+    """Accept the one explicit shared App Server endpoint under qualification."""
+    if not raw:
+        raise MatrixSelectionError("live Codex endpoint must be an absolute socket path")
+    endpoint = Path(raw)
+    if not endpoint.is_absolute() or os.path.normpath(raw) != raw:
+        raise MatrixSelectionError("live Codex endpoint must be a normalized absolute socket path")
+    return endpoint
 
 
 def parse_model_list(raw: str | None) -> tuple[str, ...]:

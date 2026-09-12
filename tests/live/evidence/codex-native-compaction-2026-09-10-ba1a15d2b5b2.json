@@ -1,0 +1,23 @@
+{
+  "status": "PASS",
+  "provider_commit": "69d41d38a3d290e7ae3bde9b57556dda41e1b2f1",
+  "fixture_sha256": "e3082895c46ebffd5f17c6e64a1f67313b403099dd08ec6e2fa5256c9394d5e4",
+  "native_version": "0.154.0",
+  "model": "gpt-5.6-terra",
+  "reasoning": "high",
+  "fixture_threshold": 1024,
+  "compaction_count": 2,
+  "synthetic_estimate_count": 2,
+  "same_thread": true,
+  "restored_history_uncharged": true,
+  "recalled_marker": true,
+  "native_authority_count": 0,
+  "turns": [
+    {"phase": "first", "status": "succeeded", "usage": {"input_tokens": 8448, "output_tokens": 39, "total_tokens": 8487, "cache_read_input_tokens": 0, "cache_write_input_tokens": 0, "reasoning_tokens": 32}},
+    {"phase": "continuing", "status": "succeeded", "usage": {"input_tokens": 8644, "output_tokens": 5, "total_tokens": 8649, "cache_read_input_tokens": 1792, "cache_write_input_tokens": 0, "reasoning_tokens": 0}},
+    {"phase": "reopened", "status": "succeeded", "usage": {"input_tokens": 8664, "output_tokens": 25, "total_tokens": 8689, "cache_read_input_tokens": 1792, "cache_write_input_tokens": 0, "reasoning_tokens": 0}}
+  ],
+  "scope": "synthetic_thread_automatic_compaction_and_client_reopen",
+  "production_threshold_qualified": false,
+  "full_provider_matrix_qualified": false
+}
