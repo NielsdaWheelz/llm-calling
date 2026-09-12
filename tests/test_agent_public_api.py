@@ -170,6 +170,27 @@ def test_importing_agent_surface_does_not_import_optional_sdk() -> None:
     assert completed.returncode == 0, completed.stderr
 
 
+def test_importing_agent_surface_does_not_import_provider_http_runtime() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import provider_runtime.agent_runtime; "
+                "assert 'provider_runtime.runtime' not in sys.modules; "
+                "assert 'provider_runtime.engines.openai_responses' not in sys.modules; "
+                "assert 'provider_runtime.engines.anthropic_messages' not in sys.modules; "
+                "assert 'provider_runtime.engines.gemini_generate' not in sys.modules"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_adapter_and_private_modules_are_not_agent_exports() -> None:
     for name in (
         "codex_sdk",
