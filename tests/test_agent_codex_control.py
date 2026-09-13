@@ -90,6 +90,8 @@ class ProtocolPeer:
         self.emit_approval = False
         self.foreign_noise = False
         self.turn_status = "inProgress"
+        self.turn_id = TURN
+        self.turn_id_after_interrupt: str | None = None
         self.drop_method: str | None = None
         self.close_code = 1000
         self.errors: dict[str, str] = {}
@@ -165,7 +167,7 @@ class ProtocolPeer:
                     result = {
                         "data": [
                             {
-                                "id": TURN,
+                                "id": self.turn_id,
                                 "status": self.turn_status,
                                 "itemsView": view,
                                 "items": [] if view == "notLoaded" else self.turn_items(),
@@ -196,6 +198,9 @@ class ProtocolPeer:
                 elif method == "turn/interrupt":
                     if self.interrupt_settles:
                         self.turn_status = "interrupted"
+                    if self.turn_id_after_interrupt:
+                        self.turn_id = self.turn_id_after_interrupt
+                        self.turn_status = "inProgress"
                     result = {}
                 else:
                     raise AssertionError(f"unexpected fixture request: {method}")

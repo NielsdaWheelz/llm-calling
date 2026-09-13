@@ -14,6 +14,9 @@ dependencies = [
     "websockets>=16,<17",
 ]
 
+[project.scripts]
+provider-runtime-control = "provider_runtime.agent_runtime.native_control_cli:main"
+
 # Claude's SDK remains optional. Codex is a core WebSocket client of a
 # host-owned service; it carries no Python SDK or executable.
 [project.optional-dependencies]
