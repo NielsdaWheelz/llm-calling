@@ -116,6 +116,16 @@ async def test_unloaded_codex_keeps_history_without_claiming_live_control(
 
 
 @pytest.mark.parametrize("operation", ["interrupt", "stop"])
+async def test_unloaded_codex_does_not_confirm_halt_from_historical_turn(
+    peer: ProtocolPeer, operation: str
+) -> None:
+    peer.status, peer.turn_status = "notLoaded", "completed"
+    _, result, _ = await invoke(codex_request(peer, operation))
+    assert result == {"ok": False, "error": {"code": "unavailable", "dispatch": "not_sent"}}
+    assert not any(row.get("method") == "turn/interrupt" for row in peer.messages)
+
+
+@pytest.mark.parametrize("operation", ["interrupt", "stop"])
 async def test_observed_no_turn_does_not_authorize_cancelling_a_new_turn(
     peer: ProtocolPeer, operation: str
 ) -> None:

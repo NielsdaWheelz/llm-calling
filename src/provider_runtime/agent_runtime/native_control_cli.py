@@ -200,6 +200,8 @@ async def _codex(request: _Request) -> dict:
         observed = (await control.inspect((target,)))[0]
         if isinstance(observed, CodexControlError):
             return _codex_error(observed)
+        if observed.thread.status == "notLoaded":
+            return _error("unavailable")
         expected = request.targets[0].turnId
         if (observed.turn.target.turn_handle if observed.turn else None) != expected:
             return _error("stale")
