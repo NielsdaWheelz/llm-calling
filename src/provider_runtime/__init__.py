@@ -5,12 +5,17 @@ its credentials, the intent vocabulary, the terminal outcomes, the stream
 envelope, the embed port, and derived cost estimation. The FULL contract
 vocabulary stays importable from ``provider_runtime.types``; registry rows
 from ``provider_runtime.registry``; test doubles from
-``provider_runtime.testing``.
+``provider_runtime.testing``. The HTTP runtime is loaded only when either of
+its two exports is read, so importing independent contracts does not initialize
+every provider engine.
 """
+
+import importlib as _importlib
+from typing import TYPE_CHECKING as _TYPE_CHECKING
+from typing import Any as _Any
 
 from provider_runtime.errors import NonGenerationCallFailed
 from provider_runtime.prices import estimate_cost
-from provider_runtime.runtime import Credentials, ProviderRuntime
 from provider_runtime.types import (
     Absent,
     AssistantMessage,
@@ -49,6 +54,24 @@ from provider_runtime.types import (
     UsageEvent,
     UserMessage,
 )
+
+if _TYPE_CHECKING:
+    from provider_runtime.runtime import Credentials, ProviderRuntime
+
+_RUNTIME_EXPORTS = frozenset({"Credentials", "ProviderRuntime"})
+
+
+def __getattr__(name: str) -> _Any:
+    if name not in _RUNTIME_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(_importlib.import_module("provider_runtime.runtime"), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | _RUNTIME_EXPORTS)
+
 
 __all__ = [
     "Absent",
