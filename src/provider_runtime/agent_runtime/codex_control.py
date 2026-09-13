@@ -269,6 +269,21 @@ class CodexControl:
         async with self._client(target.profile_key) as client:
             return await self._read(client, target, include_items=True)
 
+    async def inspect(
+        self, targets: tuple[CodexThreadTarget, ...]
+    ) -> tuple[CodexThreadRead | CodexControlError, ...]:
+        """Read one profile's requested states without loading conversation items."""
+        if not targets or any(target.profile_key != targets[0].profile_key for target in targets):
+            raise InvalidAgentRequest("Codex inspection requires targets from one profile")
+        observed: list[CodexThreadRead | CodexControlError] = []
+        async with self._client(targets[0].profile_key) as client:
+            for target in targets:
+                try:
+                    observed.append(await self._read(client, target, include_items=False))
+                except CodexControlError as error:
+                    observed.append(error)
+        return tuple(observed)
+
     async def create(self, request: CodexCreateRequest) -> CodexThreadTarget:
         # The external server may have a different filesystem view or UID.
         # CodexCreateRequest validates syntax; the server owns existence checks.

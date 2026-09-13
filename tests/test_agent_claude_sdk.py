@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import signal
+import subprocess
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
@@ -701,9 +702,16 @@ def stopped(pid: int) -> bool:
     reaped by init and not by this process. `kill(pid, 0)` succeeds against a zombie, so the
     only honest liveness answer on Linux comes from the process state in `/proc`.
     """
+    if sys.platform == "darwin":
+        observed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "stat="],
+            capture_output=True,
+            check=False,
+        )
+        return not observed.stdout.strip() or observed.stdout.lstrip().startswith(b"Z")
     try:
         line = Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
+    except FileNotFoundError:
         return True
     return line.rsplit(") ", 1)[1].split(" ", 1)[0] == "Z"
 

@@ -103,8 +103,10 @@ def test_provider_sdk_imports_are_confined_to_engines_and_embeddings() -> None:
 # module name anywhere, not just an import statement, because a name in a string can still
 # be a real lazy dependency.
 _AGENT_DEPENDENCY_ALLOWLIST: dict[str, frozenset[Path]] = {
-    # The Claude Agent SDK is the pinned optional extra; only its adapter may name it.
-    "claude_agent_sdk": frozenset({AGENT_RUNTIME / "claude_sdk.py"}),
+    # Isolated cognition and external persisted-history reading are separate adapters.
+    "claude_agent_sdk": frozenset(
+        {AGENT_RUNTIME / "claude_sdk.py", AGENT_RUNTIME / "claude_control.py"}
+    ),
     # The shared Codex client imports its WebSocket transport lazily at the wire boundary.
     "websockets": frozenset({AGENT_RUNTIME / "codex_app_server.py"}),
 }
