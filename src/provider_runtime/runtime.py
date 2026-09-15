@@ -31,13 +31,8 @@ import httpx
 import pydantic
 from opentelemetry.trace import TracerProvider
 
-from provider_runtime import embeddings
 from provider_runtime.engines import Engine, TransientAttempt
 from provider_runtime.engines._common import monotonic_ms
-from provider_runtime.engines.anthropic_messages import AnthropicMessagesEngine
-from provider_runtime.engines.gemini_generate import GeminiGenerateEngine
-from provider_runtime.engines.openai_chat import OpenAIChatEngine
-from provider_runtime.engines.openai_responses import OpenAIResponsesEngine
 from provider_runtime.errors import (
     CredentialMissing,
     InvalidRequest,
@@ -376,7 +371,7 @@ class ProviderRuntime:
         tracer_provider: TracerProvider | None = None,
     ) -> None:
         # `engines` is the deterministic-test seam (spec §11: facade tests run
-        # against FakeEngine); the production default wires the four adapters.
+        # against FakeEngine); generation lazily wires the four default adapters.
         # `tracer_provider` is the standard OTel library seam: None means the
         # process-global provider (no-op until an SDK configures one).
         self._credentials = credentials
@@ -384,16 +379,23 @@ class ProviderRuntime:
         self._http_client = http_client
         self._tracer_provider = tracer_provider
         self._endpoint_overrides = _endpoint_overrides(endpoint_overrides or {})
-        self._engines: Mapping[EngineId, Engine] = (
-            engines
-            if engines is not None
-            else {
-                "openai_responses": OpenAIResponsesEngine(http_client=http_client),
-                "openai_chat": OpenAIChatEngine(http_client=http_client),
-                "anthropic_messages": AnthropicMessagesEngine(http_client=http_client),
-                "gemini_generate": GeminiGenerateEngine(http_client=http_client),
+        self._engines = engines
+
+    def _engine(self, engine_id: EngineId) -> Engine:
+        # Embedding-only consumers do not need the generation SDKs.
+        if self._engines is None:
+            from provider_runtime.engines.anthropic_messages import AnthropicMessagesEngine
+            from provider_runtime.engines.gemini_generate import GeminiGenerateEngine
+            from provider_runtime.engines.openai_chat import OpenAIChatEngine
+            from provider_runtime.engines.openai_responses import OpenAIResponsesEngine
+
+            self._engines = {
+                "openai_responses": OpenAIResponsesEngine(http_client=self._http_client),
+                "openai_chat": OpenAIChatEngine(http_client=self._http_client),
+                "anthropic_messages": AnthropicMessagesEngine(http_client=self._http_client),
+                "gemini_generate": GeminiGenerateEngine(http_client=self._http_client),
             }
-        )
+        return self._engines[engine_id]
 
     def _credential(self, provider: ProviderName) -> ProviderCredential:
         match provider:
@@ -426,7 +428,7 @@ class ProviderRuntime:
         _validate_intent(source_row, intent, streaming=False)
         row = _dispatch_row(source_row, self._endpoint_overrides)
         credential = self._credential(source_row.provider)
-        engine = self._engines[source_row.engine]
+        engine = self._engine(source_row.engine)
         with call_span(
             "chat",
             provider=row.provider,
@@ -502,7 +504,7 @@ class ProviderRuntime:
         _validate_intent(source_row, intent, streaming=True)
         row = _dispatch_row(source_row, self._endpoint_overrides)
         credential = self._credential(source_row.provider)
-        engine = self._engines[source_row.engine]
+        engine = self._engine(source_row.engine)
         return self._stream_events(row, intent, credential, engine, cancel)
 
     async def _stream_events(
@@ -760,6 +762,8 @@ class ProviderRuntime:
         `TransientAttempt`, defects raise their own types. Retry exhaustion
         and context overflow surface here as `NonGenerationCallFailed`.
         """
+        from provider_runtime import embeddings
+
         last_cause: TransientCause | None = None
         attempt_count = 0
         tries = attempts(self._retry)
