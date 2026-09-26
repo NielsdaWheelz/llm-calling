@@ -224,6 +224,7 @@ class ApiModelFacts:
     tools: bool
     streaming: bool
     structured: ApiStructuredOutput
+    structured_with_tools: bool
     reasoning: tuple[ApiReasoningFacts, ...]
     source_default_reasoning: Presence[ReasoningKey]
     continuation_codec: str

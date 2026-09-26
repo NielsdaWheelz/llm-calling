@@ -497,12 +497,16 @@ async def test_generate_unknown_target_raises_invalid_request() -> None:
     assert engine.generate_calls == []
 
 
-async def test_generate_tools_with_strict_output_raises_invalid_request() -> None:
+async def test_generate_tools_with_strict_output_on_unproven_row_raises_invalid_request() -> None:
     engine = FakeEngine()
     tool = CanonicalTool(name="lookup", description="", parameters={"type": "object"})
     with pytest.raises(InvalidRequest):
         await make_runtime(engine).generate(
-            make_intent(tools=(tool,), output=StrictJsonOutput(name="Out", schema={}))
+            make_intent(
+                target=ProviderTarget(provider="openai", model="gpt-6-astra"),
+                tools=(tool,),
+                output=StrictJsonOutput(name="Out", schema={}),
+            )
         )
     assert engine.generate_calls == []
 

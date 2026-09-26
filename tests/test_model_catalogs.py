@@ -190,7 +190,7 @@ def test_api_catalog_is_exact_immutable_and_the_registry_has_no_public_rows() ->
     first = api_model_catalog()
     second = api_model_catalog()
     assert first == second
-    assert first.backend_contract_revision == "provider-runtime.api-model-catalog.v3"
+    assert first.backend_contract_revision == "provider-runtime.api-model-catalog.v4"
     assert first.registry_revision == registry.REGISTRY_REVISION
     assert len(first.definition_revision) == 64
     assert tuple(row.model_ref for row in first.models) == (

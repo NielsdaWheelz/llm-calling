@@ -223,11 +223,9 @@ def _validate_intent(row: ModelRow, intent: GenerateIntent, *, streaming: bool) 
     if intent.tools:
         if not row.tools:
             raise InvalidRequest(message=f"registry row {row.ref!r} does not support tools")
-        if isinstance(intent.output, StrictJsonOutput):
-            # types.py: tools+strict-output rejected here ⇒ no impossible
-            # ResponseContent state downstream.
+        if isinstance(intent.output, StrictJsonOutput) and not row.structured_with_tools:
             raise InvalidRequest(
-                message="tools and StrictJsonOutput cannot be combined in one intent"
+                message=f"registry row {row.ref!r} does not support StrictJsonOutput with tools"
             )
     if "image" not in row.modalities:
         for message in intent.messages:

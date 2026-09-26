@@ -31,8 +31,8 @@ from provider_runtime.types import (
     freeze_json_object,
 )
 
-REGISTRY_REVISION: Final = "2026-09-25.2"
-_BACKEND_CONTRACT_REVISION: Final = "provider-runtime.api-model-catalog.v3"
+REGISTRY_REVISION: Final = "2026-09-26.1"
+_BACKEND_CONTRACT_REVISION: Final = "provider-runtime.api-model-catalog.v4"
 _KEY = re.compile(r"[a-z0-9]+(?:/[a-z0-9]+)*\Z")
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
 GPT6_MODEL_IDS: Final = ("gpt-6-astra", "gpt-6-sol", "gpt-6-luna")
@@ -64,6 +64,7 @@ class _ModelRow:
     continuation_codec: str
     correlation: Literal["header", "in_band", "none"]
     source_max_output_tokens: Presence[int] = Absent()
+    structured_with_tools: bool = False
 
 
 def _source(url: str) -> SourceCitation:
@@ -121,6 +122,7 @@ def _openai_row(model: str) -> _ModelRow:
         retirement=Absent(),
         continuation_codec="openai.v2",
         correlation="header",
+        structured_with_tools=model in ("gpt-6-sol", "gpt-6-luna"),
     )
 
 
@@ -277,7 +279,7 @@ def _row_fingerprint(row: _ModelRow) -> str:
         else None
     )
     return _fingerprint(
-        b"provider-runtime.row.v3",
+        b"provider-runtime.row.v4",
         {
             "ref": row.ref,
             "provider": row.provider,
@@ -296,6 +298,7 @@ def _row_fingerprint(row: _ModelRow) -> str:
             "tools": row.tools,
             "streaming": row.streaming,
             "structured": row.structured,
+            "structured_with_tools": row.structured_with_tools,
             "reasoning": reasoning,
             "labels": tuple((key, _option_label(key)) for key in reasoning),
             "default": default,
@@ -327,6 +330,7 @@ def _api_model_facts(row: _ModelRow) -> ApiModelFacts:
         structured=NativeStructuredOutput()
         if row.structured == "native"
         else JsonModeStructuredOutput(),
+        structured_with_tools=row.structured_with_tools,
         reasoning=tuple(ApiReasoningFacts(key=key, label=_option_label(key)) for key in reasoning),
         source_default_reasoning=(
             Present(row.source_default_reasoning.value.value)
@@ -344,7 +348,7 @@ def api_model_catalog() -> ApiModelCatalog:
         backend_contract_revision=_BACKEND_CONTRACT_REVISION,
         registry_revision=REGISTRY_REVISION,
         definition_revision=_fingerprint(
-            b"provider-runtime.catalog.v3",
+            b"provider-runtime.catalog.v4",
             {"rows": tuple(model.row_fingerprint for model in models)},
         ),
         models=models,
@@ -374,6 +378,12 @@ def _validate_rows() -> None:
         ):
             raise RuntimeDefect(
                 origin="intent", code="registry_invalid", message=f"invalid dispatch for {row.ref}"
+            )
+        if row.structured_with_tools and (not row.tools or row.structured != "native"):
+            raise RuntimeDefect(
+                origin="intent",
+                code="registry_invalid",
+                message=f"invalid structured-with-tools capability for {row.ref}",
             )
         if (
             row.context_window < row.max_output_tokens
