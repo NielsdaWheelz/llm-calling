@@ -9,7 +9,7 @@ import pytest
 from provider_runtime.errors import InvalidRequest
 from provider_runtime.registry import api_model_catalog
 from provider_runtime.types import CanonicalTool, StrictJsonOutput, StructuredContent, Succeeded
-from tests.test_runtime import FakeEngine, make_intent, make_runtime, structured_succeeded
+from tests.test_runtime import FakeEngine, Verdict, make_intent, make_runtime, structured_succeeded
 
 
 @pytest.mark.parametrize("model", ("gpt-6-sol", "gpt-6-luna"))
@@ -45,4 +45,14 @@ async def test_unproven_model_still_rejects_combination_before_dispatch() -> Non
     )
     with pytest.raises(InvalidRequest):
         await make_runtime(engine).generate(intent)
+    assert not engine.generate_calls
+
+
+async def test_json_out_rejects_tools_before_dispatch() -> None:
+    tool = CanonicalTool(name="lookup", description="", parameters={"type": "object"})
+    engine = FakeEngine(
+        generate_script=[structured_succeeded({"verdict": "keep", "confidence": 3})]
+    )
+    with pytest.raises(InvalidRequest):
+        await make_runtime(engine).json_out(Verdict, make_intent(tools=(tool,)))
     assert not engine.generate_calls

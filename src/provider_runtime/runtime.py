@@ -719,6 +719,8 @@ class ProviderRuntime:
                 message="json_out requires an intent with TextOutput; "
                 "the strict schema is derived from the pydantic model"
             )
+        if intent.tools:
+            raise InvalidRequest(message="json_out requires an intent without tools")
         schema = self._closed_schema(model.model_json_schema())
         assert isinstance(schema, Mapping)
         strict_intent = replace(
