@@ -38,9 +38,9 @@ def _auth() -> CredentialRef:
 
 def _ref() -> AgentSessionRef:
     return AgentSessionRef(
-        schema_version="agent-session-ref.v1",
+        schema_version="agent-session-ref.v2",
         backend="codex",
-        transport="sdk",
+        transport="app_server",
         native_session_id="thread-test",
         profile_key="test-profile",
         state_root_fingerprint="1" * 64,
@@ -87,8 +87,10 @@ def _success_script() -> tuple[AgentEvent, ...]:
 async def test_no_network_double_fails_loudly_without_leaking_auth_name() -> None:
     runtime = NoNetworkAgentRuntime()
 
-    with pytest.raises(AssertionError, match="codex/sdk") as caught:
-        await runtime.list_sessions(SessionQuery(backend="codex", transport="sdk", auth=_auth()))
+    with pytest.raises(AssertionError, match="codex/app_server") as caught:
+        await runtime.list_sessions(
+            SessionQuery(backend="codex", transport="app_server", auth=_auth())
+        )
 
     assert "test-profile" not in str(caught.value)
 

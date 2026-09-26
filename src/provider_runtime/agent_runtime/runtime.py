@@ -286,7 +286,7 @@ class AgentRuntime:
         backend: Backend,
         auth: CredentialRef,
         *,
-        transport: AgentTransport = "sdk",
+        transport: AgentTransport,
     ) -> AgentModelCatalog:
         """Read the authenticated native catalog for one exact Agent route."""
         return await self._run_owned_operation(
@@ -1366,10 +1366,10 @@ class AgentRuntime:
 
 def _default_adapters(config: AgentRuntimeConfig) -> tuple[AgentAdapter, ...]:
     from .claude_sdk import ClaudeSdkAdapter
-    from .codex_sdk import CodexSdkAdapter
+    from .codex_adapter import CodexAppServerAdapter
 
     return (
-        CodexSdkAdapter(sandbox_controls=config.codex_sandbox),
+        CodexAppServerAdapter(sandbox_controls=config.codex_sandbox),
         ClaudeSdkAdapter(executable=_resolve_executable(config.claude_executable)),
     )
 

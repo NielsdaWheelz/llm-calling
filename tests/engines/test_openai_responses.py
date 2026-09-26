@@ -51,7 +51,7 @@ from provider_runtime.types import (
     ProviderStreamInterrupted,
     ProviderTarget,
     ProviderTimeout,
-    ReasoningLevel,
+    ReasoningKey,
     Refused,
     StreamStart,
     StrictJsonOutput,
@@ -78,7 +78,7 @@ RESPONSES_URL = "https://api.openai.com/v1/responses"
 
 # Registry rows carry the real openai wire fragment per level — a self-describing
 # request-parameter mapping the engine merges verbatim.
-REASONING_LEVELS: Mapping[ReasoningLevel, object] = {
+REASONING_LEVELS: Mapping[ReasoningKey, object] = {
     "none": {"reasoning": {"effort": "none"}},
     "low": {"reasoning": {"effort": "low"}},
     "high": {"reasoning": {"effort": "high"}},
@@ -102,9 +102,8 @@ ROW = ModelRow(
     source_default_reasoning=Absent(),
     upgrade=Absent(),
     retirement=Absent(),
-    continuation_codec="openai.v1",
+    continuation_codec="openai.v2",
     correlation="header",
-    routing=Absent(),
 )
 
 # Every request-affecting environment variable the openai SDK reads on its own.
@@ -149,7 +148,7 @@ def make_intent(
     *,
     messages: tuple[PromptMessage, ...] = (SYSTEM, USER),
     max_output_tokens: int = 128,
-    reasoning: ReasoningLevel = "high",
+    reasoning: ReasoningKey = "high",
     tools: tuple[CanonicalTool, ...] = (),
     tool_choice: ToolChoice = "auto",
     output: OutputSpec = TEXT_OUTPUT,
@@ -328,7 +327,6 @@ def assert_meta(
     assert meta.provider_request_id == Present(request_id), (
         f"meta.provider_request_id: {meta.provider_request_id!r}"
     )
-    assert meta.upstream_provider == Absent(), f"meta.upstream_provider: {meta.upstream_provider!r}"
     expected_usage = Absent() if usage is None else Present(usage)
     assert meta.usage == expected_usage, f"meta.usage: {meta.usage!r} != {expected_usage!r}"
     expected_native = Absent() if native_reasoning is None else Present(native_reasoning)
@@ -377,31 +375,21 @@ async def test_generate_sends_exact_request_body_headers_and_url() -> None:
     }, f"request body: {body!r}"
 
 
-@respx.mock
-async def test_generate_omits_reasoning_when_row_has_no_reasoning_knob() -> None:
-    route = respx.post(RESPONSES_URL).mock(
-        return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
-    )
+async def test_generate_rejects_row_without_reasoning_configurations() -> None:
     row = replace(ROW, reasoning=Absent())
-    outcome = await OpenAIResponsesEngine().generate(row, make_intent(reasoning="none"), CREDENTIAL)
-    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
-    body = request_body(route)
-    assert "reasoning" not in body, f"reasoning key must be omitted; body: {body!r}"
-    assert outcome.meta.native_reasoning == Absent(), (
-        f"native_reasoning: {outcome.meta.native_reasoning!r}"
-    )
+    with pytest.raises(InvalidRequest, match="no reasoning configurations"):
+        await OpenAIResponsesEngine().generate(row, make_intent(reasoning="none"), CREDENTIAL)
 
 
 async def test_generate_rejects_undeclared_reasoning_level() -> None:
-    with pytest.raises(InvalidRequest, match="reasoning level 'max'"):
+    with pytest.raises(InvalidRequest, match="reasoning key 'max'"):
         await OpenAIResponsesEngine().generate(ROW, make_intent(reasoning="max"), CREDENTIAL)
 
 
 async def test_generate_rejects_a_reasoning_level_on_a_knobless_row() -> None:
-    """A knobless row expresses only 'none'; an explicit level the row cannot
-    put on the wire is refused, never silently dropped."""
+    """A row without configurations cannot encode any reasoning key."""
     row = replace(ROW, reasoning=Absent())
-    with pytest.raises(InvalidRequest, match="no reasoning knob"):
+    with pytest.raises(InvalidRequest, match="no reasoning configurations"):
         await OpenAIResponsesEngine().generate(row, make_intent(reasoning="high"), CREDENTIAL)
 
 
@@ -412,7 +400,7 @@ async def test_generate_merges_row_reasoning_fragment_verbatim() -> None:
     route = respx.post(RESPONSES_URL).mock(
         return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
     )
-    levels: Mapping[ReasoningLevel, object] = {
+    levels: Mapping[ReasoningKey, object] = {
         "low": {"reasoning": {"effort": "low", "summary": "auto"}}
     }
     outcome = await OpenAIResponsesEngine().generate(
@@ -426,24 +414,12 @@ async def test_generate_merges_row_reasoning_fragment_verbatim() -> None:
     ), f"native_reasoning: {outcome.meta.native_reasoning!r}"
 
 
-@respx.mock
-async def test_generate_reasoning_none_on_a_row_declaring_no_none_sends_nothing() -> None:
-    """spec §14: "none" is the facade default, so it is callable on every row —
-    a row that declares no "none" level sends no reasoning field and lets the
-    provider's own default apply."""
-    route = respx.post(RESPONSES_URL).mock(
-        return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
-    )
-    levels: Mapping[ReasoningLevel, object] = {"low": {"reasoning": {"effort": "low"}}}
-    outcome = await OpenAIResponsesEngine().generate(
-        replace(ROW, reasoning=Present(levels)), make_intent(reasoning="none"), CREDENTIAL
-    )
-    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
-    body = request_body(route)
-    assert "reasoning" not in body, f"nothing may be sent; body: {body!r}"
-    assert outcome.meta.native_reasoning == Absent(), (
-        f"native_reasoning: {outcome.meta.native_reasoning!r}"
-    )
+async def test_generate_rejects_undeclared_none_key() -> None:
+    levels: Mapping[ReasoningKey, object] = {"low": {"reasoning": {"effort": "low"}}}
+    with pytest.raises(InvalidRequest, match="reasoning key 'none'"):
+        await OpenAIResponsesEngine().generate(
+            replace(ROW, reasoning=Present(levels)), make_intent(reasoning="none"), CREDENTIAL
+        )
 
 
 @respx.mock
@@ -463,7 +439,7 @@ async def test_generate_declared_reasoning_none_still_sends_its_fragment() -> No
 
 
 async def test_generate_rejects_non_mapping_reasoning_value_as_registry_defect() -> None:
-    levels: Mapping[ReasoningLevel, object] = {"high": "high"}
+    levels: Mapping[ReasoningKey, object] = {"high": "high"}
     with pytest.raises(RuntimeDefect, match="request-fragment mappings") as exc_info:
         await OpenAIResponsesEngine().generate(
             replace(ROW, reasoning=Present(levels)), make_intent(), CREDENTIAL
@@ -475,7 +451,7 @@ async def test_generate_rejects_reasoning_fragment_colliding_with_an_engine_set_
     """The fragment is splatted into the params literal: a row naming a field
     the engine sets itself silently rewrites the call — here `store`, whose
     `false` is what makes reasoning replay stateless."""
-    levels: Mapping[ReasoningLevel, object] = {
+    levels: Mapping[ReasoningKey, object] = {
         "high": {"reasoning": {"effort": "high"}, "store": True}
     }
     with pytest.raises(RuntimeDefect, match="'store'") as exc_info:
@@ -621,7 +597,7 @@ async def test_generate_replays_continuation_payload_verbatim() -> None:
     )
     artifact = ContinuationArtifact(
         target=TARGET,
-        codec_id="openai.v1",
+        codec_id="openai.v2",
         opaque_payload={"output": (REASONING_ITEM, FUNCTION_CALL_ITEM)},
     )
     intent = make_intent(
@@ -629,7 +605,7 @@ async def test_generate_replays_continuation_payload_verbatim() -> None:
             SYSTEM,
             USER,
             AssistantMessage(
-                text="prior",
+                text="",
                 tool_calls=(
                     ToolCall(id="call_1", name="search_library", arguments={"query": "cats"}),
                 ),
@@ -650,12 +626,35 @@ async def test_generate_replays_continuation_payload_verbatim() -> None:
     ], f"input must splice payload items verbatim; got: {body.get('input')!r}"
 
 
+async def test_generate_rejects_native_tool_call_identity_mismatch() -> None:
+    artifact = ContinuationArtifact(
+        target=TARGET,
+        codec_id="openai.v2",
+        opaque_payload={"output": (FUNCTION_CALL_ITEM,)},
+    )
+    intent = make_intent(
+        messages=(
+            USER,
+            AssistantMessage(
+                text="",
+                tool_calls=(
+                    ToolCall(id="wrong", name="search_library", arguments={"query": "cats"}),
+                ),
+                continuation=Present(artifact),
+            ),
+            ToolResultMessage(call_id="wrong", output="42", is_error=False),
+        )
+    )
+    with pytest.raises(InvalidRequest, match="differs from normalized"):
+        await OpenAIResponsesEngine().generate(ROW, intent, CREDENTIAL)
+
+
 @pytest.mark.parametrize(
     "artifact",
     [
         ContinuationArtifact(
             target=ProviderTarget(provider="openai", model="gpt-other"),
-            codec_id="openai.v1",
+            codec_id="openai.v2",
             opaque_payload={"output": (REASONING_ITEM,)},
         ),
         ContinuationArtifact(
@@ -681,7 +680,7 @@ async def test_generate_rejects_continuation_bound_elsewhere(
 
 
 async def test_generate_rejects_continuation_without_output_items() -> None:
-    artifact = ContinuationArtifact(target=TARGET, codec_id="openai.v1", opaque_payload={})
+    artifact = ContinuationArtifact(target=TARGET, codec_id="openai.v2", opaque_payload={})
     intent = make_intent(
         messages=(
             SYSTEM,
@@ -790,7 +789,7 @@ async def test_generate_decodes_success_usage_meta_and_continuation() -> None:
     assert isinstance(continuation, Present), f"continuation: {continuation!r}"
     artifact = continuation.value
     assert artifact.target == TARGET, f"artifact.target: {artifact.target!r}"
-    assert artifact.codec_id == "openai.v1", f"artifact.codec_id: {artifact.codec_id!r}"
+    assert artifact.codec_id == "openai.v2", f"artifact.codec_id: {artifact.codec_id!r}"
     assert thaw_json_value(artifact.opaque_payload)["output"] == output, (  # type: ignore[index]
         f"payload items must be the verbatim wire output: {artifact.opaque_payload!r}"
     )
@@ -1295,7 +1294,7 @@ async def test_stream_decodes_deltas_tool_calls_continuation_and_terminal() -> N
     continuation_delta = events[7]
     assert isinstance(continuation_delta, ContinuationDelta), f"{continuation_delta!r}"
     artifact = continuation_delta.artifact
-    assert artifact.target == TARGET and artifact.codec_id == "openai.v1", f"{artifact!r}"
+    assert artifact.target == TARGET and artifact.codec_id == "openai.v2", f"{artifact!r}"
     assert thaw_json_value(artifact.opaque_payload)["output"] == [  # type: ignore[index]
         done_fc,
         done_reasoning,

@@ -89,16 +89,19 @@ def usage() -> TokenUsage:
 
 def session_ref(
     backend: Backend = "claude",
-    transport: AgentTransport = "sdk",
+    transport: AgentTransport | None = None,
     profile: str = "personal",
     *,
     state_root: Path | None = None,
     cwd: Path | None = None,
 ) -> AgentSessionRef:
+    selected_transport: AgentTransport = transport or (
+        "app_server" if backend == "codex" else "sdk"
+    )
     return AgentSessionRef(
-        schema_version="agent-session-ref.v1",
+        schema_version="agent-session-ref.v2",
         backend=backend,
-        transport=transport,
+        transport=selected_transport,
         native_session_id="native-session-1",
         profile_key=profile,
         state_root_fingerprint=fingerprint_path(state_root) if state_root else "a" * 64,
@@ -110,9 +113,10 @@ def request(
     tmp_path: Path,
     *,
     backend: Backend = "claude",
-    transport: AgentTransport = "sdk",
+    transport: AgentTransport | None = None,
 ) -> AgentSessionRequest:
-    if transport != "sdk":
+    selected_transport = transport or ("app_server" if backend == "codex" else "sdk")
+    if selected_transport != ("app_server" if backend == "codex" else "sdk"):
         raise AssertionError(f"test fixture has no {transport!r} transport")
     common = {
         "auth": CredentialRef(kind="local_account", profile_key="personal"),
@@ -137,6 +141,7 @@ def codex_catalog() -> AgentModelCatalog:
         definition_revision="agent-definition-test",
         native_revision=Absent(),
         observed_at=datetime(2026, 8, 31, tzinfo=UTC),
+        supports_frozen_mcp_tools=False,
         models=(
             AgentModelFacts(
                 key="codex-test",
@@ -193,7 +198,7 @@ class ScriptedAdapter:
         self,
         *,
         backend: Backend = "claude",
-        transport: AgentTransport = "sdk",
+        transport: AgentTransport | None = None,
         lazy_ref: bool = False,
         incomplete_ref: bool = False,
         hang: bool = False,
@@ -210,7 +215,9 @@ class ScriptedAdapter:
         hang_close: bool = False,
     ) -> None:
         self._backend: Backend = backend
-        self._transport: AgentTransport = transport
+        self._transport: AgentTransport = transport or (
+            "app_server" if backend == "codex" else "sdk"
+        )
         self.lazy_ref = lazy_ref
         self.incomplete_ref = incomplete_ref
         self.hang = hang
@@ -449,7 +456,7 @@ async def test_model_catalog_is_an_authenticated_route_query_without_session_eff
     adapter = ScriptedAdapter(backend="codex")
     auth = CredentialRef(kind="local_account", profile_key="personal")
     async with runtime_for(tmp_path, adapter) as runtime:
-        catalog = await runtime.model_catalog("codex", auth)
+        catalog = await runtime.model_catalog("codex", auth, transport="app_server")
 
     assert catalog == codex_catalog()
     assert adapter.model_catalog_calls == 1
@@ -1117,6 +1124,6 @@ async def test_absent_codex_transport_dependency_is_sdk_unavailable(
     ) as runtime:
         with pytest.raises(SdkUnavailable, match="websockets dependency"):
             await runtime.list_sessions(
-                SessionQuery("codex", "sdk", CredentialRef("local_account", "lab"))
+                SessionQuery("codex", "app_server", CredentialRef("local_account", "lab"))
             )
     assert tuple(tmp_path.iterdir()) == ()

@@ -11,6 +11,7 @@ from typing import Any, Literal, cast
 from uuid import uuid4
 
 from provider_runtime.errors import sanitize_provider_text
+from provider_runtime.registry import GPT6_MODEL_IDS
 from provider_runtime.types import Absent, Presence, Present, TokenUsage
 
 from ._limits import (
@@ -455,11 +456,11 @@ class _CodexSessionState:
     user_message_id: str | None = None
 
 
-class CodexSdkAdapter:
+class CodexAppServerAdapter:
     """Own Codex app-server clients and normalize their complete message stream."""
 
     backend: Literal["codex"] = "codex"
-    transport: Literal["sdk"] = "sdk"
+    transport: Literal["app_server"] = "app_server"
     # Codex threads resume from any directory; the ref keeps cwd as provenance only.
     cwd_scopes_sessions: Literal[False] = False
 
@@ -493,7 +494,7 @@ class CodexSdkAdapter:
         environment: Mapping[str, str],
     ) -> SessionPage:
         if query.backend != self.backend or query.transport != self.transport:
-            raise InvalidAgentRequest("CodexSdkAdapter received a different route")
+            raise InvalidAgentRequest("CodexAppServerAdapter received a different route")
         self._require_local_auth(query.auth.kind)
         client = await self._open_client(environment=environment)
         try:
@@ -503,14 +504,14 @@ class CodexSdkAdapter:
                 operation="thread listing",
                 failure="executable",
             )
-            payload = self._mapping(response, "Codex SDK thread_list response")
+            payload = self._mapping(response, "Codex app-server thread_list response")
             data = payload.get("data")
             if not isinstance(data, list):
-                raise ProtocolDefect("Codex SDK thread_list data was not an array")
+                raise ProtocolDefect("Codex app-server thread_list data was not an array")
             state_root = self._endpoint(environment)
             sessions = tuple(
                 self._session_summary(
-                    self._mapping(item, "Codex SDK thread_list thread"),
+                    self._mapping(item, "Codex app-server thread_list thread"),
                     profile_key=query.auth.profile_key,
                     state_root=state_root,
                 )
@@ -518,7 +519,7 @@ class CodexSdkAdapter:
             )
             cursor = payload.get("nextCursor")
             if cursor is not None and (not isinstance(cursor, str) or not cursor):
-                raise ProtocolDefect("Codex SDK thread_list cursor was malformed")
+                raise ProtocolDefect("Codex app-server thread_list cursor was malformed")
             return SessionPage(sessions=sessions, continuation_cursor=cursor)
         finally:
             await self._close_client(client)
@@ -531,7 +532,7 @@ class CodexSdkAdapter:
         environment: Mapping[str, str],
     ) -> SessionSnapshot:
         if ref.backend != self.backend or ref.transport != self.transport:
-            raise SessionMismatch("Codex SDK cannot read a different route")
+            raise SessionMismatch("Codex app-server cannot read a different route")
         validate_read_session_auth(ref, options)
         self._require_local_auth(options.auth.kind)
         if ref.state_root_fingerprint != fingerprint_path(self._endpoint(environment)):
@@ -546,10 +547,12 @@ class CodexSdkAdapter:
                 operation="thread read",
                 failure="session",
             )
-            payload = self._mapping(response, "Codex SDK thread read response")
-            native_thread = self._mapping(payload.get("thread"), "Codex SDK thread read thread")
+            payload = self._mapping(response, "Codex app-server thread read response")
+            native_thread = self._mapping(
+                payload.get("thread"), "Codex app-server thread read thread"
+            )
             if native_thread.get("id") != ref.native_session_id:
-                raise ProtocolDefect("Codex SDK thread read changed the native identity")
+                raise ProtocolDefect("Codex app-server thread read changed the native identity")
             return SessionSnapshot(
                 ref=ref,
                 metadata=SessionMetadata(name=self._optional_string(native_thread.get("name"))),
@@ -564,7 +567,15 @@ class CodexSdkAdapter:
         environment: Mapping[str, str],
     ) -> AgentSession:
         if not isinstance(request, _ResolvedCodexSessionRequest):
-            raise InvalidAgentRequest("CodexSdkAdapter requires a catalog-resolved request")
+            raise InvalidAgentRequest("CodexAppServerAdapter requires a catalog-resolved request")
+        if request.dispatch_model not in GPT6_MODEL_IDS or request.native_reasoning not in (
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        ):
+            raise InvalidAgentRequest("Codex model or reasoning is outside the current catalog")
         self._require_local_auth(request.auth.kind)
         self._validate_policy_mapping(request.policy)
         validate_mcp_network_policy(request.mcp_servers, request.policy)
@@ -619,15 +630,15 @@ class CodexSdkAdapter:
 
             native_session_id = getattr(thread, "id", None)
             if not isinstance(native_session_id, str) or not native_session_id:
-                raise ProtocolDefect("Codex SDK returned no thread id")
+                raise ProtocolDefect("Codex app-server returned no thread id")
             if isinstance(request.open, ResumeSession) and (
                 native_session_id != request.open.ref.native_session_id
             ):
-                raise SessionUnavailable("Codex SDK resumed a different native thread")
+                raise SessionUnavailable("Codex app-server resumed a different native thread")
             if isinstance(request.open, ForkSession) and (
                 native_session_id == request.open.ref.native_session_id
             ):
-                raise ProtocolDefect("Codex SDK fork did not mint a new thread id")
+                raise ProtocolDefect("Codex app-server fork did not mint a new thread id")
             restored_usage = self._restored_usage_baseline(client, native_session_id)
             if isinstance(request.open, NewSession) and restored_usage is not None:
                 raise ProtocolDefect("Codex new thread replayed historical usage")
@@ -664,9 +675,13 @@ class CodexSdkAdapter:
     ) -> AsyncGenerator[AgentEvent, None]:
         state = self._state(session)
         if approvals is not None:
-            raise UnsupportedCapability("Codex SDK does not expose caller approval callbacks")
+            raise UnsupportedCapability(
+                "Codex app-server does not expose caller approval callbacks"
+            )
         if request.policy is not None:
-            raise UnsupportedCapability("Codex SDK cannot reconfigure policy on a started thread")
+            raise UnsupportedCapability(
+                "Codex app-server cannot reconfigure policy on a started thread"
+            )
 
         policy = state.request.policy
         inputs = [self._codex_input(part) for part in request.input]
@@ -693,7 +708,7 @@ class CodexSdkAdapter:
         turn_id = getattr(turn, "id", None)
         if not isinstance(turn_id, str) or not turn_id:
             await self._destroy_session(session, state)
-            raise ProtocolDefect("Codex SDK returned no turn id")
+            raise ProtocolDefect("Codex app-server returned no turn id")
         state.turn = turn
         state.turn_id = turn_id
         state.message_count = 0
@@ -742,9 +757,9 @@ class CodexSdkAdapter:
             raise
         except (TypeError, ValueError, RecursionError):
             await self._destroy_session(session, state)
-            raise ProtocolDefect("Codex SDK emitted an invalid event payload") from None
+            raise ProtocolDefect("Codex app-server emitted an invalid event payload") from None
         except Exception as error:
-            message = sanitize_provider_text(str(error)) or "Codex SDK turn failed"
+            message = sanitize_provider_text(str(error)) or "Codex app-server turn failed"
             self._append_diagnostic(state, message)
             usage = state.usage_accounting.finish_turn()
             await self._destroy_session(session, state)
@@ -800,7 +815,8 @@ class CodexSdkAdapter:
         )
         if any(isinstance(result, BaseException) for result in (*session_results, *results)):
             raise ProtocolDefect(
-                "Codex App Server client teardown did not complete", code="sdk_teardown_failed"
+                "Codex App Server client teardown did not complete",
+                code="app_server_teardown_failed",
             )
 
     async def _open_client(self, *, environment: Mapping[str, str]) -> CodexAppServerClient:
@@ -880,10 +896,12 @@ class CodexSdkAdapter:
                 )
             except OutputLimitExceeded:
                 raise ProtocolDefect(
-                    "Codex SDK restored usage payload exceeded its ingress bound"
+                    "Codex app-server restored usage payload exceeded its ingress bound"
                 ) from None
             if len(snapshots) >= _MAX_EVENT_COUNT or replay_bytes > _MAX_TURN_OUTPUT_BYTES:
-                raise ProtocolDefect("Codex SDK restored usage replay exceeded its ingress bound")
+                raise ProtocolDefect(
+                    "Codex app-server restored usage replay exceeded its ingress bound"
+                )
             params = self._mapping(raw_params, "Codex app-server restored token usage notification")
             if params.get("threadId") != native_session_id:
                 continue
@@ -911,11 +929,11 @@ class CodexSdkAdapter:
         response = await self._call(
             client.account(), operation="account discovery", failure="credential"
         )
-        payload = self._mapping(response, "Codex SDK account response")
+        payload = self._mapping(response, "Codex app-server account response")
         account = payload.get("account")
         if account is None:
             raise CredentialUnavailable("Codex has no authenticated local account")
-        account_payload = self._mapping(account, "Codex SDK account")
+        account_payload = self._mapping(account, "Codex app-server account")
         if account_payload.get("type") != "chatgpt":
             raise CredentialRejected("Codex local_account requires ChatGPT subscription auth")
 
@@ -931,10 +949,10 @@ class CodexSdkAdapter:
                 return await awaitable
         except TimeoutError:
             if failure == "credential":
-                raise CredentialUnavailable(f"Codex SDK {operation} timed out") from None
+                raise CredentialUnavailable(f"Codex app-server {operation} timed out") from None
             if failure == "session":
-                raise SessionUnavailable(f"Codex SDK {operation} timed out") from None
-            raise ExecutableUnavailable(f"Codex SDK {operation} timed out") from None
+                raise SessionUnavailable(f"Codex app-server {operation} timed out") from None
+            raise ExecutableUnavailable(f"Codex app-server {operation} timed out") from None
         except (
             CredentialRejected,
             CredentialUnavailable,
@@ -948,10 +966,14 @@ class CodexSdkAdapter:
             if _REQUIRED_MCP_STARTUP_FAILURE in message:
                 raise McpUnavailable("a required MCP server did not initialize") from None
             if failure == "credential":
-                raise CredentialUnavailable(f"Codex SDK {operation} failed: {message}") from None
+                raise CredentialUnavailable(
+                    f"Codex app-server {operation} failed: {message}"
+                ) from None
             if failure == "session":
-                raise SessionUnavailable(f"Codex SDK {operation} failed: {message}") from None
-            raise ExecutableUnavailable(f"Codex SDK {operation} failed: {message}") from None
+                raise SessionUnavailable(
+                    f"Codex app-server {operation} failed: {message}"
+                ) from None
+            raise ExecutableUnavailable(f"Codex app-server {operation} failed: {message}") from None
 
     def _notification_events(
         self, state: _CodexSessionState, notification: object
@@ -1781,7 +1803,7 @@ class CodexSdkAdapter:
 
     def _state(self, session: AgentSession) -> _CodexSessionState:
         if session in self._dead_sessions:
-            raise SessionUnavailable("Codex SDK session is no longer live")
+            raise SessionUnavailable("Codex app-server session is no longer live")
         try:
             return self._sessions[session]
         except KeyError as error:
@@ -1825,9 +1847,9 @@ class CodexSdkAdapter:
         *, native_session_id: str, profile_key: str, state_root: Path, cwd: str
     ) -> AgentSessionRef:
         return AgentSessionRef(
-            schema_version="agent-session-ref.v1",
+            schema_version="agent-session-ref.v2",
             backend="codex",
-            transport="sdk",
+            transport="app_server",
             native_session_id=native_session_id,
             profile_key=profile_key,
             state_root_fingerprint=fingerprint_path(state_root),
@@ -1837,7 +1859,9 @@ class CodexSdkAdapter:
     @staticmethod
     def _require_local_auth(kind: str) -> None:
         if kind != "local_account":
-            raise UnsupportedCapability("Codex SDK agent sessions require local ChatGPT auth")
+            raise UnsupportedCapability(
+                "Codex app-server agent sessions require local ChatGPT auth"
+            )
 
     @staticmethod
     def _approval_mode(policy: PermissionPolicy) -> str:
@@ -1846,7 +1870,7 @@ class CodexSdkAdapter:
         if policy.approval == "provider_review":
             return "auto_review"
         raise UnsupportedCapability(
-            "Codex SDK supports deny or provider_review approvals, not caller ask/allow"
+            "Codex app-server supports deny or provider_review approvals, not caller ask/allow"
         )
 
     @staticmethod
@@ -1860,7 +1884,7 @@ class CodexSdkAdapter:
     @staticmethod
     def _validate_policy_mapping(policy: PermissionPolicy) -> None:
         if policy.network == "allowlist":
-            raise UnsupportedCapability("Codex SDK has no typed network allowlist mapping")
+            raise UnsupportedCapability("Codex app-server has no typed network allowlist mapping")
         if policy.filesystem == "full_access" and policy.network != "unrestricted":
             raise UnsupportedCapability(
                 "Codex full_access cannot preserve restricted network policy"
@@ -1872,10 +1896,10 @@ class CodexSdkAdapter:
                 "Codex read_only sandbox has no network toggle; use workspace_write"
             )
         if policy.approval not in ("deny", "provider_review"):
-            raise UnsupportedCapability("Codex SDK approval mode is unsupported")
+            raise UnsupportedCapability("Codex app-server approval mode is unsupported")
         if policy.allowed_tools != ("*",) or policy.denied_tools:
             raise UnsupportedCapability(
-                "Codex SDK has no typed built-in tool filters; explicitly allow '*'"
+                "Codex app-server has no typed built-in tool filters; explicitly allow '*'"
             )
 
     @staticmethod
@@ -1885,7 +1909,7 @@ class CodexSdkAdapter:
                 any(marker in tool for marker in "*?[")
                 for tool in (*server.allowed_tools, *server.denied_tools)
             ):
-                raise UnsupportedCapability("Codex SDK MCP filters require exact tool names")
+                raise UnsupportedCapability("Codex app-server MCP filters require exact tool names")
 
     @staticmethod
     def _validate_strict_native_containment(request: AgentSessionRequest) -> None:
@@ -1924,7 +1948,7 @@ class CodexSdkAdapter:
             # `AgentRuntime._validate_content_files`'s single check of every turn input, so
             # this only translates the part the SDK accepts.
             return {"type": "localImage", "path": part.path}
-        raise UnsupportedCapability("Codex SDK input supports text and local images")
+        raise UnsupportedCapability("Codex app-server input supports text and local images")
 
     def _codex_config(self, request: AgentSessionRequest) -> dict[str, object]:
         config: dict[str, object] = {
@@ -2101,4 +2125,4 @@ class CodexSdkAdapter:
         return value if isinstance(value, str) and value else None
 
 
-__all__ = ["CodexSdkAdapter"]
+__all__ = ["CodexAppServerAdapter"]

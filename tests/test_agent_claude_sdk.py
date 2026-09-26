@@ -1731,7 +1731,7 @@ async def test_new_resume_and_fork_preserve_native_sdk_session_options(
     values = environment(tmp_path)
     request = session_request(tmp_path)
     ref = AgentSessionRef(
-        schema_version="agent-session-ref.v1",
+        schema_version="agent-session-ref.v2",
         backend="claude",
         transport="sdk",
         native_session_id="session-existing",
@@ -2168,7 +2168,7 @@ async def test_session_discovery_never_reads_the_ambient_sdk_store(
     adapter = ClaudeSdkAdapter()
     values = environment(tmp_path)
     ref = AgentSessionRef(
-        schema_version="agent-session-ref.v1",
+        schema_version="agent-session-ref.v2",
         backend="claude",
         transport="sdk",
         native_session_id="session-discovered",

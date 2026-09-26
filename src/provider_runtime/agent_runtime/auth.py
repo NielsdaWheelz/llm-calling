@@ -68,13 +68,11 @@ _CREDENTIAL_ENVIRONMENT: dict[Backend, tuple[str, ...]] = {
 # likely to be exported in the shell that starts one. They are credential-class for exactly
 # the reason the two backends' own names are: a child that receives one can spend it.
 # `GOOGLE_API_KEY` and the rest of the `GOOGLE_`/`AWS_`/`AZURE_` families are already covered
-# by `_AUTH_CONTROL_PREFIXES`; these five match no prefix and must be named.
+# by `_AUTH_CONTROL_PREFIXES`; these three match no prefix and must be named.
 _OTHER_PROVIDER_CREDENTIAL_ENVIRONMENT = frozenset(
     {
         "DEEPSEEK_API_KEY",
         "GEMINI_API_KEY",
-        "MOONSHOT_API_KEY",
-        "OPENROUTER_API_KEY",
         "XAI_API_KEY",
     }
 )

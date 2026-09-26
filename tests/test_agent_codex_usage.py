@@ -64,16 +64,18 @@ class UsagePeer:
                 result = {
                     "data": [
                         {
-                            "id": "fixture",
-                            "model": "fixture",
+                            "id": model,
+                            "model": model,
                             "displayName": "Fixture",
                             "hidden": False,
                             "inputModalities": ["text"],
                             "supportedReasoningEfforts": [
-                                {"reasoningEffort": "high", "description": "High"},
+                                {"reasoningEffort": effort, "description": effort}
+                                for effort in ("low", "medium", "high", "xhigh", "max")
                             ],
                             "defaultReasoningEffort": "high",
                         }
+                        for model in ("gpt-6-astra", "gpt-6-sol", "gpt-6-luna")
                     ],
                     "nextCursor": None,
                 }
@@ -156,8 +158,8 @@ async def peer() -> AsyncIterator[UsagePeer]:
 
 async def request(runtime: AgentRuntime, cwd: Path) -> CodexCatalogSessionRequest:
     auth = CredentialRef("local_account", "fixture")
-    catalog = await runtime.model_catalog("codex", auth)
-    (model,) = catalog.models
+    catalog = await runtime.model_catalog("codex", auth, transport="app_server")
+    model = next(model for model in catalog.models if model.key == "gpt-6-sol")
     return CodexCatalogSessionRequest(
         auth=auth,
         cwd=str(cwd),

@@ -1,93 +1,154 @@
-"""Canonical continuation ownership, immutability, and binding conformance."""
-
-from __future__ import annotations
+"""Bound, canonical continuation and complete native turn replay."""
 
 import json
-from typing import cast
+from dataclasses import replace
 
 import pytest
 
-from provider_runtime.continuation import decode_continuation, encode_continuation
+from provider_runtime.continuation import (
+    decode_continuation,
+    encode_continuation,
+    pending_tool_calls,
+    preflight_generation,
+    resume_generation,
+    seal_generation,
+)
+from provider_runtime.engines.anthropic_messages import _encode_request
 from provider_runtime.errors import InvalidRequest
+from provider_runtime.registry import _resolve
+from provider_runtime.runtime import Credentials, ProviderRuntime
 from provider_runtime.types import (
+    AssistantMessage,
+    CanonicalTool,
     ContinuationArtifact,
-    FrozenJsonDict,
-    JsonValueError,
+    ContinueGeneration,
+    GenerateIntent,
+    Present,
+    PromptBlock,
     ProviderTarget,
-    thaw_json_value,
+    ResponsePayload,
+    TextContent,
+    TextOutput,
+    ToolCall,
+    ToolResultMessage,
+    UserMessage,
 )
 
-TARGET = ProviderTarget(provider="openai", model="gpt-5.6-sol")
+
+def test_canonical_codec_requires_current_target_and_codec() -> None:
+    target = ProviderTarget("openai", "gpt-6-sol")
+    artifact = ContinuationArtifact(target, "openai.v2", {"private": [{"signed": "data"}]})
+    encoded = encode_continuation(artifact)
+    assert encode_continuation(decode_continuation(encoded, target, "openai.v2")) == encoded
+    with pytest.raises(InvalidRequest, match="target"):
+        decode_continuation(encoded, ProviderTarget("openai", "gpt-6-luna"), "openai.v2")
+    with pytest.raises(InvalidRequest, match="codec"):
+        decode_continuation(encoded, target, "openai.v1")
+    with pytest.raises(InvalidRequest, match="canonical"):
+        decode_continuation(json.dumps(json.loads(encoded), indent=2).encode(), target, "openai.v2")
+    with pytest.raises(InvalidRequest, match="16 MiB"):
+        encode_continuation(
+            ContinuationArtifact(target, "openai.v2", {"large": "x" * (16 * 1024 * 1024)})
+        )
 
 
-def test_continuation_round_trip_is_canonical_bound_and_recursively_immutable() -> None:
-    source = {"items": [{"kind": "reasoning", "opaque": "sealed"}], "flag": True}
-    artifact = ContinuationArtifact(
-        target=TARGET,
-        codec_id="openai.v1",
-        opaque_payload=source,
+def test_continuation_bound_applies_only_to_tool_capable_initial_requests() -> None:
+    row = _resolve("openai:gpt-6-sol")
+    target = ProviderTarget("openai", row.model_id)
+    prompt = UserMessage((PromptBlock("x" * (16 * 1024 * 1024)),))
+    intent = GenerateIntent(target, (prompt,), 64, "standard/medium", (), "auto", TextOutput())
+    preflight_generation(row, intent)
+    tool = CanonicalTool("lookup", "look up", {"type": "object"})
+    preflight_generation(row, replace(intent, tools=(tool,), tool_choice="none"))
+    with pytest.raises(InvalidRequest, match="cannot fit a continuation"):
+        preflight_generation(row, replace(intent, tools=(tool,)))
+
+
+@pytest.mark.asyncio
+async def test_three_turn_claude_continuation_preserves_signed_order_and_first_result() -> None:
+    row = _resolve("anthropic:claude-fable-5-1")
+    target = ProviderTarget("anthropic", row.model_id)
+    first = GenerateIntent(
+        target,
+        (UserMessage((PromptBlock("find facts"),)),),
+        4096,
+        "adaptive/high",
+        (CanonicalTool("lookup", "look up", {"type": "object"}),),
+        "auto",
+        TextOutput(),
     )
-    source["items"].append({"kind": "late"})  # type: ignore[union-attr]
-
-    encoded = encode_continuation(artifact)
-    decoded = decode_continuation(encoded, TARGET, "openai.v1")
-
-    assert encode_continuation(decoded) == encoded
-    assert thaw_json_value(decoded.opaque_payload) == {
-        "flag": True,
-        "items": [{"kind": "reasoning", "opaque": "sealed"}],
-    }
-    items = cast(tuple[FrozenJsonDict, ...], decoded.opaque_payload["items"])
-    with pytest.raises(TypeError):
-        items[0]["opaque"] = "changed"  # pyright: ignore[reportIndexIssue]
-
-
-def test_continuation_decode_rejects_target_codec_and_noncanonical_bytes() -> None:
-    artifact = ContinuationArtifact(TARGET, "openai.v1", {"opaque": "value"})
-    encoded = encode_continuation(artifact)
-
-    with pytest.raises(InvalidRequest, match="target does not match"):
-        decode_continuation(
-            encoded,
-            ProviderTarget(provider="openai", model="gpt-5.6-terra"),
-            "openai.v1",
+    state = preflight_generation(row, first)
+    native = ContinuationArtifact(
+        target,
+        row.continuation_codec,
+        {
+            "blocks": [
+                {"type": "thinking", "thinking": "", "signature": "signed-empty"},
+                {"type": "text", "text": "checking"},
+                {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {"key": "first"}},
+            ]
+        },
+    )
+    first_response = ResponsePayload(
+        TextContent("checking", (ToolCall("call-1", "lookup", {"key": "first"}),)), Present(native)
+    )
+    sealed = seal_generation(row, first, state, first_response)
+    assert isinstance(sealed.continuation, Present)
+    assert pending_tool_calls(sealed.continuation.value) == (
+        ToolCall("call-1", "lookup", {"key": "first"}),
+    )
+    oversized = ContinueGeneration(
+        sealed.continuation.value,
+        (ToolResultMessage("call-1", "x" * (16 * 1024 * 1024), False),),
+    )
+    with pytest.raises(InvalidRequest, match="16 MiB"):
+        resume_generation(row, oversized)
+    with pytest.raises(InvalidRequest, match="16 MiB"):
+        await ProviderRuntime(Credentials(), engines={}).generate(oversized)
+    with pytest.raises(InvalidRequest, match="exact order"):
+        resume_generation(
+            row,
+            ContinueGeneration(
+                sealed.continuation.value, (ToolResultMessage("wrong", "alpha", False),)
+            ),
         )
-    with pytest.raises(InvalidRequest, match="codec does not match"):
-        decode_continuation(encoded, TARGET, "openai.v2")
-
-    noncanonical = json.dumps(json.loads(encoded), indent=2).encode()
-    with pytest.raises(InvalidRequest, match="not canonical"):
-        decode_continuation(noncanonical, TARGET, "openai.v1")
-
-
-@pytest.mark.parametrize(
-    "value",
-    (
-        b"not-json",
-        b"[]",
-        b'{"schema_version":"provider-continuation.v1"}',
-        b'{"codec_id":"openai.v1","opaque_payload":{"x":NaN},'
-        b'"schema_version":"provider-continuation.v1",'
-        b'"target":{"model":"gpt-5.6-sol","provider":"openai"}}',
-    ),
-)
-def test_continuation_decode_rejects_malformed_or_non_json_domain_values(value: bytes) -> None:
-    with pytest.raises(InvalidRequest):
-        decode_continuation(value, TARGET, "openai.v1")
-
-
-def test_continuation_payload_enforces_the_16_mib_canonical_bound() -> None:
-    with pytest.raises(ValueError, match="16 MiB"):
-        ContinuationArtifact(
-            TARGET,
-            "openai.v1",
-            {"oversized": "x" * (16 * 1024 * 1024)},
-        )
-    with pytest.raises(JsonValueError, match="JSON-safe"):
-        ContinuationArtifact(TARGET, "openai.v1", {"bad": object()})
-
-
-def test_continuation_public_codec_has_no_implicit_target_or_codec_fallback() -> None:
-    artifact = ContinuationArtifact(TARGET, "openai.v1", {})
-    with pytest.raises(TypeError):
-        decode_continuation(encode_continuation(artifact))  # type: ignore[call-arg]
+    second, state = resume_generation(
+        row,
+        ContinueGeneration(
+            sealed.continuation.value, (ToolResultMessage("call-1", "alpha", False),)
+        ),
+    )
+    assistant = _encode_request(row, second).params["messages"][1]
+    assert [block["type"] for block in assistant["content"]] == ["thinking", "text", "tool_use"]
+    assert assistant["content"][0]["signature"] == "signed-empty"
+    second_native = ContinuationArtifact(
+        target,
+        row.continuation_codec,
+        {
+            "blocks": [
+                {"type": "thinking", "thinking": "", "signature": "signed-two"},
+                {"type": "tool_use", "id": "call-2", "name": "lookup", "input": {"key": "second"}},
+            ]
+        },
+    )
+    second_response = ResponsePayload(
+        TextContent("", (ToolCall("call-2", "lookup", {"key": "second"}),)), Present(second_native)
+    )
+    sealed = seal_generation(row, second, state, second_response)
+    assert isinstance(sealed.continuation, Present)
+    assert pending_tool_calls(sealed.continuation.value) == (
+        ToolCall("call-2", "lookup", {"key": "second"}),
+    )
+    third, _ = resume_generation(
+        row,
+        ContinueGeneration(
+            sealed.continuation.value, (ToolResultMessage("call-2", "beta", False),)
+        ),
+    )
+    assert isinstance(third.messages[-3], ToolResultMessage)
+    assert third.messages[-3].output == "alpha"
+    assert isinstance(third.messages[-2], AssistantMessage)
+    assert third.messages[-2].tool_calls[0].id == "call-2"
+    assert (
+        _encode_request(row, third).params["messages"][3]["content"][0]["signature"] == "signed-two"
+    )

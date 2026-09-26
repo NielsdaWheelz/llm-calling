@@ -69,7 +69,7 @@ def _codex_endpoint() -> Path:
 def _write_evidence(evidence: dict[str, object]) -> None:
     payload: dict[str, object] = {
         "schema_version": "codex-native-containment-live-evidence.v3",
-        "route": "codex:sdk",
+        "route": "codex:app_server",
         "auth": "local_account",
         "model": _MODEL,
         "recorded_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -102,7 +102,7 @@ async def _qualify() -> dict[str, object]:
                 codex_endpoints={_PROFILE: endpoint},
             )
         ) as runtime:
-            catalog = await runtime.model_catalog("codex", auth)
+            catalog = await runtime.model_catalog("codex", auth, transport="app_server")
             rows = tuple(row for row in catalog.models if row.key == _MODEL)
             if len(rows) != 1 or not any(item.key == "high" for item in rows[0].reasoning):
                 _fail("containment model and reasoning must exist in the exact current catalog")

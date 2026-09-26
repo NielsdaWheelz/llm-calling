@@ -1643,7 +1643,7 @@ class ClaudeSdkAdapter:
         native_session_id: str, profile_key: str, state_root: Path, cwd: str
     ) -> AgentSessionRef:
         return AgentSessionRef(
-            schema_version="agent-session-ref.v1",
+            schema_version="agent-session-ref.v2",
             backend="claude",
             transport="sdk",
             native_session_id=native_session_id,

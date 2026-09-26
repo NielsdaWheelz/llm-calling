@@ -49,9 +49,9 @@ def _credential() -> CredentialRef:
 
 def _ref() -> AgentSessionRef:
     return AgentSessionRef(
-        schema_version="agent-session-ref.v1",
+        schema_version="agent-session-ref.v2",
         backend="codex",
-        transport="sdk",
+        transport="app_server",
         native_session_id="thread-123",
         profile_key="personal",
         state_root_fingerprint="a" * 64,
@@ -137,7 +137,7 @@ def test_frozen_json_backing_storage_cannot_be_mutated_or_bypass_integer_bounds(
 @pytest.mark.parametrize(
     ("backend", "transport"),
     (
-        ("codex", "sdk"),
+        ("codex", "app_server"),
         ("claude", "sdk"),
     ),
 )
@@ -246,7 +246,7 @@ def test_ref_json_is_strict_versioned_and_round_trips_as_plain_json() -> None:
     assert ref_from_json(encoded) == ref
     assert json.loads(json.dumps(thaw_json_value(encoded)))["native_session_id"] == "thread-123"
     with pytest.raises(InvalidAgentRequest, match="schema_version"):
-        ref_from_json({**encoded, "schema_version": "agent-session-ref.v2"})
+        ref_from_json({**encoded, "schema_version": "agent-session-ref.v1"})
     with pytest.raises(InvalidAgentRequest, match="unknown fields"):
         ref_from_json({**encoded, "raw_path": "/secret/repo"})
 
@@ -376,7 +376,7 @@ def test_absolute_paths_are_validated_lexically_without_touching_the_filesystem(
 def test_closed_route_and_failure_vocabularies_have_exactly_one_owner() -> None:
     assert set(AGENT_FAILURE_CAUSES) == set(get_args(AgentFailureCause.__value__))
     assert len(AGENT_FAILURE_CAUSES) == len(set(AGENT_FAILURE_CAUSES))
-    assert AGENT_ROUTES == frozenset({("codex", "sdk"), ("claude", "sdk")})
+    assert AGENT_ROUTES == frozenset({("codex", "app_server"), ("claude", "sdk")})
     # A transport the type admits but no route reaches is exactly the stale state that let
     # unreachable branches survive here before: every declared member must be routable, and
     # every routed member must be declared.

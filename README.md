@@ -1,8 +1,8 @@
 # provider-runtime
 
-Async Python library (`>=3.12`): one standardized contract calling seven LLM
-providers — OpenAI, Anthropic, Gemini, xAI (Grok), DeepSeek, Moonshot (Kimi),
-OpenRouter — plus two subscription agent backends (Claude Code and Codex).
+Async Python library (`>=3.12`): one standardized contract calling five LLM
+providers — OpenAI, Anthropic, Gemini, xAI, and DeepSeek — plus two
+subscription agent backends (Claude Code and Codex).
 Wire handling is rented from three official SDK packages (`openai`,
 `anthropic`, `google-genai`) behind four owned protocol engines; the contract,
 error taxonomy, model registry, retry policy, agent security kernel, and
@@ -31,7 +31,7 @@ from provider_runtime import Credentials, ProviderRuntime, estimate_cost
 rt = ProviderRuntime(credentials=Credentials(openai="...", anthropic="..."))
 
 # the 95% call site:
-out = await rt.chat("anthropic:claude-fable-5", system=SYS, user=question, reasoning="high")
+out = await rt.chat("anthropic:claude-fable-5-1", system=SYS, user=question, reasoning="adaptive/high")
 
 out = await rt.generate(intent)                 # CallOutcome
 async for event in rt.stream(intent):           # RuntimeStreamEvent(seq, event)
@@ -47,14 +47,15 @@ environment variables**. Every terminal outcome, success or failure, carries a
 and write included), the full attempt trace, billability, the exact native
 reasoning value sent, and the registry revision.
 
-Multi-turn: append the returned assistant text and tool calls, plus the
-outcome's opaque `ContinuationArtifact`, to the next intent's messages. Use
+Multi-turn: pass the returned `ContinuationArtifact` and ordered tool results
+to `ContinueGeneration`; the original request and prior native turns are bound
+in the artifact. Use
 `provider_runtime.continuation.encode_continuation` / `decode_continuation`
 when crossing a persistence boundary; the bounded canonical codec binds bytes
-to the exact target and provider codec. The
-artifact carries native reasoning state (encrypted reasoning items, thinking
-signatures, `thoughtSignature`, `reasoning_content`, ordered
-`reasoning_details`) and is replayed verbatim, never parsed, only to the
+to the exact target and provider codec. `pending_tool_calls` reads the exact
+ordered calls after restart. The artifact carries native reasoning state
+(encrypted reasoning items, thinking signatures, `thoughtSignature`,
+`reasoning_content`) and is replayed verbatim only to the
 identical target — anything else raises `InvalidRequest`. DeepSeek
 thinking-mode tool turns replay `reasoning_content`; default-auto tool turns
 omit `tool_choice`, using the provider's documented default selection. A
@@ -63,7 +64,7 @@ not support it in thinking mode.
 
 `json_out` derives a strict JSON schema from a pydantic model: native strict
 output on openai/anthropic/gemini/xai, JSON mode plus validation on
-deepseek/moonshot and the pinned OpenRouter row. A validation miss returns
+deepseek. A validation miss returns
 `Failed(InvalidStructuredOutput)` with full `CallMeta` — no repair, no retry.
 
 ### Portable tools
@@ -99,7 +100,7 @@ registry.py    private capability rows/resolution; public api_model_catalog()
 continuation.py bounded canonical provider-continuation codec
 retry.py       single retry owner: DEFAULT_RETRY + the attempt iterator
 otel.py        one span per facade call over opentelemetry-api only
-prices.py      estimate_cost(meta) over the vendored genai-prices snapshot
+prices.py      estimate_cost(meta) over a dated provider-rate snapshot
 runtime.py     ProviderRuntime: dispatch, intent gates, retry loop, stream
                envelope, cancellation, json_out/chat sugar
 engines/       the four protocol adapters (Engine protocol; one attempt each)
@@ -114,7 +115,7 @@ agent_runtime/ agent lane: authenticated model catalog, tagged session requests,
 | Engine | SDK | Serves |
 |---|---|---|
 | `openai_responses` | `openai` | OpenAI proper (native Responses API) |
-| `openai_chat` | `openai` (compatibility client) | DeepSeek, Moonshot, xAI, OpenRouter |
+| `openai_chat` | `openai` (compatibility client) | DeepSeek, xAI |
 | `anthropic_messages` | `anthropic` | Anthropic |
 | `gemini_generate` | `google-genai` | Gemini |
 
@@ -135,11 +136,9 @@ verified against provider docs, never a place to remember guesses. Any row
 change bumps the catalog's `registry_revision`, which is also stamped into
 every `CallMeta` and flows into the consumer's ledger.
 
-OpenRouter is one pinned, policy-constrained target, never a substrate: every
-OpenRouter row carries explicit routing pins (`only`, `order`,
-`quantizations`) with fallbacks disabled, `require_parameters` on, data
-collection denied, and ZDR required. There is no unpinned passthrough — an
-exotic model gets a fully pinned row or it is not callable.
+The catalog is closed to the nine current API model identities. Reasoning keys
+and labels are public; native wire fragments stay private to the library.
+Unknown refs and undeclared reasoning keys fail before dispatch.
 
 ## Retry, observability, cost
 
@@ -158,19 +157,18 @@ content, continuation payloads, credentials.
 
 **Cost** is a derived `CostEstimate` (usd micros, source, as-of date) computed
 on demand by `estimate_cost(meta)` over a vendored snapshot of
-`pydantic/genai-prices` — indicative, never authoritative, never stored on
-`CallMeta`. `tools/refresh_prices.py` refreshes the snapshot; the library
-itself never fetches.
+official provider rates — indicative, never authoritative, never stored on
+`CallMeta`. Unknown price tiers return `Absent`; the library never fetches.
 
 ## Agent lane
 
-Exactly two routes ship: `(codex, sdk)` and `(claude, sdk)`. The core package
+Exactly two routes ship: `(codex, app_server)` and `(claude, sdk)`. The core package
 declares `websockets`; the host separately installs the latest stable Codex and
 supervises its shared service. Native version metadata is diagnostic, not an
 admission gate; protocol validation, subscription auth, and containment remain
 fail-closed. Installing a newer version does not certify its live behavior.
-The Codex route retains the `sdk` name and owns the documented
-WebSocket-over-Unix-socket App Server client; Claude remains on its official
+The Codex route owns the documented WebSocket-over-Unix-socket App Server
+client; Claude remains on its official
 SDK. This package
 owns the authorization model — a retained security kernel with restrictive permission
 defaults, narrowing-only policy changes, unsafe-action confirmation for
@@ -191,7 +189,7 @@ The full
 living contract is [docs/agent-runtime.md](docs/agent-runtime.md).
 
 Codex selection is catalog-bound: query
-`AgentRuntime.model_catalog("codex", auth)`, then submit a
+`AgentRuntime.model_catalog("codex", transport="app_server", auth=auth)`, then submit a
 `CodexCatalogSessionRequest` with the exact model key, reasoning key,
 definition revision, and row fingerprint. The runtime re-reads and validates
 those facts before opening a session and never accepts a free-form Codex model.
@@ -244,19 +242,17 @@ before merging any registry or engine change and before any Nexus pin bump.
 
 ```bash
 LLM_RUNTIME_LIVE=1 OPENAI_API_KEY=... ANTHROPIC_API_KEY=... GEMINI_API_KEY=... \
-MOONSHOT_API_KEY=... OPENROUTER_API_KEY=... DEEPSEEK_API_KEY=... XAI_API_KEY=... \
+DEEPSEEK_API_KEY=... XAI_API_KEY=... \
 uv run pytest -m live_provider tests/live/test_provider_matrix.py
 ```
 
 The `LLM_RUNTIME_LIVE*` variables are read by the opt-in live matrices only,
 never by the package. A missing provider key skips that provider's rows with a
-recorded reason; the release run is unfiltered with all seven keys set. The
+recorded reason; the release run is unfiltered with all five keys set. The
 agent lane has its own matrix (`tests/live/test_agent_matrix.py`) with the
-same opt-in flag and evidence conventions. Its dedicated paid Terra containment
+same opt-in flag and evidence conventions. Its dedicated paid Codex containment
 probe is `tests/live/test_codex_containment.py` and requires an explicit
 test-owned Codex endpoint. Shared worker/TUI control has its own separately
 approved live qualification; deterministic fixtures do not substitute for it.
 
-The spec for the current architecture is
-[docs/pivot-spec.md](docs/pivot-spec.md); the engineering rules the code is
-held to live in [docs/rules/](docs/rules/).
+The engineering rules live in [docs/rules/](docs/rules/).

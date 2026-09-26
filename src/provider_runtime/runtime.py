@@ -32,8 +32,9 @@ import pydantic
 from opentelemetry.trace import TracerProvider
 
 from provider_runtime import embeddings
+from provider_runtime.continuation import preflight_generation, resume_generation, seal_generation
 from provider_runtime.engines import Engine, TransientAttempt
-from provider_runtime.engines._common import monotonic_ms
+from provider_runtime.engines._common import monotonic_ms, row_reasoning
 from provider_runtime.engines.anthropic_messages import AnthropicMessagesEngine
 from provider_runtime.engines.gemini_generate import GeminiGenerateEngine
 from provider_runtime.engines.openai_chat import OpenAIChatEngine
@@ -70,6 +71,9 @@ from provider_runtime.types import (
     CancelSignal,
     CodecStreamEvent,
     ConfirmedNonBillable,
+    ContinuationDelta,
+    ContinuationTooLarge,
+    ContinueGeneration,
     EmbeddingCall,
     EmbeddingResponse,
     EngineId,
@@ -88,9 +92,10 @@ from provider_runtime.types import (
     ProviderContextTooLarge,
     ProviderCredential,
     ProviderName,
+    ProviderRequest,
     ProviderStreamInterrupted,
     ProviderTarget,
-    ReasoningLevel,
+    ReasoningKey,
     Refused,
     RetryPolicy,
     RuntimeStreamEvent,
@@ -120,8 +125,6 @@ class Credentials:
     openai: str | None = field(default=None, repr=False)
     anthropic: str | None = field(default=None, repr=False)
     gemini: str | None = field(default=None, repr=False)
-    moonshot: str | None = field(default=None, repr=False)
-    openrouter: str | None = field(default=None, repr=False)
     deepseek: str | None = field(default=None, repr=False)
     xai: str | None = field(default=None, repr=False)
 
@@ -195,7 +198,6 @@ def _runtime_meta(
         provider=row.provider,
         model=row.model_id,
         provider_request_id=request_id,
-        upstream_provider=Absent(),
         usage=Absent(),
         attempt_trace=trace,
         billability=billability,
@@ -209,6 +211,13 @@ def _runtime_meta(
 
 
 def _validate_intent(row: ModelRow, intent: GenerateIntent, *, streaming: bool) -> None:
+    if (
+        type(intent.reasoning) is not str
+        or not 1 <= len(intent.reasoning) <= 64
+        or not intent.reasoning.isascii()
+    ):
+        raise InvalidRequest(message="reasoning key must be 1..64 ASCII characters")
+    row_reasoning(row, intent)
     if streaming and not row.streaming:
         raise InvalidRequest(message=f"registry row {row.ref!r} does not support streaming")
     if intent.tools:
@@ -304,9 +313,7 @@ def _invalid_structured_detail(
 # Runtime
 
 
-_PROVIDERS = frozenset(
-    {"openai", "anthropic", "gemini", "moonshot", "openrouter", "deepseek", "xai"}
-)
+_PROVIDERS = frozenset({"openai", "anthropic", "gemini", "deepseek", "xai"})
 
 
 def _endpoint_overrides(
@@ -403,10 +410,6 @@ class ProviderRuntime:
                 key = self._credentials.anthropic
             case "gemini":
                 key = self._credentials.gemini
-            case "moonshot":
-                key = self._credentials.moonshot
-            case "openrouter":
-                key = self._credentials.openrouter
             case "deepseek":
                 key = self._credentials.deepseek
             case "xai":
@@ -419,11 +422,37 @@ class ProviderRuntime:
 
     # -- generate -----------------------------------------------------------
 
-    async def generate(
-        self, intent: GenerateIntent, *, cancel: CancelSignal | None = None
+    def _prepare(
+        self, request: ProviderRequest, *, streaming: bool
+    ) -> tuple[ModelRow, GenerateIntent, dict[str, object]]:
+        if isinstance(request, ContinueGeneration):
+            row = resolve_target(request.continuation.target)
+            intent, state = resume_generation(row, request)
+        else:
+            intent = request
+            row = resolve_target(intent.target)
+            _validate_intent(row, intent, streaming=streaming)
+            state = preflight_generation(row, intent)
+            return row, intent, state
+        _validate_intent(row, intent, streaming=streaming)
+        return row, intent, state
+
+    @staticmethod
+    def _seal_outcome(
+        row: ModelRow, intent: GenerateIntent, state: dict[str, object], outcome: CallOutcome
     ) -> CallOutcome:
-        source_row = resolve_target(intent.target)
-        _validate_intent(source_row, intent, streaming=False)
+        if not isinstance(outcome, Succeeded):
+            return outcome
+        try:
+            response = seal_generation(row, intent, state, outcome.response)
+        except ValueError:
+            return Failed(meta=outcome.meta, failure=ContinuationTooLarge())
+        return replace(outcome, response=response)
+
+    async def generate(
+        self, request: ProviderRequest, *, cancel: CancelSignal | None = None
+    ) -> CallOutcome:
+        source_row, intent, state = self._prepare(request, streaming=False)
         row = _dispatch_row(source_row, self._endpoint_overrides)
         credential = self._credential(source_row.provider)
         engine = self._engines[source_row.engine]
@@ -435,6 +464,7 @@ class ProviderRuntime:
         ) as span:
             with as_current(span):
                 outcome = await self._generate_outcome(row, intent, credential, engine, cancel)
+                outcome = self._seal_outcome(source_row, intent, state, outcome)
             record_outcome(span, outcome.meta, cost_estimate=estimate_cost(outcome.meta))
             return outcome
 
@@ -496,19 +526,20 @@ class ProviderRuntime:
     # -- stream -------------------------------------------------------------
 
     def stream(
-        self, intent: GenerateIntent, *, cancel: CancelSignal | None = None
+        self, request: ProviderRequest, *, cancel: CancelSignal | None = None
     ) -> AsyncIterator[RuntimeStreamEvent]:
-        source_row = resolve_target(intent.target)
-        _validate_intent(source_row, intent, streaming=True)
+        source_row, intent, state = self._prepare(request, streaming=True)
         row = _dispatch_row(source_row, self._endpoint_overrides)
         credential = self._credential(source_row.provider)
         engine = self._engines[source_row.engine]
-        return self._stream_events(row, intent, credential, engine, cancel)
+        return self._stream_events(source_row, row, intent, state, credential, engine, cancel)
 
     async def _stream_events(
         self,
+        source_row: ModelRow,
         row: ModelRow,
         intent: GenerateIntent,
+        state: dict[str, object],
         credential: ProviderCredential,
         engine: Engine,
         cancel: CancelSignal | None,
@@ -576,8 +607,31 @@ class ProviderRuntime:
                                         start_forwarded = True
                                         yield envelope(event)
                                 case TerminalEvent(outcome=outcome):
-                                    yield terminal(_absorbed(outcome, trace, billability))
+                                    sealed = self._seal_outcome(
+                                        source_row,
+                                        intent,
+                                        state,
+                                        _absorbed(outcome, trace, billability),
+                                    )
+                                    if isinstance(sealed, Refused):
+                                        raise ProtocolDefect(
+                                            code="stream_refusal_arm",
+                                            message="stream returned a non-stream refusal",
+                                        )
+                                    if isinstance(sealed, Succeeded) and isinstance(
+                                        sealed.response.continuation, Present
+                                    ):
+                                        yield envelope(
+                                            ContinuationDelta(
+                                                artifact=sealed.response.continuation.value
+                                            )
+                                        )
+                                    yield terminal(sealed)
                                     return
+                                case ContinuationDelta():
+                                    # The native artifact is wrapped with the complete
+                                    # prefix only after the successful terminal.
+                                    semantic_forwarded = True
                                 case _:
                                     semantic_forwarded = True
                                     yield envelope(event)
@@ -707,17 +761,12 @@ class ProviderRuntime:
         *,
         system: str = "",
         user: str,
-        reasoning: ReasoningLevel = "none",
+        reasoning: ReasoningKey,
         max_output_tokens: int | None = None,
     ) -> CallOutcome:
         """The 95% call site: one system/user turn against a registry ref.
 
-        `reasoning` defaults to "none", which is callable on every row: a row
-        declaring a "none" fragment sends it; a row that declares no "none"
-        level sends no reasoning field at all and the provider's own default
-        applies. "none" never raises. Any OTHER level a row does not declare
-        does raise `InvalidRequest` — silently discarding an explicit
-        non-default request is banned.
+        The caller supplies one exact model-scoped configuration key.
         """
         row = resolve(ref)
         user_message = UserMessage(blocks=(PromptBlock(text=user),))

@@ -189,17 +189,14 @@ def record_outcome(span: Span, meta: CallMeta, *, cost_estimate: Presence[CostEs
 def _provider_name(provider: ProviderName) -> str:
     """The semconv 1.37 well-known `gen_ai.provider.name` value for a provider.
 
-    The registry's well-known list is MUST-level where it applies, and two of
-    our providers are named differently there. Providers absent from it
-    (moonshot, openrouter) are the sanctioned custom-value case and pass
-    through as their registry name.
+    The registry's well-known list uses different names for gemini and xai.
     """
     match provider:
         case "gemini":
             return "gcp.gemini"
         case "xai":
             return "x_ai"
-        case "openai" | "anthropic" | "deepseek" | "moonshot" | "openrouter":
+        case "openai" | "anthropic" | "deepseek":
             return provider
         case _:
             assert_never(provider)

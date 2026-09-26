@@ -71,7 +71,7 @@ from provider_runtime.agent_runtime import (
     TextContent,
     TurnRequest,
 )
-from provider_runtime.agent_runtime.codex_sdk import CodexSdkAdapter
+from provider_runtime.agent_runtime.codex_adapter import CodexAppServerAdapter
 from provider_runtime.agent_runtime.types import AGENT_ROUTES
 from provider_runtime.types import Absent, Presence, Present, TokenUsage
 from tests.live.agent_matrix import (
@@ -112,7 +112,7 @@ class LiveRoute:
         return self.name
 
 
-class _ObservedCodexAdapter(CodexSdkAdapter):
+class _ObservedCodexAdapter(CodexAppServerAdapter):
     """Live-only witness for the native cumulative values before projection."""
 
     def __init__(self) -> None:

@@ -191,8 +191,6 @@ def test_policy_can_never_allow_credential_class_environment_names() -> None:
 OTHER_PROVIDER_CREDENTIAL_NAMES = (
     "DEEPSEEK_API_KEY",
     "GEMINI_API_KEY",
-    "MOONSHOT_API_KEY",
-    "OPENROUTER_API_KEY",
     "XAI_API_KEY",
 )
 

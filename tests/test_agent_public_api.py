@@ -84,7 +84,7 @@ def test_importing_agent_surface_does_not_import_provider_http_runtime() -> None
 
 def test_adapter_and_private_modules_are_not_agent_exports() -> None:
     for name in (
-        "codex_sdk",
+        "codex_adapter",
         "claude_sdk",
         "_claude_launcher",
         "_limits",

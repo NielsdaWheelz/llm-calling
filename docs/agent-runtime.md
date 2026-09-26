@@ -6,7 +6,7 @@ provider runtime:
 
 ```text
 ProviderRuntime: one API generation intent -> one provider HTTP outcome
-AgentRuntime:    one local SDK session -> streamed turns and durable session refs
+AgentRuntime:    one local agent session -> streamed turns and durable session refs
 ```
 
 The agent runtime does not pretend a stateful coding agent is a stateless model
@@ -20,12 +20,11 @@ one terminal outcome per started turn.
 The routing algebra is closed:
 
 ```text
-(codex, sdk)  -> host-owned Codex app-server over WebSocket on a Unix socket
+(codex, app_server) -> host-owned Codex app-server over WebSocket on a Unix socket
 (claude, sdk) -> claude-agent-sdk
 ```
 
-There is no `cli` route or automatic fallback. The public route name remains
-`sdk` for stored-reference compatibility. On Codex, provider-runtime owns the
+There is no `cli` route or automatic fallback. On Codex, provider-runtime owns the
 documented WebSocket client protocol over an externally configured Unix socket.
 It has no Python Codex SDK, bundled executable, private App Server, or
 `AsyncCodex` path. Claude remains on the official SDK and receives the exact
@@ -102,7 +101,7 @@ config = AgentRuntimeConfig(
 auth = CredentialRef(kind="local_account", profile_key="personal")
 
 async with AgentRuntime(config) as runtime:
-    catalog = await runtime.model_catalog("codex", auth)
+    catalog = await runtime.model_catalog("codex", transport="app_server", auth=auth)
     model = catalog.models[0]  # Application selection, never a library default.
     reasoning = model.reasoning[0]
     request = CodexCatalogSessionRequest(
@@ -128,9 +127,13 @@ async with AgentRuntime(config) as runtime:
 
 ## Model catalog and tagged requests
 
-`AgentRuntime.model_catalog("codex", auth)` drives the authenticated public
-App Server RPC `model/list` through every page and returns every visible row in native
-order. `AgentModelCatalog` carries a content-derived definition revision;
+`AgentRuntime.model_catalog("codex", transport="app_server", auth=auth)` drives
+the authenticated public App Server RPC `model/list` through every page. It
+requires all three GPT-6 models and all five low/medium/high/xhigh/max effort
+rows for each, omits unrelated identities and ultra, and fails closed if the
+required set is incomplete. `AgentModelCatalog.supports_frozen_mcp_tools` is
+`False`, so callers cannot assume portable tool publication on this route.
+`AgentModelCatalog` carries a content-derived definition revision;
 each `AgentModelFacts` carries exact model/dispatch identity, ordered reasoning
 facts, modalities, lifecycle/upgrade facts, and a content-derived row
 fingerprint. The public App Server catalog reports neither context-window nor
@@ -247,7 +250,7 @@ runtime. Persist `session.ref` only after it is complete.
 
 `AgentSessionRef` carries:
 
-- schema version;
+- schema version `agent-session-ref.v2`;
 - backend and transport;
 - native session identifier;
 - profile key;
@@ -551,7 +554,7 @@ uv run pytest -m live_provider tests/live/test_agent_matrix.py
 ```
 
 An omitted route selector is the release run and covers both shipped routes.
-`LLM_RUNTIME_LIVE_AGENT_ROUTES=codex:sdk` or `claude:sdk` narrows a debugging run
+`LLM_RUNTIME_LIVE_AGENT_ROUTES=codex:app_server` or `claude:sdk` narrows a debugging run
 and certifies nothing. The matrix never enrolls an account or prints tokens.
 Per route it certifies: one full streamed turn under the route's restrictive
 policy (the defaults, plus the `allowed_tools=("*",)` sentinel Codex requires),

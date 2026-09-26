@@ -75,16 +75,18 @@ class ProtocolPeer:
         self.account: object = {"type": "chatgpt"}
         self.models = [
             {
-                "id": "fixture-model",
-                "model": "fixture-native-model",
+                "id": model,
+                "model": model,
                 "displayName": "Fixture Model",
                 "hidden": False,
                 "inputModalities": ["text", "image"],
                 "supportedReasoningEfforts": [
-                    {"reasoningEffort": "high", "description": "High"},
+                    {"reasoningEffort": effort, "description": effort}
+                    for effort in ("low", "medium", "high", "xhigh", "max")
                 ],
                 "defaultReasoningEffort": "high",
             }
+            for model in ("gpt-6-astra", "gpt-6-sol", "gpt-6-luna")
         ]
         self.emit_managed = False
         self.emit_approval = False
@@ -449,7 +451,9 @@ async def test_native_metadata_does_not_substitute_subscription_auth(
             await runtime.codex.create(CodexCreateRequest("lab", tmp_path))
         assert (failure.value.code, failure.value.dispatch) == ("auth", "NotSent")
         with pytest.raises(CredentialUnavailable if account is None else CredentialRejected):
-            await runtime.model_catalog("codex", CredentialRef("local_account", "lab"))
+            await runtime.model_catalog(
+                "codex", CredentialRef("local_account", "lab"), transport="app_server"
+            )
     assert [message.get("method") for message in peer.messages] == [
         "initialize",
         "initialized",
@@ -468,10 +472,11 @@ async def test_shared_catalog_preserves_exact_generation_and_resolves_native_dis
     async with AgentRuntime(
         AgentRuntimeConfig(state_root_base=tmp_path, codex_endpoints={"personal": peer.socket})
     ) as runtime:
-        catalog = await runtime.model_catalog("codex", auth)
-        (row,) = catalog.models
-        assert row.key == "fixture-model"
-        assert row.dispatch_model == "fixture-native-model"
+        catalog = await runtime.model_catalog("codex", auth, transport="app_server")
+        assert catalog.supports_frozen_mcp_tools is False
+        row = next(row for row in catalog.models if row.key == "gpt-6-sol")
+        assert row.key == "gpt-6-sol"
+        assert row.dispatch_model == "gpt-6-sol"
         assert row.source_context_window == Absent()
         assert row.source_max_output_tokens == Absent()
         assert row.source_default_reasoning == Present("high")
@@ -512,8 +517,8 @@ async def test_shared_catalog_preserves_exact_generation_and_resolves_native_dis
         ):
             with pytest.raises(InvalidAgentRequest):
                 await runtime.open_session(invalid)
-        peer.models[0]["model"] = "changed-wire-model"
-        with pytest.raises(InvalidAgentRequest):
+        peer.models[1]["model"] = "changed-wire-model"
+        with pytest.raises(ProtocolDefect):
             await runtime.open_session(request)
         assert sum(message.get("method") == "thread/start" for message in peer.messages) == before
     assert peer.socket.is_socket()
@@ -521,8 +526,8 @@ async def test_shared_catalog_preserves_exact_generation_and_resolves_native_dis
 
 async def managed_request(runtime: AgentRuntime, cwd: Path) -> CodexCatalogSessionRequest:
     auth = CredentialRef("local_account", "lab")
-    catalog = await runtime.model_catalog("codex", auth)
-    (row,) = catalog.models
+    catalog = await runtime.model_catalog("codex", auth, transport="app_server")
+    row = next(row for row in catalog.models if row.key == "gpt-6-sol")
     return CodexCatalogSessionRequest(
         auth=auth,
         cwd=str(cwd),
@@ -543,7 +548,9 @@ async def test_catalog_discovery_cancellation_closes_only_its_owned_connection(
     peer.hold_method = "model/list"
     async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"lab": peer.socket})) as runtime:
         pending = asyncio.create_task(
-            runtime.model_catalog("codex", CredentialRef("local_account", "lab"))
+            runtime.model_catalog(
+                "codex", CredentialRef("local_account", "lab"), transport="app_server"
+            )
         )
         await peer.received.wait()
         if cancel_owner == "caller":
@@ -979,7 +986,7 @@ async def test_shared_codex_rejects_client_secret_environment_before_resolution(
         with pytest.raises(UnsupportedCapability, match="client environment"):
             await runtime.open_session(
                 CodexCatalogSessionRequest(
-                    model_key="fixture-model",
+                    model_key="gpt-6-sol",
                     reasoning="high",
                     agent_definition_revision="not-read",
                     row_fingerprint="0" * 64,
@@ -1067,7 +1074,7 @@ async def test_unconfigured_codex_profile_never_enrolls_a_private_home(tmp_path:
             await runtime.list_sessions(
                 SessionQuery(
                     backend="codex",
-                    transport="sdk",
+                    transport="app_server",
                     auth=CredentialRef(kind="local_account", profile_key="unconfigured"),
                 )
             )

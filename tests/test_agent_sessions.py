@@ -31,9 +31,9 @@ AUTH = CredentialRef(kind="local_account", profile_key="personal")
 
 def _ref(*, cwd_fingerprint: str | None = None) -> AgentSessionRef:
     return AgentSessionRef(
-        schema_version="agent-session-ref.v1",
+        schema_version="agent-session-ref.v2",
         backend="codex",
-        transport="sdk",
+        transport="app_server",
         native_session_id="thread-123",
         profile_key="personal",
         state_root_fingerprint="a" * 64,
@@ -53,7 +53,7 @@ def test_resume_identity_rejects_backend_profile_and_state_root_mismatch() -> No
         validate_session_ref(
             _ref(),
             backend="codex",
-            transport="sdk",
+            transport="app_server",
             profile_key="other",
             state_root_fingerprint="a" * 64,
             cwd="/workspace/repo",
@@ -63,7 +63,7 @@ def test_resume_identity_rejects_backend_profile_and_state_root_mismatch() -> No
         validate_session_ref(
             _ref(),
             backend="codex",
-            transport="sdk",
+            transport="app_server",
             profile_key="personal",
             state_root_fingerprint="c" * 64,
             cwd="/workspace/repo",
@@ -85,7 +85,7 @@ def test_cwd_only_gates_backends_that_scope_sessions_by_cwd() -> None:
     validate_session_ref(
         _ref(),
         backend="codex",
-        transport="sdk",
+        transport="app_server",
         profile_key="personal",
         state_root_fingerprint="a" * 64,
         cwd="/workspace/repo",
@@ -95,7 +95,7 @@ def test_cwd_only_gates_backends_that_scope_sessions_by_cwd() -> None:
         validate_session_ref(
             _ref(),
             backend="codex",
-            transport="sdk",
+            transport="app_server",
             profile_key="personal",
             state_root_fingerprint="a" * 64,
             cwd="/workspace/repo",
@@ -135,7 +135,7 @@ def test_session_discovery_values_are_metadata_only_and_paginated() -> None:
     metadata = SessionMetadata(name="Work")
     summary = SessionSummary(ref=_ref(), metadata=metadata)
     page = SessionPage(sessions=(summary,), continuation_cursor="next")
-    query = SessionQuery(backend="codex", transport="sdk", auth=AUTH, cursor=None, limit=25)
+    query = SessionQuery(backend="codex", transport="app_server", auth=AUTH, cursor=None, limit=25)
     snapshot = SessionSnapshot(ref=_ref(), metadata=metadata)
 
     assert page.sessions[0].metadata.name == "Work"
@@ -149,6 +149,6 @@ def test_session_discovery_values_are_metadata_only_and_paginated() -> None:
             SessionReadOptions(auth=CredentialRef(kind="local_account", profile_key="other")),
         )
     with pytest.raises(InvalidAgentRequest, match="positive"):
-        SessionQuery(backend="codex", transport="sdk", auth=AUTH, limit=0)
+        SessionQuery(backend="codex", transport="app_server", auth=AUTH, limit=0)
     with pytest.raises(InvalidAgentRequest, match="non-empty"):
-        SessionQuery(backend="codex", transport="sdk", auth=AUTH, cursor="")
+        SessionQuery(backend="codex", transport="app_server", auth=AUTH, cursor="")

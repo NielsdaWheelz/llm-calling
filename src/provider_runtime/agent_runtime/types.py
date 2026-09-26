@@ -30,19 +30,19 @@ from .model_catalog import AgentReasoningKey
 from .policy import PermissionPolicy, PermissionPolicyPatch
 
 type Backend = Literal["codex", "claude"]
-type AgentTransport = Literal["sdk"]
+type AgentTransport = Literal["app_server", "sdk"]
 type CredentialKind = Literal["local_account", "api_key_environment", "secret_reference"]
 type ApprovalDecision = Literal["allow", "deny", "abort"]
 
 _BACKENDS: tuple[Backend, ...] = ("codex", "claude")
-_TRANSPORTS: tuple[AgentTransport, ...] = ("sdk",)
+_TRANSPORTS: tuple[AgentTransport, ...] = ("app_server", "sdk")
 # The closed routing table has exactly one owner in the package; runtime.py and the adapters
 # read this name instead of re-listing. One transport per backend is not an invariant this
 # table asserts — it is what the two shipped lanes happen to be. Consumers key off the pair,
 # never off the backend alone.
 AGENT_ROUTES: frozenset[tuple[Backend, AgentTransport]] = frozenset(
     {
-        ("codex", "sdk"),
+        ("codex", "app_server"),
         ("claude", "sdk"),
     }
 )
@@ -219,7 +219,7 @@ type AgentOutputSpec = TextAgentOutput | JsonSchemaAgentOutput
 
 @dataclass(frozen=True, slots=True)
 class AgentSessionRef:
-    schema_version: Literal["agent-session-ref.v1"]
+    schema_version: Literal["agent-session-ref.v2"]
     backend: Backend
     transport: AgentTransport
     native_session_id: str
@@ -228,8 +228,8 @@ class AgentSessionRef:
     cwd_fingerprint: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != "agent-session-ref.v1":
-            raise InvalidAgentRequest("AgentSessionRef.schema_version must be agent-session-ref.v1")
+        if self.schema_version != "agent-session-ref.v2":
+            raise InvalidAgentRequest("AgentSessionRef.schema_version must be agent-session-ref.v2")
         if (self.backend, self.transport) not in AGENT_ROUTES:
             raise InvalidAgentRequest("AgentSessionRef has an unsupported backend/transport pair")
         _require_non_empty(self.native_session_id, "AgentSessionRef.native_session_id")
@@ -482,7 +482,7 @@ class CodexCatalogSessionRequest(_SessionRequestBase):
     row_fingerprint: str
     native: CodexNativeOptions | None = None
     backend: Literal["codex"] = field(default="codex", init=False)
-    transport: Literal["sdk"] = field(default="sdk", init=False)
+    transport: Literal["app_server"] = field(default="app_server", init=False)
 
     def __post_init__(self) -> None:
         self._validate_common("CodexCatalogSessionRequest")
@@ -619,7 +619,7 @@ def ref_from_json(value: Mapping[str, object]) -> AgentSessionRef:
         raise InvalidAgentRequest(f"agent session ref JSON has unknown fields: {unknown}")
     if missing:
         raise InvalidAgentRequest(f"agent session ref JSON is missing fields: {missing}")
-    if value["schema_version"] != "agent-session-ref.v1":
+    if value["schema_version"] != "agent-session-ref.v2":
         raise InvalidAgentRequest("agent session ref schema_version is unsupported")
     backend_value = value["backend"]
     transport_value = value["transport"]
@@ -641,7 +641,7 @@ def ref_from_json(value: Mapping[str, object]) -> AgentSessionRef:
     backend: Backend = backend_value
     transport: AgentTransport = transport_value
     return AgentSessionRef(
-        schema_version="agent-session-ref.v1",
+        schema_version="agent-session-ref.v2",
         backend=backend,
         transport=transport,
         native_session_id=str(string_fields["native_session_id"]),

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal, Protocol
 
+from provider_runtime.registry import GPT6_MODEL_IDS
 from provider_runtime.types import (
     Absent,
     Presence,
@@ -18,7 +19,7 @@ from provider_runtime.types import (
 
 from .errors import ProtocolDefect
 
-AGENT_BACKEND_CONTRACT_REVISION = "provider-runtime.agent-model-catalog.v1"
+AGENT_BACKEND_CONTRACT_REVISION = "provider-runtime.agent-model-catalog.v2"
 _MAX_PAGES = 64
 
 type AgentModelKey = str
@@ -87,6 +88,7 @@ class AgentModelCatalog:
     observed_at: datetime
     models: tuple[AgentModelFacts, ...]
     diagnostics: tuple[AgentCatalogDiagnostic, ...]
+    supports_frozen_mcp_tools: bool
 
 
 class GenericAsyncRpc(Protocol):
@@ -158,15 +160,19 @@ async def read_codex_model_catalog(
 
     if len(native_revisions) > 1:
         raise ProtocolDefect("Codex model/list changed native revision during pagination")
-    observed = tuple(_normalize_row(row) for row in rows)
+    observed = tuple(_normalize_row(row) for row in rows if row.get("id") in GPT6_MODEL_IDS)
     _validate_observed_rows(observed)
     facts, diagnostics = _resolve_upgrades(observed)
     observed_at = (now or (lambda: datetime.now(UTC)))()
     if observed_at.tzinfo is None or observed_at.utcoffset() is None:
         raise ProtocolDefect("AgentModelCatalog.observed_at must be timezone-aware")
+    supports_frozen_mcp_tools = False
     definition_revision = _hash(
-        b"provider-runtime.agent-model-catalog.v1",
-        {"row_fingerprints": tuple(row.row_fingerprint for row in facts)},
+        b"provider-runtime.agent-model-catalog.v2",
+        {
+            "row_fingerprints": tuple(row.row_fingerprint for row in facts),
+            "supports_frozen_mcp_tools": supports_frozen_mcp_tools,
+        },
     )
     return AgentModelCatalog(
         backend_contract_revision=AGENT_BACKEND_CONTRACT_REVISION,
@@ -175,12 +181,15 @@ async def read_codex_model_catalog(
         observed_at=observed_at,
         models=facts,
         diagnostics=diagnostics,
+        supports_frozen_mcp_tools=supports_frozen_mcp_tools,
     )
 
 
 def _normalize_row(row: Mapping[str, object]) -> _ObservedModel:
     key = _required_string(row, "id")
     dispatch_model = _required_string(row, "model")
+    if dispatch_model != key:
+        raise ProtocolDefect(f"Codex model {key!r} has an aliased dispatch identity")
     label = _required_string(row, "displayName", fallback="display_name")
     modalities_value = row.get("inputModalities", row.get("input_modalities"))
     if not isinstance(modalities_value, list) or not modalities_value:
@@ -201,10 +210,12 @@ def _normalize_row(row: Mapping[str, object]) -> _ObservedModel:
     for item in reasoning_value:
         option = _object_mapping(item, f"Codex model {key!r} reasoning row")
         native = _required_enum_string(option, "reasoningEffort", fallback="reasoning_effort")
-        label_value = _required_string(option, "description")
-        reasoning.append(
-            AgentReasoningFacts(key=native, label=label_value, native_wire_value=native)
-        )
+        if native not in ("low", "medium", "high", "xhigh", "max"):
+            continue
+        _required_string(option, "description")
+        reasoning.append(AgentReasoningFacts(key=native, label=native, native_wire_value=native))
+    if not reasoning:
+        raise ProtocolDefect(f"Codex model {key!r} has no approved reasoning rows")
     if len({item.key for item in reasoning}) != len(reasoning):
         raise ProtocolDefect(f"Codex model {key!r} has duplicate reasoning keys")
 
@@ -213,9 +224,12 @@ def _normalize_row(row: Mapping[str, object]) -> _ObservedModel:
         source_default: Presence[str] = Absent()
     else:
         default = _enum_string(default_value)
-        if not default or sum(item.key == default for item in reasoning) != 1:
+        if default == "ultra":
+            source_default = Absent()
+        elif not default or sum(item.key == default for item in reasoning) != 1:
             raise ProtocolDefect(f"Codex model {key!r} source default is not one reasoning row")
-        source_default = Present(default)
+        else:
+            source_default = Present(default)
 
     upgrades: list[str] = []
     direct_upgrade = row.get("upgrade")
@@ -230,9 +244,8 @@ def _normalize_row(row: Mapping[str, object]) -> _ObservedModel:
         key=key,
         dispatch_model=dispatch_model,
         label=label,
-        # The pinned public SDK's Model row exposes neither capacity. Do not
-        # infer private cache/debug fields into the source contract; a future
-        # SDK addition must be adopted here deliberately with conformance.
+        # The pinned app-server model row exposes neither capacity. Do not
+        # infer private cache/debug fields into the source contract.
         source_context_window=Absent(),
         source_max_output_tokens=Absent(),
         input_modalities=tuple(modalities),
@@ -243,12 +256,16 @@ def _normalize_row(row: Mapping[str, object]) -> _ObservedModel:
 
 
 def _validate_observed_rows(rows: tuple[_ObservedModel, ...]) -> None:
-    if not rows:
-        raise ProtocolDefect("Codex model/list returned no visible models")
     if len({row.key for row in rows}) != len(rows):
         raise ProtocolDefect("Codex model/list returned duplicate model ids")
     if len({row.dispatch_model for row in rows}) != len(rows):
         raise ProtocolDefect("Codex model/list returned duplicate dispatch models")
+    if {row.key for row in rows} != set(GPT6_MODEL_IDS):
+        raise ProtocolDefect("Codex model/list omitted an approved GPT-6 model")
+    required_efforts = {"low", "medium", "high", "xhigh", "max"}
+    for row in rows:
+        if {item.key for item in row.reasoning} != required_efforts:
+            raise ProtocolDefect(f"Codex model {row.key!r} omitted an approved reasoning effort")
 
 
 def _resolve_upgrades(
