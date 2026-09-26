@@ -928,7 +928,7 @@ class CodexAppServerAdapter:
                     raise ProtocolDefect("Codex replay changed thread identity")
                 continue
             if method != "thread/tokenUsage/updated":
-                raise ProtocolDefect(f"Codex emitted unexpected pre-turn notification {method}")
+                raise ProtocolDefect("Codex emitted an unexpected pre-turn notification")
             raw_params = getattr(notification, "params", None)
             if raw_params is None:
                 payload = getattr(notification, "payload", None)

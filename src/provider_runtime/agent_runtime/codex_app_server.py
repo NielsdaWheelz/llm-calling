@@ -438,7 +438,7 @@ class CodexAppServerClient:
         method = message.get("method")
         self._require_method(method)
         method = cast(str, method)
-        params = self._mapping(message.get("params"), f"{method} params")
+        params = self._mapping(message.get("params"), "Codex server method params")
         if self.config.request_policy == "observe_only":
             # Worker requests are intentionally left pending for a native TUI. Never
             # turn a subscription race into a competing approval response.
@@ -490,18 +490,18 @@ class CodexAppServerClient:
                 ),
                 size=size,
             )
-            raise ProtocolDefect(f"Codex app-server requested forbidden authority {method}")
+            raise ProtocolDefect("Codex app-server requested forbidden authority")
         forbidden = _FORBIDDEN_SERVER_REQUESTS.get(method)
         if forbidden is not None:
             await self._write({"id": request_id, "error": {"code": -32601, "message": forbidden}})
-            raise ProtocolDefect(f"Codex app-server requested forbidden callback {method}")
+            raise ProtocolDefect("Codex app-server requested forbidden callback")
         await self._write(
             {
                 "id": request_id,
                 "error": {"code": -32601, "message": "unsupported server request"},
             }
         )
-        raise ProtocolDefect(f"Codex app-server sent unknown server request {method}")
+        raise ProtocolDefect("Codex app-server sent an unknown server request")
 
     def _route_response(self, message: dict[str, object]) -> None:
         if set(message) not in ({"id", "result"}, {"id", "error"}):

@@ -71,6 +71,9 @@ class ProtocolPeer:
 
     def __init__(self, socket: Path) -> None:
         self.socket = socket
+        self.connection: ServerConnection | None = None
+        self.pre_thread_start_notification: dict[str, object] | None = None
+        self.server_request_replied = asyncio.Event()
         self.messages: list[dict[str, object]] = []
         self.closed_connections = 0
         self.initialize: object = {"userAgent": "codex_cli_rs/0.154.0 (Linux synthetic; x86_64)"}
@@ -123,12 +126,15 @@ class ProtocolPeer:
         }
 
     async def handle(self, connection: ServerConnection) -> None:
+        self.connection = connection
         try:
             async for frame in connection:
                 message = json.loads(frame)
                 self.messages.append(message)
                 method = message.get("method")
                 if method is None:
+                    if "id" in message:
+                        self.server_request_replied.set()
                     continue
                 if method == "initialized":
                     continue
@@ -213,6 +219,8 @@ class ProtocolPeer:
                     result = {}
                 else:
                     raise AssertionError(f"unexpected fixture request: {method}")
+                if method == "thread/start" and self.pre_thread_start_notification is not None:
+                    await connection.send(json.dumps(self.pre_thread_start_notification))
                 await connection.send(json.dumps({"id": message["id"], "result": result}))
                 if method == "turn/start":
                     await self.turn_events(connection)
@@ -1164,6 +1172,76 @@ async def test_frozen_codex_mcp_uses_only_scoped_headers_and_exact_tools(
             ]
         assert "scoped-" not in str(failure.value)
         await runtime.close_session(session)
+
+
+@pytest.mark.parametrize("message_kind", ["notification", "request"])
+@pytest.mark.parametrize(
+    "native_method", ["Bearer scoped-probe-token", "Bearer scoped-", "probe-token"]
+)
+async def test_scoped_bearer_does_not_escape_preturn_defect(
+    tmp_path: Path, peer: ProtocolPeer, message_kind: str, native_method: str
+) -> None:
+    async def resolver(_name: str) -> str:
+        return "Bearer scoped-probe-token"
+
+    peer.emit_managed = True
+    if message_kind == "notification":
+        peer.pre_thread_start_notification = {
+            "method": native_method,
+            "params": {"threadId": THREAD},
+        }
+    async with AgentRuntime(
+        AgentRuntimeConfig(tmp_path, {"lab": peer.socket}, secret_resolver=resolver)
+    ) as runtime:
+        base = await managed_request(runtime, tmp_path)
+        request = replace(
+            base,
+            policy=PermissionPolicy(
+                allowed_tools=("*",),
+                filesystem="workspace_write",
+                network="unrestricted",
+                approval="deny",
+                unsafe_confirmation=UnsafeConfirmation(("network_unrestricted",)),
+            ),
+            mcp_servers=(
+                McpServerSpec(
+                    name="external",
+                    transport="streamable_http",
+                    url="https://synthetic.invalid/mcp",
+                    header_refs=(
+                        HeaderReference(
+                            name="Authorization",
+                            source=CredentialRef("secret_reference", "lab", "synthetic-reference"),
+                        ),
+                    ),
+                    allowed_tools=("find_notes",),
+                ),
+            ),
+        )
+        with pytest.raises(ProtocolDefect) as failure:
+            if message_kind == "notification":
+                await runtime.open_session(request)
+            else:
+                session = await runtime.open_session(request)
+                assert peer.connection is not None
+                await peer.connection.send(
+                    json.dumps(
+                        {
+                            "id": "pre-turn",
+                            "method": native_method,
+                            "params": {"threadId": THREAD},
+                        }
+                    )
+                )
+                await asyncio.wait_for(peer.server_request_replied.wait(), 2)
+                [
+                    event
+                    async for event in runtime.stream_turn(
+                        session, TurnRequest(input=(TextContent("probe"),))
+                    )
+                ]
+        assert "scoped-" not in str(failure.value)
+        assert "probe-token" not in str(failure.value)
 
 
 async def test_queued_intervention_rejects_next_managed_submit_before_dispatch(
