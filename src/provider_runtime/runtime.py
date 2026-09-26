@@ -43,6 +43,7 @@ from provider_runtime.otel import as_current, call_span, record_outcome
 from provider_runtime.prices import estimate_cost
 from provider_runtime.registry import (
     REGISTRY_REVISION,
+    api_generation_combination_source_status,
 )
 from provider_runtime.registry import (
     _ModelRow as ModelRow,
@@ -206,15 +207,18 @@ def _runtime_meta(
 def _validate_intent(row: ModelRow, intent: GenerateIntent, *, streaming: bool) -> None:
     if streaming and not row.streaming:
         raise InvalidRequest(message=f"registry row {row.ref!r} does not support streaming")
-    if intent.tools:
+    if (
+        api_generation_combination_source_status(
+            model_ref=row.ref,
+            reasoning=intent.reasoning,
+            output="strict_json" if isinstance(intent.output, StrictJsonOutput) else "text",
+            model_tools=bool(intent.tools),
+        )
+        == "unsupported"
+    ):
         if not row.tools:
             raise InvalidRequest(message=f"registry row {row.ref!r} does not support tools")
-        if isinstance(intent.output, StrictJsonOutput):
-            # types.py: tools+strict-output rejected here ⇒ no impossible
-            # ResponseContent state downstream.
-            raise InvalidRequest(
-                message="tools and StrictJsonOutput cannot be combined in one intent"
-            )
+        raise InvalidRequest(message="tools and StrictJsonOutput cannot be combined in one intent")
     if "image" not in row.modalities:
         for message in intent.messages:
             if isinstance(message, UserMessage) and any(

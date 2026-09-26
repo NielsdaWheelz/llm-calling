@@ -660,6 +660,33 @@ def api_model_catalog() -> ApiModelCatalog:
     )
 
 
+type ApiGenerationCombinationSourceStatus = Literal["unqualified", "unsupported"]
+
+
+def api_generation_combination_source_status(
+    *,
+    model_ref: str,
+    reasoning: str,
+    output: Literal["text", "strict_json"],
+    model_tools: bool,
+) -> ApiGenerationCombinationSourceStatus:
+    """Report source compatibility, never live provider qualification."""
+    row = _resolve(model_ref)
+    if type(reasoning) is not str or reasoning not in _REASONING_LEVELS:
+        raise InvalidRequest(message=f"invalid reasoning level {reasoning!r}")
+    if reasoning != "none" and (
+        not isinstance(row.reasoning, Present) or reasoning not in row.reasoning.value
+    ):
+        raise InvalidRequest(
+            message=f"reasoning level {reasoning!r} is not declared for {row.ref!r}"
+        )
+    if output not in ("text", "strict_json") or type(model_tools) is not bool:
+        raise InvalidRequest(message="invalid generation combination")
+    if model_tools and (not row.tools or output == "strict_json"):
+        return "unsupported"
+    return "unqualified"
+
+
 # ---------------------------------------------------------------------------
 # Row invariants — enforced once at module import; a violated row is a defect.
 
@@ -770,4 +797,8 @@ def _validate_rows(rows: tuple[_ModelRow, ...]) -> None:
 
 _validate_rows(_ROWS)
 
-__all__ = ["api_model_catalog"]
+__all__ = [
+    "ApiGenerationCombinationSourceStatus",
+    "api_generation_combination_source_status",
+    "api_model_catalog",
+]

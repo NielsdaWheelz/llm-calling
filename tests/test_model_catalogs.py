@@ -238,6 +238,10 @@ def test_api_catalog_is_exact_immutable_and_the_registry_has_no_public_rows() ->
         if isinstance(row.source_default_reasoning, Present):
             assert row.source_default_reasoning.value in tuple(fact.key for fact in row.reasoning)
 
-    assert registry.__all__ == ["api_model_catalog"]
+    assert registry.__all__ == [
+        "ApiGenerationCombinationSourceStatus",
+        "api_generation_combination_source_status",
+        "api_model_catalog",
+    ]
     for deleted in ("ROWS", "ModelRow", "OpenRouterRouting", "resolve", "resolve_target"):
         assert not hasattr(registry, deleted), f"private registry owner leaked as {deleted}"
