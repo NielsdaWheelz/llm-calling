@@ -29,7 +29,6 @@ from provider_runtime.agent_runtime import (
     EnvironmentReference,
     HeaderReference,
     InvalidAgentRequest,
-    McpConfigurationError,
     McpServerSpec,
     NewSession,
     PermissionPolicy,
@@ -498,7 +497,7 @@ async def test_shared_catalog_preserves_exact_generation_and_resolves_native_dis
         AgentRuntimeConfig(state_root_base=tmp_path, codex_endpoints={"personal": peer.socket})
     ) as runtime:
         catalog = await runtime.model_catalog("codex", auth, transport="app_server")
-        assert catalog.supports_frozen_mcp_tools is True
+        assert catalog.supports_frozen_mcp_tools is False
         row = next(row for row in catalog.models if row.key == "gpt-6-sol")
         assert row.key == "gpt-6-sol"
         assert row.dispatch_model == "gpt-6-sol"
@@ -1042,48 +1041,15 @@ async def test_shared_codex_rejects_client_secret_environment_before_resolution(
     assert resolved == [] and peer.messages == []
 
 
-async def test_frozen_codex_mcp_uses_only_scoped_headers_and_exact_tools(
+async def test_frozen_codex_mcp_is_ineligible_before_secret_resolution(
     tmp_path: Path, peer: ProtocolPeer
 ) -> None:
     resolved: list[str] = []
-    bearer = "Bearer "
 
     async def resolver(name: str) -> str:
         resolved.append(name)
-        return bearer
+        return "Bearer synthetic-secret"
 
-    peer.emit_managed = True
-    peer.answer = "Bearer scoped-probe-token"
-    peer.answer_deltas = ("Bearer scoped-", "probe-token")
-    peer.extra_turn_notifications = [
-        ("error", {"error": {"message": "Bearer scoped-"}}),
-        ("warning", {"message": "probe-token"}),
-        (
-            "item/started",
-            {
-                "item": {
-                    "id": "mcp-1",
-                    "type": "mcpToolCall",
-                    "server": "external",
-                    "tool": "find_notes",
-                    "arguments": {"left": "Bearer scoped-", "right": "probe-token"},
-                }
-            },
-        ),
-        (
-            "item/completed",
-            {
-                "item": {
-                    "id": "mcp-1",
-                    "type": "mcpToolCall",
-                    "server": "external",
-                    "tool": "find_notes",
-                    "status": "completed",
-                    "result": {"left": "Bearer scoped-", "right": "probe-token"},
-                }
-            },
-        ),
-    ]
     async with AgentRuntime(
         AgentRuntimeConfig(tmp_path, {"lab": peer.socket}, secret_resolver=resolver)
     ) as runtime:
@@ -1112,136 +1078,10 @@ async def test_frozen_codex_mcp_uses_only_scoped_headers_and_exact_tools(
                 ),
             ),
         )
-        with pytest.raises(McpConfigurationError):
+        with pytest.raises(UnsupportedCapability, match="frozen MCP tool authority"):
             await runtime.open_session(request)
+        assert resolved == []
         assert not any(message.get("method") == "thread/start" for message in peer.messages)
-        bearer = "Bearer scoped-probe-token"
-        session = await runtime.open_session(request)
-        start = next(m for m in peer.messages if m.get("method") == "thread/start")
-        params = start["params"]
-        assert isinstance(params, dict)
-        assert params["environments"] == []
-        config = params["config"]
-        assert config["agents"]["enabled"] is False
-        assert config["features"]["code_mode_host"]["enabled"] is True
-        assert config["features"]["code_mode"]["excluded_tool_namespaces"] == [
-            "functions",
-            "clock",
-            "web",
-            "image_gen",
-        ]
-        server = config["mcp_servers"]["external"]
-        assert server["http_headers"] == {"Authorization": "Bearer scoped-probe-token"}
-        assert server["enabled_tools"] == ["find_notes"]
-        assert server["tools"] == {"find_notes": {"approval_mode": "approve"}}
-        assert "default_tools_approval_mode" not in server
-        assert resolved == ["synthetic-reference", "synthetic-reference"]
-        events = [
-            event
-            async for event in runtime.stream_turn(
-                session, TurnRequest(input=(TextContent("probe"),))
-            )
-        ]
-        assert all(
-            "scoped-" not in str(event) and "probe-token" not in str(event) for event in events
-        )
-        assert [event.text for event in events if isinstance(event, AgentText)] == ["[redacted]"]
-        assert isinstance(events[-1], AgentTerminal) and events[-1].final_text == "[redacted]"
-        peer.answer = "scoped-probe-token"
-        peer.answer_deltas = ("scoped-", "probe-token")
-        events = [
-            event
-            async for event in runtime.stream_turn(
-                session, TurnRequest(input=(TextContent("probe again"),))
-            )
-        ]
-        assert all(
-            "scoped-" not in str(event) and "probe-token" not in str(event) for event in events
-        )
-        assert [event.text for event in events if isinstance(event, AgentText)] == ["[redacted]"]
-        assert isinstance(events[-1], AgentTerminal) and events[-1].final_text == "[redacted]"
-        peer.extra_turn_notifications = [
-            ("Bearer scoped-probe-token", {"message": "scoped-probe-token"})
-        ]
-        with pytest.raises(ProtocolDefect) as failure:
-            [
-                event
-                async for event in runtime.stream_turn(
-                    session, TurnRequest(input=(TextContent("probe malformed"),))
-                )
-            ]
-        assert "scoped-" not in str(failure.value)
-        await runtime.close_session(session)
-
-
-@pytest.mark.parametrize("message_kind", ["notification", "request"])
-@pytest.mark.parametrize(
-    "native_method", ["Bearer scoped-probe-token", "Bearer scoped-", "probe-token"]
-)
-async def test_scoped_bearer_does_not_escape_preturn_defect(
-    tmp_path: Path, peer: ProtocolPeer, message_kind: str, native_method: str
-) -> None:
-    async def resolver(_name: str) -> str:
-        return "Bearer scoped-probe-token"
-
-    peer.emit_managed = True
-    if message_kind == "notification":
-        peer.pre_thread_start_notification = {
-            "method": native_method,
-            "params": {"threadId": THREAD},
-        }
-    async with AgentRuntime(
-        AgentRuntimeConfig(tmp_path, {"lab": peer.socket}, secret_resolver=resolver)
-    ) as runtime:
-        base = await managed_request(runtime, tmp_path)
-        request = replace(
-            base,
-            policy=PermissionPolicy(
-                allowed_tools=("*",),
-                filesystem="workspace_write",
-                network="unrestricted",
-                approval="deny",
-                unsafe_confirmation=UnsafeConfirmation(("network_unrestricted",)),
-            ),
-            mcp_servers=(
-                McpServerSpec(
-                    name="external",
-                    transport="streamable_http",
-                    url="https://synthetic.invalid/mcp",
-                    header_refs=(
-                        HeaderReference(
-                            name="Authorization",
-                            source=CredentialRef("secret_reference", "lab", "synthetic-reference"),
-                        ),
-                    ),
-                    allowed_tools=("find_notes",),
-                ),
-            ),
-        )
-        with pytest.raises(ProtocolDefect) as failure:
-            if message_kind == "notification":
-                await runtime.open_session(request)
-            else:
-                session = await runtime.open_session(request)
-                assert peer.connection is not None
-                await peer.connection.send(
-                    json.dumps(
-                        {
-                            "id": "pre-turn",
-                            "method": native_method,
-                            "params": {"threadId": THREAD},
-                        }
-                    )
-                )
-                await asyncio.wait_for(peer.server_request_replied.wait(), 2)
-                [
-                    event
-                    async for event in runtime.stream_turn(
-                        session, TurnRequest(input=(TextContent("probe"),))
-                    )
-                ]
-        assert "scoped-" not in str(failure.value)
-        assert "probe-token" not in str(failure.value)
 
 
 async def test_queued_intervention_rejects_next_managed_submit_before_dispatch(

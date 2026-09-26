@@ -132,8 +132,8 @@ the authenticated public App Server RPC `model/list` through every page. It
 requires all three GPT-6 models and all five low/medium/high/xhigh/max effort
 rows for each, omits unrelated identities and ultra, and fails closed if the
 required set is incomplete. `AgentModelCatalog.supports_frozen_mcp_tools` is
-`True` for the pinned App Server route: an exact frozen HTTPS MCP tool set can
-be called in text and strict JSON-output turns.
+`False` for the pinned App Server route: its public startup contract cannot
+exclude native MCP resource helpers from every model-visible tool plan.
 `AgentModelCatalog` carries a content-derived definition revision;
 each `AgentModelFacts` carries exact model/dispatch identity, ordered reasoning
 facts, modalities, lifecycle/upgrade facts, and a content-derived row
@@ -314,49 +314,35 @@ Codex has no public typed per-name built-in filter. The portable policy therefor
 still requires the sentinel `allowed_tools=("*",)`. The additional
 `CodexNativeOptions(builtin_tools="disabled")` posture writes the complete
 supported feature-off configuration. Without MCP it requires read-only
-filesystem and disabled network. With frozen MCP it requires `workspace_write`,
-unrestricted network, denied approvals, one or more required HTTPS servers with
-exact allowed tools and a scoped Authorization header. Both forms require empty
-copied environment and no additional roots. Provider review is refused.
+filesystem and disabled network. Frozen MCP is refused before resolving its
+secret references or starting a thread. The contained form requires empty copied
+environment and no additional roots. Provider review is refused.
 Claude continues to accept exact tool names, reject glob patterns and its two
 network-reaching built-ins, and verify the reported effective set.
 
 ## MCP
 
-MCP configuration is session-scoped on both routes.
+MCP configuration is session-scoped on the Claude route. Codex refuses it.
 
 - Stdio MCP is accepted only with explicit `full_access` and `unrestricted`
   policy because the selected local executable is outside sandbox attestation.
 - Streamable HTTP MCP requires HTTPS and must fit the network policy.
 - Claude can enforce an exact hostname allowlist but accepts no credential refs.
-- Codex accepts only scoped secret-reference Authorization headers for this
-  route, never client environment references. It cannot enforce an exact
-  hostname allowlist, so remote MCP requires unrestricted network. Use
-  `workspace_write` + `unrestricted`, acknowledging `network_unrestricted`:
-  the native sandbox permits network and confines writes to `cwd`. The frozen
-  tool set is separately enforced by exact `enabled_tools` and per-tool
-  approval, while global approval remains denied. See SECURITY.md.
+- Codex refuses MCP sessions. The pinned native App Server has no public
+  startup tool ceiling, and model metadata may override its Code Mode flag.
 
 Secrets are resolved at the process boundary through `secret_resolver` or a
-named environment source. The Codex route passes a scoped bearer only in the
-native HTTPS MCP `http_headers` config, never in the App Server child
-environment or public events. Its tool events expose identity and outcome only;
-native payloads and fragmented diagnostics are suppressed for bearer sessions.
-Visible text is held until terminal selection, then emitted once as a redacted
-complete event: this adds turn-length display latency because native deltas do
-not identify which completed message will be authoritative.
+named environment source. Codex refuses MCP before resolving its headers.
 
 Stdio MCP under full access is not a credential
 boundary: a same-uid command can inspect peer processes. Use a dedicated OS user
 or container for credentialed stdio servers.
 
 Applications with a canonical `llm-tools` plan use
-`lower_mcp_tools(McpToolPublication(...))`. It projects exactly that frozen
-plan into one authenticated HTTPS MCP server plus an immutable reverse index;
-`PublishedMcpTools.observe` maps Codex `AgentToolUse` observations back to
-canonical tool ids and rejects names outside the publication without retaining
-their payload. The existing provider function-tool adapter and this MCP
-adapter share the same exposure/alias owner.
+`lower_mcp_tools(McpToolPublication(...))`. It projects a frozen plan into one
+authenticated HTTPS MCP server plus an immutable reverse index, but the pinned
+Codex route cannot admit that projection. The provider function-tool adapter
+remains available for API calls.
 
 Applications may configure `AgentRuntimeConfig.codex_sandbox` with
 `CodexSandboxControls(exclude_slash_tmp, exclude_tmpdir_env_var)`. Both native
@@ -382,10 +368,8 @@ Native extension objects are versioned, backend-specific escape hatches:
   It also suppresses app, skill, environment, permission, and collaboration
   instructions plus request-user-input. New threads start with empty environments;
   every turn, including a resumed or forked turn, overrides environments to empty.
-  Delegation is disabled. For frozen MCP, its isolated
-  Code Mode host exposes only the exact approved MCP tools; shell, patch,
-  delegation, and utility namespaces are absent. Any native authority event
-  still poisons the turn before publication;
+  Delegation is disabled. Any native authority event still poisons the turn
+  before publication;
 - `ClaudeNativeOptions(include_partial_messages=...)` is session-scoped.
 
 Unknown or wrong-backend native options fail before SDK startup.

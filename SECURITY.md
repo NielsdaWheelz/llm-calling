@@ -12,8 +12,7 @@ vendor surfaces. Codex uses the public App Server protocol; Claude uses the
 official SDK. It is not a hosted subscription proxy, multi-tenant sandbox,
 login service, or token broker.
 
-The only shipped routes are `codex:sdk` and `claude:sdk`; `sdk` is the closed
-agent-transport discriminator, while Codex attaches only to the configured
+The shipped routes are `codex:app_server` and `claude:sdk`; Codex attaches only to the configured
 shared App Server over WebSocket/UDS. There is no private-process fallback. Session
 authentication is subscription-only: each
 route rejects named API-key and secret-reference session credentials before any
@@ -52,7 +51,7 @@ subscription auth. Unknown server requests are rejected, worker approval
 requests are deliberately left unanswered for the attached TUI, and managed
 cognition denies its own approval requests.
 
-The host owns the latest-stable native Codex installation. Initialize metadata
+The host owns the pinned native Codex installation. Initialize metadata
 must have the documented shape; its version string grants no authority and is
 not a compatibility gate. Protocol drift still fails closed. Routine fixtures
 do not certify an upgraded native binary; live containment remains a separate
@@ -130,21 +129,12 @@ use a dedicated OS user or container.
 The one confined remote-MCP shape is Claude streamable HTTP MCP under an exact
 hostname allowlist, with no credential references supplied by this package.
 
-Codex streamable HTTP MCP is the shape that carries reference
-headers/environment. Codex cannot enforce a hostname allowlist, so remote MCP
-needs unrestricted network. The shape to use is `workspace_write` +
-`unrestricted`, acknowledging `network_unrestricted` only: the route writes
-`sandbox_workspace_write.network_access = true`, which is the one network toggle
-the Codex config carries. `full_access` + `unrestricted` remains accepted but
-acknowledges filesystem authority remote MCP does not need.
-
-`workspace_write` confines writes, not reads and not egress. Codex's
-workspace-write sandbox is read-only access plus write access to the session
-`cwd`, its `additional_dirs`, and by default `/tmp` and `$TMPDIR`; everything
-else on the host stays readable. With `network_access = true` there is no
-hostname allowlist and no port restriction, so anything the session can read it
-can also send. Treat a Codex remote-MCP session as exfiltration-capable: run it
-as a dedicated OS user or in a container, or use the Claude shape instead.
+Codex MCP sessions are ineligible. Pinned App Server 0.157.1 can expose native
+resource helpers whenever an MCP server exists. Its public startup API cannot
+apply an independent tool allowlist, and model metadata can override the
+`code_mode_only` feature. The catalog reports
+`supports_frozen_mcp_tools=False`; the runtime refuses tool-bearing Codex
+sessions before resolving scoped secrets or starting a native thread.
 
 `read_only` + network is refused rather than approximated. The Codex config
 exposes a network toggle only under `sandbox_workspace_write`, with no read-only

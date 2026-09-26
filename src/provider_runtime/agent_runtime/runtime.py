@@ -424,6 +424,8 @@ class AgentRuntime:
     ) -> _ResolvedCodexSessionRequest:
         if request.agent_definition_revision != catalog.definition_revision:
             raise InvalidAgentRequest("Codex catalog definition revision is stale")
+        if request.mcp_servers:
+            raise UnsupportedCapability("Codex frozen MCP tool authority is unavailable")
         rows = tuple(row for row in catalog.models if row.key == request.model_key)
         if len(rows) != 1:
             raise InvalidAgentRequest("Codex model_key is absent from the current catalog")
