@@ -367,7 +367,7 @@ class AgentRuntime:
         )
         validate_mcp_network_policy(request.mcp_servers, request.policy)
         if request.backend == "codex" and any(
-            server.environment_refs or server.header_refs for server in request.mcp_servers
+            server.environment_refs for server in request.mcp_servers
         ):
             raise UnsupportedCapability(
                 "shared Codex cannot deliver MCP client environment references"

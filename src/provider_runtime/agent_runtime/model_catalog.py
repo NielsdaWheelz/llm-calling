@@ -19,7 +19,7 @@ from provider_runtime.types import (
 
 from .errors import ProtocolDefect
 
-AGENT_BACKEND_CONTRACT_REVISION = "provider-runtime.agent-model-catalog.v2"
+AGENT_BACKEND_CONTRACT_REVISION = "provider-runtime.agent-model-catalog.v3"
 _MAX_PAGES = 64
 
 type AgentModelKey = str
@@ -166,9 +166,9 @@ async def read_codex_model_catalog(
     observed_at = (now or (lambda: datetime.now(UTC)))()
     if observed_at.tzinfo is None or observed_at.utcoffset() is None:
         raise ProtocolDefect("AgentModelCatalog.observed_at must be timezone-aware")
-    supports_frozen_mcp_tools = False
+    supports_frozen_mcp_tools = True
     definition_revision = _hash(
-        b"provider-runtime.agent-model-catalog.v2",
+        b"provider-runtime.agent-model-catalog.v3",
         {
             "row_fingerprints": tuple(row.row_fingerprint for row in facts),
             "supports_frozen_mcp_tools": supports_frozen_mcp_tools,

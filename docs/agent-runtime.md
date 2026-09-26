@@ -132,7 +132,8 @@ the authenticated public App Server RPC `model/list` through every page. It
 requires all three GPT-6 models and all five low/medium/high/xhigh/max effort
 rows for each, omits unrelated identities and ultra, and fails closed if the
 required set is incomplete. `AgentModelCatalog.supports_frozen_mcp_tools` is
-`False`, so callers cannot assume portable tool publication on this route.
+`True` for the pinned App Server route: an exact frozen HTTPS MCP tool set can
+be called in text and strict JSON-output turns.
 `AgentModelCatalog` carries a content-derived definition revision;
 each `AgentModelFacts` carries exact model/dispatch identity, ordered reasoning
 facts, modalities, lifecycle/upgrade facts, and a content-derived row
@@ -312,9 +313,11 @@ adapter sees it.
 Codex has no public typed per-name built-in filter. The portable policy therefore
 still requires the sentinel `allowed_tools=("*",)`. The additional
 `CodexNativeOptions(builtin_tools="disabled")` posture writes the complete
-supported feature-off configuration and requires read-only
-filesystem, disabled network, denied approvals, empty copied environment, no
-MCP, and no additional roots. Provider review is refused in this posture.
+supported feature-off configuration. Without MCP it requires read-only
+filesystem and disabled network. With frozen MCP it requires `workspace_write`,
+unrestricted network, denied approvals, one or more required HTTPS servers with
+exact allowed tools and a scoped Authorization header. Both forms require empty
+copied environment and no additional roots. Provider review is refused.
 Claude continues to accept exact tool names, reject glob patterns and its two
 network-reaching built-ins, and verify the reported effective set.
 
@@ -326,17 +329,24 @@ MCP configuration is session-scoped on both routes.
   policy because the selected local executable is outside sandbox attestation.
 - Streamable HTTP MCP requires HTTPS and must fit the network policy.
 - Claude can enforce an exact hostname allowlist but accepts no credential refs.
-- Codex accepts environment/header references, but its route cannot enforce an
-  exact hostname allowlist, so remote MCP requires unrestricted network. Use
-  `workspace_write` + `unrestricted`, acknowledging `network_unrestricted`
-  only: the route writes `sandbox_workspace_write.network_access = true`, which
-  confines writes to `cwd`/`additional_dirs` while leaving reads and egress
-  open. `read_only` + network is refused — the Codex config has a network
-  toggle only under `sandbox_workspace_write`. See SECURITY.md.
+- Codex accepts only scoped secret-reference Authorization headers for this
+  route, never client environment references. It cannot enforce an exact
+  hostname allowlist, so remote MCP requires unrestricted network. Use
+  `workspace_write` + `unrestricted`, acknowledging `network_unrestricted`:
+  the native sandbox permits network and confines writes to `cwd`. The frozen
+  tool set is separately enforced by exact `enabled_tools` and per-tool
+  approval, while global approval remains denied. See SECURITY.md.
 
 Secrets are resolved at the process boundary through `secret_resolver` or a
-named environment source, placed only in opaque child-environment aliases, and
-never copied into public values. Stdio MCP under full access is not a credential
+named environment source. The Codex route passes a scoped bearer only in the
+native HTTPS MCP `http_headers` config, never in the App Server child
+environment or public events. Its tool events expose identity and outcome only;
+native payloads and fragmented diagnostics are suppressed for bearer sessions.
+Visible text is held until terminal selection, then emitted once as a redacted
+complete event: this adds turn-length display latency because native deltas do
+not identify which completed message will be authoritative.
+
+Stdio MCP under full access is not a credential
 boundary: a same-uid command can inspect peer processes. Use a dedicated OS user
 or container for credentialed stdio servers.
 
@@ -370,12 +380,12 @@ Native extension objects are versioned, backend-specific escape hatches:
 - `CodexNativeOptions(builtin_tools="disabled")` disables the execution,
   integration, and local-context feature set through explicit native controls.
   It also suppresses app, skill, environment, permission, and collaboration
-  instructions plus request-user-input.
-  This is a containment posture, not proof of pre-execution
-  prevention: public controls do not establish that Code Mode/native `exec` is
-  absent before computation. The child is credentialless, read-only, and
-  offline. Its first observable authority event poisons the turn, invalidates
-  the session, and makes every later terminal ineligible;
+  instructions plus request-user-input. New threads start with empty environments;
+  every turn, including a resumed or forked turn, overrides environments to empty.
+  Delegation is disabled. For frozen MCP, its isolated
+  Code Mode host exposes only the exact approved MCP tools; shell, patch,
+  delegation, and utility namespaces are absent. Any native authority event
+  still poisons the turn before publication;
 - `ClaudeNativeOptions(include_partial_messages=...)` is session-scoped.
 
 Unknown or wrong-backend native options fail before SDK startup.

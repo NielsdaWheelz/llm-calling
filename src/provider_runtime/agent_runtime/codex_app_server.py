@@ -193,7 +193,7 @@ class CodexAppServerClient:
             initialized = await self.request(
                 "initialize",
                 {
-                    "capabilities": {"experimentalApi": False},
+                    "capabilities": {"experimentalApi": True},
                     "clientInfo": {
                         "name": self.config.client_name,
                         "title": self.config.client_title,
@@ -320,6 +320,10 @@ class CodexAppServerClient:
             await self.request("thread/start", self._thread_params(kwargs)),
             "thread/start response",
         )
+        if kwargs.get("environments") == []:
+            thread = self._mapping(response.get("thread"), "thread/start thread")
+            if thread.get("environments") != []:
+                raise ProtocolDefect("Codex thread did not preserve empty environments")
         return self._select_thread(self._response_thread_id(response, "thread/start"))
 
     async def thread_resume(self, thread_id: str, **kwargs: object) -> CodexThread:

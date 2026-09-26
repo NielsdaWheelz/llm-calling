@@ -82,6 +82,7 @@ class UsagePeer:
             elif method in ("thread/start", "thread/resume"):
                 if method == "thread/resume":
                     assert message["params"]["threadId"] == THREAD
+                    assert "environments" not in message["params"]
                     assert self.restored is not None
                     await connection.send(
                         json.dumps(
@@ -95,8 +96,12 @@ class UsagePeer:
                             }
                         )
                     )
-                result = {"thread": {"id": THREAD}}
+                thread = {"id": THREAD}
+                if "environments" in message["params"]:
+                    thread["environments"] = message["params"]["environments"]
+                result = {"thread": thread}
             elif method == "turn/start":
+                assert message["params"]["environments"] == []
                 self.turns += 1
                 result = {"turn": {"id": str(self.turns)}}
             else:

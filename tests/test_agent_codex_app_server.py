@@ -46,7 +46,7 @@ async def transport() -> AsyncIterator[Transport]:
             message = json.loads(wire)
             method = message.get("method")
             if method == "initialize":
-                assert message["params"]["capabilities"] == {"experimentalApi": False}
+                assert message["params"]["capabilities"] == {"experimentalApi": True}
                 result = {"userAgent": "codex_cli_rs/0.153.4 (Linux synthetic; x86_64)"}
             elif method == "thread/start":
                 result = {"thread": {"id": _THREAD}}

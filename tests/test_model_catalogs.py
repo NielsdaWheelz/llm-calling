@@ -93,7 +93,7 @@ async def test_codex_catalog_reads_every_page_and_normalizes_only_public_facts()
         ("model/list", {"includeHidden": False, "cursor": "page-2"}),
     ]
     assert catalog.backend_contract_revision == AGENT_BACKEND_CONTRACT_REVISION
-    assert catalog.supports_frozen_mcp_tools is False
+    assert catalog.supports_frozen_mcp_tools is True
     assert catalog.native_revision == Present("native-revision")
     assert tuple(row.key for row in catalog.models) == GPT6_MODEL_IDS
     astra = catalog.models[0]
