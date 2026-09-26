@@ -365,13 +365,9 @@ class AgentRuntime:
             request,
             request.policy,
         )
+        if isinstance(request, CodexCatalogSessionRequest) and request.mcp_servers:
+            raise UnsupportedCapability("Codex frozen MCP tool authority is unavailable")
         validate_mcp_network_policy(request.mcp_servers, request.policy)
-        if request.backend == "codex" and any(
-            server.environment_refs for server in request.mcp_servers
-        ):
-            raise UnsupportedCapability(
-                "shared Codex cannot deliver MCP client environment references"
-            )
         adapter = self._adapter(request.backend, request.transport)
         adapter.validate_auth(request.auth)
         environment, state_root = await self._environment(
@@ -424,8 +420,6 @@ class AgentRuntime:
     ) -> _ResolvedCodexSessionRequest:
         if request.agent_definition_revision != catalog.definition_revision:
             raise InvalidAgentRequest("Codex catalog definition revision is stale")
-        if request.mcp_servers:
-            raise UnsupportedCapability("Codex frozen MCP tool authority is unavailable")
         rows = tuple(row for row in catalog.models if row.key == request.model_key)
         if len(rows) != 1:
             raise InvalidAgentRequest("Codex model_key is absent from the current catalog")

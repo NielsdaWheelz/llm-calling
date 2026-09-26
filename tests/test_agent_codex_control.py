@@ -991,7 +991,7 @@ async def test_cancelled_create_disconnects_without_resending_or_server_cleanup(
     assert sum(m.get("method") == "thread/start" for m in peer.messages) == 1
 
 
-async def test_shared_codex_rejects_client_secret_environment_before_resolution(
+async def test_codex_stdio_mcp_is_ineligible_before_secret_resolution(
     tmp_path: Path, peer: ProtocolPeer
 ) -> None:
     resolved = []
@@ -1003,7 +1003,7 @@ async def test_shared_codex_rejects_client_secret_environment_before_resolution(
     async with AgentRuntime(
         AgentRuntimeConfig(tmp_path, {"lab": peer.socket}, secret_resolver=resolver)
     ) as runtime:
-        with pytest.raises(UnsupportedCapability, match="client environment"):
+        with pytest.raises(UnsupportedCapability, match="frozen MCP tool authority"):
             await runtime.open_session(
                 CodexCatalogSessionRequest(
                     model_key="gpt-6-sol",

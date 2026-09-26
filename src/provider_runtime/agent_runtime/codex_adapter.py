@@ -30,7 +30,6 @@ from ._structured_output import OutputSchemaMismatch, parse_structured_output
 from .auth import (
     freeze_native_json_object,
     freeze_native_json_value,
-    mcp_header_environment_name,
     redact_native_payload,
 )
 from .codex_app_server import (
@@ -43,8 +42,6 @@ from .errors import (
     CredentialUnavailable,
     ExecutableUnavailable,
     InvalidAgentRequest,
-    McpConfigurationError,
-    McpUnavailable,
     MissingTerminalEvent,
     ProtocolDefect,
     SdkUnavailable,
@@ -95,10 +92,7 @@ from .types import (
     TurnRequest,
     _ResolvedCodexSessionRequest,
     thaw_json_value,
-    validate_mcp_network_policy,
 )
-
-_REQUIRED_MCP_STARTUP_FAILURE = "required MCP servers failed to initialize"
 
 # The configurable execution, integration, and local-context features in the
 # Codex runtime. Keep this as one closed vendor mapping behind
@@ -206,7 +200,6 @@ _INERT_NATIVE_METHODS = frozenset(
         "thread/goal/updated",
         "thread/name/updated",
         "serverRequest/resolved",
-        "mcpServer/startupStatus/updated",
         "remoteControl/status/changed",
         "deprecationNotice",
     }
@@ -258,7 +251,6 @@ _PRETURN_INERT_METHODS = frozenset(
         "thread/name/updated",
         "thread/status/changed",
         "thread/settings/updated",
-        "mcpServer/startupStatus/updated",
         "remoteControl/status/changed",
     }
 )
@@ -444,7 +436,6 @@ class _CodexSessionState:
     request: _ResolvedCodexSessionRequest
     ref: AgentSessionRef
     usage_accounting: _CodexUsageAccounting
-    secret_values: tuple[str, ...] = field(default=(), repr=False)
     turn: Any | None = None
     turn_id: str | None = None
     message_count: int = 0
@@ -454,7 +445,6 @@ class _CodexSessionState:
     completed_item_ids: set[str] = field(default_factory=set)
     started_item_types: dict[str, str] = field(default_factory=dict)
     diagnostics: list[str] = field(default_factory=list)
-    active_mcp_calls: dict[str, tuple[str, str]] = field(default_factory=dict)
     active_tool_calls: dict[str, str] = field(default_factory=dict)
     custom_item_calls: dict[str, str] = field(default_factory=dict)
     server_request_ids: set[tuple[type[object], object]] = field(default_factory=set)
@@ -575,6 +565,8 @@ class CodexAppServerAdapter:
     ) -> AgentSession:
         if not isinstance(request, _ResolvedCodexSessionRequest):
             raise InvalidAgentRequest("CodexAppServerAdapter requires a catalog-resolved request")
+        if request.mcp_servers:
+            raise UnsupportedCapability("Codex frozen MCP tool authority is unavailable")
         if request.dispatch_model not in GPT6_MODEL_IDS or request.native_reasoning not in (
             "low",
             "medium",
@@ -585,20 +577,11 @@ class CodexAppServerAdapter:
             raise InvalidAgentRequest("Codex model or reasoning is outside the current catalog")
         self._require_local_auth(request.auth.kind)
         self._validate_policy_mapping(request.policy)
-        validate_mcp_network_policy(request.mcp_servers, request.policy)
-        self._validate_mcp_filters(request)
         state_root = self._endpoint(environment)
         native = request.native
         if isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled":
             self._validate_strict_native_containment(request)
-        elif request.mcp_servers:
-            raise UnsupportedCapability("Codex MCP requires disabled built-in tools")
-        config = self._codex_config(request, environment)
-        secret_values = tuple(
-            environment[mcp_header_environment_name("codex", reference.source)]
-            for server in request.mcp_servers
-            for reference in server.header_refs
-        )
+        config = self._codex_config(request)
         client = await self._open_client(environment=environment)
         try:
             await self._verify_auth(client)
@@ -629,7 +612,6 @@ class CodexAppServerAdapter:
                     client.thread_start(**kwargs),
                     operation="thread start",
                     failure="session",
-                    secret_values=secret_values,
                 )
             elif isinstance(request.open, ResumeSession):
                 self._validate_open_ref(request, request.open.ref, environment)
@@ -637,7 +619,6 @@ class CodexAppServerAdapter:
                     client.thread_resume(request.open.ref.native_session_id, **kwargs),
                     operation="thread resume",
                     failure="session",
-                    secret_values=secret_values,
                 )
             elif isinstance(request.open, ForkSession):
                 self._validate_open_ref(request, request.open.ref, environment)
@@ -645,7 +626,6 @@ class CodexAppServerAdapter:
                     client.thread_fork(request.open.ref.native_session_id, **kwargs),
                     operation="thread fork",
                     failure="session",
-                    secret_values=secret_values,
                 )
             else:
                 raise InvalidAgentRequest("unknown Codex session operation")
@@ -677,7 +657,6 @@ class CodexAppServerAdapter:
                 thread=thread,
                 request=request,
                 ref=ref,
-                secret_values=secret_values,
                 usage_accounting=_CodexUsageAccounting(
                     baseline_known=isinstance(request.open, NewSession)
                     or restored_usage is not None,
@@ -730,7 +709,6 @@ class CodexAppServerAdapter:
             state.thread.turn(inputs, **kwargs),
             operation="turn start",
             failure="session",
-            secret_values=state.secret_values,
         )
         turn_id = getattr(turn, "id", None)
         if not isinstance(turn_id, str) or not turn_id:
@@ -746,7 +724,6 @@ class CodexAppServerAdapter:
         state.started_item_types.clear()
         state.usage_accounting.begin_turn()
         state.diagnostics.clear()
-        state.active_mcp_calls.clear()
         state.active_tool_calls.clear()
         state.custom_item_calls.clear()
         state.server_request_ids.clear()
@@ -771,7 +748,6 @@ class CodexAppServerAdapter:
                     turn.interrupt(),
                     operation="turn interrupt",
                     failure="session",
-                    secret_values=state.secret_values,
                 )
             except Exception:
                 # The output bound already determines the terminal outcome; close the
@@ -790,19 +766,13 @@ class CodexAppServerAdapter:
             return
         except ProtocolDefect:
             await self._destroy_session(session, state)
-            if state.secret_values:
-                raise ProtocolDefect("Codex protocol defect during scoped MCP turn") from None
             raise
         except (TypeError, ValueError, RecursionError):
             await self._destroy_session(session, state)
             raise ProtocolDefect("Codex app-server emitted an invalid event payload") from None
         except Exception as error:
             quota_error = self._is_quota_error_text(str(error))
-            message = (
-                "Codex app-server turn failed"
-                if state.secret_values
-                else sanitize_provider_text(str(error)) or "Codex app-server turn failed"
-            )
+            message = sanitize_provider_text(str(error)) or "Codex app-server turn failed"
             self._append_diagnostic(state, message)
             usage = state.usage_accounting.finish_turn()
             await self._destroy_session(session, state)
@@ -833,7 +803,6 @@ class CodexAppServerAdapter:
             state.turn.interrupt(),
             operation="turn interrupt",
             failure="session",
-            secret_values=state.secret_values,
         )
 
     def _interrupted_final_text(self, session: AgentSession) -> str:
@@ -989,7 +958,6 @@ class CodexAppServerAdapter:
         *,
         operation: str,
         failure: Literal["credential", "executable", "session"],
-        secret_values: tuple[str, ...] = (),
     ) -> Any:
         try:
             async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
@@ -1000,11 +968,8 @@ class CodexAppServerAdapter:
             if failure == "session":
                 raise SessionUnavailable(f"Codex app-server {operation} timed out") from None
             raise ExecutableUnavailable(f"Codex app-server {operation} timed out") from None
-        except ProtocolDefect:
-            if secret_values:
-                raise ProtocolDefect("Codex protocol defect during scoped MCP request") from None
-            raise
         except (
+            ProtocolDefect,
             CredentialRejected,
             CredentialUnavailable,
             ExecutableUnavailable,
@@ -1013,10 +978,6 @@ class CodexAppServerAdapter:
             raise
         except Exception as error:
             message = sanitize_provider_text(str(error))
-            if _REQUIRED_MCP_STARTUP_FAILURE in message:
-                raise McpUnavailable("a required MCP server did not initialize") from None
-            if secret_values:
-                message = "native request failed"
             if failure == "credential":
                 raise CredentialUnavailable(
                     f"Codex app-server {operation} failed: {message}"
@@ -1064,13 +1025,7 @@ class CodexAppServerAdapter:
         if state.output_bytes + size > _MAX_TURN_OUTPUT_BYTES:
             raise OutputLimitExceeded(_MAX_TURN_OUTPUT_BYTES)
         state.output_bytes += size
-        params = cast(
-            Mapping[str, object],
-            self._redact_secrets(
-                self._mapping(raw_params, f"Codex app-server {method} notification"),
-                state.secret_values,
-            ),
-        )
+        params = self._mapping(raw_params, f"Codex app-server {method} notification")
         self._validate_notification_identity(state, method, params)
         if self._strict_native_containment(state) and method in ("item/started", "item/completed"):
             item = self._mapping(params.get("item"), "Codex item")
@@ -1079,12 +1034,6 @@ class CodexAppServerAdapter:
         if method == "turn/completed":
             # The native completion frame travels first; the owned terminal is last.
             terminal = self._turn_terminal(state, params)
-            if state.secret_values:
-                return (
-                    (AgentText(terminal.final_text), terminal)
-                    if terminal.final_text
-                    else (terminal,)
-                )
             return (
                 AgentNative(native_type=method, payload=redact_native_payload(params)),
                 terminal,
@@ -1092,17 +1041,6 @@ class CodexAppServerAdapter:
         event = self._notification_event(state, method, params)
         if state.authority_seen and self._strict_native_containment(state):
             raise ProtocolDefect("Codex emitted forbidden native authority")
-        if state.secret_values and isinstance(event, AgentNative | AgentText):
-            return ()
-        if state.secret_values and isinstance(event, AgentToolUse):
-            if event.phase == "updated":
-                return ()
-            event = AgentToolUse(
-                tool_call_id=event.tool_call_id,
-                name=event.name,
-                phase=event.phase,
-                succeeded=event.succeeded,
-            )
         return () if event is None else (event,)
 
     def _server_request_event(
@@ -1124,6 +1062,8 @@ class CodexAppServerAdapter:
         if state.output_bytes + size > _MAX_TURN_OUTPUT_BYTES:
             raise OutputLimitExceeded(_MAX_TURN_OUTPUT_BYTES)
         state.output_bytes += size
+        if request.method == "mcpServer/elicitation/request":
+            raise ProtocolDefect("Codex requested unconfigured MCP elicitation")
         identity = (type(request.request_id), request.request_id)
         if identity in state.server_request_ids:
             raise ProtocolDefect("Codex server request identity repeated within a turn")
@@ -1133,12 +1073,6 @@ class CodexAppServerAdapter:
             if params.get("conversationId") != state.ref.native_session_id:
                 raise ProtocolDefect("legacy Codex approval changed thread identity")
             self._non_empty_string(params, "callId", request.method)
-        elif request.method == "mcpServer/elicitation/request":
-            if params.get("threadId") != state.ref.native_session_id:
-                raise ProtocolDefect("MCP elicitation changed thread identity")
-            turn_id = params.get("turnId")
-            if turn_id is not None and turn_id != state.turn_id:
-                raise ProtocolDefect("MCP elicitation changed turn identity")
         else:
             self._validate_notification_identity(state, request.method, params)
         state.authority_seen = True
@@ -1269,20 +1203,7 @@ class CodexAppServerAdapter:
                 succeeded=status == "approved",
             )
         if method == "item/mcpToolCall/progress":
-            item_id = self._string(params, "itemId", method)
-            identity = state.active_mcp_calls.get(item_id)
-            if identity is None:
-                raise ProtocolDefect("MCP tool progress arrived before its start")
-            server, tool = identity
-            self._require_active_tool(state, item_id, f"{server}/{tool}", method)
-            return AgentToolUse(
-                tool_call_id=item_id,
-                name=f"{server}/{tool}",
-                phase="updated",
-                payload=freeze_native_json_object(
-                    {"message": self._string(params, "message", method)}
-                ),
-            )
+            raise ProtocolDefect("Codex emitted an unconfigured MCP tool call")
         if method == "item/commandExecution/terminalInteraction":
             item_id = self._non_empty_string(params, "itemId", method)
             self._require_active_tool(state, item_id, "commandExecution", method)
@@ -1426,24 +1347,7 @@ class CodexAppServerAdapter:
                 ),
             )
         if item_type == "mcpToolCall":
-            server = self._string(item, "server", method)
-            tool = self._string(item, "tool", method)
-            requested = {spec.name: spec for spec in state.request.mcp_servers}
-            spec = requested.get(server)
-            if spec is None:
-                raise ProtocolDefect("MCP tool call used an unconfigured server")
-            if (spec.allowed_tools and tool not in spec.allowed_tools) or tool in spec.denied_tools:
-                raise ProtocolDefect("MCP tool call violated its exact tool policy")
-            if item_id in state.active_mcp_calls:
-                raise ProtocolDefect("MCP tool call started more than once")
-            state.active_mcp_calls[item_id] = (server, tool)
-            self._start_tool(state, item_id, f"{server}/{tool}")
-            return AgentToolUse(
-                tool_call_id=item_id,
-                name=f"{server}/{tool}",
-                phase="started",
-                payload=freeze_native_json_value(item.get("arguments")),
-            )
+            raise ProtocolDefect("Codex emitted an unconfigured MCP tool call")
         if item_type == "fileChange":
             self._start_tool(state, item_id, "fileChange")
             state.authority_seen = True
@@ -1549,28 +1453,7 @@ class CodexAppServerAdapter:
                 succeeded=item.get("status") == "completed",
             )
         if item_type == "mcpToolCall":
-            identity = state.active_mcp_calls.pop(item_id, None)
-            if identity is None:
-                raise ProtocolDefect("MCP tool call completed before its start")
-            if (
-                self._string(item, "server", method),
-                self._string(item, "tool", method),
-            ) != identity:
-                raise ProtocolDefect("MCP tool call changed server or tool identity")
-            status = item.get("status")
-            if status not in ("completed", "failed"):
-                raise ProtocolDefect("completed MCP tool call had an impossible status")
-            server, tool = identity
-            self._complete_tool(state, item_id, f"{server}/{tool}", method)
-            return AgentToolUse(
-                tool_call_id=item_id,
-                name=f"{server}/{tool}",
-                phase="completed",
-                payload=freeze_native_json_value(
-                    item.get("result") if status == "completed" else {"error": "mcp_tool_failed"}
-                ),
-                succeeded=status == "completed",
-            )
+            raise ProtocolDefect("Codex emitted an unconfigured MCP tool call")
         if item_type == "fileChange":
             # A declined or failed patch is a completed tool action that did not apply.
             status = self._patch_status(item.get("status"), method)
@@ -1618,8 +1501,6 @@ class CodexAppServerAdapter:
         state: _CodexSessionState,
         params: Mapping[str, object],
     ) -> AgentTerminal:
-        if state.active_mcp_calls:
-            raise ProtocolDefect("turn completed with active MCP tool calls")
         if state.started_item_types:
             raise ProtocolDefect("turn completed with unfinished Codex item lifecycles")
         if state.active_tool_calls:
@@ -1816,26 +1697,6 @@ class CodexAppServerAdapter:
         native = state.request.native
         return isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled"
 
-    @staticmethod
-    def _redact_secret_text(value: str, secret_values: tuple[str, ...]) -> str:
-        for secret in secret_values:
-            value = value.replace(secret, "[redacted]")
-            if secret.startswith("Bearer "):
-                value = value.replace(secret[len("Bearer ") :], "[redacted]")
-        return value
-
-    @classmethod
-    def _redact_secrets(cls, value: object, secret_values: tuple[str, ...]) -> object:
-        if not secret_values:
-            return value
-        if isinstance(value, str):
-            return cls._redact_secret_text(value, secret_values)
-        if isinstance(value, Mapping):
-            return {key: cls._redact_secrets(item, secret_values) for key, item in value.items()}
-        if isinstance(value, list):
-            return [cls._redact_secrets(item, secret_values) for item in value]
-        return value
-
     @classmethod
     def _validate_last_usage(cls, last: TokenUsage, total: TokenUsage) -> None:
         if (
@@ -2001,25 +1862,9 @@ class CodexAppServerAdapter:
             )
 
     @staticmethod
-    def _validate_mcp_filters(request: AgentSessionRequest) -> None:
-        for server in request.mcp_servers:
-            if any(
-                any(marker in tool for marker in "*?[")
-                for tool in (*server.allowed_tools, *server.denied_tools)
-            ):
-                raise UnsupportedCapability("Codex app-server MCP filters require exact tool names")
-
-    @staticmethod
     def _validate_strict_native_containment(request: AgentSessionRequest) -> None:
         policy = request.policy
-        frozen_mcp = bool(request.mcp_servers)
-        if frozen_mcp and (
-            policy.filesystem != "workspace_write" or policy.network != "unrestricted"
-        ):
-            raise UnsupportedCapability(
-                "Codex frozen MCP requires workspace-write sandbox and unrestricted MCP transport"
-            )
-        if not frozen_mcp and (policy.filesystem != "read_only" or policy.network != "disabled"):
+        if policy.filesystem != "read_only" or policy.network != "disabled":
             raise UnsupportedCapability(
                 "Codex disabled built-ins require read-only filesystem and disabled network"
             )
@@ -2035,21 +1880,6 @@ class CodexAppServerAdapter:
             raise UnsupportedCapability(
                 "Codex disabled built-ins do not permit additional filesystem roots"
             )
-        for server in request.mcp_servers:
-            if (
-                server.transport != "streamable_http"
-                or not server.required
-                or not server.allowed_tools
-                or server.denied_tools
-                or server.environment_refs
-                or len(server.header_refs) != 1
-                or server.header_refs[0].name.lower() != "authorization"
-                or server.header_refs[0].source.kind != "secret_reference"
-                or server.header_refs[0].source.profile_key != request.auth.profile_key
-            ):
-                raise UnsupportedCapability(
-                    "Codex frozen MCP requires one scoped Authorization header and exact required HTTPS tools"
-                )
 
     @staticmethod
     def _text_only(parts: tuple[object, ...], context: str) -> str:
@@ -2068,9 +1898,7 @@ class CodexAppServerAdapter:
             return {"type": "localImage", "path": part.path}
         raise UnsupportedCapability("Codex app-server input supports text and local images")
 
-    def _codex_config(
-        self, request: AgentSessionRequest, environment: Mapping[str, str]
-    ) -> dict[str, object]:
+    def _codex_config(self, request: AgentSessionRequest) -> dict[str, object]:
         config: dict[str, object] = {
             "mcp_servers": {},
             "web_search": "disabled",
@@ -2096,16 +1924,6 @@ class CodexAppServerAdapter:
                     "tools": {"experimental_request_user_input": {"enabled": False}},
                 }
             )
-            if request.mcp_servers:
-                features = cast(dict[str, object], config["features"])
-                features["code_mode"] = {
-                    "enabled": True,
-                    "excluded_tool_namespaces": ["functions", "clock", "web", "image_gen"],
-                }
-                features["code_mode_host"] = {
-                    "enabled": True,
-                    "disable_in_process_fallback": True,
-                }
         if request.policy.filesystem == "workspace_write":
             workspace: dict[str, object] = {
                 "writable_roots": [request.cwd, *request.additional_dirs],
@@ -2117,48 +1935,6 @@ class CodexAppServerAdapter:
                     exclude_tmpdir_env_var=self._sandbox_controls.exclude_tmpdir_env_var,
                 )
             config["sandbox_workspace_write"] = workspace
-        if request.mcp_servers:
-            servers: dict[str, object] = {}
-            for server in request.mcp_servers:
-                if server.transport == "stdio":
-                    entry: dict[str, object] = {
-                        "command": server.command,
-                        "args": list(server.args),
-                    }
-                else:
-                    entry = {"url": server.url}
-                    headers: dict[str, str] = {}
-                    for reference in server.header_refs:
-                        value = environment.get(
-                            mcp_header_environment_name("codex", reference.source)
-                        )
-                        if value is None:
-                            raise CredentialUnavailable("Codex MCP header source is unavailable")
-                        if (
-                            not value.startswith("Bearer ")
-                            or len(value) > 8192
-                            or value != value.strip()
-                            or any(ord(char) < 32 or ord(char) > 126 for char in value)
-                            or any(char.isspace() for char in value[len("Bearer ") :])
-                        ):
-                            raise McpConfigurationError("Codex MCP header value is invalid")
-                        headers[reference.name] = value
-                    if headers:
-                        entry["http_headers"] = headers
-                entry["required"] = server.required
-                if server.allowed_tools:
-                    entry["enabled_tools"] = list(server.allowed_tools)
-                    if (
-                        isinstance(native, CodexNativeOptions)
-                        and native.builtin_tools == "disabled"
-                    ):
-                        entry["tools"] = {
-                            name: {"approval_mode": "approve"} for name in server.allowed_tools
-                        }
-                if server.denied_tools:
-                    entry["disabled_tools"] = list(server.denied_tools)
-                servers[server.name] = entry
-            config["mcp_servers"] = servers
         return config
 
     @staticmethod
@@ -2217,8 +1993,6 @@ class CodexAppServerAdapter:
         drops instead, because there the callers are teardown paths with an outcome of their
         own that must not be replaced by a bound.
         """
-        if state.secret_values:
-            message = "Codex turn diagnostic"
         if message in state.diagnostics:
             return
         if len(state.diagnostics) >= _MAX_DIAGNOSTICS:
