@@ -755,8 +755,8 @@ type FailureCode = Literal[
 
 
 # ---------------------------------------------------------------------------
-# Response payload — output arm determined by the intent's OutputSpec, never
-# re-inferred.
+# Response payload — tool-call turns are intermediate TextContent. A final
+# answer follows the intent's OutputSpec, never an arm inferred from the wire.
 
 
 @dataclass(frozen=True, slots=True)
@@ -771,7 +771,6 @@ class StructuredContent:
     text: str
 
 
-# tools+strict-output rejected at intent validation ⇒ no impossible state.
 type ResponseContent = TextContent | StructuredContent
 
 
