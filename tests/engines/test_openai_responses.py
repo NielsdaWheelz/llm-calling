@@ -14,6 +14,7 @@ import httpx
 import pytest
 import respx
 
+from provider_runtime.continuation import preflight_generation, resume_generation, seal_generation
 from provider_runtime.engines import TransientAttempt
 from provider_runtime.engines.openai_responses import OpenAIResponsesEngine
 from provider_runtime.errors import (
@@ -22,7 +23,7 @@ from provider_runtime.errors import (
     ProtocolDefect,
     RuntimeDefect,
 )
-from provider_runtime.registry import REGISTRY_REVISION
+from provider_runtime.registry import REGISTRY_REVISION, _resolve_target
 from provider_runtime.registry import _ModelRow as ModelRow
 from provider_runtime.types import (
     Absent,
@@ -31,6 +32,7 @@ from provider_runtime.types import (
     CodecStreamEvent,
     ContinuationArtifact,
     ContinuationDelta,
+    ContinueGeneration,
     Failed,
     FinalAttempt,
     GenerateIntent,
@@ -539,6 +541,70 @@ async def test_generate_encodes_strict_json_output_as_native_text_format() -> No
     assert outcome.response.content == StructuredContent(
         payload={"verdict": "yes"}, text='{"verdict": "yes"}'
     ), f"content: {outcome.response.content!r}"
+
+
+@respx.mock
+async def test_generate_strict_json_tool_turn_then_structured_final() -> None:
+    target = ProviderTarget("openai", "gpt-6-sol")
+    row = _resolve_target(target)
+    route = respx.post(RESPONSES_URL).mock(
+        return_value=mock_response(
+            envelope(
+                output=[REASONING_ITEM, FUNCTION_CALL_ITEM], usage=usage_body(), model=target.model
+            )
+        )
+    )
+    intent = make_intent(
+        target=target, reasoning="standard/low", tools=(SEARCH_TOOL,), output=VERDICT_OUTPUT
+    )
+    first = await OpenAIResponsesEngine().generate(row, intent, CREDENTIAL)
+    assert isinstance(first, Succeeded), f"tool turn: {first!r}"
+    assert first.response.content == TextContent(
+        "", (ToolCall("call_1", "search_library", {"query": "cats"}),)
+    )
+    assert isinstance(first.response.continuation, Present)
+    state = preflight_generation(row, intent)
+    sealed = seal_generation(row, intent, state, first.response)
+    assert isinstance(sealed.continuation, Present)
+    resumed, _ = resume_generation(
+        row,
+        ContinueGeneration(
+            sealed.continuation.value,
+            (ToolResultMessage("call_1", "found cats", False),),
+        ),
+    )
+    assert resumed.output == VERDICT_OUTPUT
+
+    final_item = {
+        "id": "msg_2",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": '{"verdict":"yes"}', "annotations": []}],
+    }
+    route.mock(
+        return_value=mock_response(
+            envelope(output=[final_item], usage=usage_body(), model=target.model)
+        )
+    )
+    second = await OpenAIResponsesEngine().generate(row, resumed, CREDENTIAL)
+    assert isinstance(second, Succeeded), f"final turn: {second!r}"
+    assert second.response.content == StructuredContent(
+        payload={"verdict": "yes"}, text='{"verdict":"yes"}'
+    )
+    body = request_body(route)
+    text_format = body["text"]
+    assert isinstance(text_format, dict)
+    json_format = text_format["format"]
+    assert isinstance(json_format, dict)
+    assert json_format["schema"] == thaw_json_value(VERDICT_OUTPUT.schema)
+    wire_input = body["input"]
+    assert isinstance(wire_input, list)
+    assert wire_input[2:] == [
+        REASONING_ITEM,
+        FUNCTION_CALL_ITEM,
+        {"type": "function_call_output", "call_id": "call_1", "output": "found cats"},
+    ]
 
 
 @respx.mock

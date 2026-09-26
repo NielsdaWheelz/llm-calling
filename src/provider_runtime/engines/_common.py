@@ -140,12 +140,15 @@ def validate_continuation(
 def response_content(
     intent: GenerateIntent, *, text: str, tool_calls: tuple[ToolCall, ...]
 ) -> ResponseContent | InvalidStructuredOutput:
-    """The output arm is the intent's OutputSpec, never re-inferred from the wire.
+    """The final output arm is the intent's OutputSpec, never inferred from the wire.
 
-    Strict JSON parse only; NO repair. A provider that answers a strict-JSON
-    intent with unparseable output is an expected model failure — the value the
-    caller folds into Failed — not a wire-protocol defect.
+    Tool-bearing turns are intermediate; only a final answer must satisfy the
+    requested output. Strict JSON parse only; NO repair. A provider that
+    answers a strict-JSON intent with unparseable final output is an expected
+    model failure — the value the caller folds into Failed, not a wire defect.
     """
+    if tool_calls:
+        return TextContent(text=text, tool_calls=tool_calls)
     match intent.output:
         case TextOutput():
             return TextContent(text=text, tool_calls=tool_calls)
