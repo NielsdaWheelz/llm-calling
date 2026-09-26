@@ -81,15 +81,7 @@ before constructing a `ToolCall`; an SDK that exposes only parsed JSON cannot
 attest raw transport bytes. The adapter separately enforces valid bounded JSON
 and the selected grant's canonical `ParsedJson` input-byte ceiling.
 
-The Codex MCP projection accepts the same frozen plan through
-`provider_runtime.agent_runtime.tool_projection.lower_mcp_tools(`
-`McpToolPublication(...))`. The returned server configuration publishes the
-same request-local aliases and its `observe` method narrows native MCP events back
-to canonical tool ids. The pinned App Server cannot enforce the required native
-tool ceiling, so Codex rejects sessions carrying that configuration. The
-optional projection module is not re-exported from
-the dependency-light `agent_runtime` package. Neither adapter chooses tools
-from a product operation name.
+The adapter does not choose tools from a product operation name.
 
 ## Architecture
 

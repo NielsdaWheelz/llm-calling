@@ -338,12 +338,6 @@ Stdio MCP under full access is not a credential
 boundary: a same-uid command can inspect peer processes. Use a dedicated OS user
 or container for credentialed stdio servers.
 
-Applications with a canonical `llm-tools` plan use
-`lower_mcp_tools(McpToolPublication(...))`. It projects a frozen plan into one
-authenticated HTTPS MCP server plus an immutable reverse index, but the pinned
-Codex route cannot admit that projection. The provider function-tool adapter
-remains available for API calls.
-
 Applications may configure `AgentRuntimeConfig.codex_sandbox` with
 `CodexSandboxControls(exclude_slash_tmp, exclude_tmpdir_env_var)`. Both native
 workspace-write exclusions apply on new, resumed, and forked Codex sessions.
