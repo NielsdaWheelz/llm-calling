@@ -133,7 +133,7 @@ Codex MCP sessions are ineligible. Pinned App Server 0.157.1 can expose native
 resource helpers whenever an MCP server exists. Its public startup API cannot
 apply an independent tool allowlist, and model metadata can override the
 `code_mode_only` feature. The catalog reports
-`supports_frozen_mcp_tools=False`; the runtime refuses tool-bearing Codex
+no frozen-MCP capability; the runtime refuses tool-bearing Codex
 sessions before resolving scoped secrets or starting a native thread.
 
 `read_only` + network is refused rather than approximated. The Codex config

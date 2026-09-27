@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import weakref
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
@@ -81,6 +82,7 @@ from .types import (
     ApprovalHandler,
     ApprovalRequest,
     CodexNativeOptions,
+    CodexRemoteExecution,
     CodexSandboxControls,
     CredentialRef,
     ForkSession,
@@ -436,6 +438,7 @@ class _CodexSessionState:
     request: _ResolvedCodexSessionRequest
     ref: AgentSessionRef
     usage_accounting: _CodexUsageAccounting
+    remote_environment: tuple[dict[str, object], ...] = ()
     turn: Any | None = None
     turn_id: str | None = None
     message_count: int = 0
@@ -479,7 +482,11 @@ class CodexAppServerAdapter:
         try:
             await self._verify_auth(client)
             return await self._call(
-                read_codex_model_catalog(client), operation="model catalog", failure="executable"
+                read_codex_model_catalog(
+                    client, remote_shell_qualified=self._qualified_remote_version(client)
+                ),
+                operation="model catalog",
+                failure="executable",
             )
         finally:
             await self._close_client(client)
@@ -581,16 +588,30 @@ class CodexAppServerAdapter:
         native = request.native
         if isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled":
             self._validate_strict_native_containment(request)
+        remote = native.remote_execution if isinstance(native, CodexNativeOptions) else None
+        if remote is not None and (
+            request.policy.filesystem != "full_access"
+            or request.policy.network != "unrestricted"
+            or request.policy.approval != "deny"
+        ):
+            raise UnsupportedCapability(
+                "Codex remote shell requires full filesystem, unrestricted network and denied approvals"
+            )
         config = self._codex_config(request)
         client = await self._open_client(environment=environment)
         try:
             await self._verify_auth(client)
+            remote_environment: tuple[dict[str, object], ...] = ()
+            if remote is not None:
+                remote_environment = await self._register_remote_execution(client, remote)
             kwargs: dict[str, object] = {
                 "approval_mode": self._approval_mode(request.policy),
                 "config": config,
                 "cwd": request.cwd,
                 "sandbox": self._sandbox(request.policy),
             }
+            if remote_environment:
+                kwargs["environments"] = list(remote_environment)
             kwargs["model"] = request.dispatch_model
             if request.system:
                 # `baseInstructions` is the public App Server system-role field on thread
@@ -662,6 +683,7 @@ class CodexAppServerAdapter:
                     or restored_usage is not None,
                     cumulative=restored_usage,
                 ),
+                remote_environment=remote_environment,
             )
             return session
         except BaseException:
@@ -690,6 +712,8 @@ class CodexAppServerAdapter:
         kwargs: dict[str, object] = {
             "approval_mode": self._approval_mode(policy),
         }
+        if state.remote_environment:
+            kwargs["environments"] = list(state.remote_environment)
         if self._strict_native_containment(state):
             kwargs["environments"] = []
             try:
@@ -1905,6 +1929,29 @@ class CodexAppServerAdapter:
             "shell_environment_policy": {"inherit": "core", "exclude": []},
         }
         native = request.native
+        if isinstance(native, CodexNativeOptions) and native.remote_execution is not None:
+            config.update(
+                {
+                    "agents": {"enabled": False},
+                    "apps": {"_default": {"enabled": False}},
+                    "features": {
+                        name: False
+                        for name in (
+                            "apps",
+                            "hooks",
+                            "memories",
+                            "multi_agent",
+                            "multi_agent_v2",
+                            "plugins",
+                            "skill_mcp_dependency_install",
+                        )
+                    },
+                    "include_apps_instructions": False,
+                    "shell_environment_policy": {"inherit": "all", "ignore_default_excludes": True},
+                    "skills": {"bundled": {"enabled": False}, "include_instructions": True},
+                    "tools": {"experimental_request_user_input": {"enabled": False}},
+                }
+            )
         if isinstance(native, CodexNativeOptions) and native.web_search is not None:
             config["web_search"] = "live" if native.web_search else "disabled"
         if isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled":
@@ -1936,6 +1983,49 @@ class CodexAppServerAdapter:
                 )
             config["sandbox_workspace_write"] = workspace
         return config
+
+    async def _register_remote_execution(
+        self, client: CodexAppServerClient, remote: CodexRemoteExecution
+    ) -> tuple[dict[str, object], ...]:
+        if not self._qualified_remote_version(client):
+            raise UnsupportedCapability("Codex remote shell requires app-server 0.157.1")
+        environment_id = f"provider-runtime-{uuid4()}"
+        await self._call(
+            client.request(
+                "environment/add",
+                {
+                    "environmentId": environment_id,
+                    "execServerUrl": remote.exec_server_url,
+                    "connectTimeoutMs": 10_000,
+                },
+            ),
+            operation="remote execution registration",
+            failure="session",
+        )
+        info = await self._call(
+            client.request("environment/info", {"environmentId": environment_id}),
+            operation="remote execution readiness",
+            failure="session",
+        )
+        if not isinstance(info, Mapping) or not isinstance(info.get("shell"), Mapping):
+            raise ProtocolDefect("Codex remote execution readiness response was malformed")
+        if not isinstance(info.get("cwd"), str) or not info["cwd"]:
+            raise ProtocolDefect("Codex remote execution reported no working directory")
+        return (
+            {
+                "environmentId": environment_id,
+                "cwd": remote.cwd,
+                "runtimeWorkspaceRoots": [remote.cwd],
+            },
+        )
+
+    @staticmethod
+    def _qualified_remote_version(client: CodexAppServerClient) -> bool:
+        user_agent = client.metadata.get("userAgent")
+        return (
+            isinstance(user_agent, str)
+            and re.match(r"^[^/]+/0\.157\.1(?:\s|$)", user_agent) is not None
+        )
 
     @staticmethod
     def _count_streamed_text(state: _CodexSessionState, text: str) -> None:

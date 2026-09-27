@@ -141,7 +141,6 @@ def codex_catalog() -> AgentModelCatalog:
         definition_revision="agent-definition-test",
         native_revision=Absent(),
         observed_at=datetime(2026, 8, 31, tzinfo=UTC),
-        supports_frozen_mcp_tools=False,
         models=(
             AgentModelFacts(
                 key="codex-test",
@@ -153,6 +152,7 @@ def codex_catalog() -> AgentModelCatalog:
                 reasoning=(
                     AgentReasoningFacts(key="high", label="High", native_wire_value="high"),
                 ),
+                execution=(),
                 source_default_reasoning=Present("high"),
                 upgrade=Absent(),
                 retirement=Absent(),

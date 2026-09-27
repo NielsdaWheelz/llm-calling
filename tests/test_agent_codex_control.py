@@ -497,7 +497,7 @@ async def test_shared_catalog_preserves_exact_generation_and_resolves_native_dis
         AgentRuntimeConfig(state_root_base=tmp_path, codex_endpoints={"personal": peer.socket})
     ) as runtime:
         catalog = await runtime.model_catalog("codex", auth, transport="app_server")
-        assert catalog.supports_frozen_mcp_tools is False
+        assert {mode.mode for mode in catalog.models[0].execution} == {"contained"}
         row = next(row for row in catalog.models if row.key == "gpt-6-sol")
         assert row.key == "gpt-6-sol"
         assert row.dispatch_model == "gpt-6-sol"

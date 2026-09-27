@@ -19,12 +19,33 @@ from provider_runtime.types import (
 
 from .errors import ProtocolDefect
 
-AGENT_BACKEND_CONTRACT_REVISION = "provider-runtime.agent-model-catalog.v4"
+AGENT_BACKEND_CONTRACT_REVISION = "provider-runtime.agent-model-catalog.v5"
 _MAX_PAGES = 64
 
 type AgentModelKey = str
 type AgentReasoningKey = str
 type NativeCatalogRevision = str
+
+
+@dataclass(frozen=True, slots=True)
+class AgentExecutionFacts:
+    mode: Literal["contained", "remote_shell"]
+    final_outputs: tuple[Literal["text", "json_schema"], ...]
+    description: str
+
+
+CODEX_EXECUTION_FACTS = (
+    AgentExecutionFacts(
+        mode="contained",
+        final_outputs=("text", "json_schema"),
+        description="Native execution tools disabled; final text or strict JSON.",
+    ),
+    AgentExecutionFacts(
+        mode="remote_shell",
+        final_outputs=("text", "json_schema"),
+        description="Native shell uses a supplied remote execution environment; final text or strict JSON.",
+    ),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +95,7 @@ class AgentModelFacts:
     source_max_output_tokens: Presence[int]
     input_modalities: tuple[Literal["text", "image"], ...]
     reasoning: tuple[AgentReasoningFacts, ...]
+    execution: tuple[AgentExecutionFacts, ...]
     source_default_reasoning: Presence[AgentReasoningKey]
     upgrade: Presence[AgentUpgradeFacts]
     retirement: Absent
@@ -88,7 +110,6 @@ class AgentModelCatalog:
     observed_at: datetime
     models: tuple[AgentModelFacts, ...]
     diagnostics: tuple[AgentCatalogDiagnostic, ...]
-    supports_frozen_mcp_tools: bool
 
 
 class GenericAsyncRpc(Protocol):
@@ -116,6 +137,7 @@ async def read_codex_model_catalog(
     client: GenericAsyncRpc,
     *,
     now: Callable[[], datetime] | None = None,
+    remote_shell_qualified: bool = False,
 ) -> AgentModelCatalog:
     """Read every visible page and normalize it without convenience APIs."""
     cursor: str | None = None
@@ -162,16 +184,15 @@ async def read_codex_model_catalog(
         raise ProtocolDefect("Codex model/list changed native revision during pagination")
     observed = tuple(_normalize_row(row) for row in rows if row.get("id") in GPT6_MODEL_IDS)
     _validate_observed_rows(observed)
-    facts, diagnostics = _resolve_upgrades(observed)
+    execution = CODEX_EXECUTION_FACTS if remote_shell_qualified else CODEX_EXECUTION_FACTS[:1]
+    facts, diagnostics = _resolve_upgrades(observed, execution=execution)
     observed_at = (now or (lambda: datetime.now(UTC)))()
     if observed_at.tzinfo is None or observed_at.utcoffset() is None:
         raise ProtocolDefect("AgentModelCatalog.observed_at must be timezone-aware")
-    supports_frozen_mcp_tools = False
     definition_revision = _hash(
         AGENT_BACKEND_CONTRACT_REVISION.encode(),
         {
             "row_fingerprints": tuple(row.row_fingerprint for row in facts),
-            "supports_frozen_mcp_tools": supports_frozen_mcp_tools,
         },
     )
     return AgentModelCatalog(
@@ -181,7 +202,6 @@ async def read_codex_model_catalog(
         observed_at=observed_at,
         models=facts,
         diagnostics=diagnostics,
-        supports_frozen_mcp_tools=supports_frozen_mcp_tools,
     )
 
 
@@ -270,6 +290,8 @@ def _validate_observed_rows(rows: tuple[_ObservedModel, ...]) -> None:
 
 def _resolve_upgrades(
     rows: tuple[_ObservedModel, ...],
+    *,
+    execution: tuple[AgentExecutionFacts, ...],
 ) -> tuple[tuple[AgentModelFacts, ...], tuple[AgentCatalogDiagnostic, ...]]:
     facts: list[AgentModelFacts] = []
     diagnostics: list[AgentCatalogDiagnostic] = []
@@ -299,7 +321,7 @@ def _resolve_upgrades(
                 diagnostics.append(
                     UpgradeTargetAmbiguous(model_key=row.key, native_target=source_target)
                 )
-        fingerprint = _row_fingerprint(row, upgrade)
+        fingerprint = _row_fingerprint(row, upgrade, execution=execution)
         facts.append(
             AgentModelFacts(
                 key=row.key,
@@ -309,6 +331,7 @@ def _resolve_upgrades(
                 source_max_output_tokens=row.source_max_output_tokens,
                 input_modalities=row.input_modalities,
                 reasoning=row.reasoning,
+                execution=execution,
                 source_default_reasoning=row.source_default_reasoning,
                 upgrade=upgrade,
                 retirement=Absent(),
@@ -321,6 +344,8 @@ def _resolve_upgrades(
 def _row_fingerprint(
     row: _ObservedModel,
     upgrade: Presence[AgentUpgradeFacts],
+    *,
+    execution: tuple[AgentExecutionFacts, ...],
 ) -> str:
     return _hash(
         b"provider-runtime.agent-model-row.v1",
@@ -337,6 +362,14 @@ def _row_fingerprint(
                     "native_wire_value": item.native_wire_value,
                 }
                 for item in row.reasoning
+            ),
+            "execution": tuple(
+                {
+                    "mode": item.mode,
+                    "final_outputs": item.final_outputs,
+                    "description": item.description,
+                }
+                for item in execution
             ),
             "source_default_reasoning": _presence_json(row.source_default_reasoning),
             "native_upgrade_targets": row.native_upgrade_targets,

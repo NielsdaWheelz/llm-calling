@@ -1,12 +1,12 @@
 # Local agent runtime
 
-`provider_runtime.agent_runtime` is the public runtime for subscription-backed,
-local Codex and Claude Code sessions. It is deliberately separate from the HTTP
+`provider_runtime.agent_runtime` is the public runtime for subscription-backed
+Codex and Claude Code sessions. It is deliberately separate from the HTTP
 provider runtime:
 
 ```text
 ProviderRuntime: one API generation intent -> one provider HTTP outcome
-AgentRuntime:    one local agent session -> streamed turns and durable session refs
+AgentRuntime:    one native agent session -> streamed turns and durable session refs
 ```
 
 The agent runtime does not pretend a stateful coding agent is a stateless model
@@ -43,9 +43,9 @@ uv sync --extra claude-sdk
 ```
 
 The base package directly constrains `websockets>=16,<17`; the lockfile pins its
-exact resolution. The host independently installs and supervises the latest
-stable Codex App Server/TUI. Native `userAgent` is string metadata, not a
-version-based admission rule. The Claude extra carries
+exact resolution. The host installs and supervises Codex App Server/TUI. Remote
+shell requires App Server 0.157.1 as reported by native `userAgent`; its
+exec-server identity is attested by the host. The Claude extra carries
 `claude-agent-sdk>=0.2.130,<1` with its exact lock resolution. A missing transport
 dependency raises `SdkUnavailable`; a missing or unreachable configured Codex
 endpoint is a typed credential/profile
@@ -54,8 +54,8 @@ availability failure, never a private-runtime fallback.
 Initialize response shape, correlation, account routing, and authority
 classification remain strict. New native behavior is not implicitly certified:
 protocol drift fails closed and live qualification is separate from routine
-fixture coverage. No version parser, compatibility fallback, or private server
-is selected when the shared endpoint is incompatible.
+fixture coverage. No compatibility fallback or private server is selected when
+the shared endpoint is incompatible.
 
 Codex replays cumulative usage around `thread/resume`. The owned
 transport keeps every notification in wire order, validates an explicit
@@ -131,9 +131,11 @@ async with AgentRuntime(config) as runtime:
 the authenticated public App Server RPC `model/list` through every page. It
 requires all three GPT-6 models and all five low/medium/high/xhigh/max effort
 rows for each, omits unrelated identities and ultra, and fails closed if the
-required set is incomplete. `AgentModelCatalog.supports_frozen_mcp_tools` is
-`False` for the pinned App Server route: its public startup contract cannot
-exclude native MCP resource helpers from every model-visible tool plan.
+required set is incomplete. each model row publishes `execution` facts for
+`contained` and `remote_shell`, with final `text` and `json_schema` output
+support. `remote_shell` requires a supplied private exec-server endpoint and
+the pinned app-server 0.157.1 protocol. these facts say what the provider route
+can do; callers own sandbox isolation and domain authority.
 `AgentModelCatalog` carries a content-derived definition revision;
 each `AgentModelFacts` carries exact model/dispatch identity, ordered reasoning
 facts, modalities, lifecycle/upgrade facts, and a content-derived row
@@ -319,6 +321,25 @@ secret references or starting a thread. The contained form requires empty copied
 environment and no additional roots. Provider review is refused.
 Claude continues to accept exact tool names, reject glob patterns and its two
 network-reaching built-ins, and verify the reported effective set.
+
+For native remote shell, pass
+`CodexNativeOptions(remote_execution=CodexRemoteExecution(exec_server_url=...,
+cwd=...))`. The endpoint must be `ws://127.0.0.1:<port>` and the session cwd
+must match the remote cwd. The adapter registers the environment, checks native
+readiness, and selects it on both thread and turn. The caller owns the
+exec-server process and its isolation. Policy must explicitly acknowledge
+`full_access` filesystem and `unrestricted` network with `deny` approvals;
+native policy does not confine the remote shell. A lost remote environment
+fails the turn; the adapter does not select local execution.
+
+The temporary local qualification on 2026-09-26 used one installed
+`codex-cli 0.157.1` binary for App Server and exec-server. Native
+`environment/add` and `environment/info` succeeded. A model-originated remote
+shell returned text; the library adapter then completed strict JSON shell turns
+for `gpt-6-luna/low` and `gpt-6-sol/high`, each with a completed native command
+event and a validated structured terminal. This establishes the protocol
+combination on macOS. Linux namespace isolation, private API calls, and product
+release qualification belong to the consuming host.
 
 ## MCP
 

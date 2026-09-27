@@ -320,10 +320,7 @@ class CodexAppServerClient:
             await self.request("thread/start", self._thread_params(kwargs)),
             "thread/start response",
         )
-        if kwargs.get("environments") == []:
-            thread = self._mapping(response.get("thread"), "thread/start thread")
-            if thread.get("environments") != []:
-                raise ProtocolDefect("Codex thread did not preserve empty environments")
+        self._verify_thread_environments(response, kwargs, "thread/start")
         return self._select_thread(self._response_thread_id(response, "thread/start"))
 
     async def thread_resume(self, thread_id: str, **kwargs: object) -> CodexThread:
@@ -334,6 +331,7 @@ class CodexAppServerClient:
             ),
             "thread/resume response",
         )
+        self._verify_thread_environments(response, kwargs, "thread/resume")
         return self._select_thread(self._response_thread_id(response, "thread/resume"))
 
     async def thread_fork(self, thread_id: str, **kwargs: object) -> CodexThread:
@@ -343,7 +341,18 @@ class CodexAppServerClient:
             ),
             "thread/fork response",
         )
+        self._verify_thread_environments(response, kwargs, "thread/fork")
         return self._select_thread(self._response_thread_id(response, "thread/fork"))
+
+    @classmethod
+    def _verify_thread_environments(
+        cls, response: Mapping[str, object], kwargs: Mapping[str, object], operation: str
+    ) -> None:
+        if "environments" not in kwargs:
+            return
+        thread = cls._mapping(response.get("thread"), f"{operation} thread")
+        if thread.get("environments") != kwargs["environments"]:
+            raise ProtocolDefect("Codex thread did not preserve execution environment")
 
     def _select_thread(self, thread_id: str) -> CodexThread:
         self._thread_id = thread_id

@@ -392,9 +392,40 @@ def validate_mcp_network_policy(
 
 
 @dataclass(frozen=True, slots=True)
+class CodexRemoteExecution:
+    """An already running private exec-server and its disposable working directory."""
+
+    exec_server_url: str
+    cwd: str
+
+    def __post_init__(self) -> None:
+        if type(self.exec_server_url) is not str:
+            raise InvalidAgentRequest("Codex remote exec endpoint must be a URL string")
+        parsed = urlsplit(self.exec_server_url)
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        if (
+            parsed.scheme != "ws"
+            or parsed.hostname != "127.0.0.1"
+            or port is None
+            or port == 0
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in ("", "/")
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise InvalidAgentRequest("Codex remote exec endpoint must be a loopback WebSocket URL")
+        _require_absolute_path(self.cwd, "CodexRemoteExecution.cwd")
+
+
+@dataclass(frozen=True, slots=True)
 class CodexNativeOptions:
     web_search: bool | None = None
     builtin_tools: Literal["disabled"] | None = None
+    remote_execution: CodexRemoteExecution | None = None
 
     def __post_init__(self) -> None:
         if self.web_search is not None and type(self.web_search) is not bool:
@@ -407,6 +438,14 @@ class CodexNativeOptions:
             raise InvalidAgentRequest(
                 "CodexNativeOptions.builtin_tools='disabled' forbids web search"
             )
+        if self.remote_execution is not None and not isinstance(
+            self.remote_execution, CodexRemoteExecution
+        ):
+            raise InvalidAgentRequest("CodexNativeOptions.remote_execution is invalid")
+        if self.remote_execution is not None and self.builtin_tools == "disabled":
+            raise InvalidAgentRequest("Codex remote execution requires native shell tools")
+        if self.remote_execution is not None and self.web_search is True:
+            raise InvalidAgentRequest("Codex remote execution does not enable native web search")
 
 
 @dataclass(frozen=True, slots=True)
@@ -508,6 +547,11 @@ class CodexCatalogSessionRequest(_SessionRequestBase):
             raise InvalidAgentRequest(
                 "CodexNativeOptions.web_search requires unrestricted network policy"
             )
+        if isinstance(self.native, CodexNativeOptions) and self.native.remote_execution is not None:
+            if self.cwd != self.native.remote_execution.cwd:
+                raise InvalidAgentRequest("Codex session cwd must match the remote execution cwd")
+            if self.additional_dirs:
+                raise InvalidAgentRequest("Codex remote execution forbids additional directories")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

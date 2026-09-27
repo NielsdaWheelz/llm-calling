@@ -86,14 +86,14 @@ async def test_codex_catalog_reads_every_page_and_normalizes_only_public_facts()
         ]
     )
     catalog = await read_codex_model_catalog(
-        client, now=lambda: datetime(2026, 9, 25, 12, tzinfo=UTC)
+        client, now=lambda: datetime(2026, 9, 25, 12, tzinfo=UTC), remote_shell_qualified=True
     )
     assert client.calls == [
         ("model/list", {"includeHidden": False, "cursor": None}),
         ("model/list", {"includeHidden": False, "cursor": "page-2"}),
     ]
     assert catalog.backend_contract_revision == AGENT_BACKEND_CONTRACT_REVISION
-    assert catalog.supports_frozen_mcp_tools is False
+    assert {mode.mode for mode in catalog.models[0].execution} == {"contained", "remote_shell"}
     assert catalog.native_revision == Present("native-revision")
     assert tuple(row.key for row in catalog.models) == GPT6_MODEL_IDS
     astra = catalog.models[0]
