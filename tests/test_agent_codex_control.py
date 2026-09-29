@@ -101,7 +101,6 @@ class ProtocolPeer:
         self.older_items: list[dict[str, object]] = []
         self.interrupt_settles = True
         self.status = "idle"
-        self.selected_view: dict[str, object] | None = None
         self.intervene = False
         self.name = "synthetic worker"
         self.raw_reply: str | None = None
@@ -163,8 +162,6 @@ class ProtocolPeer:
                     result = {"thread": self.thread()}
                 elif method == "thread/read":
                     result = {"thread": self.thread()}
-                elif method == "tui/view/read":
-                    result = {"view": self.selected_view}
                 elif method == "thread/turns/list":
                     view = message["params"].get("itemsView", "summary")
                     result = {

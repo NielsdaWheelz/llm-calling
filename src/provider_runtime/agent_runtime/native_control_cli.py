@@ -16,10 +16,9 @@ from . import claude_control
 from .codex_control import (
     CodexControl,
     CodexControlError,
-    CodexSelectedObservation,
-    CodexSelectedTarget,
+    CodexCreateRequest,
+    CodexThreadRead,
     CodexThreadTarget,
-    CodexView,
 )
 from .errors import AgentRuntimeError, InvalidAgentRequest, ProtocolDefect
 
@@ -34,23 +33,8 @@ class _Closed(BaseModel):
         return self
 
 
-class _View(_Closed):
-    viewId: str
-    revision: int = Field(ge=0, lt=1 << 64)
-
-    @field_validator("viewId")
-    @classmethod
-    def canonical_uuid(cls, value: str) -> str:
-        if str(UUID(value)) != value:
-            raise ValueError("invalid view identity")
-        return value
-
-
 class _Target(_Closed):
-    sessionId: str | None = None
-    pid: int | None = Field(default=None, gt=0)
-    startIdentity: str | None = Field(default=None, min_length=1, max_length=128)
-    view: _View | None = None
+    sessionId: str
     turnId: str | None = None
 
     @field_validator("sessionId", "turnId")
@@ -60,15 +44,9 @@ class _Target(_Closed):
             raise ValueError("invalid native identity")
         return value
 
-    @field_validator("startIdentity")
-    @classmethod
-    def process_identity(cls, value: str | None) -> str | None:
-        if value is not None and (not value.isdecimal() or int(value) <= 0):
-            raise ValueError("invalid process start identity")
-        return value
-
 
 class _Input(_Closed):
+    cwd: str | None = Field(default=None, min_length=1, max_length=4096)
     text: str | None = None
     input: Literal["peer", "user"] | None = None
     delivery: Literal["direct", "queue"] | None = None
@@ -78,17 +56,15 @@ class _Input(_Closed):
 
 
 class _Request(_Closed):
-    operation: Literal["inspect", "read", "send", "interrupt", "stop", "results"]
+    operation: Literal["create", "inspect", "read", "send", "interrupt", "stop", "results"]
     provider: Literal["Codex", "Claude"]
     profileKey: str = Field(min_length=1, max_length=128)
     endpoint: str | None = None
-    targets: list[_Target] = Field(min_length=1, max_length=128)
+    targets: list[_Target] | None = Field(default=None, min_length=1, max_length=128)
     input: _Input | None = None
 
     @model_validator(mode="after")
     def validate_operation(self) -> Self:
-        if self.operation != "inspect" and len(self.targets) != 1:
-            raise ValueError("operation requires exactly one target")
         if self.provider == "Codex":
             if (
                 not self.endpoint
@@ -96,17 +72,29 @@ class _Request(_Closed):
                 or "\0" in self.endpoint
             ):
                 raise ValueError("codex requires an absolute unix endpoint")
-        elif self.endpoint is not None or any(target.view is not None for target in self.targets):
+        elif self.endpoint is not None:
             raise ValueError("claude uses its selected profile environment")
+        if self.operation == "create":
+            if (
+                self.provider != "Codex"
+                or self.targets is not None
+                or self.input is None
+                or self.input.model_fields_set != {"cwd"}
+                or self.input.cwd is None
+            ):
+                raise ValueError("codex create requires only cwd input")
+            if not Path(self.input.cwd).is_absolute() or "\0" in self.input.cwd:
+                raise ValueError("create requires an absolute cwd")
+            return self
+        if self.targets is None:
+            raise ValueError("operation requires targets")
+        if self.operation != "inspect" and len(self.targets) != 1:
+            raise ValueError("operation requires exactly one target")
         for target in self.targets:
-            if self.operation == "results":
-                if target.model_fields_set != {"sessionId"}:
-                    raise ValueError("results requires only conversation identity")
-            elif target.pid is None or target.startIdentity is None:
-                raise ValueError("current operation requires exact process lifetime")
-            elif self.operation != "inspect":
-                if target.sessionId is None or (self.provider == "Codex" and target.view is None):
-                    raise ValueError("current operation requires captured binding")
+            if self.provider == "Claude" and target.turnId is not None:
+                raise ValueError("claude has no turn target")
+            if self.operation == "results" and target.model_fields_set != {"sessionId"}:
+                raise ValueError("results requires only conversation identity")
         if self.operation == "send":
             if self.input is None or self.input.model_fields_set != {"text", "input", "delivery"}:
                 raise ValueError("send requires text, input and delivery")
@@ -152,8 +140,7 @@ def _codex_error(error: CodexControlError) -> dict:
     return _error(code)
 
 
-def _codex_observation(value: CodexSelectedObservation) -> dict:
-    read = value.read
+def _codex_observation(read: CodexThreadRead) -> dict:
     status = read.thread.status
     match status:
         case "active":
@@ -171,12 +158,11 @@ def _codex_observation(value: CodexSelectedObservation) -> dict:
     result: dict = {
         "status": {"state": state, "source": "unavailable" if status == "notLoaded" else "native"},
         "sessionId": read.thread.target.thread_handle,
-        "view": {"viewId": value.view.view_id, "revision": value.view.revision},
         "methods": {
             "read": "native" if read.history_available else "unavailable",
             "sendPeer": "native" if accepts_input else "unavailable",
             "sendUser": "native" if accepts_input else "unavailable",
-            "queueUser": "native" if accepts_input else "unavailable",
+            "queueUser": "unavailable",
             "stop": "native"
             if status == "idle"
             or available
@@ -209,12 +195,20 @@ async def _codex(request: _Request) -> dict:
         native_owners=True,
     )
     try:
+        if request.operation == "create":
+            assert request.input is not None and request.input.cwd is not None
+            created = await control.create(
+                CodexCreateRequest(request.profileKey, Path(request.input.cwd))
+            )
+            return _success({"sessionId": created.thread_handle})
+        assert request.targets is not None
+        targets = tuple(
+            CodexThreadTarget(request.profileKey, target.sessionId or "")
+            for target in request.targets
+        )
         if request.operation == "results":
-            target = request.targets[0]
-            assert target.sessionId is not None
             page = await control.results(
-                CodexThreadTarget(request.profileKey, target.sessionId),
-                request.input.cursor if request.input else None,
+                targets[0], request.input.cursor if request.input else None
             )
             return _success(
                 {
@@ -222,20 +216,8 @@ async def _codex(request: _Request) -> dict:
                     **({"nextCursor": page.next_cursor} if page.next_cursor else {}),
                 }
             )
-        targets = tuple(
-            CodexSelectedTarget(
-                request.profileKey,
-                target.pid or 0,
-                target.startIdentity or "",
-                CodexThreadTarget(request.profileKey, target.sessionId)
-                if target.sessionId
-                else None,
-                CodexView(target.view.viewId, target.view.revision) if target.view else None,
-            )
-            for target in request.targets
-        )
         if request.operation == "inspect":
-            rows = await control.inspect_selected(targets)
+            rows = await control.inspect(targets)
             return _success(
                 [
                     _codex_error(row)
@@ -247,7 +229,9 @@ async def _codex(request: _Request) -> dict:
         target = targets[0]
         if request.operation == "read":
             assert request.input is not None and request.input.scope is not None
-            value = await control.read_selected(target, request.input.scope, request.input.maxBytes)
+            value = await control.read_conversation(
+                target, request.input.scope, request.input.maxBytes
+            )
             output = value.output
             return _bound_read(
                 {
@@ -269,12 +253,12 @@ async def _codex(request: _Request) -> dict:
                 and request.input.delivery is not None
             )
             return _success(
-                await control.send_selected(
+                await control.send_conversation(
                     target, request.input.text, request.input.input, request.input.delivery
                 )
             )
         if request.operation in ("interrupt", "stop"):
-            return _success(await control.interrupt_selected(target, request.targets[0].turnId))
+            return _success(await control.interrupt_conversation(target, request.targets[0].turnId))
         assert_never(request.operation)
     except CodexControlError as error:
         return _codex_error(error)
@@ -292,62 +276,67 @@ def _claude_observation(session: claude_control.ClaudeSession) -> dict:
             "sendPeer": "unavailable",
             "sendUser": "unavailable",
             "queueUser": "unavailable",
-            "stop": "native" if session.job_id else "terminal",
+            "stop": "native" if session.kind == "background" and session.job_id else "unavailable",
         },
     }
     result["sessionId"] = session.session_id
-    if session.kind == "interactive":
-        result["terminalOwnsAgent"] = True
     return result
 
 
+def _claude_conversation_observation(
+    session_id: str, sessions: tuple[claude_control.ClaudeSession, ...] | None
+) -> dict:
+    if sessions is not None:
+        try:
+            session = claude_control.match_session(sessions, session_id, None)
+        except claude_control.ClaudeControlError:
+            pass
+        else:
+            return _claude_observation(session)
+    return {
+        "sessionId": session_id,
+        "status": {"state": "unknown", "source": "unavailable"},
+        "methods": {
+            "read": "native" if claude_control.history_available() else "unavailable",
+            "sendPeer": "unavailable",
+            "sendUser": "unavailable",
+            "queueUser": "unavailable",
+            "stop": "unavailable",
+        },
+    }
+
+
 async def _claude(request: _Request) -> dict:
+    assert request.targets is not None
     target = request.targets[0]
-    if request.operation in ("interrupt", "send"):
+    if request.operation in ("create", "interrupt", "send"):
         return _error("unavailable")
     if request.operation == "results":
-        assert target.sessionId is not None
         return _success(
             claude_control.results(
                 target.sessionId, request.input.cursor if request.input else None
             )
         )
-    sessions = await claude_control.list_sessions()
+    if request.operation == "stop":
+        return _success(await claude_control.stop_conversation(target.sessionId))
+    try:
+        sessions = await claude_control.list_sessions()
+    except claude_control.ClaudeControlError:
+        sessions = None
     if request.operation == "inspect":
-        rows = []
-        for target in request.targets:
-            assert target.pid is not None and target.startIdentity is not None
-            try:
-                claude_control.verify_process(target.pid, target.startIdentity)
-                session = claude_control.match_session(sessions, target.sessionId, target.pid)
-                rows.append(_success(_claude_observation(session)))
-            except claude_control.ClaudeControlError as error:
-                rows.append(
-                    _error(
-                        "unavailable" if error.code == "unsupported" else error.code, error.dispatch
-                    )
-                )
-        return _success(rows)
-    assert (
-        target.pid is not None and target.startIdentity is not None and target.sessionId is not None
-    )
-    claude_control.verify_process(target.pid, target.startIdentity)
-    claude_control.match_session(sessions, target.sessionId, target.pid)
+        return _success(
+            [
+                _success(_claude_conversation_observation(row.sessionId, sessions))
+                for row in request.targets
+            ]
+        )
     if request.operation == "read":
         assert request.input is not None and request.input.scope is not None
         result = claude_control.read_messages(
             target.sessionId, request.input.scope, request.input.maxBytes
         )
-        claude_control.verify_process(target.pid, target.startIdentity)
-        after = claude_control.match_session(
-            await claude_control.list_sessions(), target.sessionId, target.pid
-        )
-        result["inspection"] = _claude_observation(after)
+        result["inspection"] = _claude_conversation_observation(target.sessionId, sessions)
         return _bound_read(result)
-    if request.operation == "stop":
-        return _success(
-            await claude_control.stop(target.sessionId, target.pid, target.startIdentity)
-        )
     assert_never(request.operation)
 
 
@@ -356,7 +345,7 @@ async def _run(request: _Request) -> dict:
     assert task is not None
     loop = asyncio.get_running_loop()
     loop.add_signal_handler(signal.SIGTERM, task.cancel)
-    mutation = request.operation in ("send", "interrupt", "stop")
+    mutation = request.operation in ("create", "send", "interrupt", "stop")
     try:
         async with asyncio.timeout(2 if request.operation == "inspect" else 10):
             match request.provider:
@@ -414,7 +403,7 @@ def main() -> None:
     if len(output) > 65536:
         result = (
             _error("unknown", "unknown")
-            if operation in ("send", "stop", "interrupt")
+            if operation in ("create", "send", "stop", "interrupt")
             else _error("unavailable")
         )
         output = json.dumps(result).encode() + b"\n"

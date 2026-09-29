@@ -717,7 +717,17 @@ def stopped(pid: int) -> bool:
 
 
 def test_importing_adapter_does_not_import_optional_sdk() -> None:
-    assert "claude_agent_sdk" not in sys.modules
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys\n"
+            "import provider_runtime.agent_runtime.claude_sdk\n"
+            "assert 'claude_agent_sdk' not in sys.modules\n",
+        ],
+        check=True,
+        capture_output=True,
+    )
 
 
 async def test_the_launcher_turns_the_sdk_child_into_a_group_this_runtime_can_reap(
