@@ -453,3 +453,17 @@ async def test_invalid_requests_and_unsupported_claude_send_do_not_launch_a_prov
             }
             _, result, _ = await invoke(request, PATH="/nonexistent")
             assert result == {"ok": False, "error": {"code": "rejected", "dispatch": "not_sent"}}
+
+    for input in (
+        {"cwd": "/workspace"},
+        *({"cwd": "/workspace", "bypassPermissions": value} for value in (None, 0, 1, "true")),
+    ):
+        request = {
+            "operation": "create",
+            "provider": "Codex",
+            "profileKey": "personal",
+            "endpoint": "unix:///nonexistent",
+            "input": input,
+        }
+        _, result, _ = await invoke(request, PATH="/nonexistent")
+        assert result == {"ok": False, "error": {"code": "rejected", "dispatch": "not_sent"}}

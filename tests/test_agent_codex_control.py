@@ -1089,5 +1089,11 @@ async def test_create_delegates_cwd_existence_to_the_external_server(
     created = [message for message in peer.messages if message.get("method") == "thread/start"]
     assert len(created) == 1
     params = created[0]["params"]
-    assert isinstance(params, dict) and params["cwd"] == str(server_cwd)
+    assert params == {
+        "cwd": str(server_cwd),
+        "sandbox": "workspace-write",
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "config": {"sandbox_workspace_write": {"network_access": False}},
+    }
     assert any(message.get("method") == "thread/unsubscribe" for message in peer.messages)

@@ -47,6 +47,7 @@ class _Target(_Closed):
 
 class _Input(_Closed):
     cwd: str | None = Field(default=None, min_length=1, max_length=4096)
+    bypassPermissions: bool | None = None
     text: str | None = None
     input: Literal["peer", "user"] | None = None
     delivery: Literal["direct", "queue"] | None = None
@@ -79,10 +80,11 @@ class _Request(_Closed):
                 self.provider != "Codex"
                 or self.targets is not None
                 or self.input is None
-                or self.input.model_fields_set != {"cwd"}
+                or self.input.model_fields_set != {"cwd", "bypassPermissions"}
                 or self.input.cwd is None
+                or self.input.bypassPermissions is None
             ):
-                raise ValueError("codex create requires only cwd input")
+                raise ValueError("codex create requires cwd and bypassPermissions")
             if not Path(self.input.cwd).is_absolute() or "\0" in self.input.cwd:
                 raise ValueError("create requires an absolute cwd")
             return self
@@ -196,9 +198,14 @@ async def _codex(request: _Request) -> dict:
     )
     try:
         if request.operation == "create":
-            assert request.input is not None and request.input.cwd is not None
+            assert (
+                request.input is not None
+                and request.input.cwd is not None
+                and request.input.bypassPermissions is not None
+            )
             created = await control.create(
-                CodexCreateRequest(request.profileKey, Path(request.input.cwd))
+                CodexCreateRequest(request.profileKey, Path(request.input.cwd)),
+                native_bypass_permissions=request.input.bypassPermissions,
             )
             return _success({"sessionId": created.thread_handle})
         assert request.targets is not None

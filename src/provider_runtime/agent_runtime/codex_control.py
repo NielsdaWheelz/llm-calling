@@ -632,7 +632,9 @@ class CodexControl:
             value, truncated = encoded[-max_bytes:].decode(errors="ignore"), True
         return CodexOutput(value, scope, truncated, state, output_id, turn_id)
 
-    async def create(self, request: CodexCreateRequest) -> CodexThreadTarget:
+    async def create(
+        self, request: CodexCreateRequest, *, native_bypass_permissions: bool = False
+    ) -> CodexThreadTarget:
         # The external server may have a different filesystem view or UID.
         # CodexCreateRequest validates syntax; the server owns existence checks.
         async with self._client(request.profile_key) as client:
@@ -640,7 +642,14 @@ class CodexControl:
                 await self._request(
                     client,
                     "thread/start",
-                    {"cwd": str(request.cwd)}
+                    {
+                        "cwd": str(request.cwd),
+                        **(
+                            {"approvalPolicy": "never", "sandbox": "danger-full-access"}
+                            if native_bypass_permissions
+                            else {}
+                        ),
+                    }
                     if self._native_owners
                     else {
                         "cwd": str(request.cwd),
