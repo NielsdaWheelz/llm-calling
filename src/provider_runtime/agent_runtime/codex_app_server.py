@@ -79,12 +79,15 @@ class CodexAppServerConfig:
     client_name: str = "provider_runtime"
     client_title: str = "provider-runtime"
     client_version: str = "0.1.0"
+    experimental_api: bool = False
 
     def __post_init__(self) -> None:
         if not self.socket_path.is_absolute():
             raise ValueError("Codex app-server socket must be absolute")
         if self.request_policy not in ("deny_owned", "observe_only"):
             raise ValueError("Codex app-server request policy is invalid")
+        if type(self.experimental_api) is not bool:
+            raise ValueError("Codex app-server experimental capability must be boolean")
         if any(
             type(value) is not str or not value or "\0" in value or "\n" in value
             for value in (
@@ -172,7 +175,7 @@ class CodexAppServerClient:
             raise ProtocolDefect("Codex app-server client was started more than once")
         try:
             self._connection = await unix_connect(
-                str(self.config.socket_path),
+                str(self.config.socket_path.resolve(strict=True)),
                 uri="ws://localhost",
                 open_timeout=_OPERATION_TIMEOUT_SECONDS,
                 close_timeout=2,
@@ -193,7 +196,7 @@ class CodexAppServerClient:
             initialized = await self.request(
                 "initialize",
                 {
-                    "capabilities": {"experimentalApi": False},
+                    "capabilities": {"experimentalApi": self.config.experimental_api},
                     "clientInfo": {
                         "name": self.config.client_name,
                         "title": self.config.client_title,
