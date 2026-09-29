@@ -142,8 +142,8 @@ def match_session(
     return matches[0]
 
 
-def verify_process(pid: int, start_identity: str) -> None:
-    """Compare the exact kernel lifetime encoded by the host, without signals."""
+def process_start_identity(pid: int) -> str:
+    """Read the exact kernel process lifetime without sending signals."""
     try:
         if sys.platform == "linux":
             fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
@@ -162,7 +162,11 @@ def verify_process(pid: int, start_identity: str) -> None:
             raise ClaudeControlError("unavailable")
     except (OSError, ValueError, IndexError):
         raise ClaudeControlError("stale") from None
-    if actual != start_identity:
+    return actual
+
+
+def verify_process(pid: int, start_identity: str) -> None:
+    if process_start_identity(pid) != start_identity:
         raise ClaudeControlError("stale")
 
 
@@ -296,11 +300,15 @@ def results(session_id: str, cursor: str | None) -> dict:
     return {"resultIds": ids}
 
 
-async def stop(session_id: str, pid: int, start_identity: str) -> dict[str, str]:
+async def stop(
+    session_id: str, pid: int, start_identity: str, *, expected_job_id: str | None = None
+) -> dict[str, str]:
     verify_process(pid, start_identity)
     session = match_session(await list_sessions(), session_id, pid)
     if session.job_id is None:
         raise ClaudeControlError("unsupported")
+    if expected_job_id is not None and session.job_id != expected_job_id:
+        raise ClaudeControlError("stale")
     if session.state in ("done", "failed", "stopped"):
         return {"method": "native", "outcome": "finished"}
     verify_process(pid, start_identity)
@@ -318,3 +326,18 @@ async def stop(session_id: str, pid: int, start_identity: str) -> dict[str, str]
     if len(observed) == 1 and observed[0].state in ("done", "failed") and observed[0].pid is None:
         return {"method": "native", "outcome": "finished"}
     return {"method": "native", "outcome": "unknown"}
+
+
+async def stop_conversation(session_id: str) -> dict[str, str]:
+    try:
+        session = match_session(await list_sessions(), session_id, None)
+    except ClaudeControlError:
+        raise ClaudeControlError("unavailable") from None
+    if session.kind != "background" or session.job_id is None:
+        raise ClaudeControlError("unavailable")
+    if session.state in ("done", "failed", "stopped"):
+        return {"method": "native", "outcome": "finished"}
+    if session.pid is None:
+        raise ClaudeControlError("unavailable")
+    start_identity = process_start_identity(session.pid)
+    return await stop(session_id, session.pid, start_identity, expected_job_id=session.job_id)

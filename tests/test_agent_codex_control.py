@@ -101,7 +101,6 @@ class ProtocolPeer:
         self.older_items: list[dict[str, object]] = []
         self.interrupt_settles = True
         self.status = "idle"
-        self.selected_view: dict[str, object] | None = None
         self.intervene = False
         self.name = "synthetic worker"
         self.raw_reply: str | None = None
@@ -163,8 +162,6 @@ class ProtocolPeer:
                     result = {"thread": self.thread()}
                 elif method == "thread/read":
                     result = {"thread": self.thread()}
-                elif method == "tui/view/read":
-                    result = {"view": self.selected_view}
                 elif method == "thread/turns/list":
                     view = message["params"].get("itemsView", "summary")
                     result = {
@@ -1092,5 +1089,11 @@ async def test_create_delegates_cwd_existence_to_the_external_server(
     created = [message for message in peer.messages if message.get("method") == "thread/start"]
     assert len(created) == 1
     params = created[0]["params"]
-    assert isinstance(params, dict) and params["cwd"] == str(server_cwd)
+    assert params == {
+        "cwd": str(server_cwd),
+        "sandbox": "workspace-write",
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "config": {"sandbox_workspace_write": {"network_access": False}},
+    }
     assert any(message.get("method") == "thread/unsubscribe" for message in peer.messages)

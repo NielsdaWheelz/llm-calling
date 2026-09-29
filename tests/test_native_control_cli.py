@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import ctypes
 import json
 import os
 import signal
@@ -17,29 +16,10 @@ from websockets.asyncio.server import unix_serve
 
 from tests.test_agent_codex_control import THREAD, TURN, ProtocolPeer
 
-VIEW = {"viewId": "01992818-9222-714c-9c91-e39d3f006e64", "revision": 1}
-
-
-def process_target() -> dict:
-    pid = os.getpid()
-    if sys.platform == "darwin":
-        info = ctypes.create_string_buffer(136)
-        assert ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidinfo(
-            pid, 3, 0, info, len(info)
-        ) == len(info)
-        start = str(
-            int.from_bytes(info.raw[120:128], sys.byteorder) * 1_000_000
-            + int.from_bytes(info.raw[128:136], sys.byteorder)
-        )
-    else:
-        start = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
-    return {"pid": pid, "startIdentity": start}
-
 
 class ControlPeer(ProtocolPeer):
     def __init__(self, socket: Path) -> None:
         super().__init__(socket)
-        self.selected_view = {**VIEW, "threadId": THREAD}
         self.status = "active"
 
     def thread(self) -> dict[str, object]:
@@ -47,6 +27,7 @@ class ControlPeer(ProtocolPeer):
         state = "idle" if self.turn_status == "interrupted" else self.status
         result["status"] = {"type": state, **({"activeFlags": []} if state == "active" else {})}
         result["canAcceptDirectInput"] = state in ("active", "idle")
+        result["historyMode"] = "paginated"
         return result
 
 
@@ -96,10 +77,7 @@ def codex_request(peer: ProtocolPeer, operation: str, **fields: object) -> dict:
         "endpoint": "unix://" + str(peer.socket),
         "targets": [
             {
-                "pid": 1234,
-                "startIdentity": "1",
                 "sessionId": THREAD,
-                "view": VIEW,
                 **({"turnId": TURN} if operation in ("interrupt", "stop") else {}),
             }
         ],
@@ -118,10 +96,10 @@ async def test_codex_observation_and_multiline_submission_use_same_native_sessio
     row = value["result"][0]["result"]
     assert row["status"] == {"state": "idle", "source": "native"}
     assert row["sessionId"] == THREAD and row["turn"] == {"id": TURN, "state": "completed"}
-    assert row["view"] == VIEW
-    assert row["methods"] == dict.fromkeys(
-        ("read", "sendPeer", "sendUser", "queueUser", "stop"), "native"
-    )
+    assert row["methods"] == {
+        **dict.fromkeys(("read", "sendPeer", "sendUser", "stop"), "native"),
+        "queueUser": "unavailable",
+    }
     text = "first line\nsecond line $(do not execute)"
     _, result, _ = await invoke(
         codex_request(peer, "send", input={"text": text, "input": "user", "delivery": "direct"})
@@ -141,7 +119,6 @@ async def test_codex_observation_and_multiline_submission_use_same_native_sessio
     assert sent[0]["params"] == {
         "threadId": THREAD,
         "input": [{"type": "text", "text": text}],
-        "expectedView": VIEW,
     }
 
 
@@ -224,7 +201,7 @@ async def test_stop_interrupts_exact_turn_without_stopping_native_server(
     }
     interrupts = [row for row in peer.messages if row.get("method") == "turn/interrupt"]
     assert len(interrupts) == 1
-    assert interrupts[0]["params"] == {"threadId": THREAD, "turnId": TURN, "expectedView": VIEW}
+    assert interrupts[0]["params"] == {"threadId": THREAD, "turnId": TURN}
     assert not any("stop" in str(row.get("method")) for row in peer.messages)
     _, result, _ = await invoke(codex_request(peer, "inspect"))
     assert result["result"][0]["result"]["status"]["state"] == "idle"
@@ -286,7 +263,7 @@ def claude_fixture(tmp_path: Path) -> tuple[Path, Path]:
     return binary, root
 
 
-async def test_claude_matches_pid_exposes_blocker_and_stops_only_matched_job(
+async def test_claude_observes_conversation_blocker_and_stops_only_matched_job(
     tmp_path: Path,
 ) -> None:
     binary, root = claude_fixture(tmp_path)
@@ -294,7 +271,7 @@ async def test_claude_matches_pid_exposes_blocker_and_stops_only_matched_job(
         "provider": "Claude",
         "profileKey": "claude-personal",
         "operation": "inspect",
-        "targets": [process_target(), {"pid": 9999, "startIdentity": "1"}],
+        "targets": [{"sessionId": THREAD}, {"sessionId": "01992818-9229-714c-9c91-e39d3f006e64"}],
     }
     env = {"PATH": str(binary), "CLAUDE_CONFIG_DIR": str(root)}
     code, result, stderr = await invoke(request, **env)
@@ -307,8 +284,8 @@ async def test_claude_matches_pid_exposes_blocker_and_stops_only_matched_job(
     assert found["result"]["sessionId"] == THREAD
     assert found["result"]["methods"]["sendPeer"] == "unavailable"
     assert found["result"]["methods"]["stop"] == "native"
-    assert missing == {"ok": False, "error": {"code": "stale", "dispatch": "not_sent"}}
-    request.update(operation="stop", targets=[{"sessionId": THREAD, **process_target()}])
+    assert missing["result"]["status"] == {"state": "unknown", "source": "unavailable"}
+    request.update(operation="stop", targets=[{"sessionId": THREAD}])
     _, result, _ = await invoke(request, **env)
     assert result == {"ok": True, "result": {"method": "native", "outcome": "stopped"}}
 
@@ -354,7 +331,7 @@ async def test_claude_native_history_is_scoped_to_selected_profile(tmp_path: Pat
         "provider": "Claude",
         "profileKey": "claude-personal",
         "operation": "read",
-        "targets": [{"sessionId": THREAD, **process_target()}],
+        "targets": [{"sessionId": THREAD}],
         "input": {"scope": "latest", "maxBytes": 16384},
     }
     results = [
@@ -366,12 +343,9 @@ async def test_claude_native_history_is_scoped_to_selected_profile(tmp_path: Pat
     assert results[0][1]["result"]["scope"] == "latest"
 
 
-@pytest.mark.parametrize(
-    "kind,has_pid,owns",
-    [("interactive", True, True), ("interactive", False, False), ("background", True, False)],
-)
-async def test_only_exact_interactive_claude_pid_owns_its_terminal_lifetime(
-    tmp_path: Path, kind: str, has_pid: bool, owns: bool
+@pytest.mark.parametrize("kind", ["interactive", "background"])
+async def test_claude_conversation_stop_requires_native_background_job(
+    tmp_path: Path, kind: str
 ) -> None:
     binary, root = claude_fixture(tmp_path)
     state_file = root / "fixture-state.json"
@@ -384,13 +358,12 @@ async def test_only_exact_interactive_claude_pid_owns_its_terminal_lifetime(
         "provider": "Claude",
         "profileKey": "personal",
         "operation": "inspect",
-        "targets": [{"sessionId": THREAD, **(process_target() if has_pid else {})}],
+        "targets": [{"sessionId": THREAD}],
     }
     _, result, _ = await invoke(request, PATH=str(binary), CLAUDE_CONFIG_DIR=str(root))
-    if has_pid:
-        assert result["result"][0]["result"].get("terminalOwnsAgent", False) is owns
-    else:
-        assert result == {"ok": False, "error": {"code": "rejected", "dispatch": "not_sent"}}
+    observation = result["result"][0]["result"]
+    assert "terminalOwnsAgent" not in observation
+    assert observation["methods"]["stop"] == ("native" if kind == "background" else "unavailable")
 
 
 async def test_hung_claude_observation_times_out_and_reaps_only_its_cli(tmp_path: Path) -> None:
@@ -400,14 +373,17 @@ async def test_hung_claude_observation_times_out_and_reaps_only_its_cli(tmp_path
         "provider": "Claude",
         "profileKey": "claude-personal",
         "operation": "inspect",
-        "targets": [process_target()],
+        "targets": [{"sessionId": THREAD}],
     }
     try:
         code, result, stderr = await asyncio.wait_for(
             invoke(request, PATH=str(binary), CLAUDE_CONFIG_DIR=str(root)), timeout=3
         )
-        assert (code, stderr) == (1, b"")
-        assert result == {"ok": False, "error": {"code": "unavailable", "dispatch": "not_sent"}}
+        assert (code, stderr) == (0, b"")
+        assert result["result"][0]["result"]["status"] == {
+            "state": "unknown",
+            "source": "unavailable",
+        }
         with pytest.raises(ProcessLookupError):
             os.kill(int((root / "fixture-child").read_text()), 0)
     finally:
@@ -425,7 +401,7 @@ async def test_helper_termination_reaps_its_claude_child(tmp_path: Path) -> None
         "provider": "Claude",
         "profileKey": "claude-personal",
         "operation": "inspect",
-        "targets": [process_target()],
+        "targets": [{"sessionId": THREAD}],
     }
     try:
         code, result, stderr = await invoke(
@@ -459,9 +435,35 @@ async def test_invalid_requests_and_unsupported_claude_send_do_not_launch_a_prov
     assert result == {"ok": False, "error": {"code": "rejected", "dispatch": "not_sent"}}
     invalid.update(
         operation="send",
-        targets=[{"sessionId": THREAD, **process_target()}],
+        targets=[{"sessionId": THREAD}],
         input={"text": "hello", "input": "user", "delivery": "direct"},
     )
     del invalid["endpoint"]
     _, result, _ = await invoke(invalid, PATH="/nonexistent")
     assert result == {"ok": False, "error": {"code": "unavailable", "dispatch": "not_sent"}}
+
+    for provider in ("Codex", "Claude"):
+        for field, value in (("pid", 1), ("startIdentity", "1"), ("view", {})):
+            request = {
+                "operation": "inspect",
+                "provider": provider,
+                "profileKey": "personal",
+                "targets": [{"sessionId": THREAD, field: value}],
+                **({"endpoint": "unix:///nonexistent"} if provider == "Codex" else {}),
+            }
+            _, result, _ = await invoke(request, PATH="/nonexistent")
+            assert result == {"ok": False, "error": {"code": "rejected", "dispatch": "not_sent"}}
+
+    for input in (
+        {"cwd": "/workspace"},
+        *({"cwd": "/workspace", "bypassPermissions": value} for value in (None, 0, 1, "true")),
+    ):
+        request = {
+            "operation": "create",
+            "provider": "Codex",
+            "profileKey": "personal",
+            "endpoint": "unix:///nonexistent",
+            "input": input,
+        }
+        _, result, _ = await invoke(request, PATH="/nonexistent")
+        assert result == {"ok": False, "error": {"code": "rejected", "dispatch": "not_sent"}}
