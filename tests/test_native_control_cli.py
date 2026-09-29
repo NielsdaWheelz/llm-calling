@@ -456,7 +456,15 @@ async def test_invalid_requests_and_unsupported_claude_send_do_not_launch_a_prov
 
     for input in (
         {"cwd": "/workspace"},
-        *({"cwd": "/workspace", "bypassPermissions": value} for value in (None, 0, 1, "true")),
+        *(
+            {"cwd": "/workspace", "name": "review-1", "bypassPermissions": value}
+            for value in (None, 0, 1, "true")
+        ),
+        {"cwd": "/workspace", "bypassPermissions": False},
+        *(
+            {"cwd": "/workspace", "bypassPermissions": False, "name": value}
+            for value in (None, "", 1, "bad name", "a" * 65)
+        ),
     ):
         request = {
             "operation": "create",

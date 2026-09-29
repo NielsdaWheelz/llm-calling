@@ -633,52 +633,82 @@ class CodexControl:
         return CodexOutput(value, scope, truncated, state, output_id, turn_id)
 
     async def create(
-        self, request: CodexCreateRequest, *, native_bypass_permissions: bool = False
+        self,
+        request: CodexCreateRequest,
+        *,
+        native_bypass_permissions: bool = False,
+        native_name: str | None = None,
     ) -> CodexThreadTarget:
         # The external server may have a different filesystem view or UID.
         # CodexCreateRequest validates syntax; the server owns existence checks.
-        async with self._client(request.profile_key) as client:
-            result = _object(
-                await self._request(
-                    client,
-                    "thread/start",
-                    {
-                        "cwd": str(request.cwd),
-                        **(
-                            {"approvalPolicy": "never", "sandbox": "danger-full-access"}
-                            if native_bypass_permissions
-                            else {}
-                        ),
-                    }
-                    if self._native_owners
-                    else {
-                        "cwd": str(request.cwd),
-                        "sandbox": "workspace-write",
-                        "approvalPolicy": "on-request",
-                        "approvalsReviewer": "user",
-                        "config": {"sandbox_workspace_write": {"network_access": False}},
-                    },
-                    mutation=True,
+        if self._native_owners and (not native_name or len(native_name.encode()) > 64):
+            raise InvalidAgentRequest("Native Codex creation requires a bounded name")
+        target: CodexThreadTarget | None = None
+        try:
+            async with self._client(request.profile_key) as client:
+                result = _object(
+                    await self._request(
+                        client,
+                        "thread/start",
+                        {
+                            "cwd": str(request.cwd),
+                            **(
+                                {"approvalPolicy": "never", "sandbox": "danger-full-access"}
+                                if native_bypass_permissions
+                                else {}
+                            ),
+                        }
+                        if self._native_owners
+                        else {
+                            "cwd": str(request.cwd),
+                            "sandbox": "workspace-write",
+                            "approvalPolicy": "on-request",
+                            "approvalsReviewer": "user",
+                            "config": {"sandbox_workspace_write": {"network_access": False}},
+                        },
+                        mutation=True,
+                    )
                 )
-            )
-            summary = _summary(request.profile_key, _object(result.get("thread")))
-            target = summary.target
-            if self._native_owners:
+                summary = _summary(request.profile_key, _object(result.get("thread")))
+                target = summary.target
+                if self._native_owners:
+                    result = await self._request(
+                        client,
+                        "thread/name/set",
+                        {"threadId": target.thread_handle, "name": native_name},
+                        mutation=True,
+                        known_thread=target,
+                    )
+                    if result != {}:
+                        raise CodexControlError("invalid", "Unknown", target)
+                    return target
+                result = _object(
+                    await self._request(
+                        client,
+                        "thread/unsubscribe",
+                        {
+                            "threadId": target.thread_handle,
+                        },
+                        mutation=True,
+                        known_thread=target,
+                    )
+                )
+                if result.get("status") not in ("notLoaded", "notSubscribed", "unsubscribed"):
+                    raise ProtocolDefect("Codex unsubscribe returned an unknown status")
                 return target
-            result = _object(
-                await self._request(
-                    client,
-                    "thread/unsubscribe",
-                    {
-                        "threadId": target.thread_handle,
-                    },
-                    mutation=True,
-                    known_thread=target,
-                )
-            )
-            if result.get("status") not in ("notLoaded", "notSubscribed", "unsubscribed"):
-                raise ProtocolDefect("Codex unsubscribe returned an unknown status")
-            return target
+        except CodexControlError:
+            raise
+        except (
+            asyncio.CancelledError,
+            TimeoutError,
+            AgentRuntimeError,
+            ProtocolDefect,
+            OSError,
+            ValueError,
+        ):
+            if not self._native_owners or target is None:
+                raise
+            raise CodexControlError("unavailable", "Unknown", target) from None
 
     async def prompt(self, request: CodexPromptRequest) -> CodexTurnTarget:
         self._guard(request.thread)
