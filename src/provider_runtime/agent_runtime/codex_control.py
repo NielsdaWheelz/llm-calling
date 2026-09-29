@@ -681,6 +681,18 @@ class CodexControl:
                     )
                     if result != {}:
                         raise CodexControlError("invalid", "Unknown", target)
+                    result = _object(
+                        await self._request(
+                            client,
+                            "thread/resume",
+                            {"threadId": target.thread_handle},
+                            mutation=True,
+                            known_thread=target,
+                        )
+                    )
+                    prepared = _summary(request.profile_key, _object(result.get("thread")))
+                    if prepared.target != target:
+                        raise CodexControlError("invalid", "Unknown", target)
                     return target
                 result = _object(
                     await self._request(
