@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
 import os
 import signal
@@ -16,11 +17,43 @@ from websockets.asyncio.server import unix_serve
 
 from tests.test_agent_codex_control import THREAD, TURN, ProtocolPeer
 
+VIEW = {"viewId": "01992818-9222-714c-9c91-e39d3f006e64", "revision": 1}
+
+
+def process_target() -> dict:
+    pid = os.getpid()
+    if sys.platform == "darwin":
+        info = ctypes.create_string_buffer(136)
+        assert ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidinfo(
+            pid, 3, 0, info, len(info)
+        ) == len(info)
+        start = str(
+            int.from_bytes(info.raw[120:128], sys.byteorder) * 1_000_000
+            + int.from_bytes(info.raw[128:136], sys.byteorder)
+        )
+    else:
+        start = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    return {"pid": pid, "startIdentity": start}
+
+
+class ControlPeer(ProtocolPeer):
+    def __init__(self, socket: Path) -> None:
+        super().__init__(socket)
+        self.selected_view = {**VIEW, "threadId": THREAD}
+        self.status = "active"
+
+    def thread(self) -> dict[str, object]:
+        result = super().thread()
+        state = "idle" if self.turn_status == "interrupted" else self.status
+        result["status"] = {"type": state, **({"activeFlags": []} if state == "active" else {})}
+        result["canAcceptDirectInput"] = state in ("active", "idle")
+        return result
+
 
 @pytest.fixture
 async def peer() -> AsyncIterator[ProtocolPeer]:
     with tempfile.TemporaryDirectory(prefix="native-peer-", dir="/tmp") as directory:
-        value = ProtocolPeer(Path(directory) / "peer.sock")
+        value = ControlPeer(Path(directory) / "peer.sock")
         async with await unix_serve(value.handle, str(value.socket)):
             yield value
 
@@ -63,10 +96,14 @@ def codex_request(peer: ProtocolPeer, operation: str, **fields: object) -> dict:
         "endpoint": "unix://" + str(peer.socket),
         "targets": [
             {
+                "pid": 1234,
+                "startIdentity": "1",
                 "sessionId": THREAD,
+                "view": VIEW,
                 **({"turnId": TURN} if operation in ("interrupt", "stop") else {}),
             }
         ],
+        **({"input": {"scope": "latest"}} if operation == "read" else {}),
         **fields,
     }
 
@@ -75,29 +112,44 @@ async def test_codex_observation_and_multiline_submission_use_same_native_sessio
     peer: ProtocolPeer,
 ) -> None:
     peer.turn_status = "completed"
+    peer.status = "idle"
     code, value, stderr = await invoke(codex_request(peer, "inspect"))
     assert (code, stderr) == (0, b"")
     row = value["result"][0]["result"]
-    assert row["status"] == {"state": "done", "source": "native"}
-    assert row["sessionId"] == THREAD and row["turnId"] == TURN
-    assert row["methods"] == dict.fromkeys(("read", "send", "interrupt"), "native")
+    assert row["status"] == {"state": "idle", "source": "native"}
+    assert row["sessionId"] == THREAD and row["turn"] == {"id": TURN, "state": "completed"}
+    assert row["view"] == VIEW
+    assert row["methods"] == dict.fromkeys(
+        ("read", "sendPeer", "sendUser", "queueUser", "stop"), "native"
+    )
     text = "first line\nsecond line $(do not execute)"
-    _, result, _ = await invoke(codex_request(peer, "send", input={"text": text}))
+    _, result, _ = await invoke(
+        codex_request(peer, "send", input={"text": text, "input": "user", "delivery": "direct"})
+    )
     assert result == {
         "ok": True,
-        "result": {"method": "native", "outcome": "accepted", "turnId": TURN},
+        "result": {
+            "method": "native",
+            "input": "user",
+            "delivery": "direct",
+            "outcome": "accepted",
+            "turnId": TURN,
+        },
     }
     sent = [row for row in peer.messages if row.get("method") == "turn/start"]
     assert len(sent) == 1
     assert sent[0]["params"] == {
         "threadId": THREAD,
         "input": [{"type": "text", "text": text}],
+        "expectedView": VIEW,
     }
 
 
 async def test_lost_native_write_is_unknown_and_never_retried(peer: ProtocolPeer) -> None:
     peer.drop_method = "turn/start"
-    code, result, stderr = await invoke(codex_request(peer, "send", input={"text": "work"}))
+    code, result, stderr = await invoke(
+        codex_request(peer, "send", input={"text": "work", "input": "user", "delivery": "direct"})
+    )
     assert (code, stderr) == (1, b"")
     assert result == {"ok": False, "error": {"code": "unknown", "dispatch": "unknown"}}
     assert sum(row.get("method") == "turn/start" for row in peer.messages) == 1
@@ -110,7 +162,13 @@ async def test_unloaded_codex_keeps_history_without_claiming_live_control(
     _, result, _ = await invoke(codex_request(peer, "inspect"))
     row = result["result"][0]["result"]
     assert row["status"] == {"state": "unknown", "source": "unavailable"}
-    assert row["methods"] == {"read": "native", "send": "terminal", "interrupt": "terminal"}
+    assert row["methods"] == {
+        "read": "native",
+        "sendPeer": "unavailable",
+        "sendUser": "unavailable",
+        "queueUser": "unavailable",
+        "stop": "unavailable",
+    }
     _, history, _ = await invoke(codex_request(peer, "read"))
     assert history["result"]["text"] == peer.answer
 
@@ -129,7 +187,9 @@ async def test_unloaded_codex_does_not_confirm_halt_from_historical_turn(
 async def test_observed_no_turn_does_not_authorize_cancelling_a_new_turn(
     peer: ProtocolPeer, operation: str
 ) -> None:
-    _, result, _ = await invoke(codex_request(peer, operation, targets=[{"sessionId": THREAD}]))
+    target = codex_request(peer, operation)["targets"][0]
+    del target["turnId"]
+    _, result, _ = await invoke(codex_request(peer, operation, targets=[target]))
     assert result == {"ok": False, "error": {"code": "stale", "dispatch": "not_sent"}}
     assert not any(row.get("method") == "turn/interrupt" for row in peer.messages)
 
@@ -138,12 +198,17 @@ async def test_read_retains_native_history_outside_viewport_and_bounds_encoded_o
     peer: ProtocolPeer,
 ) -> None:
     peer.answer = "older native result\n" + "\x01é" * 20000
-    _, result, _ = await invoke(codex_request(peer, "read", input={"maxBytes": 32768}))
-    assert result == {"ok": False, "error": {"code": "unavailable", "dispatch": "not_sent"}}
+    _, result, _ = await invoke(
+        codex_request(peer, "read", input={"scope": "latest", "maxBytes": 32768})
+    )
+    assert result["result"]["truncated"] is True
+    assert len(result["result"]["text"].encode()) <= 32768
     peer.answer = "older native result\n" + "\x01é" * 2000
-    _, result, _ = await invoke(codex_request(peer, "read", input={"maxBytes": 1024}))
+    _, result, _ = await invoke(
+        codex_request(peer, "read", input={"scope": "latest", "maxBytes": 1024})
+    )
     output = result["result"]
-    assert output["source"] == "native" and output["scope"] == "latest_turn"
+    assert output["source"] == "native" and output["scope"] == "latest"
     assert output["truncated"] is True
     assert len(output["text"].encode()) <= 1024
     assert output["text"]
@@ -153,13 +218,17 @@ async def test_stop_interrupts_exact_turn_without_stopping_native_server(
     peer: ProtocolPeer,
 ) -> None:
     code, result, _ = await invoke(codex_request(peer, "stop"))
-    assert code == 0 and result == {"ok": True, "result": {"agent": "interrupted"}}
+    assert code == 0 and result == {
+        "ok": True,
+        "result": {"method": "native", "outcome": "interrupted", "turnId": TURN},
+    }
     interrupts = [row for row in peer.messages if row.get("method") == "turn/interrupt"]
     assert len(interrupts) == 1
-    assert interrupts[0]["params"] == {"threadId": THREAD, "turnId": TURN}
+    assert interrupts[0]["params"] == {"threadId": THREAD, "turnId": TURN, "expectedView": VIEW}
     assert not any("stop" in str(row.get("method")) for row in peer.messages)
     _, result, _ = await invoke(codex_request(peer, "inspect"))
-    assert result["result"][0]["result"]["status"]["state"] == "stopped"
+    assert result["result"][0]["result"]["status"]["state"] == "idle"
+    assert result["result"][0]["result"]["turn"]["state"] == "interrupted"
 
 
 async def test_successor_after_interrupt_preserves_possible_effect(peer: ProtocolPeer) -> None:
@@ -204,7 +273,7 @@ def claude_fixture(tmp_path: Path) -> tuple[Path, Path]:
                     "cwd": "/synthetic",
                     "kind": "background",
                     "startedAt": 1000,
-                    "pid": 1234,
+                    "pid": os.getpid(),
                     "sessionId": THREAD,
                     "id": "job-one",
                     "state": "blocked",
@@ -225,7 +294,7 @@ async def test_claude_matches_pid_exposes_blocker_and_stops_only_matched_job(
         "provider": "Claude",
         "profileKey": "claude-personal",
         "operation": "inspect",
-        "targets": [{"pid": 1234}, {"pid": 9999}],
+        "targets": [process_target(), {"pid": 9999, "startIdentity": "1"}],
     }
     env = {"PATH": str(binary), "CLAUDE_CONFIG_DIR": str(root)}
     code, result, stderr = await invoke(request, **env)
@@ -234,32 +303,49 @@ async def test_claude_matches_pid_exposes_blocker_and_stops_only_matched_job(
     assert found["result"]["status"] == {
         "state": "blocked",
         "source": "native",
-        "reason": "permission",
     }
     assert found["result"]["sessionId"] == THREAD
-    assert found["result"]["methods"]["send"] == "terminal"
+    assert found["result"]["methods"]["sendPeer"] == "unavailable"
+    assert found["result"]["methods"]["stop"] == "native"
     assert missing == {"ok": False, "error": {"code": "stale", "dispatch": "not_sent"}}
-    request.update(operation="stop", targets=[{"sessionId": THREAD, "pid": 1234}])
+    request.update(operation="stop", targets=[{"sessionId": THREAD, **process_target()}])
     _, result, _ = await invoke(request, **env)
-    assert result == {"ok": True, "result": {"agent": "stopped"}}
+    assert result == {"ok": True, "result": {"method": "native", "outcome": "stopped"}}
 
 
 async def test_claude_native_history_is_scoped_to_selected_profile(tmp_path: Path) -> None:
     pytest.importorskip("claude_agent_sdk")
+    binary, fixture_root = claude_fixture(tmp_path)
     roots = [tmp_path / "personal", tmp_path / "work"]
     for root, text in zip(
         roots, ["personal history beyond viewport", "work history beyond viewport"], strict=True
     ):
         project = root / "projects" / "-synthetic"
         project.mkdir(parents=True)
+        (root / "fixture-state.json").write_text((fixture_root / "fixture-state.json").read_text())
         (project / f"{THREAD}.jsonl").write_text(
             json.dumps(
                 {
-                    "type": "assistant",
-                    "uuid": TURN,
+                    "type": "user",
+                    "uuid": THREAD,
                     "parentUuid": None,
                     "sessionId": THREAD,
-                    "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+                    "message": {"role": "user", "content": "fixture"},
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "assistant",
+                    "uuid": TURN,
+                    "parentUuid": THREAD,
+                    "sessionId": THREAD,
+                    "message": {
+                        "id": "native-message",
+                        "role": "assistant",
+                        "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": text}],
+                    },
                 }
             )
             + "\n"
@@ -268,22 +354,24 @@ async def test_claude_native_history_is_scoped_to_selected_profile(tmp_path: Pat
         "provider": "Claude",
         "profileKey": "claude-personal",
         "operation": "read",
-        "targets": [{"sessionId": THREAD}],
-        "input": {"maxBytes": 16384},
+        "targets": [{"sessionId": THREAD, **process_target()}],
+        "input": {"scope": "latest", "maxBytes": 16384},
     }
-    results = [await invoke(request, CLAUDE_CONFIG_DIR=str(root)) for root in roots]
+    results = [
+        await invoke(request, PATH=str(binary), CLAUDE_CONFIG_DIR=str(root)) for root in roots
+    ]
     assert "personal history" in results[0][1]["result"]["text"]
     assert "work history" not in results[0][1]["result"]["text"]
     assert "work history" in results[1][1]["result"]["text"]
-    assert results[0][1]["result"]["scope"] == "recent_messages"
+    assert results[0][1]["result"]["scope"] == "latest"
 
 
 @pytest.mark.parametrize(
-    "kind,pid,owns",
-    [("interactive", 1234, True), ("interactive", None, False), ("background", 1234, False)],
+    "kind,has_pid,owns",
+    [("interactive", True, True), ("interactive", False, False), ("background", True, False)],
 )
 async def test_only_exact_interactive_claude_pid_owns_its_terminal_lifetime(
-    tmp_path: Path, kind: str, pid: int | None, owns: bool
+    tmp_path: Path, kind: str, has_pid: bool, owns: bool
 ) -> None:
     binary, root = claude_fixture(tmp_path)
     state_file = root / "fixture-state.json"
@@ -296,10 +384,13 @@ async def test_only_exact_interactive_claude_pid_owns_its_terminal_lifetime(
         "provider": "Claude",
         "profileKey": "personal",
         "operation": "inspect",
-        "targets": [{"sessionId": THREAD, **({"pid": pid} if pid else {})}],
+        "targets": [{"sessionId": THREAD, **(process_target() if has_pid else {})}],
     }
     _, result, _ = await invoke(request, PATH=str(binary), CLAUDE_CONFIG_DIR=str(root))
-    assert result["result"][0]["result"].get("terminalOwnsAgent", False) is owns
+    if has_pid:
+        assert result["result"][0]["result"].get("terminalOwnsAgent", False) is owns
+    else:
+        assert result == {"ok": False, "error": {"code": "rejected", "dispatch": "not_sent"}}
 
 
 async def test_hung_claude_observation_times_out_and_reaps_only_its_cli(tmp_path: Path) -> None:
@@ -309,7 +400,7 @@ async def test_hung_claude_observation_times_out_and_reaps_only_its_cli(tmp_path
         "provider": "Claude",
         "profileKey": "claude-personal",
         "operation": "inspect",
-        "targets": [{"pid": 1234}],
+        "targets": [process_target()],
     }
     try:
         code, result, stderr = await asyncio.wait_for(
@@ -334,7 +425,7 @@ async def test_helper_termination_reaps_its_claude_child(tmp_path: Path) -> None
         "provider": "Claude",
         "profileKey": "claude-personal",
         "operation": "inspect",
-        "targets": [{"pid": 1234}],
+        "targets": [process_target()],
     }
     try:
         code, result, stderr = await invoke(
@@ -366,7 +457,11 @@ async def test_invalid_requests_and_unsupported_claude_send_do_not_launch_a_prov
     code, result, stderr = await invoke(invalid, PATH="/nonexistent")
     assert (code, stderr) == (1, b"")
     assert result == {"ok": False, "error": {"code": "rejected", "dispatch": "not_sent"}}
-    invalid.update(operation="send", targets=[{"sessionId": THREAD}], input={"text": "hello"})
+    invalid.update(
+        operation="send",
+        targets=[{"sessionId": THREAD, **process_target()}],
+        input={"text": "hello", "input": "user", "delivery": "direct"},
+    )
     del invalid["endpoint"]
     _, result, _ = await invoke(invalid, PATH="/nonexistent")
-    assert result == {"ok": False, "error": {"code": "unsupported", "dispatch": "not_sent"}}
+    assert result == {"ok": False, "error": {"code": "unavailable", "dispatch": "not_sent"}}
