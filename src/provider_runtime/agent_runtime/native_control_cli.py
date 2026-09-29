@@ -48,6 +48,7 @@ class _Target(_Closed):
 class _Input(_Closed):
     cwd: str | None = Field(default=None, min_length=1, max_length=4096)
     bypassPermissions: bool | None = None
+    name: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
     text: str | None = None
     input: Literal["peer", "user"] | None = None
     delivery: Literal["direct", "queue"] | None = None
@@ -80,11 +81,12 @@ class _Request(_Closed):
                 self.provider != "Codex"
                 or self.targets is not None
                 or self.input is None
-                or self.input.model_fields_set != {"cwd", "bypassPermissions"}
+                or self.input.model_fields_set != {"cwd", "bypassPermissions", "name"}
                 or self.input.cwd is None
                 or self.input.bypassPermissions is None
+                or self.input.name is None
             ):
-                raise ValueError("codex create requires cwd and bypassPermissions")
+                raise ValueError("codex create requires cwd, bypassPermissions and name")
             if not Path(self.input.cwd).is_absolute() or "\0" in self.input.cwd:
                 raise ValueError("create requires an absolute cwd")
             return self
@@ -127,8 +129,8 @@ def _success(result: object) -> dict:
     return {"ok": True, "result": result}
 
 
-def _codex_error(error: CodexControlError) -> dict:
-    if error.dispatch == "Unknown":
+def _codex_error(error: CodexControlError, *, partial_create: bool = False) -> dict:
+    if error.dispatch == "Unknown" and not partial_create:
         return _error("unknown", "unknown")
     code = {
         "missing": "stale",
@@ -139,7 +141,11 @@ def _codex_error(error: CodexControlError) -> dict:
         "auth": "unavailable",
         "quota": "unavailable",
     }.get(error.code, "rejected")
-    return _error(code)
+    result = _error(code, "unknown" if partial_create else "not_sent")
+    if partial_create:
+        assert error.known_thread is not None
+        result["error"]["sessionId"] = error.known_thread.thread_handle
+    return result
 
 
 def _codex_observation(read: CodexThreadRead) -> dict:
@@ -202,10 +208,12 @@ async def _codex(request: _Request) -> dict:
                 request.input is not None
                 and request.input.cwd is not None
                 and request.input.bypassPermissions is not None
+                and request.input.name is not None
             )
             created = await control.create(
                 CodexCreateRequest(request.profileKey, Path(request.input.cwd)),
                 native_bypass_permissions=request.input.bypassPermissions,
+                native_name=request.input.name,
             )
             return _success({"sessionId": created.thread_handle})
         assert request.targets is not None
@@ -268,7 +276,9 @@ async def _codex(request: _Request) -> dict:
             return _success(await control.interrupt_conversation(target, request.targets[0].turnId))
         assert_never(request.operation)
     except CodexControlError as error:
-        return _codex_error(error)
+        return _codex_error(
+            error, partial_create=request.operation == "create" and error.known_thread is not None
+        )
     finally:
         await control.close()
 
