@@ -58,7 +58,7 @@ class _Input(_Closed):
 
 
 class _Request(_Closed):
-    operation: Literal["create", "inspect", "read", "send", "interrupt", "stop", "results"]
+    operation: Literal["create", "inspect", "read", "send", "interrupt", "stop", "results", "usage"]
     provider: Literal["Codex", "Claude"]
     profileKey: str = Field(min_length=1, max_length=128)
     endpoint: str | None = None
@@ -76,6 +76,10 @@ class _Request(_Closed):
                 raise ValueError("codex requires an absolute unix endpoint")
         elif self.endpoint is not None:
             raise ValueError("claude uses its selected profile environment")
+        if self.operation == "usage":
+            if self.provider != "Codex" or self.targets is not None or self.input is not None:
+                raise ValueError("codex usage accepts no targets or input")
+            return self
         if self.operation == "create":
             if (
                 self.provider != "Codex"
@@ -203,6 +207,8 @@ async def _codex(request: _Request) -> dict:
         native_owners=True,
     )
     try:
+        if request.operation == "usage":
+            return _success(await control.usage(request.profileKey))
         if request.operation == "create":
             assert (
                 request.input is not None
@@ -324,7 +330,7 @@ def _claude_conversation_observation(
 
 
 async def _claude(request: _Request) -> dict:
-    assert request.targets is not None
+    assert request.targets is not None and request.operation != "usage"
     target = request.targets[0]
     if request.operation in ("create", "interrupt", "send"):
         return _error("unavailable")
