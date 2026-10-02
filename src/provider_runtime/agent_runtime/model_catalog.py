@@ -166,7 +166,10 @@ async def read_codex_model_catalog(
         raise ProtocolDefect("AgentModelCatalog.observed_at must be timezone-aware")
     definition_revision = _hash(
         b"provider-runtime.agent-model-catalog.v1",
-        {"row_fingerprints": tuple(row.row_fingerprint for row in facts)},
+        {
+            "row_fingerprints": tuple(row.row_fingerprint for row in facts),
+            "native_containment_revision": "codex-contained-native-tools.v2",
+        },
     )
     return AgentModelCatalog(
         backend_contract_revision=AGENT_BACKEND_CONTRACT_REVISION,

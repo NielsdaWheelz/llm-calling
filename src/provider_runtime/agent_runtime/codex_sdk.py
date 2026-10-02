@@ -162,14 +162,17 @@ _DISABLED_BUILTIN_FEATURES = (
     "shell_snapshot",
     "shell_tool",
     "shell_zsh_fork",
+    "sleep_tool",
     "skill_mcp_dependency_install",
     "standalone_web_search",
+    "send_message_to_user_async",
     "terminal_visualization_instructions",
     "token_budget",
     "tool_call_mcp_elicitation",
     "tool_suggest",
     "unified_exec",
     "unified_exec_zsh_fork",
+    "view_image",
     "web_search_cached",
     "web_search_request",
     "workspace_dependencies",
@@ -621,6 +624,12 @@ class CodexSdkAdapter:
                 "sandbox": self._sandbox(request.policy),
             }
             kwargs["model"] = request.dispatch_model
+            if (
+                isinstance(request.open, NewSession)
+                and isinstance(native, CodexNativeOptions)
+                and native.builtin_tools == "disabled"
+            ):
+                kwargs["environments"] = []
             if request.tools:
                 kwargs["dynamicTools"] = [
                     {
@@ -728,6 +737,8 @@ class CodexSdkAdapter:
             "effort": state.request.native_reasoning,
             "clientUserMessageId": input_id,
         }
+        if self._strict_native_containment(state):
+            params["environments"] = []
         if isinstance(state.request.output, JsonSchemaAgentOutput):
             params["output_schema"] = thaw_json_value(state.request.output.schema)
         params = CodexAppServerClient._thread_params(params)
@@ -2056,6 +2067,7 @@ class CodexSdkAdapter:
         if isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled":
             config.update(
                 {
+                    "agents": {"enabled": False},
                     "apps": {"_default": {"enabled": False}},
                     "features": {name: False for name in _DISABLED_BUILTIN_FEATURES},
                     "include_apps_instructions": False,
@@ -2066,7 +2078,10 @@ class CodexSdkAdapter:
                         "bundled": {"enabled": False},
                         "include_instructions": False,
                     },
-                    "tools": {"experimental_request_user_input": {"enabled": False}},
+                    "tools": {
+                        "experimental_request_user_input": {"enabled": False},
+                        "update_plan": {"enabled": False},
+                    },
                 }
             )
         if request.policy.filesystem == "workspace_write":

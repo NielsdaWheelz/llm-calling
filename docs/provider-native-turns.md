@@ -10,6 +10,9 @@ there is one engine for contained and callback-bearing codex turns.
 1. select exact model and reasoning from `model_catalog`; open a
    `CodexCatalogSessionRequest` with its revision and fingerprint. native
    built-ins and web remain disabled when portable callbacks are declared.
+   contained codex requests explicitly disable agents and select no native
+   execution environments. provider containment semantics participate in the
+   catalog definition revision; a config repair rotates consumer definitions.
 2. `prepare_turn(session, request, *, attempt_id, input_id, controls)` performs
    pure validation and reserves the local session slot. it freezes
    `submitted_request` and its canonical sha-256 digest. it performs no provider

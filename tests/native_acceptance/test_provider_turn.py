@@ -46,7 +46,7 @@ from provider_runtime.agent_runtime.codex_app_server import (
     CodexAppServerResponseError,
     CodexConnectionUnavailable,
 )
-from provider_runtime.types import CanonicalTool, canonical_json_bytes
+from provider_runtime.types import CanonicalTool, canonical_json_bytes, thaw_json_value
 
 
 class Peer:
@@ -59,6 +59,7 @@ class Peer:
         self.received: asyncio.Queue[dict[str, object]] = asyncio.Queue()
         self.turn_entered = asyncio.Event()
         self.start_request: dict[str, object] | None = None
+        self.session_requests: list[dict[str, object]] = []
         self._sessions = 0
         self.connections: list[ServerConnection] = []
         self._callback_start: dict[str, object] | None = None
@@ -132,6 +133,7 @@ class Peer:
                     "nextCursor": None,
                 }
             elif method == "thread/start":
+                self.session_requests.append(request)
                 self._sessions += 1
                 thread_id = f"thread-loopback-{self._sessions}"
                 result = {"thread": {"id": thread_id}}
@@ -334,6 +336,38 @@ async def terminal(runtime: AgentRuntime, handle) -> AgentTerminal:
     ]
     assert isinstance(events[-1], AgentTerminal)
     return events[-1]
+
+
+async def test_n014_contained_request_overrides_model_and_inherited_native_authority(
+    peer: Peer, tmp_path: Path
+) -> None:
+    async with AgentRuntime(
+        AgentRuntimeConfig(state_root_base=tmp_path, codex_endpoints={"loopback": peer.socket})
+    ) as runtime:
+        owner = await session(runtime, tmp_path, tools=True)
+        turn = runtime.prepare_turn(
+            owner,
+            TurnRequest(input=(TextContent("verify the contained route"),)),
+            attempt_id="contained-config-attempt",
+            input_id="contained-config-input",
+            controls=AgentTurnControls(rpc_seconds=1, pending_calls=1, pending_call_bytes=1024),
+        )
+        assert thaw_json_value(turn.submitted_request)["params"]["environments"] == []
+        assert (await turn.close()).local_closed
+    assert peer.starts == 0
+    params = peer.session_requests[0]["params"]
+    assert isinstance(params, dict)
+    assert params["environments"] == []
+    config = params["config"]
+    assert isinstance(config, dict)
+    assert config["agents"] == {"enabled": False}
+    tools = config["tools"]
+    assert isinstance(tools, dict)
+    assert tools["update_plan"] == {"enabled": False}
+    features = config["features"]
+    assert isinstance(features, dict)
+    for feature in ("sleep_tool", "view_image", "send_message_to_user_async"):
+        assert features[feature] is False
 
 
 @pytest.mark.parametrize(
