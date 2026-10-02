@@ -79,3 +79,14 @@ the live host remains task-owned for integrated app acceptance; root owns
 its final cleanup. macos uid 501 is proven here. linux uid 10001 container
 socket visibility and persistent production host topology require their own
 qualification; these facts must not be inferred from the macos run.
+
+## integrated schema defect
+
+jarvis's actual native request exposed `invalid_json_schema`: `oneOf` is
+forbidden. the original native failure was retained. pure codex request
+preflight now rejects that keyword and the other established composition,
+root/object closure, and required-field restrictions without normalization.
+the schema-member traversal preserves a legitimate property named `oneOf`.
+the initial focused probe failed eight unsupported-keyword cases and passed
+the literal-property case. the repaired focused suite is green. restrictions
+and remaining remote-validation limits are documented in the public contract.

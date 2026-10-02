@@ -336,6 +336,110 @@ async def terminal(runtime: AgentRuntime, handle) -> AgentTerminal:
     return events[-1]
 
 
+@pytest.mark.parametrize(
+    "unsupported",
+    ("oneOf", "allOf", "not", "dependentRequired", "dependentSchemas", "if", "then", "else"),
+)
+async def test_n001_unsupported_output_schema_is_rejected_before_native_io(
+    peer: Peer, tmp_path: Path, unsupported: str
+) -> None:
+    output = JsonSchemaAgentOutput(
+        name="unsupported",
+        schema={
+            "type": "object",
+            "properties": {"result": {unsupported: [{"type": "string"}, {"type": "null"}]}},
+            "required": ["result"],
+            "additionalProperties": False,
+        },
+    )
+    with pytest.raises(InvalidAgentRequest, match=unsupported):
+        CodexCatalogSessionRequest(
+            auth=CredentialRef("local_account", "test"),
+            open=NewSession(),
+            cwd=str(tmp_path),
+            policy=PermissionPolicy(allowed_tools=("*",)),
+            model_key="loopback-model",
+            reasoning="high",
+            agent_definition_revision="test",
+            row_fingerprint="0" * 64,
+            output=output,
+            native=CodexNativeOptions(builtin_tools="disabled", web_search=False),
+        )
+    assert peer.connections == []
+    assert peer.starts == 0
+
+
+async def test_n001_schema_keyword_property_names_are_not_schema_keywords(
+    peer: Peer, tmp_path: Path
+) -> None:
+    output = JsonSchemaAgentOutput(
+        name="literal_property",
+        schema={
+            "type": "object",
+            "properties": {"oneOf": {"type": "string", "enum": ["oneOf"]}},
+            "required": ["oneOf"],
+            "additionalProperties": False,
+        },
+    )
+    request = CodexCatalogSessionRequest(
+        auth=CredentialRef("local_account", "test"),
+        open=NewSession(),
+        cwd=str(tmp_path),
+        policy=PermissionPolicy(allowed_tools=("*",)),
+        model_key="loopback-model",
+        reasoning="high",
+        agent_definition_revision="test",
+        row_fingerprint="0" * 64,
+        output=output,
+    )
+    assert request.output == output
+    assert peer.connections == []
+
+
+@pytest.mark.parametrize(
+    "schema, message",
+    (
+        ({"type": "array", "items": {"type": "string"}}, "root"),
+        ({"type": "object", "anyOf": [{"type": "object"}]}, "anyOf"),
+        ({"type": "object", "properties": {}}, "additionalProperties"),
+        (
+            {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            "required",
+        ),
+        (
+            {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+                "$defs": {"answer": {"oneOf": [{"type": "string"}, {"type": "null"}]}},
+            },
+            "oneOf",
+        ),
+    ),
+)
+async def test_n001_established_native_schema_constraints_are_local(
+    peer: Peer, tmp_path: Path, schema: dict[str, object], message: str
+) -> None:
+    with pytest.raises(InvalidAgentRequest, match=message):
+        CodexCatalogSessionRequest(
+            auth=CredentialRef("local_account", "test"),
+            open=NewSession(),
+            cwd=str(tmp_path),
+            policy=PermissionPolicy(allowed_tools=("*",)),
+            model_key="loopback-model",
+            reasoning="high",
+            agent_definition_revision="test",
+            row_fingerprint="0" * 64,
+            output=JsonSchemaAgentOutput(name="invalid", schema=schema),
+        )
+    assert peer.connections == []
+    assert peer.starts == 0
+
+
 async def test_n003_native_success_survives_invalid_product_json(
     peer: Peer, tmp_path: Path
 ) -> None:

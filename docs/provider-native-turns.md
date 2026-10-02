@@ -73,3 +73,13 @@ selected settings, invalid identities, malformed frames, and impossible
 callback lifecycles fail closed. output/context reservations are host
 admission facts; the installed native protocol has no enforceable token-ceiling
 field. do not claim otherwise.
+
+codex output-schema preflight rejects actual `oneOf` and the established
+unsupported composition keywords before native i/o. it requires an object
+root, closed object properties, and all object fields required. it traverses
+schema members, not arbitrary annotation or property-name strings. no schema
+is rewritten. the restrictions follow the
+[official strict-output contract](https://developers.openai.com/api/docs/guides/structured-outputs)
+and the actual installed jarvis failure. this is not an exhaustive local copy
+of the remote validator; undocumented restrictions remain original native
+failures, not proven non-submission or automatic retry permission.
