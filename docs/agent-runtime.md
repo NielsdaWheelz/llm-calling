@@ -69,9 +69,10 @@ Unknown pre-turn messages fail before a billable turn.
 The transport bounds queued notifications independently of per-message and
 per-turn limits: at most 100,000 events and 64 MiB of wire data. Overflow
 fails pending RPCs and disconnects this client, never the shared service.
-Earlier authority events remain observable; a queued terminal cannot survive
-a known transport failure. Malformed responses and RPC timeouts fail the
-same connection before another request can start.
+Earlier wire frames remain observable in order. The typed reader retains an
+already validated native terminal when a later transport frame fails; this
+does not make the connection reusable. Malformed responses and RPC timeouts
+fail the same connection before another request can start.
 
 `AgentRuntimeConfig.codex_endpoints` maps caller-owned opaque profile keys to
 absolute Unix-socket paths. The runtime has no Codex executable setting. Claude
@@ -356,9 +357,11 @@ option is removed, not silently ignored or translated into another process.
 `JsonSchemaAgentOutput` carries a plain JSON Schema mapping (pass
 `model_json_schema()` where a pydantic model exists). The adapter passes the
 schema through the App Server's public `turn/start.outputSchema` field; the
-backend enforces it. The final value is strict-parsed and frozen — no JSON
-repair, no coercion — and a miss is the `output_schema_violation` terminal
-failure.
+backend enforces it. The original terminal retains raw native structured data
+and terminal evidence before application validation. `decode_agent_output`
+strict-parses the selected final answer only when no raw structured payload
+was supplied. Invalid supplied data never falls back to valid-looking text.
+An output mismatch is separate from the original native terminal.
 
 Native extension objects are versioned, backend-specific escape hatches:
 
@@ -379,7 +382,9 @@ Unknown or wrong-backend native options fail before SDK startup.
 
 ## Event and terminal grammar
 
-The normalized stream is exactly six kinds:
+The normalized event union has nine kinds. Prepared native turns emit the
+callback, message, and input-recorded forms; contained streaming retains its
+authority-observation forms:
 
 ```text
 AgentText              one chunk of assistant output text
@@ -389,8 +394,13 @@ AgentUsage             TokenUsage, normalized to the provider lane's noun
 AgentPermissionRequest one answered unsafe-action confirmation (request + decision)
 AgentNative            an explicitly allowlisted inert observation, as a bounded,
                        recursively redacted payload
+AgentToolCall          exact native turn/call identity, name, frozen arguments,
+                       and an opaque per-delivery reply token
+AgentMessage           completed native message identity, phase, and text
+AgentInputRecorded     correlated native user-input persistence, not a steer ack
 AgentTerminal          exactly-once terminal: status, typed failure value,
-                       final text, structured output, usage, session ref
+                       final text, raw structured payload, usage, session ref,
+                       native terminal evidence or local stop evidence
 ```
 
 ### Authoritative assistant response
@@ -403,9 +413,9 @@ it but must not execute it or treat its cross-item concatenation as structured
 output. Both structured and unstructured terminals use the same authoritative
 message selection before strict JSON parsing or downstream schema validation.
 
-For Codex, the adapter retains each completed `agentMessage` item's identity,
-text, phase, and native completion order. At terminal it scans those items in
-reverse order and selects the last `phase=final_answer` item. If none exists, it
+For Codex, the adapter validates completed `agentMessage` item identities and
+retains the latest text per eligible phase. At terminal it
+selects the last `phase=final_answer` item. If none exists, it
 selects the last completed item whose phase is absent, matching the supported
 App Server behavior. Commentary is never eligible,
 even if it is individually valid JSON or arrives after the final answer. Multiple
@@ -556,7 +566,7 @@ and certifies nothing. The matrix never enrolls an account or prints tokens.
 Per route it certifies: one full streamed turn under the route's restrictive
 policy (the defaults, plus the `allowed_tools=("*",)` sentinel Codex requires),
 a resumed second turn on the same native session, and a structured output turn
-— asserting the six-kind grammar, the terminal shape, and normalized
+— asserting the event grammar, the terminal shape, and normalized
 `TokenUsage` on the way through. Codex runs four more turns after the resume.
 A live-only observer independently captures the raw native cumulative values
 before projection and proves all six invocation-local terminals equal their

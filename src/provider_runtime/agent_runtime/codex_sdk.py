@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import weakref
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import uuid4
 
 from provider_runtime.errors import sanitize_provider_text
-from provider_runtime.types import Absent, Presence, Present, TokenUsage
+from provider_runtime.types import Absent, Presence, Present, TokenUsage, canonical_json_bytes
 
 from ._limits import (
     _MAX_DIAGNOSTICS,
@@ -25,7 +26,6 @@ from ._limits import (
     OutputLimitExceeded,
     bounded_payload_size,
 )
-from ._structured_output import OutputSchemaMismatch, parse_structured_output
 from .auth import (
     freeze_native_json_object,
     freeze_native_json_value,
@@ -34,6 +34,8 @@ from .auth import (
 from .codex_app_server import (
     CodexAppServerClient,
     CodexAppServerConfig,
+    CodexAppServerResponseError,
+    CodexRequestId,
     CodexServerRequest,
 )
 from .errors import (
@@ -42,11 +44,11 @@ from .errors import (
     ExecutableUnavailable,
     InvalidAgentRequest,
     McpUnavailable,
-    MissingTerminalEvent,
     ProtocolDefect,
     SdkUnavailable,
     SessionMismatch,
     SessionUnavailable,
+    TurnNotStarted,
     UnsupportedCapability,
 )
 from .events import (
@@ -75,6 +77,24 @@ from .sessions import (
     validate_read_session_auth,
     validate_session_ref,
 )
+from .turn import (
+    AgentAccepted,
+    AgentAttempt,
+    AgentCloseResult,
+    AgentControlReceipt,
+    AgentInputRecorded,
+    AgentMessage,
+    AgentNotSubmitted,
+    AgentSubmission,
+    AgentToolCall,
+    AgentToolReply,
+    AgentTurn,
+    AgentTurnControls,
+    AgentTurnRef,
+    AgentUncertain,
+    LocalStopEvidence,
+    NativeTerminalEvidence,
+)
 from .types import (
     AgentSessionRef,
     AgentSessionRequest,
@@ -82,15 +102,20 @@ from .types import (
     ApprovalRequest,
     CodexNativeOptions,
     CodexSandboxControls,
+    ContentPart,
     CredentialRef,
     ForkSession,
     ImageContent,
+    JsonObject,
     JsonSchemaAgentOutput,
+    JsonValue,
     NewSession,
     ResumeSession,
     TextContent,
     TurnRequest,
     _ResolvedCodexSessionRequest,
+    freeze_json_object,
+    freeze_json_value,
     thaw_json_value,
     validate_mcp_network_policy,
 )
@@ -191,6 +216,7 @@ _INERT_NATIVE_METHODS = frozenset(
         "item/plan/delta",
         "turn/plan/updated",
         "thread/status/changed",
+        "thread/settings/updated",
         "account/rateLimits/updated",
         "model/rerouted",
         "model/safetyBuffering/updated",
@@ -214,6 +240,7 @@ _THREAD_BOUND_INERT_METHODS = frozenset(
         "thread/goal/updated",
         "thread/name/updated",
         "thread/status/changed",
+        "thread/settings/updated",
     }
 )
 
@@ -251,6 +278,7 @@ _PRETURN_INERT_METHODS = frozenset(
         "thread/goal/updated",
         "thread/name/updated",
         "thread/status/changed",
+        "thread/settings/updated",
         "mcpServer/startupStatus/updated",
         "remoteControl/status/changed",
     }
@@ -450,9 +478,13 @@ class _CodexSessionState:
     active_tool_calls: dict[str, str] = field(default_factory=dict)
     custom_item_calls: dict[str, str] = field(default_factory=dict)
     server_request_ids: set[tuple[type[object], object]] = field(default_factory=set)
+    ended_callback_request_ids: set[tuple[type[object], object]] = field(default_factory=set)
     authority_seen: bool = False
     quota_exhausted: bool = False
     user_message_id: str | None = None
+    attempt: AgentAttempt | None = None
+    controlled: bool = False
+    handle: _CodexAgentTurn | None = None
 
 
 class CodexSdkAdapter:
@@ -573,7 +605,13 @@ class CodexSdkAdapter:
         native = request.native
         if isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled":
             self._validate_strict_native_containment(request)
-        client = await self._open_client(environment=environment)
+        if request.tools and not (
+            isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled"
+        ):
+            raise UnsupportedCapability(
+                "declared native callbacks require disabled Codex built-ins"
+            )
+        client = await self._open_client(environment=environment, callbacks=bool(request.tools))
         try:
             await self._verify_auth(client)
             kwargs: dict[str, object] = {
@@ -583,6 +621,15 @@ class CodexSdkAdapter:
                 "sandbox": self._sandbox(request.policy),
             }
             kwargs["model"] = request.dispatch_model
+            if request.tools:
+                kwargs["dynamicTools"] = [
+                    {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "inputSchema": thaw_json_value(freeze_json_object(tool.parameters)),
+                    }
+                    for tool in request.tools
+                ]
             if request.system:
                 # `baseInstructions` is the public App Server system-role field on thread
                 # start/resume/fork and *replaces* Codex's built-in base prompt rather than
@@ -628,7 +675,7 @@ class CodexSdkAdapter:
                 native_session_id == request.open.ref.native_session_id
             ):
                 raise ProtocolDefect("Codex SDK fork did not mint a new thread id")
-            restored_usage = self._restored_usage_baseline(client, native_session_id)
+            restored_usage = self._restored_usage_baseline(client, native_session_id, request)
             if isinstance(request.open, NewSession) and restored_usage is not None:
                 raise ProtocolDefect("Codex new thread replayed historical usage")
 
@@ -655,47 +702,46 @@ class CodexSdkAdapter:
             await self._close_client(client)
             raise
 
-    async def stream_turn(
+    def prepare_turn(
         self,
         session: AgentSession,
         request: TurnRequest,
         *,
-        approvals: ApprovalHandler | None,
-    ) -> AsyncGenerator[AgentEvent, None]:
+        attempt_id: str,
+        input_id: str,
+        controls: AgentTurnControls,
+        release: Callable[[], None],
+        validate_input: Callable[[tuple[ContentPart, ...]], None] | None = None,
+    ) -> AgentTurn:
         state = self._state(session)
-        if approvals is not None:
-            raise UnsupportedCapability("Codex SDK does not expose caller approval callbacks")
         if request.policy is not None:
-            raise UnsupportedCapability("Codex SDK cannot reconfigure policy on a started thread")
-
-        policy = state.request.policy
-        inputs = [self._codex_input(part) for part in request.input]
-        kwargs: dict[str, object] = {
-            "approval_mode": self._approval_mode(policy),
+            raise UnsupportedCapability("Codex cannot reconfigure policy on a started thread")
+        if not state.client.usable:
+            raise SessionUnavailable("Codex session connection is no longer usable")
+        if type(input_id) is not str or not input_id:
+            raise InvalidAgentRequest("prepared input_id must be non-empty")
+        self._restored_usage_baseline(state.client, state.ref.native_session_id, state.request)
+        params: dict[str, object] = {
+            "threadId": state.ref.native_session_id,
+            "input": [self._codex_input(part) for part in request.input],
+            "approval_mode": self._approval_mode(state.request.policy),
+            "effort": state.request.native_reasoning,
+            "clientUserMessageId": input_id,
         }
-        if self._strict_native_containment(state):
-            try:
-                self._restored_usage_baseline(state.client, state.ref.native_session_id)
-            except ProtocolDefect:
-                await self._destroy_session(session, state)
-                raise
-            state.user_message_id = str(uuid4())
-            kwargs["clientUserMessageId"] = state.user_message_id
-        kwargs["effort"] = state.request.native_reasoning
-        output = state.request.output
-        if isinstance(output, JsonSchemaAgentOutput):
-            # The schema is a plain frozen JSON mapping; the backend enforces it natively.
-            kwargs["output_schema"] = thaw_json_value(output.schema)
-
-        turn = await self._call(
-            state.thread.turn(inputs, **kwargs), operation="turn start", failure="session"
+        if isinstance(state.request.output, JsonSchemaAgentOutput):
+            params["output_schema"] = thaw_json_value(state.request.output.schema)
+        params = CodexAppServerClient._thread_params(params)
+        submitted = freeze_json_object({"method": "turn/start", "params": params})
+        if len(canonical_json_bytes(submitted)) > _MAX_MESSAGE_BYTES:
+            raise InvalidAgentRequest("prepared Codex request exceeds its transport byte bound")
+        attempt = AgentAttempt(
+            attempt_id, hashlib.sha256(canonical_json_bytes(submitted)).hexdigest()
         )
-        turn_id = getattr(turn, "id", None)
-        if not isinstance(turn_id, str) or not turn_id:
-            await self._destroy_session(session, state)
-            raise ProtocolDefect("Codex SDK returned no turn id")
-        state.turn = turn
-        state.turn_id = turn_id
+        state.turn = None
+        state.turn_id = None
+        state.user_message_id = input_id
+        state.attempt = attempt
+        state.controlled = True
         state.message_count = 0
         state.output_bytes = 0
         state.streamed_text_bytes = 0
@@ -708,67 +754,70 @@ class CodexSdkAdapter:
         state.active_tool_calls.clear()
         state.custom_item_calls.clear()
         state.server_request_ids.clear()
+        state.ended_callback_request_ids.clear()
         state.authority_seen = False
         state.quota_exhausted = False
+        handle = _CodexAgentTurn(
+            self, session, state, submitted, request, controls, release, validate_input
+        )
+        state.handle = handle
+        return handle
 
-        terminal_seen = False
+    def session_usable(self, session: AgentSession) -> bool:
+        state = self._sessions.get(session)
+        return (
+            state is not None
+            and state.client.usable
+            and (
+                state.handle is None
+                or state.handle._closed
+                and (
+                    state.handle.terminal is not None
+                    or isinstance(state.handle.submission, AgentNotSubmitted)
+                )
+            )
+        )
+
+    def turn_submission(self, session: AgentSession) -> AgentSubmission | None:
+        state = self._sessions.get(session)
+        return None if state is None or state.handle is None else state.handle.submission
+
+    async def stream_turn(
+        self,
+        session: AgentSession,
+        request: TurnRequest,
+        *,
+        approvals: ApprovalHandler | None,
+    ) -> AsyncGenerator[AgentEvent, None]:
+        state = self._state(session)
+        if approvals is not None:
+            raise UnsupportedCapability("Codex does not expose caller approval callbacks")
+        if state.request.tools:
+            raise UnsupportedCapability("declared callbacks require prepare_turn, not stream_turn")
+        handle = self.prepare_turn(
+            session,
+            request,
+            attempt_id=str(uuid4()),
+            input_id=str(uuid4()),
+            controls=AgentTurnControls(_OPERATION_TIMEOUT_SECONDS, 16, 1_048_576),
+            release=lambda: None,
+        )
         try:
-            stream = turn.stream()
-            async for notification in stream:
-                for event in self._notification_events(state, notification):
-                    if isinstance(event, AgentTerminal):
-                        terminal_seen = True
-                        state.turn = None
-                    yield event
-                    if isinstance(event, AgentTerminal):
-                        return
-        except OutputLimitExceeded:
-            usage = state.usage_accounting.finish_turn()
-            try:
-                await turn.interrupt()
-            finally:
-                await self._destroy_session(session, state)
-            yield AgentTerminal(
-                status="failed",
-                failure=AgentFailure("output_limit_exceeded"),
-                final_text=self._selected_final_text(state, required=False),
-                session_ref=state.ref,
-                usage=usage,
-                diagnostics=tuple(state.diagnostics),
-            )
-            return
-        except ProtocolDefect:
-            await self._destroy_session(session, state)
-            raise
-        except (TypeError, ValueError, RecursionError):
-            await self._destroy_session(session, state)
-            raise ProtocolDefect("Codex SDK emitted an invalid event payload") from None
-        except Exception as error:
-            message = sanitize_provider_text(str(error)) or "Codex SDK turn failed"
-            self._append_diagnostic(state, message)
-            usage = state.usage_accounting.finish_turn()
-            await self._destroy_session(session, state)
-            yield AgentTerminal(
-                status="failed",
-                failure=AgentQuotaExhausted()
-                if self._is_quota_error_text(message)
-                else AgentFailure("backend_failed"),
-                final_text=self._selected_final_text(state, required=False),
-                session_ref=state.ref,
-                usage=usage,
-                diagnostics=tuple(state.diagnostics),
-            )
-            return
+            submission = await handle.submit()
+            if isinstance(submission, AgentNotSubmitted):
+                raise SessionUnavailable(submission.reason)
+            async for event in handle.events():
+                yield event
         finally:
-            state.usage_accounting.abandon_turn()
-        if not terminal_seen:
-            await self._destroy_session(session, state)
-            raise MissingTerminalEvent()
+            await handle.close()
 
     async def interrupt(self, session: AgentSession) -> None:
         if session in self._dead_sessions:
             return
         state = self._state(session)
+        if state.handle is not None:
+            await state.handle.interrupt()
+            return
         if state.turn is None:
             # Block-and-stop: a turn that never became identifiable releases the session.
             await self._destroy_session(session, state)
@@ -803,8 +852,12 @@ class CodexSdkAdapter:
                 "Codex App Server client teardown did not complete", code="sdk_teardown_failed"
             )
 
-    async def _open_client(self, *, environment: Mapping[str, str]) -> CodexAppServerClient:
-        client = CodexAppServerClient(CodexAppServerConfig(socket_path=self._endpoint(environment)))
+    async def _open_client(
+        self, *, environment: Mapping[str, str], callbacks: bool = False
+    ) -> CodexAppServerClient:
+        client = CodexAppServerClient(
+            CodexAppServerConfig(socket_path=self._endpoint(environment), callbacks=callbacks)
+        )
         try:
             async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
                 await client.__aenter__()
@@ -821,7 +874,9 @@ class CodexSdkAdapter:
             raise CredentialUnavailable("Codex profile has no configured external endpoint")
         return Path(value)
 
-    def _restored_usage_baseline(self, client: Any, native_session_id: str) -> TokenUsage | None:
+    def _restored_usage_baseline(
+        self, client: Any, native_session_id: str, request: _ResolvedCodexSessionRequest
+    ) -> TokenUsage | None:
         """Consume and validate app-server replay emitted before resume/fork responds."""
         take_pending = getattr(client, "take_pending_messages", None)
         if not callable(take_pending):
@@ -864,6 +919,8 @@ class CodexSdkAdapter:
                     raise ProtocolDefect("Codex replay omitted or changed thread identity")
                 if observed_id is not None and observed_id != native_session_id:
                     raise ProtocolDefect("Codex replay changed thread identity")
+                if method == "thread/settings/updated":
+                    self._validate_thread_settings(request, params)
                 continue
             if method != "thread/tokenUsage/updated":
                 raise ProtocolDefect(f"Codex emitted unexpected pre-turn notification {method}")
@@ -982,16 +1039,18 @@ class CodexSdkAdapter:
             )
             raise
         state.message_count += 1
-        if state.message_count > _MAX_EVENT_COUNT:
+        if not state.controlled and state.message_count > _MAX_EVENT_COUNT:
             raise OutputLimitExceeded(_MAX_EVENT_COUNT)
-        if state.output_bytes + size > _MAX_TURN_OUTPUT_BYTES:
+        if not state.controlled and state.output_bytes + size > _MAX_TURN_OUTPUT_BYTES:
             raise OutputLimitExceeded(_MAX_TURN_OUTPUT_BYTES)
         state.output_bytes += size
         params = self._mapping(raw_params, f"Codex app-server {method} notification")
         self._validate_notification_identity(state, method, params)
         if self._strict_native_containment(state) and method in ("item/started", "item/completed"):
             item = self._mapping(params.get("item"), "Codex item")
-            if item.get("type") == "userMessage" and item.get("clientId") != state.user_message_id:
+            if item.get("type") == "userMessage" and (
+                state.handle is None or not state.handle.accepts_input(item.get("clientId"))
+            ):
                 raise ProtocolDefect("Codex cognition observed foreign user input")
         if method == "turn/completed":
             # The native completion frame travels first; the owned terminal is last.
@@ -1016,12 +1075,18 @@ class CodexSdkAdapter:
         except OutputLimitExceeded:
             raise ProtocolDefect("Codex server request exceeded its ingress bound") from None
         state.message_count += 1
-        if state.message_count > _MAX_EVENT_COUNT:
+        if not state.controlled and state.message_count > _MAX_EVENT_COUNT:
             raise OutputLimitExceeded(_MAX_EVENT_COUNT)
-        if state.output_bytes + size > _MAX_TURN_OUTPUT_BYTES:
+        if not state.controlled and state.output_bytes + size > _MAX_TURN_OUTPUT_BYTES:
             raise OutputLimitExceeded(_MAX_TURN_OUTPUT_BYTES)
         state.output_bytes += size
         identity = (type(request.request_id), request.request_id)
+        if request.method == "item/tool/call" and state.controlled and state.request.tools:
+            self._validate_notification_identity(state, request.method, request.params)
+            state.server_request_ids.add(identity)
+            if state.handle is None:
+                raise ProtocolDefect("controlled callback has no owned turn handle")
+            return state.handle.tool_call(request)
         if identity in state.server_request_ids:
             raise ProtocolDefect("Codex server request identity repeated within a turn")
         state.server_request_ids.add(identity)
@@ -1239,9 +1304,13 @@ class CodexSdkAdapter:
             if type(request_id) not in (str, int) or request_id == "":
                 raise ProtocolDefect("serverRequest/resolved had a malformed identity")
             identity = (type(request_id), request_id)
-            if identity not in state.server_request_ids:
+            if (
+                identity not in state.server_request_ids
+                and identity not in state.ended_callback_request_ids
+            ):
                 raise ProtocolDefect("serverRequest/resolved did not match a server request")
-            state.server_request_ids.remove(identity)
+            state.server_request_ids.discard(identity)
+            state.ended_callback_request_ids.discard(identity)
             return AgentNative(native_type=method, payload=redact_native_payload(params))
         if method == "turn/diff/updated":
             state.authority_seen = True
@@ -1290,6 +1359,10 @@ class CodexSdkAdapter:
             )
         if method in _FORBIDDEN_SESSION_NOTIFICATIONS:
             raise ProtocolDefect(f"Codex app-server changed session lifecycle via {method}")
+        if method == "thread/settings/updated":
+            self._validate_thread_settings(state.request, params)
+        if method == "model/rerouted" and self._strict_native_containment(state):
+            raise ProtocolDefect("Codex rerouted the selected native model")
         if method in _INERT_NATIVE_METHODS:
             return AgentNative(native_type=method, payload=redact_native_payload(params))
         raise ProtocolDefect(f"Codex app-server emitted unknown notification {method}")
@@ -1373,6 +1446,11 @@ class CodexSdkAdapter:
             tool = self._non_empty_string(item, "tool", method)
             name = self._dynamic_tool_name(item, tool)
             self._start_tool(state, item_id, name)
+            if state.controlled and state.request.tools:
+                if state.handle is None:
+                    raise ProtocolDefect("declared tool item has no controlled turn")
+                state.handle.tool_started(item_id, name, item.get("arguments"))
+                return None
             state.authority_seen = True
             return AgentToolUse(
                 tool_call_id=item_id,
@@ -1434,6 +1512,25 @@ class CodexSdkAdapter:
         if item_type in _INERT_ITEM_TYPES:
             if item_type == "agentMessage":
                 self._record_completed_agent_message(state, item_id, item, method)
+                if state.controlled:
+                    if state.turn_id is None:
+                        raise ProtocolDefect("completed message omitted its native turn")
+                    phase = item.get("phase")
+                    return AgentMessage(
+                        AgentTurnRef(state.ref, state.turn_id),
+                        item_id,
+                        "unknown"
+                        if phase is None
+                        else cast(Literal["commentary", "final_answer"], phase),
+                        self._string(item, "text", method),
+                    )
+            if item_type == "userMessage" and state.controlled:
+                if state.turn_id is None or state.handle is None:
+                    raise ProtocolDefect("recorded input omitted its controlled native turn")
+                input_id = self._non_empty_string(item, "clientId", method)
+                if not state.handle.accepts_input(input_id):
+                    raise ProtocolDefect("native user item has no prepared input delivery")
+                return AgentInputRecorded(AgentTurnRef(state.ref, state.turn_id), input_id, item_id)
             return None
         if started_type is None:
             raise ProtocolDefect("Codex authority item completed before its start")
@@ -1502,6 +1599,11 @@ class CodexSdkAdapter:
         else:
             name = item_type
         self._complete_tool(state, item_id, name, method)
+        if item_type == "dynamicToolCall" and state.controlled and state.request.tools:
+            if state.handle is None:
+                raise ProtocolDefect("completed declared tool has no owned handle")
+            state.handle.tool_completed(item_id, item.get("status"))
+            return None
         state.authority_seen = True
         status = item.get("status")
         succeeded = status not in ("failed", "declined")
@@ -1533,27 +1635,20 @@ class CodexSdkAdapter:
         final_text = self._selected_final_text(state, required=status == "completed")
         usage = state.usage_accounting.finish_turn()
         diagnostics = tuple(state.diagnostics)
+        if state.attempt is None or state.turn_id is None:
+            raise ProtocolDefect("Codex native terminal omitted its submitted attempt")
+        evidence = NativeTerminalEvidence(
+            state.attempt,
+            AgentTurnRef(state.ref, state.turn_id),
+            "codex-turn-completed.v1",
+        )
         if status == "completed":
-            structured = None
-            if isinstance(state.request.output, JsonSchemaAgentOutput):
-                try:
-                    # Strict parse and freeze only; the backend enforced the schema natively.
-                    structured = parse_structured_output(final_text)
-                except OutputSchemaMismatch:
-                    return AgentTerminal(
-                        status="failed",
-                        failure=AgentFailure("output_schema_violation"),
-                        final_text=final_text,
-                        session_ref=state.ref,
-                        usage=usage,
-                        diagnostics=diagnostics,
-                    )
             return AgentTerminal(
                 status="succeeded",
                 failure=None,
                 final_text=final_text,
                 session_ref=state.ref,
-                structured_output=structured,
+                evidence=evidence,
                 usage=usage,
                 diagnostics=diagnostics,
             )
@@ -1563,6 +1658,7 @@ class CodexSdkAdapter:
                 failure=None,
                 final_text=final_text,
                 session_ref=state.ref,
+                evidence=evidence,
                 usage=usage,
                 diagnostics=diagnostics,
             )
@@ -1577,6 +1673,7 @@ class CodexSdkAdapter:
                 failure=failure,
                 final_text=final_text,
                 session_ref=state.ref,
+                evidence=evidence,
                 usage=usage,
                 diagnostics=diagnostics,
             )
@@ -1779,6 +1876,25 @@ class CodexSdkAdapter:
                     f"Codex {safe_method} event changed or omitted its turn identity"
                 )
 
+    def _validate_thread_settings(
+        self, request: _ResolvedCodexSessionRequest, params: Mapping[str, object]
+    ) -> None:
+        settings = self._mapping(params.get("threadSettings"), "native thread settings")
+        if settings.get("model") != request.dispatch_model or settings.get("cwd") != request.cwd:
+            raise ProtocolDefect("Codex native settings changed the selected model or cwd")
+        if settings.get("effort") != request.native_reasoning:
+            raise ProtocolDefect("Codex native settings changed the selected reasoning effort")
+        native = request.native
+        if isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled":
+            sandbox = self._mapping(settings.get("sandboxPolicy"), "native sandbox policy")
+            if (
+                settings.get("modelProvider") != "openai"
+                or settings.get("approvalPolicy") != "never"
+                or sandbox.get("type") != "readOnly"
+                or sandbox.get("networkAccess", False) is not False
+            ):
+                raise ProtocolDefect("Codex native settings widened the contained policy")
+
     def _state(self, session: AgentSession) -> _CodexSessionState:
         if session in self._dead_sessions:
             raise SessionUnavailable("Codex SDK session is no longer live")
@@ -1926,9 +2042,10 @@ class CodexSdkAdapter:
             return {"type": "localImage", "path": part.path}
         raise UnsupportedCapability("Codex SDK input supports text and local images")
 
-    def _codex_config(self, request: AgentSessionRequest) -> dict[str, object]:
+    def _codex_config(self, request: _ResolvedCodexSessionRequest) -> dict[str, object]:
         config: dict[str, object] = {
             "mcp_servers": {},
+            "model_reasoning_effort": request.native_reasoning,
             "web_search": "disabled",
             "shell_environment_policy": {"inherit": "core", "exclude": []},
         }
@@ -1986,7 +2103,7 @@ class CodexSdkAdapter:
         size = len(text.encode("utf-8"))
         if size > _MAX_EVENT_TEXT_BYTES:
             raise OutputLimitExceeded(_MAX_EVENT_TEXT_BYTES)
-        if state.streamed_text_bytes + size > _MAX_FINAL_TEXT_BYTES:
+        if not state.controlled and state.streamed_text_bytes + size > _MAX_FINAL_TEXT_BYTES:
             raise OutputLimitExceeded(_MAX_FINAL_TEXT_BYTES)
         state.streamed_text_bytes += size
 
@@ -2003,6 +2120,12 @@ class CodexSdkAdapter:
             raise ProtocolDefect("Codex completed agent message carried an unknown phase")
         if phase in (None, "final_answer") and len(text.encode("utf-8")) > _MAX_FINAL_TEXT_BYTES:
             raise OutputLimitExceeded(_MAX_FINAL_TEXT_BYTES)
+        if state.controlled:
+            if phase == "commentary":
+                return
+            state.completed_agent_messages[:] = [
+                message for message in state.completed_agent_messages if message.phase != phase
+            ]
         state.completed_agent_messages.append(
             _CompletedAgentMessage(
                 item_id=item_id,
@@ -2040,6 +2163,10 @@ class CodexSdkAdapter:
         if message in state.diagnostics:
             return
         if len(state.diagnostics) >= _MAX_DIAGNOSTICS:
+            if state.controlled:
+                state.diagnostics.pop(0)
+                state.diagnostics.append(message)
+                return
             raise OutputLimitExceeded(_MAX_DIAGNOSTICS)
         state.diagnostics.append(message)
 
@@ -2099,6 +2226,544 @@ class CodexSdkAdapter:
     @staticmethod
     def _optional_string(value: object) -> str | None:
         return value if isinstance(value, str) and value else None
+
+
+@dataclass(slots=True)
+class _PendingReply:
+    call: AgentToolCall
+    request_id: CodexRequestId
+    attempted: bool = False
+    sent: bool = False
+
+
+class _CodexAgentTurn:
+    """One exclusive native turn; its reader never waits on host callbacks."""
+
+    def __init__(
+        self,
+        adapter: CodexSdkAdapter,
+        session: AgentSession,
+        state: _CodexSessionState,
+        submitted: JsonObject,
+        request: TurnRequest,
+        controls: AgentTurnControls,
+        release: Callable[[], None],
+        validate_input: Callable[[tuple[ContentPart, ...]], None] | None,
+    ) -> None:
+        if state.attempt is None or state.user_message_id is None:
+            raise ProtocolDefect("prepared turn omitted its immutable attempt/input identity")
+        self._adapter = adapter
+        self._session = session
+        self._state = state
+        self._attempt = state.attempt
+        self._submitted_request = submitted
+        self._request = request
+        self._controls = controls
+        self._release = release
+        self._validate_input = validate_input
+        self._submission: AgentSubmission | None = None
+        self._terminal: AgentTerminal | None = None
+        self._error: BaseException | None = None
+        self._started = False
+        self._writer_entered = False
+        self._revoked = False
+        self._released = False
+        self._closed = False
+        self._consumer_open = False
+        self._input_ids = {state.user_message_id}
+        self._calls: dict[str, tuple[str, JsonValue, int]] = {}
+        self._reply_tokens: dict[str, _PendingReply] = {}
+        self._pending_call_bytes = 0
+        self._events: asyncio.Queue[tuple[AgentEvent, int]] = asyncio.Queue(maxsize=256)
+        self._queued_bytes = 0
+        self._accepted: asyncio.Future[AgentSubmission] = asyncio.get_running_loop().create_future()
+        self._finished = asyncio.Event()
+        self._sender: asyncio.Task[None] | None = None
+        self._reader: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[AgentCloseResult] | None = None
+
+    @property
+    def attempt(self) -> AgentAttempt:
+        return self._attempt
+
+    @property
+    def submission(self) -> AgentSubmission | None:
+        return self._submission
+
+    @property
+    def terminal(self) -> AgentTerminal | None:
+        return self._terminal
+
+    @property
+    def submitted_request(self) -> JsonObject:
+        return self._submitted_request
+
+    async def submit(self) -> AgentSubmission:
+        if self._started:
+            raise InvalidAgentRequest("a prepared turn can be submitted exactly once")
+        self._started = True
+        if self._revoked or self._closed:
+            self._submission = AgentNotSubmitted(self.attempt, "revoked before submission")
+            self._finish()
+            self._release_slot()
+            return self._submission
+        self._reader = asyncio.create_task(self._read())
+        self._sender = asyncio.create_task(self._send())
+        try:
+            return await asyncio.shield(self._accepted)
+        except asyncio.CancelledError:
+            self.revoke()
+            await self.close()
+            raise
+
+    def _enter_writer(self) -> None:
+        self._require_authority()
+        self._writer_entered = True
+        self._submission = AgentUncertain(self.attempt, None, "native writer entered")
+
+    async def _send(self) -> None:
+        params = self._submitted_request["params"]
+        if not isinstance(params, Mapping):
+            raise ProtocolDefect("prepared request lost its immutable params")
+        try:
+            response = await self._state.client.request(
+                "turn/start",
+                thaw_json_value(freeze_json_object(params)),
+                on_write=self._enter_writer,
+                timeout_seconds=self._controls.rpc_seconds,
+            )
+            payload = self._adapter._mapping(response, "turn/start response")
+            turn = self._adapter._mapping(payload.get("turn"), "turn/start turn")
+            self._accept(self._adapter._non_empty_string(turn, "id", "turn/start response"))
+        except asyncio.CancelledError:
+            if not self._writer_entered and not isinstance(self._submission, AgentAccepted):
+                self._submission = AgentNotSubmitted(
+                    self.attempt,
+                    sanitize_provider_text(str(self._error))
+                    if self._error is not None
+                    else "writer was cancelled before entry",
+                )
+                if not self._accepted.done():
+                    self._accepted.set_result(self._submission)
+            raise
+        except Exception as error:
+            if self._terminal is not None:
+                self._error = error
+                await self._state.client.close()
+                return
+            if not isinstance(self._submission, AgentAccepted):
+                reason = sanitize_provider_text(str(error)) or type(error).__name__
+                self._submission = (
+                    AgentUncertain(self.attempt, self._turn_ref(), reason)
+                    if self._writer_entered
+                    else AgentNotSubmitted(self.attempt, reason)
+                )
+                if not self._accepted.done():
+                    self._accepted.set_result(self._submission)
+                self._error = error
+                await self._state.client.close()
+            elif isinstance(error, ProtocolDefect):
+                self._error = error
+                await self._state.client.close()
+
+    def _accept(self, native_turn_id: str) -> None:
+        if self._state.turn_id is not None and self._state.turn_id != native_turn_id:
+            raise ProtocolDefect("native acknowledgment changed the prepared turn identity")
+        if not self._writer_entered:
+            raise ProtocolDefect("native turn evidence preceded its possible writer")
+        self._state.turn_id = native_turn_id
+        self._submission = AgentAccepted(
+            self.attempt, AgentTurnRef(self._state.ref, native_turn_id)
+        )
+        if not self._accepted.done():
+            self._accepted.set_result(self._submission)
+
+    async def _read(self) -> None:
+        try:
+            async with asyncio.timeout(self._request.timeout_seconds):
+                while True:
+                    message = await self._state.client.next_message()
+                    params = message.params
+                    thread_id = params.get("threadId")
+                    native = params.get("turnId")
+                    turn = params.get("turn")
+                    if native is None and isinstance(turn, Mapping):
+                        native = turn.get("id")
+                    if self._state.turn_id is None and message.method in _TURN_SCOPED_METHODS:
+                        if (
+                            thread_id != self._state.ref.native_session_id
+                            or type(native) is not str
+                            or not native
+                        ):
+                            raise ProtocolDefect(
+                                "native turn evidence omitted exact thread/turn identity"
+                            )
+                        self._state.turn_id = native
+                    values = self._adapter._notification_events(self._state, message)
+                    native_terminal = next(
+                        (value for value in values if isinstance(value, AgentTerminal)), None
+                    )
+                    if native_terminal is not None:
+                        evidence = native_terminal.evidence
+                        if not isinstance(evidence, NativeTerminalEvidence) or not isinstance(
+                            evidence.native_ref, AgentTurnRef
+                        ):
+                            raise ProtocolDefect("Codex native seal has invalid provenance")
+                        self._accept(evidence.native_ref.native_turn_id)
+                        self._terminal = native_terminal
+                        return
+                    if (
+                        message.method == "turn/started"
+                        or isinstance(message, CodexServerRequest)
+                        and message.method == "item/tool/call"
+                    ):
+                        if self._state.turn_id is None:
+                            raise ProtocolDefect("native acceptance omitted turn identity")
+                        self._accept(self._state.turn_id)
+                    for value in values:
+                        self._publish(value)
+        except TimeoutError:
+            if not self._writer_entered:
+                self._error = TurnNotStarted("turn_timeout")
+                return
+            submission = self._submission
+            if not isinstance(submission, AgentAccepted | AgentUncertain):
+                submission = AgentUncertain(self.attempt, self._turn_ref(), "native turn deadline")
+                self._submission = submission
+            self._terminal = AgentTerminal(
+                status="failed",
+                failure=AgentFailure("turn_timeout"),
+                final_text=self._adapter._selected_final_text(self._state, required=False),
+                session_ref=self._state.ref,
+                evidence=LocalStopEvidence(submission, "turn_timeout"),
+                usage=self._state.usage_accounting.finish_turn(),
+                diagnostics=tuple(self._state.diagnostics),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if self._terminal is None:
+                if self._error is None:
+                    self._error = error
+                if not isinstance(self._submission, AgentAccepted):
+                    reason = sanitize_provider_text(str(self._error)) or type(self._error).__name__
+                    self._submission = (
+                        AgentUncertain(self.attempt, self._turn_ref(), reason)
+                        if self._writer_entered
+                        else None
+                    )
+        finally:
+            if not self._writer_entered:
+                self.revoke()
+                sender = self._sender
+                if sender is not None and not sender.done():
+                    sender.cancel()
+                    await asyncio.gather(sender, return_exceptions=True)
+                if not isinstance(self._submission, AgentNotSubmitted):
+                    self._submission = AgentNotSubmitted(
+                        self.attempt, "all deferred writers quiesced before entry"
+                    )
+            if not self._accepted.done():
+                if self._submission is None:
+                    self._submission = AgentNotSubmitted(self.attempt, "writer did not enter")
+                self._accepted.set_result(self._submission)
+            self._finish()
+
+    def _publish(self, event: AgentEvent) -> None:
+        try:
+            size = bounded_payload_size(event, _MAX_MESSAGE_BYTES, max_items=_MAX_MESSAGE_ITEMS)
+        except OutputLimitExceeded:
+            raise ProtocolDefect("native event exceeded its per-message bound") from None
+        if self._events.full() or self._queued_bytes + size > _MAX_MESSAGE_BYTES:
+            raise ProtocolDefect("native pending event buffer exceeded its finite bound")
+        self._queued_bytes += size
+        self._events.put_nowait((event, size))
+
+    async def events(self) -> AsyncGenerator[AgentEvent, None]:
+        if self._consumer_open:
+            raise InvalidAgentRequest("a controlled turn has one event consumer")
+        self._consumer_open = True
+        while True:
+            if self._events.empty() and self._finished.is_set():
+                if self._terminal is not None:
+                    yield self._terminal
+                elif self._error is not None:
+                    raise self._error
+                return
+            next_event = asyncio.create_task(self._events.get())
+            finished = asyncio.create_task(self._finished.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    {next_event, finished}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if next_event in done:
+                    value, size = next_event.result()
+                    self._queued_bytes -= size
+                    yield value
+            finally:
+                for task in (next_event, finished):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(next_event, finished, return_exceptions=True)
+
+    def accepts_input(self, input_id: object) -> bool:
+        return type(input_id) is str and input_id in self._input_ids
+
+    def tool_started(self, call_id: str, name: str, arguments: object) -> None:
+        if name not in {tool.name for tool in self._state.request.tools}:
+            raise ProtocolDefect("native callback named an undeclared tool")
+        if call_id in self._calls:
+            raise ProtocolDefect("native tool item started more than once")
+        frozen = freeze_json_value(arguments)
+        size = len(canonical_json_bytes(frozen))
+        if (
+            len(self._calls) >= self._controls.pending_calls
+            or self._pending_call_bytes + size > self._controls.pending_call_bytes
+        ):
+            raise ProtocolDefect("native pending callback buffer exceeded its finite bound")
+        self._calls[call_id] = (name, frozen, size)
+        self._pending_call_bytes += size
+
+    def tool_call(self, request: CodexServerRequest) -> AgentToolCall:
+        params = request.params
+        call_id = self._adapter._non_empty_string(params, "callId", request.method)
+        tool = self._adapter._non_empty_string(params, "tool", request.method)
+        name = self._adapter._dynamic_tool_name(params, tool)
+        original = self._calls.get(call_id)
+        if original is None:
+            raise ProtocolDefect("native callback preceded its declared tool item")
+        arguments = freeze_json_value(params.get("arguments"))
+        if original[:2] != (name, arguments):
+            raise ProtocolDefect("native callback changed its item name or arguments")
+        turn = self._turn_ref()
+        if turn is None:
+            raise ProtocolDefect("native callback omitted its owned turn")
+        token = str(uuid4())
+        call = AgentToolCall(turn, call_id, token, name, arguments)
+        self._reply_tokens[token] = _PendingReply(call, request.request_id)
+        return call
+
+    def tool_completed(self, call_id: str, status: object) -> None:
+        if status not in ("completed", "failed"):
+            raise ProtocolDefect("native dynamic item completed with an impossible status")
+        original = self._calls.pop(call_id, None)
+        if original is None:
+            raise ProtocolDefect("native callback item completed without its original proposal")
+        tokens = [
+            token
+            for token, pending in self._reply_tokens.items()
+            if pending.call.call_id == call_id
+        ]
+        if status == "completed" and not any(self._reply_tokens[token].sent for token in tokens):
+            raise ProtocolDefect("native callback succeeded without an owned delivered reply")
+        self._pending_call_bytes -= original[2]
+        for token in tokens:
+            pending = self._reply_tokens.pop(token)
+            identity = (type(pending.request_id), pending.request_id)
+            if identity in self._state.server_request_ids:
+                self._state.server_request_ids.remove(identity)
+                self._state.ended_callback_request_ids.add(identity)
+
+    async def reply(self, call: AgentToolCall, result: AgentToolReply) -> None:
+        self._require_authority()
+        pending = self._reply_tokens.get(call.reply_token)
+        if pending is None or pending.call != call or pending.attempted:
+            raise ProtocolDefect("native reply does not identify a fresh exact owned callback")
+        if not isinstance(result, AgentToolReply):
+            raise InvalidAgentRequest("reply requires AgentToolReply")
+        pending.attempted = True
+
+        def enter() -> None:
+            self._require_authority()
+            pending.sent = True
+
+        async with asyncio.timeout(self._controls.rpc_seconds):
+            await self._state.client.respond(
+                pending.request_id,
+                {
+                    "contentItems": [{"type": "inputText", "text": result.text}],
+                    "success": result.success,
+                },
+                on_write=enter,
+            )
+
+    async def steer(self, *, input_id: str, input: tuple[ContentPart, ...]) -> AgentControlReceipt:
+        validated = TurnRequest(input=input)
+        if type(input_id) is not str or not input_id or input_id in self._input_ids:
+            raise InvalidAgentRequest("steering requires a fresh stable input delivery id")
+        if self._validate_input is not None:
+            self._validate_input(validated.input)
+        params = {
+            "threadId": self._state.ref.native_session_id,
+            "expectedTurnId": self._state.turn_id,
+            "clientUserMessageId": input_id,
+            "input": [self._adapter._codex_input(part) for part in validated.input],
+        }
+        return await self._control("steer", input_id, params)
+
+    async def interrupt(self) -> AgentControlReceipt:
+        return await self._control(
+            "interrupt",
+            None,
+            {"threadId": self._state.ref.native_session_id, "turnId": self._state.turn_id},
+        )
+
+    async def _control(
+        self,
+        operation: Literal["steer", "interrupt"],
+        input_id: str | None,
+        params: Mapping[str, object],
+    ) -> AgentControlReceipt:
+        request_id = str(uuid4())
+        turn = self._turn_ref()
+        if (
+            turn is None
+            or self._closed
+            or (
+                self._finished.is_set()
+                and (
+                    operation == "steer"
+                    or self._terminal is not None
+                    and isinstance(self._terminal.evidence, NativeTerminalEvidence)
+                )
+            )
+            or (operation == "steer" and self._revoked)
+        ):
+            return AgentControlReceipt(
+                operation,
+                request_id,
+                turn,
+                "not_sent",
+                input_id,
+                "turn has no live control authority",
+            )
+        entered = False
+
+        def enter() -> None:
+            nonlocal entered
+            if operation == "steer":
+                self._require_authority()
+                if input_id is None or input_id in self._input_ids:
+                    raise InvalidAgentRequest("steering input id already entered its native writer")
+                self._input_ids.add(input_id)
+            elif self._closed or self._terminal is not None:
+                raise SessionUnavailable("native interrupt target already ended")
+            entered = True
+
+        try:
+            response = await self._state.client.request(
+                f"turn/{operation}",
+                params,
+                on_write=enter,
+                timeout_seconds=self._controls.rpc_seconds,
+            )
+            payload = self._adapter._mapping(response, f"turn/{operation} response")
+            if operation == "steer" and payload.get("turnId") != turn.native_turn_id:
+                raise ProtocolDefect("native steering acknowledgment changed the expected turn")
+            if operation == "interrupt" and payload:
+                raise ProtocolDefect("native interrupt acknowledgment was not empty")
+            return AgentControlReceipt(
+                operation,
+                request_id,
+                turn,
+                "accepted",
+                input_id,
+                "rpc accepted; native termination/input incorporation is separate",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            reason = sanitize_provider_text(str(error)) or type(error).__name__
+            disposition = "unknown" if entered else "not_sent"
+            if isinstance(error, CodexAppServerResponseError) and error.code in (
+                -32600,
+                -32601,
+                -32602,
+            ):
+                disposition = "rejected"
+            return AgentControlReceipt(operation, request_id, turn, disposition, input_id, reason)
+
+    def _turn_ref(self) -> AgentTurnRef | None:
+        submission = self._submission
+        if isinstance(submission, AgentAccepted):
+            return submission.turn
+        if isinstance(submission, AgentUncertain) and submission.turn is not None:
+            return submission.turn
+        if self._closed or isinstance(submission, AgentNotSubmitted):
+            return None
+        return (
+            None
+            if self._state.turn_id is None
+            else AgentTurnRef(self._state.ref, self._state.turn_id)
+        )
+
+    def _require_authority(self) -> None:
+        if self._revoked or self._closed or self._finished.is_set():
+            raise SessionUnavailable("controlled turn authority has been revoked or ended")
+
+    def revoke(self) -> None:
+        self._revoked = True
+
+    def _finish(self) -> None:
+        self._finished.set()
+
+    def _release_slot(self) -> None:
+        if not self._released:
+            self._released = True
+            self._release()
+
+    async def close(self) -> AgentCloseResult:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close())
+        return await asyncio.shield(self._close_task)
+
+    async def _close(self) -> AgentCloseResult:
+        self.revoke()
+        diagnostics: list[str] = []
+        sender = self._sender
+        if sender is not None and not sender.done():
+            sender.cancel()
+            await asyncio.gather(sender, return_exceptions=True)
+        reader = self._reader
+        if reader is not None and not reader.done():
+            try:
+                async with asyncio.timeout(min(2.0, self._controls.rpc_seconds)):
+                    await asyncio.shield(reader)
+            except TimeoutError:
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
+                diagnostics.append("native reader did not reach a terminal before local close")
+        needs_discard = (
+            not self._state.client.usable
+            or self._writer_entered
+            and (self._terminal is None or isinstance(self._terminal.evidence, LocalStopEvidence))
+        )
+        if needs_discard:
+            if self._state.client.usable and self._state.turn_id is not None:
+                try:
+                    async with asyncio.timeout(min(2.0, self._controls.rpc_seconds)):
+                        receipt = await self.interrupt()
+                    diagnostics.append(
+                        f"native interrupt rpc {receipt.disposition}; remote finality remains separate"
+                    )
+                except Exception as error:
+                    diagnostics.append(sanitize_provider_text(str(error)) or type(error).__name__)
+            try:
+                async with asyncio.timeout(min(2.0, self._controls.rpc_seconds)):
+                    await self._adapter.close_session(self._session)
+            except Exception as error:
+                diagnostics.append(sanitize_provider_text(str(error)) or type(error).__name__)
+        if not self._writer_entered and not isinstance(
+            self._submission, AgentAccepted | AgentNotSubmitted
+        ):
+            self._submission = AgentNotSubmitted(
+                self.attempt, "all deferred writers quiesced before entry"
+            )
+        self._closed = True
+        self._state.usage_accounting.abandon_turn()
+        self._finish()
+        self._release_slot()
+        return AgentCloseResult(True, tuple(diagnostics[:_MAX_DIAGNOSTICS]))
 
 
 __all__ = ["CodexSdkAdapter"]

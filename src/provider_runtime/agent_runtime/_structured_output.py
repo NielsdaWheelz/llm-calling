@@ -12,11 +12,19 @@ from __future__ import annotations
 import json
 
 from .errors import InvalidAgentRequest
-from .types import FrozenJsonDict, freeze_json_value
+from .events import AgentTerminal
+from .types import (
+    AgentOutputSpec,
+    FrozenJsonDict,
+    JsonSchemaAgentOutput,
+    JsonValue,
+    TextAgentOutput,
+    freeze_json_value,
+)
 
 
 class OutputSchemaMismatch(Exception):
-    """Expected model-output failure; adapters convert it to a terminal value."""
+    """Expected product-output failure, independent of original provider evidence."""
 
 
 class _InvalidJson(Exception):
@@ -62,8 +70,22 @@ def freeze_structured_output(value: object) -> FrozenJsonDict:
     return frozen
 
 
+def decode_agent_output(output: AgentOutputSpec, terminal: AgentTerminal) -> JsonValue:
+    """Decode after native evidence is retained; invalid supplied data never falls back."""
+    if not isinstance(terminal, AgentTerminal):
+        raise InvalidAgentRequest("decode_agent_output requires AgentTerminal")
+    if isinstance(output, TextAgentOutput):
+        return terminal.final_text
+    if not isinstance(output, JsonSchemaAgentOutput):
+        raise InvalidAgentRequest("decode_agent_output requires a public output contract")
+    if terminal.raw_structured_output is not None:
+        return freeze_structured_output(terminal.raw_structured_output.value)
+    return parse_structured_output(terminal.final_text)
+
+
 __all__ = [
     "OutputSchemaMismatch",
+    "decode_agent_output",
     "freeze_structured_output",
     "parse_structured_output",
 ]

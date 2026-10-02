@@ -202,6 +202,7 @@ async def test_process_rejects_invalid_environment_before_spawning(tmp_path: Pat
         )
 
 
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="Linux pidfd descriptor accounting")
 async def test_owned_process_pins_its_pid_and_releases_the_handle_on_teardown(
     tmp_path: Path,
 ) -> None:

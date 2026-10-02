@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import signal
+import subprocess
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
@@ -17,6 +18,7 @@ from typing import Any, Literal, cast
 import pytest
 
 import provider_runtime.agent_runtime.claude_sdk as claude_module
+from provider_runtime.agent_runtime import OutputSchemaMismatch, decode_agent_output
 from provider_runtime.agent_runtime._claude_launcher import (
     OwnedProcessGroup,
     ensure_claude_launcher,
@@ -699,12 +701,15 @@ def stopped(pid: int) -> bool:
 
     A descendant of the launched child is nobody's child once its own parent dies, so it is
     reaped by init and not by this process. `kill(pid, 0)` succeeds against a zombie, so the
-    only honest liveness answer on Linux comes from the process state in `/proc`.
+    liveness answer comes from the native process state, not signal-zero alone.
     """
     try:
         line = Path(f"/proc/{pid}/stat").read_text()
     except OSError:
-        return True
+        observed = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False
+        )
+        return not observed.stdout.strip() or observed.stdout.lstrip().startswith("Z")
     return line.rsplit(") ", 1)[1].split(" ", 1)[0] == "Z"
 
 
@@ -1179,7 +1184,7 @@ async def test_success_fixture_normalizes_text_tools_usage_and_native_frames(
     assert terminal.status == "succeeded"
     assert terminal.failure is None
     assert terminal.final_text == "Inspection complete."
-    assert terminal.structured_output is None
+    assert terminal.raw_structured_output is None
     assert terminal.diagnostics == ()
     assert terminal.usage == Present(
         TokenUsage(
@@ -1777,19 +1782,20 @@ async def _stream_structured(
         await adapter.close()
 
 
-async def test_structured_output_is_sent_natively_and_a_violation_is_a_terminal_failure(
+async def test_structured_output_decode_does_not_rewrite_the_native_terminal(
     installed_sdk: SimpleNamespace, tmp_path: Path
 ) -> None:
-    """The plain JSON Schema passes through the SDK's native option — the backend enforces
-    it — and a final answer that is not strict JSON is an expected model-output failure."""
+    """Native output schema is sent; residual decoding happens after native evidence."""
     events, options = await _stream_structured(tmp_path, "minimal_violation")
 
     assert options.include_partial_messages is False
     assert options.output_format == {"type": "json_schema", "schema": ANSWER_SCHEMA}
     terminal = terminal_of(events)
-    assert terminal.status == "failed"
-    assert terminal.failure == AgentFailure("output_schema_violation")
-    assert terminal.structured_output is None
+    assert terminal.status == "succeeded"
+    assert terminal.failure is None
+    assert terminal.raw_structured_output is None
+    with pytest.raises(OutputSchemaMismatch):
+        decode_agent_output(JsonSchemaAgentOutput(name="answer", schema=ANSWER_SCHEMA), terminal)
 
 
 async def test_sdk_native_structured_output_value_is_frozen_into_the_terminal(
@@ -1799,10 +1805,14 @@ async def test_sdk_native_structured_output_value_is_frozen_into_the_terminal(
 
     terminal = terminal_of(events)
     assert terminal.status == "succeeded"
-    assert thaw_json_value(terminal.structured_output) == {"answer": "ok"}
+    assert terminal.raw_structured_output is not None
+    assert thaw_json_value(terminal.raw_structured_output.value) == {"answer": "ok"}
+    assert thaw_json_value(
+        decode_agent_output(JsonSchemaAgentOutput(name="answer", schema=ANSWER_SCHEMA), terminal)
+    ) == {"answer": "ok"}
 
 
-async def test_structured_output_falls_back_to_strict_parsing_of_final_text(
+async def test_absent_sdk_payload_decodes_strict_final_text(
     installed_sdk: SimpleNamespace, tmp_path: Path
 ) -> None:
     events, _options = await _stream_structured(tmp_path, "minimal_text")
@@ -1810,7 +1820,10 @@ async def test_structured_output_falls_back_to_strict_parsing_of_final_text(
     terminal = terminal_of(events)
     assert terminal.status == "succeeded"
     assert terminal.final_text == '{"answer": "ok"}'
-    assert thaw_json_value(terminal.structured_output) == {"answer": "ok"}
+    assert terminal.raw_structured_output is None
+    assert thaw_json_value(
+        decode_agent_output(JsonSchemaAgentOutput(name="answer", schema=ANSWER_SCHEMA), terminal)
+    ) == {"answer": "ok"}
 
 
 async def test_policy_and_mcp_configuration_are_mapped_and_startup_is_fail_closed(

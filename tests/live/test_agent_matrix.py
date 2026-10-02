@@ -130,8 +130,10 @@ class _ObservedCodexAdapter(CodexSdkAdapter):
         self.cumulative_by_thread.setdefault(thread_id, []).append((turn_id, cumulative))
         return cumulative
 
-    def _restored_usage_baseline(self, client: Any, native_session_id: str) -> TokenUsage | None:
-        baseline = super()._restored_usage_baseline(client, native_session_id)
+    def _restored_usage_baseline(
+        self, client: Any, native_session_id: str, request: Any
+    ) -> TokenUsage | None:
+        baseline = super()._restored_usage_baseline(client, native_session_id, request)
         if baseline is not None:
             self.restored_by_thread.setdefault(native_session_id, []).append(baseline)
         return baseline

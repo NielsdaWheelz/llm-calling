@@ -11,6 +11,7 @@ from typing import Literal, cast
 from urllib.parse import urlsplit
 
 from provider_runtime.types import (
+    CanonicalTool,
     FrozenJsonDict,
     JsonObject,
     JsonValue,
@@ -481,11 +482,34 @@ class CodexCatalogSessionRequest(_SessionRequestBase):
     agent_definition_revision: str
     row_fingerprint: str
     native: CodexNativeOptions | None = None
+    tools: tuple[CanonicalTool, ...] = ()
     backend: Literal["codex"] = field(default="codex", init=False)
     transport: Literal["sdk"] = field(default="sdk", init=False)
 
     def __post_init__(self) -> None:
         self._validate_common("CodexCatalogSessionRequest")
+        require_tuple(self.tools, "CodexCatalogSessionRequest.tools")
+        if any(not isinstance(tool, CanonicalTool) for tool in self.tools):
+            raise InvalidAgentRequest("CodexCatalogSessionRequest.tools must contain CanonicalTool")
+        if len({tool.name for tool in self.tools}) != len(self.tools):
+            raise InvalidAgentRequest("CodexCatalogSessionRequest.tools has duplicate names")
+        owned_tools: list[CanonicalTool] = []
+        for tool in self.tools:
+            if (
+                type(tool.name) is not str
+                or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", tool.name) is None
+            ):
+                raise InvalidAgentRequest("Codex native tool name violates the common grammar")
+            if type(tool.description) is not str:
+                raise InvalidAgentRequest("Codex native tool description must be text")
+            owned_tools.append(
+                CanonicalTool(
+                    tool.name,
+                    tool.description,
+                    freeze_json_object(tool.parameters, context=f"tool {tool.name} schema"),
+                )
+            )
+        object.__setattr__(self, "tools", tuple(owned_tools))
         _require_non_empty(self.model_key, "CodexCatalogSessionRequest.model_key")
         _require_non_empty(self.reasoning, "CodexCatalogSessionRequest.reasoning")
         _require_non_empty(

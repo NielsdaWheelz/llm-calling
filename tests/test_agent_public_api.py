@@ -21,7 +21,7 @@ def test_every_agent_all_name_is_importable_sorted_and_unique() -> None:
 
 
 def test_the_event_union_is_exported_whole() -> None:
-    """The six kinds are one closed vocabulary; exporting a subset would publish half a grammar."""
+    """The contained and controlled events form one closed exported vocabulary."""
     assert agent_runtime.AgentText is events.AgentText
     assert agent_runtime.AgentTerminal is events.AgentTerminal
     assert events.AGENT_EVENT_KINDS == (
@@ -31,6 +31,9 @@ def test_the_event_union_is_exported_whole() -> None:
         events.AgentPermissionRequest,
         events.AgentNative,
         events.AgentTerminal,
+        events.AgentToolCall,
+        events.AgentMessage,
+        events.AgentInputRecorded,
     )
     for kind in events.AGENT_EVENT_KINDS:
         assert kind.__name__ in agent_runtime.__all__, f"{kind.__name__} must be exported"
