@@ -8,6 +8,7 @@ import os
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, assert_never, cast
 from uuid import UUID
@@ -272,6 +273,42 @@ class CodexControl:
         self._native_owners = native_owners
         self._clients: set[CodexAppServerClient] = set()
         self._closed = False
+
+    async def usage(self, profile_key: str) -> dict[str, object]:
+        """Read the default quota snapshot without loading or creating a thread."""
+        _profile(profile_key)
+        async with self._client(profile_key) as client:
+            result = _object(await self._request(client, "account/rateLimits/read", {}))
+            reported_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        snapshot = _object(result.get("rateLimits"))
+        report: dict[str, object] = {"reportedAt": reported_at}
+        for position in ("primary", "secondary"):
+            value = snapshot.get(position)
+            if value is None:
+                continue
+            window = _object(value)
+            duration = window.get("windowDurationMins")
+            if duration is not None and type(duration) is not int:
+                raise CodexControlError("unavailable", "NotSent")
+            if duration not in (300, 10080):
+                continue
+            key = "fiveHour" if duration == 300 else "sevenDay"
+            used = window.get("usedPercent")
+            if key in report or type(used) is not int or used < 0:
+                raise CodexControlError("unavailable", "NotSent")
+            normalized: dict[str, object] = {"usedPercent": used}
+            reset = window.get("resetsAt")
+            if reset is not None:
+                if type(reset) is not int:
+                    raise CodexControlError("unavailable", "NotSent")
+                try:
+                    normalized["resetsAt"] = (
+                        datetime.fromtimestamp(reset, UTC).isoformat().replace("+00:00", "Z")
+                    )
+                except (OverflowError, OSError, ValueError):
+                    raise CodexControlError("unavailable", "NotSent") from None
+            report[key] = normalized
+        return report
 
     async def list(self, request: CodexListRequest) -> CodexThreadPage:
         async with self._client(request.profile_key) as client:
