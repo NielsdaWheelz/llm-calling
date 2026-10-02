@@ -608,6 +608,38 @@ async def test_n009_callback_before_start_ack_executes_exact_reply_then_seals(
         assert runtime.session_usable(owner)
 
 
+async def test_n015_interrupted_native_seal_can_abort_a_pending_callback(
+    peer: Peer, tmp_path: Path
+) -> None:
+    peer.mode = "callback_before_ack"
+    async with AgentRuntime(
+        AgentRuntimeConfig(state_root_base=tmp_path, codex_endpoints={"loopback": peer.socket})
+    ) as runtime:
+        owner = await session(runtime, tmp_path, tools=True)
+        turn = runtime.prepare_turn(
+            owner,
+            TurnRequest(input=(TextContent("read the source"),)),
+            attempt_id="aborted-pending-callback",
+            input_id="first-input",
+            controls=AgentTurnControls(rpc_seconds=1, pending_calls=2, pending_call_bytes=32768),
+        )
+        assert isinstance(await turn.submit(), AgentAccepted)
+        events = turn.events()
+        call = await anext(events)
+        assert isinstance(call, AgentToolCall)
+        turn.revoke()
+        assert (await turn.interrupt()).disposition == "accepted"
+        result = [event async for event in events]
+        assert isinstance(result[-1], AgentTerminal)
+        assert result[-1].status == "cancelled"
+        assert isinstance(result[-1].evidence, NativeTerminalEvidence)
+        assert turn.terminal is result[-1]
+        assert (await turn.close()).local_closed
+        assert not runtime.session_usable(owner)
+        with pytest.raises(SessionUnavailable):
+            await turn.reply(call, AgentToolReply(text="late result", success=True))
+
+
 async def test_n013_steer_ack_recorded_input_and_progress_are_distinct(
     peer: Peer, tmp_path: Path
 ) -> None:

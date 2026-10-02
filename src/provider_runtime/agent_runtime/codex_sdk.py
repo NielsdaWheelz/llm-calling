@@ -1620,18 +1620,19 @@ class CodexSdkAdapter:
         state: _CodexSessionState,
         params: Mapping[str, object],
     ) -> AgentTerminal:
+        turn = self._mapping(params.get("turn"), "turn/completed turn")
+        status = turn.get("status")
+        aborted_items = state.controlled and status in ("interrupted", "failed")
         if state.active_mcp_calls:
             raise ProtocolDefect("turn completed with active MCP tool calls")
-        if state.started_item_types:
+        if state.started_item_types and not aborted_items:
             raise ProtocolDefect("turn completed with unfinished Codex item lifecycles")
-        if state.active_tool_calls:
+        if state.active_tool_calls and not aborted_items:
             raise ProtocolDefect("turn completed with active Codex authority items")
-        if state.server_request_ids:
+        if state.server_request_ids and not aborted_items:
             raise ProtocolDefect("turn completed with unresolved Codex server requests")
         if state.authority_seen and self._strict_native_containment(state):
             raise ProtocolDefect("turn completed after forbidden Codex native authority activity")
-        turn = self._mapping(params.get("turn"), "turn/completed turn")
-        status = turn.get("status")
         final_text = self._selected_final_text(state, required=status == "completed")
         usage = state.usage_accounting.finish_turn()
         diagnostics = tuple(state.diagnostics)
@@ -2735,11 +2736,22 @@ class _CodexAgentTurn:
                 diagnostics.append("native reader did not reach a terminal before local close")
         needs_discard = (
             not self._state.client.usable
+            or bool(
+                self._state.started_item_types
+                or self._state.active_tool_calls
+                or self._state.server_request_ids
+            )
             or self._writer_entered
             and (self._terminal is None or isinstance(self._terminal.evidence, LocalStopEvidence))
         )
         if needs_discard:
-            if self._state.client.usable and self._state.turn_id is not None:
+            if (
+                self._state.client.usable
+                and self._state.turn_id is not None
+                and (
+                    self._terminal is None or isinstance(self._terminal.evidence, LocalStopEvidence)
+                )
+            ):
                 try:
                     async with asyncio.timeout(min(2.0, self._controls.rpc_seconds)):
                         receipt = await self.interrupt()

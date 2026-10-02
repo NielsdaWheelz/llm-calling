@@ -90,3 +90,21 @@ the schema-member traversal preserves a legitimate property named `oneOf`.
 the initial focused probe failed eight unsupported-keyword cases and passed
 the literal-property case. the repaired focused suite is green. restrictions
 and remaining remote-validation limits are documented in the public contract.
+
+## actual pending-callback cancellation
+
+the isolated linux topology proof uses actual codex 0.160.0 as uid/gid 10001.
+its first cancellation failed on the native reader's requirement that every
+started dynamic item complete before an interrupted native turn. the actual
+server instead ends the turn with the callback item unfinished. an exact
+controlled regression reproduced this failure before the repair.
+
+native interrupted/failed evidence now retains its correlated seal. successful
+completion still requires resolved native items/requests; forbidden authority
+remains rejected. closing a sealed turn with aborted pending items discards
+only that session. it never marks host actions done or stops the shared server.
+153 affected cases pass and source pyright remains clean. the actual repeat
+held two independent callbacks: job-a cancelled with native evidence, while
+job-b retained its own callback, replied, and completed strict json.
+receipts: `/private/tmp/nexus-native-topology-zcDlUE/job-a.json` and `job-b.json`.
+this is a real native topology/cancellation proof, not research.
