@@ -179,7 +179,6 @@ def make_meta(
         provider="anthropic",
         model=MODEL,
         provider_request_id=Present("req_abc"),
-        upstream_provider=Absent(),
         usage=usage,
         attempt_trace=recorded,
         billability=billability,
@@ -256,8 +255,6 @@ def test_call_span_sets_exactly_the_gen_ai_request_attributes() -> None:
         ("openai", "openai"),
         ("anthropic", "anthropic"),
         ("gemini", "gcp.gemini"),
-        ("moonshot", "moonshot"),
-        ("openrouter", "openrouter"),
         ("deepseek", "deepseek"),
         ("xai", "x_ai"),
     ],
@@ -267,7 +264,6 @@ def test_provider_name_uses_the_semconv_well_known_value(
 ) -> None:
     # semconv 1.37 registry: "If one of them applies, then the respective value
     # MUST be used" — gemini and xai are named gcp.gemini / x_ai there;
-    # moonshot and openrouter are absent from the list and stay custom.
     tracer_provider = RecordingTracerProvider()
     with call_span("chat", provider=provider, model=MODEL, tracer_provider=tracer_provider):
         pass
@@ -278,7 +274,7 @@ def test_provider_name_uses_the_semconv_well_known_value(
 def test_every_provider_name_is_mapped() -> None:
     # The parametrisation above must cover the whole ProviderName literal, so a
     # new provider cannot ship with an unchecked semconv value.
-    covered = {"openai", "anthropic", "gemini", "moonshot", "openrouter", "deepseek", "xai"}
+    covered = {"openai", "anthropic", "gemini", "deepseek", "xai"}
     assert covered == set(get_args(ProviderName.__value__))
 
 

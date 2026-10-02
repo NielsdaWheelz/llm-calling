@@ -9,6 +9,8 @@ stream envelope grammar ScriptedRuntime mirrors from the real runtime.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pydantic
 import pytest
 
@@ -75,9 +77,8 @@ ROW = ModelRow(
     source_default_reasoning=Absent(),
     upgrade=Absent(),
     retirement=Absent(),
-    continuation_codec="openai.v1",
+    continuation_codec="openai.v2",
     correlation="header",
-    routing=Absent(),
 )
 
 
@@ -99,7 +100,6 @@ def engine_meta() -> CallMeta:
         provider="openai",
         model="gpt-test",
         provider_request_id=Present("req-1"),
-        upstream_provider=Absent(),
         usage=Absent(),
         attempt_trace=(
             AttemptRecord(
@@ -252,7 +252,7 @@ async def test_fake_engine_stream_rejects_a_generate_step() -> None:
 
 async def test_fake_engine_drives_provider_runtime_generate() -> None:
     """FakeEngine is what test_runtime.py-style consumers inject at the seam."""
-    row = next(candidate for candidate in registry._ROWS if candidate.provider == "openai")
+    row = registry._resolve("openai:gpt-6-sol")
     outcome = succeeded()
     engine = FakeEngine([outcome])
     runtime = ProviderRuntime(
@@ -264,12 +264,15 @@ async def test_fake_engine_drives_provider_runtime_generate() -> None:
             "gemini_generate": engine,
         },
     )
-    intent = make_intent(target=ProviderTarget(provider=row.provider, model=row.model_id))
+    intent = replace(
+        make_intent(target=ProviderTarget(provider=row.provider, model=row.model_id)),
+        reasoning="standard/medium",
+    )
 
     result = await runtime.generate(intent)
 
     assert isinstance(result, Succeeded)
-    assert result.response is outcome.response
+    assert result.response == outcome.response
     seen_row, seen_intent, seen_credential = engine.calls[0]
     assert seen_row == row
     assert seen_intent is intent
@@ -306,15 +309,15 @@ async def test_scripted_chat_returns_outcome_and_captures_args_verbatim() -> Non
     outcome = succeeded()
     runtime = ScriptedRuntime(chat_outcomes=[outcome])
 
-    assert await runtime.chat("openai:gpt-5.6-sol", user="hi") is outcome
+    assert await runtime.chat("openai:gpt-6-sol", user="hi", reasoning="standard/medium") is outcome
     assert runtime.calls == [
         CapturedRuntimeCall(
             operation="chat",
             call=ChatCall(
-                ref="openai:gpt-5.6-sol",
+                ref="openai:gpt-6-sol",
                 system="",
                 user="hi",
-                reasoning="none",
+                reasoning="standard/medium",
                 max_output_tokens=None,
             ),
             credential_provider=Absent(),
@@ -327,7 +330,7 @@ async def test_scripted_queues_are_per_operation() -> None:
     # call is a script mismatch, not a silent fallback.
     runtime = ScriptedRuntime(generate_outcomes=[succeeded()])
     with pytest.raises(AssertionError, match=r"chat call 1 \(ref 'openai:x'\)"):
-        await runtime.chat("openai:x", user="hi")
+        await runtime.chat("openai:x", user="hi", reasoning="standard/medium")
 
 
 async def test_scripted_json_out_returns_reply_and_captures_model_with_intent() -> None:

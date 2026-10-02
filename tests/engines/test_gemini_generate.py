@@ -62,7 +62,7 @@ from provider_runtime.types import (
     ProviderStreamInterrupted,
     ProviderTarget,
     ProviderTimeout,
-    ReasoningLevel,
+    ReasoningKey,
     StreamStart,
     StrictJsonOutput,
     StructuredContent,
@@ -90,11 +90,11 @@ from provider_runtime.types import (
 # GenerateContent config params merged verbatim. Gemini 3+ rows carry
 # thinking_config.thinking_level; 2.5-era rows carry thinking_budget. Neither
 # generation can switch thinking off, so no row declares "none".
-LEVEL_REASONING: Mapping[ReasoningLevel, object] = {
+LEVEL_REASONING: Mapping[ReasoningKey, object] = {
     "low": {"thinking_config": {"thinking_level": "LOW"}},
     "high": {"thinking_config": {"thinking_level": "HIGH"}},
 }
-BUDGET_REASONING: Mapping[ReasoningLevel, object] = {
+BUDGET_REASONING: Mapping[ReasoningKey, object] = {
     "high": {"thinking_config": {"thinking_budget": 24576}},
 }
 
@@ -114,9 +114,8 @@ LEVEL_ROW = ModelRow(
     source_default_reasoning=Absent(),
     upgrade=Absent(),
     retirement=Absent(),
-    continuation_codec="gemini.v1",
+    continuation_codec="gemini.v2",
     correlation="none",
-    routing=Absent(),
 )
 
 BUDGET_ROW = ModelRow(
@@ -135,9 +134,8 @@ BUDGET_ROW = ModelRow(
     source_default_reasoning=Absent(),
     upgrade=Absent(),
     retirement=Absent(),
-    continuation_codec="gemini.v1",
+    continuation_codec="gemini.v2",
     correlation="none",
-    routing=Absent(),
 )
 
 # No reasoning knob at all; json_mode structured output.
@@ -157,9 +155,8 @@ KNOBLESS_ROW = ModelRow(
     source_default_reasoning=Absent(),
     upgrade=Absent(),
     retirement=Absent(),
-    continuation_codec="gemini.v1",
+    continuation_codec="gemini.v2",
     correlation="none",
-    routing=Absent(),
 )
 
 SEARCH_TOOL = CanonicalTool(
@@ -187,7 +184,7 @@ def intent_for(
     row: ModelRow,
     *,
     messages: tuple[PromptMessage, ...] | None = None,
-    reasoning: ReasoningLevel = "high",
+    reasoning: ReasoningKey = "high",
     tools: tuple[CanonicalTool, ...] = (),
     tool_choice: str = "auto",
     output: TextOutput | StrictJsonOutput | None = None,
@@ -341,26 +338,12 @@ async def test_thinking_budget_row_sends_budget_and_reports_native_reasoning(
     ), f"got {outcome.meta.native_reasoning}"
 
 
-@respx.mock
-async def test_reasoning_none_on_a_row_declaring_no_none_sends_no_thinking_config(
+async def test_reasoning_none_on_a_row_declaring_no_none_is_rejected(
     engine: GeminiGenerateEngine,
 ) -> None:
-    """spec §14: "none" is the facade default, so it is callable on every row —
-    a row that declares no "none" level sends no thinking config and lets the
-    provider's own default apply. No gemini row can switch thinking off, so
-    every gemini row with a knob is exactly this shape."""
     assert "none" not in BUDGET_REASONING, "fixture premise: the row declares no 'none' level"
-    route = mock_generate(BUDGET_ROW, response_body(model_version="gemini-2.5-flash"))
-    outcome = await engine.generate(
-        BUDGET_ROW, intent_for(BUDGET_ROW, reasoning="none"), CREDENTIAL
-    )
-    config = last_request_json(route)["generationConfig"]
-    assert isinstance(config, dict)
-    assert "thinkingConfig" not in config, f"nothing may be sent; config: {config}"
-    assert isinstance(outcome, Succeeded)
-    assert outcome.meta.native_reasoning == Absent(), (
-        f"nothing was sent, so native_reasoning must be Absent, got {outcome.meta.native_reasoning}"
-    )
+    with pytest.raises(InvalidRequest, match="reasoning key 'none'"):
+        await engine.generate(BUDGET_ROW, intent_for(BUDGET_ROW, reasoning="none"), CREDENTIAL)
 
 
 @respx.mock
@@ -374,7 +357,7 @@ async def test_reasoning_none_still_owns_the_rows_knob_keys(
             BUDGET_ROW,
             intent_for(
                 BUDGET_ROW,
-                reasoning="none",
+                reasoning="high",
                 provider_options={"thinkingConfig": {"thinking_budget": 0}},
             ),
             CREDENTIAL,
@@ -406,7 +389,7 @@ async def test_reasoning_fragment_naming_an_engine_set_config_field_is_a_registr
     """The fragment is merged into the config the engine builds, so a row
     naming a field the engine writes itself either loses its knob or overrides
     the caller — here the caller's own output cap."""
-    poisoned: Mapping[ReasoningLevel, object] = {
+    poisoned: Mapping[ReasoningKey, object] = {
         "high": {"thinking_config": {"thinking_level": "HIGH"}, "max_output_tokens": 8}
     }
     row = replace(LEVEL_ROW, reasoning=Present(poisoned))
@@ -422,19 +405,11 @@ async def test_reasoning_on_knobless_row_raises_invalid_request(
         await engine.generate(KNOBLESS_ROW, intent_for(KNOBLESS_ROW, reasoning="high"), CREDENTIAL)
 
 
-@respx.mock
-async def test_knobless_row_with_reasoning_none_sends_no_thinking_config(
+async def test_knobless_row_with_reasoning_none_is_rejected(
     engine: GeminiGenerateEngine,
 ) -> None:
-    route = mock_generate(KNOBLESS_ROW, response_body(model_version="gemini-2.0-flash-lite"))
-    outcome = await engine.generate(
-        KNOBLESS_ROW, intent_for(KNOBLESS_ROW, reasoning="none"), CREDENTIAL
-    )
-    config = last_request_json(route)["generationConfig"]
-    assert isinstance(config, dict)
-    assert "thinkingConfig" not in config, f"config: {config}"
-    assert isinstance(outcome, Succeeded)
-    assert outcome.meta.native_reasoning == Absent()
+    with pytest.raises(InvalidRequest, match="no reasoning configurations"):
+        await engine.generate(KNOBLESS_ROW, intent_for(KNOBLESS_ROW, reasoning="none"), CREDENTIAL)
 
 
 @respx.mock
@@ -455,9 +430,8 @@ async def test_row_base_url_overrides_the_sdk_default(engine: GeminiGenerateEngi
         source_default_reasoning=Absent(),
         upgrade=Absent(),
         retirement=Absent(),
-        continuation_codec="gemini.v1",
+        continuation_codec="gemini.v2",
         correlation="none",
-        routing=Absent(),
     )
     route = respx.post(
         "https://gemini-proxy.example/v1beta/models/gemini-3-pro:generateContent"
@@ -534,8 +508,20 @@ async def test_tools_and_tool_results_encode_to_generate_content_wire(
     assert contents[2] == {
         "role": "user",
         "parts": [
-            {"functionResponse": {"name": "search", "response": {"output": "found cats"}}},
-            {"functionResponse": {"name": "search", "response": {"error": "kennel closed"}}},
+            {
+                "functionResponse": {
+                    "id": "call_0",
+                    "name": "search",
+                    "response": {"output": "found cats"},
+                }
+            },
+            {
+                "functionResponse": {
+                    "id": "call_1",
+                    "name": "search",
+                    "response": {"error": "kennel closed"},
+                }
+            },
         ],
     }, f"consecutive tool results must coalesce into ONE user turn; contents: {contents}"
 
@@ -630,15 +616,14 @@ async def test_structured_native_sends_mime_and_json_schema(engine: GeminiGenera
 
 @respx.mock
 async def test_structured_json_mode_sends_mime_only(engine: GeminiGenerateEngine) -> None:
+    row = replace(KNOBLESS_ROW, reasoning=Present(LEVEL_REASONING))
     route = mock_generate(
-        KNOBLESS_ROW,
+        row,
         response_body(parts=[{"text": '{"answer": "x"}'}], model_version="gemini-2.0-flash-lite"),
     )
     await engine.generate(
-        KNOBLESS_ROW,
-        intent_for(
-            KNOBLESS_ROW, reasoning="none", output=StrictJsonOutput("answer", ANSWER_SCHEMA)
-        ),
+        row,
+        intent_for(row, reasoning="high", output=StrictJsonOutput("answer", ANSWER_SCHEMA)),
         CREDENTIAL,
     )
     config = last_request_json(route)["generationConfig"]
@@ -781,7 +766,6 @@ async def test_success_decode_populates_meta_and_usage(engine: GeminiGenerateEng
         "correlation is 'none' on this wire — the body's responseId must NOT become "
         f"a request id; got {meta.provider_request_id}"
     )
-    assert meta.upstream_provider == Absent()
     assert meta.registry_revision == REGISTRY_REVISION
     assert meta.native_reasoning == Present('{"thinking_config":{"thinking_level":"HIGH"}}')
     assert meta.billability == PossiblyBillable()
@@ -814,15 +798,15 @@ async def test_missing_model_version_falls_back_to_row_model_id(
 
 
 @respx.mock
-async def test_tool_call_decode_synthesizes_deterministic_ids(
+async def test_tool_call_decode_preserves_provider_ids(
     engine: GeminiGenerateEngine,
 ) -> None:
     mock_generate(
         LEVEL_ROW,
         response_body(
             parts=[
-                {"functionCall": {"name": "search", "args": {"query": "cats"}}},
-                {"functionCall": {"name": "search", "args": {"query": "dogs"}}},
+                {"functionCall": {"id": "call_0", "name": "search", "args": {"query": "cats"}}},
+                {"functionCall": {"id": "call_1", "name": "search", "args": {"query": "dogs"}}},
             ],
         ),
     )
@@ -835,7 +819,7 @@ async def test_tool_call_decode_synthesizes_deterministic_ids(
     assert content.tool_calls == (
         ToolCall(id="call_0", name="search", arguments={"query": "cats"}),
         ToolCall(id="call_1", name="search", arguments={"query": "dogs"}),
-    ), f"the wire has no call ids — decode synthesizes call_<index>; got {content.tool_calls}"
+    ), f"the wire call ids must survive decoding; got {content.tool_calls}"
 
 
 @respx.mock
@@ -973,7 +957,7 @@ async def test_thought_signatures_round_trip_verbatim(engine: GeminiGenerateEngi
             parts=[
                 {"text": "calling now", "thoughtSignature": "c2ln"},
                 {
-                    "functionCall": {"name": "search", "args": {"query": "x"}},
+                    "functionCall": {"id": "call_0", "name": "search", "args": {"query": "x"}},
                     "thoughtSignature": "c2lnMg==",
                 },
             ],
@@ -992,7 +976,7 @@ async def test_thought_signatures_round_trip_verbatim(engine: GeminiGenerateEngi
         "parts": [
             {"text": "calling now", "thoughtSignature": "c2ln"},
             {
-                "functionCall": {"name": "search", "args": {"query": "x"}},
+                "functionCall": {"id": "call_0", "name": "search", "args": {"query": "x"}},
                 "thoughtSignature": "c2lnMg==",
             },
         ]
@@ -1019,14 +1003,22 @@ async def test_thought_signatures_round_trip_verbatim(engine: GeminiGenerateEngi
         "parts": [
             {"text": "calling now", "thoughtSignature": "c2ln"},
             {
-                "functionCall": {"name": "search", "args": {"query": "x"}},
+                "functionCall": {"id": "call_0", "name": "search", "args": {"query": "x"}},
                 "thoughtSignature": "c2lnMg==",
             },
         ],
     }, f"the payload's parts are the SOLE wire source for the turn; contents: {contents}"
     assert contents[2] == {
         "role": "user",
-        "parts": [{"functionResponse": {"name": "search", "response": {"output": "found"}}}],
+        "parts": [
+            {
+                "functionResponse": {
+                    "id": "call_0",
+                    "name": "search",
+                    "response": {"output": "found"},
+                }
+            }
+        ],
     }, f"contents: {contents}"
 
 
@@ -1057,7 +1049,7 @@ async def test_continuation_bound_to_other_codec_or_target_raises_invalid_reques
 
     wrong_target = ContinuationArtifact(
         target=ProviderTarget(provider="gemini", model="gemini-2.5-flash"),
-        codec_id="gemini.v1",
+        codec_id="gemini.v2",
         opaque_payload={"parts": [{"text": "x"}]},
     )
     messages = (
@@ -1073,7 +1065,7 @@ async def test_continuation_payload_without_parts_raises_invalid_request(
 ) -> None:
     broken = ContinuationArtifact(
         target=ProviderTarget(provider="gemini", model="gemini-3-pro"),
-        codec_id="gemini.v1",
+        codec_id="gemini.v2",
         opaque_payload={"reasoning": "not gemini shaped"},
     )
     messages: tuple[PromptMessage, ...] = (
@@ -1120,7 +1112,11 @@ async def test_stream_decodes_text_tools_continuation_and_folds_usage(
                             "role": "model",
                             "parts": [
                                 {
-                                    "functionCall": {"name": "search", "args": {"query": "x"}},
+                                    "functionCall": {
+                                        "id": "call_0",
+                                        "name": "search",
+                                        "args": {"query": "x"},
+                                    },
                                     "thoughtSignature": "c2ln",
                                 }
                             ],
@@ -1165,13 +1161,16 @@ async def test_stream_decodes_text_tools_continuation_and_folds_usage(
     continuation_event = events[5]
     assert isinstance(continuation_event, ContinuationDelta)
     artifact = continuation_event.artifact
-    assert artifact.codec_id == "gemini.v1"
+    assert artifact.codec_id == "gemini.v2"
     payload_parts = thaw_json_value(artifact.opaque_payload)["parts"]  # type: ignore[index]
     assert payload_parts == [
         {"text": "Hel"},
         {"text": "internal plan", "thought": True},
         {"text": "lo"},
-        {"functionCall": {"name": "search", "args": {"query": "x"}}, "thoughtSignature": "c2ln"},
+        {
+            "functionCall": {"id": "call_0", "name": "search", "args": {"query": "x"}},
+            "thoughtSignature": "c2ln",
+        },
     ], f"ALL parts accumulate in order, thoughts and signatures included; got {payload_parts}"
 
     terminal = events[-1]

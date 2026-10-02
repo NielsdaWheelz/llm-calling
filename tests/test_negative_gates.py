@@ -3,11 +3,11 @@
 Source-scan invariants for things that must never come back or drift: provider
 SDK imports outside the engine seam, agent SDK names outside their audited
 adapters, retry-policy construction outside the single retry owner, environment
-reads in the provider lane, unpinned OpenRouter routing, continuation payloads
+reads in the provider lane, continuation payloads
 in any repr, an unbounded facade, and deleted legacy modules returning.
 
 Gates are cheap and deterministic: AST or line scanning over the checked-out
-source plus direct assertions over the real registry rows — no subprocesses,
+source — no subprocesses,
 no network.
 """
 
@@ -20,11 +20,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import provider_runtime
-from provider_runtime.registry import _ROWS as ROWS
 from provider_runtime.types import (
     ContinuationArtifact,
     ContinuationDelta,
-    Present,
     ProviderTarget,
     RuntimeStreamEvent,
 )
@@ -103,8 +101,10 @@ def test_provider_sdk_imports_are_confined_to_engines_and_embeddings() -> None:
 # module name anywhere, not just an import statement, because a name in a string can still
 # be a real lazy dependency.
 _AGENT_DEPENDENCY_ALLOWLIST: dict[str, frozenset[Path]] = {
-    # The Claude Agent SDK is the pinned optional extra; only its adapter may name it.
-    "claude_agent_sdk": frozenset({AGENT_RUNTIME / "claude_sdk.py"}),
+    # Isolated cognition and external persisted-history reading are separate adapters.
+    "claude_agent_sdk": frozenset(
+        {AGENT_RUNTIME / "claude_sdk.py", AGENT_RUNTIME / "claude_control.py"}
+    ),
     # The shared Codex client imports its WebSocket transport lazily at the wire boundary.
     "websockets": frozenset({AGENT_RUNTIME / "codex_app_server.py"}),
 }
@@ -196,32 +196,13 @@ def test_provider_lane_reads_zero_environment_variables() -> None:
 
 
 # ---------------------------------------------------------------------------
-# OpenRouter rows stay pinned
-
-
-def test_every_openrouter_registry_row_pins_routing_with_fallbacks_off() -> None:
-    """No unpinned OpenRouter passthrough (spec §7) — checked over the real ROWS."""
-    openrouter_rows = [row for row in ROWS if row.provider == "openrouter"]
-    assert openrouter_rows, "the registry ships no openrouter row; this gate would be vacuous"
-    for row in openrouter_rows:
-        assert isinstance(row.routing, Present), (
-            f"openrouter row {row.ref!r} carries no routing pins"
-        )
-        routing = row.routing.value
-        assert routing.allow_fallbacks is False, (
-            f"openrouter row {row.ref!r} must pin allow_fallbacks=False; "
-            f"got {routing.allow_fallbacks!r}"
-        )
-
-
-# ---------------------------------------------------------------------------
 # Continuation payloads never appear in repr
 
 
 def test_continuation_payload_never_appears_in_repr() -> None:
     sentinel = "OPAQUE-CONTINUATION-SENTINEL-b2ff41"
     artifact = ContinuationArtifact(
-        target=ProviderTarget(provider="openai", model="gpt-5.6-sol"),
+        target=ProviderTarget(provider="openai", model="gpt-6-sol"),
         codec_id="openai.v1",
         opaque_payload={"reasoning_item": sentinel},
     )

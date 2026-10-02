@@ -37,6 +37,7 @@ from provider_runtime.types import (
     Cancelled,
     CancelSignal,
     CodecStreamEvent,
+    ContinueGeneration,
     EmbeddingCall,
     EmbeddingResponse,
     Failed,
@@ -46,7 +47,8 @@ from provider_runtime.types import (
     Present,
     ProviderCredential,
     ProviderName,
-    ReasoningLevel,
+    ProviderRequest,
+    ReasoningKey,
     Refused,
     RuntimeStreamEvent,
     StructuredReply,
@@ -134,8 +136,8 @@ class ChatCall:
     ref: str
     system: str
     user: str
-    reasoning: ReasoningLevel
-    # Facade-signature echo: None means "row default", recorded as passed.
+    reasoning: ReasoningKey
+    # Facade-signature echo.
     max_output_tokens: int | None
 
 
@@ -148,7 +150,7 @@ class JsonOutCall:
 @dataclass(frozen=True, slots=True)
 class CapturedRuntimeCall:
     operation: RuntimeOperation
-    call: GenerateIntent | JsonOutCall | ChatCall | EmbeddingCall
+    call: ProviderRequest | JsonOutCall | ChatCall | EmbeddingCall
     # Present only for embed — the sole credential-bearing facade method. The
     # key is deliberately NOT captured.
     credential_provider: Presence[ProviderName]
@@ -169,8 +171,11 @@ async def _envelopes(script: tuple[CodecStreamEvent, ...]) -> AsyncIterator[Runt
         yield RuntimeStreamEvent(seq=seq, event=event)
 
 
-def _target_of(intent: GenerateIntent) -> str:
-    return f"target {intent.target.provider}:{intent.target.model}"
+def _target_of(request: ProviderRequest) -> str:
+    target = (
+        request.continuation.target if isinstance(request, ContinueGeneration) else request.target
+    )
+    return f"target {target.provider}:{target.model}"
 
 
 class ScriptedRuntime:
@@ -207,20 +212,20 @@ class ScriptedRuntime:
         )
 
     async def generate(
-        self, intent: GenerateIntent, *, cancel: CancelSignal | None = None
+        self, request: ProviderRequest, *, cancel: CancelSignal | None = None
     ) -> CallOutcome:
         del cancel
-        self._capture("generate", intent, Absent())
-        return self._pop(self._generate_outcomes, "generate", _target_of(intent))
+        self._capture("generate", request, Absent())
+        return self._pop(self._generate_outcomes, "generate", _target_of(request))
 
     def stream(
-        self, intent: GenerateIntent, *, cancel: CancelSignal | None = None
+        self, request: ProviderRequest, *, cancel: CancelSignal | None = None
     ) -> AsyncIterator[RuntimeStreamEvent]:
         # Eager like the real facade, which raises its call-shape defects
         # before any iteration: capture, pop, and fail at call time.
         del cancel
-        self._capture("stream", intent, Absent())
-        return _envelopes(self._pop(self._stream_scripts, "stream", _target_of(intent)))
+        self._capture("stream", request, Absent())
+        return _envelopes(self._pop(self._stream_scripts, "stream", _target_of(request)))
 
     async def json_out[T: pydantic.BaseModel](
         self,
@@ -248,7 +253,7 @@ class ScriptedRuntime:
         *,
         system: str = "",
         user: str,
-        reasoning: ReasoningLevel = "none",
+        reasoning: ReasoningKey,
         max_output_tokens: int | None = None,
     ) -> CallOutcome:
         self._capture(
@@ -276,7 +281,7 @@ class ScriptedRuntime:
     def _capture(
         self,
         operation: RuntimeOperation,
-        call: GenerateIntent | JsonOutCall | ChatCall | EmbeddingCall,
+        call: ProviderRequest | JsonOutCall | ChatCall | EmbeddingCall,
         credential_provider: Presence[ProviderName],
     ) -> None:
         self.calls.append(

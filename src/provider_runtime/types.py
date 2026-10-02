@@ -21,9 +21,7 @@ from typing import Literal, Protocol, assert_never
 # ---------------------------------------------------------------------------
 # Provider identity
 
-type ProviderName = Literal[
-    "openai", "anthropic", "gemini", "moonshot", "openrouter", "deepseek", "xai"
-]
+type ProviderName = Literal["openai", "anthropic", "gemini", "deepseek", "xai"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,9 +30,8 @@ class ProviderTarget:
     model: str
 
 
-# Closed superset of per-model reasoning levels; no "default" — provider defaults
-# are registry facts, not selectable behavior.
-type ReasoningLevel = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+# A configuration key is meaningful only within its model's catalog row.
+type ReasoningKey = str
 type EngineId = Literal["openai_responses", "openai_chat", "anthropic_messages", "gemini_generate"]
 
 
@@ -183,23 +180,11 @@ class RetirementFacts:
 
 
 @dataclass(frozen=True, slots=True)
-class ApiRoutingFacts:
-    only: tuple[str, ...]
-    order: tuple[str, ...]
-    quantizations: tuple[str, ...]
-    allow_fallbacks: Literal[False] = False
-    require_parameters: Literal[True] = True
-    data_collection: Literal["deny"] = "deny"
-    zdr: Literal[True] = True
-
-
-@dataclass(frozen=True, slots=True)
 class ApiDispatchFacts:
     model_id: str
     engine: EngineId
     base_url: Presence[str]
     correlation: Literal["header", "in_band", "none"]
-    routing: Presence[ApiRoutingFacts]
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,35 +202,30 @@ type ApiStructuredOutput = NativeStructuredOutput | JsonModeStructuredOutput
 
 @dataclass(frozen=True, slots=True)
 class ApiReasoningFacts:
-    key: ReasoningLevel
-    native_wire_fragment: JsonObject
+    key: ReasoningKey
+    label: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "native_wire_fragment",
-            freeze_json_object(
-                self.native_wire_fragment,
-                context="ApiReasoningFacts.native_wire_fragment",
-            ),
-        )
+        if not 1 <= len(self.key) <= 64 or not self.key.isascii() or not self.label:
+            raise ValueError("reasoning options require a bounded ASCII key and label")
 
 
 @dataclass(frozen=True, slots=True)
 class ApiModelFacts:
     model_ref: str
+    label: str
     provider: ProviderName
     dispatch: ApiDispatchFacts
     upgrade: Presence[UpgradeFacts]
     retirement: Presence[RetirementFacts]
     context_window: int
-    max_output_tokens: int
+    max_output_tokens: Presence[int]
     input_modalities: tuple[Literal["text", "image"], ...]
     tools: bool
     streaming: bool
     structured: ApiStructuredOutput
     reasoning: tuple[ApiReasoningFacts, ...]
-    source_default_reasoning: Presence[ReasoningLevel]
+    source_default_reasoning: Presence[ReasoningKey]
     continuation_codec: str
     row_fingerprint: str
 
@@ -421,8 +401,6 @@ class ContinuationArtifact:
             opaque_payload,
             context="ContinuationArtifact.opaque_payload",
         )
-        if len(canonical_json_bytes(frozen)) > 16 * 1024 * 1024:
-            raise ValueError("ContinuationArtifact.opaque_payload exceeds 16 MiB")
         object.__setattr__(self, "target", target)
         object.__setattr__(self, "codec_id", codec_id)
         object.__setattr__(self, "opaque_payload", frozen)
@@ -461,13 +439,24 @@ class GenerateIntent:
     target: ProviderTarget
     messages: tuple[PromptMessage, ...]
     max_output_tokens: int
-    reasoning: ReasoningLevel
+    reasoning: ReasoningKey
     tools: tuple[CanonicalTool, ...]
     tool_choice: ToolChoice
     output: OutputSpec
     # Per-engine extension passthrough, never overrides: any key the engine
     # itself maps from core intent fields raises InvalidRequest.
     provider_options: Mapping[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ContinueGeneration:
+    """Resume exactly the frozen generation in the artifact with ordered results."""
+
+    continuation: ContinuationArtifact
+    tool_results: tuple[ToolResultMessage, ...]
+
+
+type ProviderRequest = GenerateIntent | ContinueGeneration
 
 
 # ---------------------------------------------------------------------------
@@ -516,7 +505,7 @@ class TokenUsage:
         Invariant: ``TokenUsage.input_tokens`` is ALWAYS the cache-INCLUSIVE
         total prompt token count — it already contains any cache_read/
         cache_write components the provider reports separately, matching
-        OpenAI/Gemini/Moonshot/OpenRouter wire semantics. An engine whose
+        OpenAI/Gemini/DeepSeek/xAI wire semantics. An engine whose
         native wire input count excludes cache components (Anthropic) MUST
         normalize it to the inclusive total at ingress, before calling this
         constructor, so every engine conforms. `prices.estimate_cost` relies
@@ -610,9 +599,6 @@ class CallMeta:
     # Header-borne (anthropic request-id, openai x-request-id) or in-band;
     # Gemini: always Absent — the registry records that correlation fact.
     provider_request_id: Presence[str]
-    # openrouter engine fills from response provider metadata; direct engines:
-    # Absent. Feeds llm_calls.upstream_provider.
-    upstream_provider: Presence[str]
     usage: Presence[TokenUsage]
     attempt_trace: tuple[AttemptRecord, ...]
     billability: Billability
@@ -631,7 +617,7 @@ class CallMeta:
 @dataclass(frozen=True, slots=True)
 class CostEstimate:
     amount_usd_micros: int
-    source: str  # e.g. "genai-prices@2026-08-01"
+    source: str  # dated snapshot provenance
     as_of: date
 
     def __post_init__(self) -> None:
@@ -716,6 +702,11 @@ class InvalidStructuredOutput:
 
 
 @dataclass(frozen=True, slots=True)
+class ContinuationTooLarge:
+    """A paid tool-bearing turn cannot fit its bounded replay artifact."""
+
+
+@dataclass(frozen=True, slots=True)
 class TransientExhausted:
     # attempts == len(meta.attempt_trace)
     attempts: int
@@ -727,7 +718,11 @@ class TransientExhausted:
 
 
 type ExpectedModelFailure = (
-    ProviderContextTooLarge | InvalidToolArguments | InvalidStructuredOutput | TransientExhausted
+    ProviderContextTooLarge
+    | InvalidToolArguments
+    | InvalidStructuredOutput
+    | ContinuationTooLarge
+    | TransientExhausted
 )
 
 # Ledger origin union; the runtime's own image is a subset — plan/budget exist
@@ -754,6 +749,7 @@ type FailureCode = Literal[
     "context_too_large",
     "invalid_tool_arguments",
     "invalid_structured_output",
+    "continuation_too_large",
 ]
 
 
@@ -888,8 +884,7 @@ class UsageEvent:
 @dataclass(frozen=True, slots=True)
 class TerminalEvent:
     # outcome.meta carries the AUTHORITATIVE final call facts: the engine folds
-    # all provider usage frames into one merged TokenUsage + request id +
-    # upstream_provider before emission.
+    # all provider usage frames into one merged TokenUsage + request id.
     outcome: StreamOutcome
 
 

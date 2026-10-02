@@ -26,14 +26,6 @@ from llm_tools import (
 )
 
 import provider_runtime.tool_adapter as tool_adapter
-from provider_runtime.agent_runtime.events import AgentToolUse
-from provider_runtime.agent_runtime.tool_projection import (
-    CanonicalMcpToolObservation,
-    McpToolPublication,
-    RejectedMcpToolObservation,
-    lower_mcp_tools,
-)
-from provider_runtime.agent_runtime.types import CredentialRef
 from provider_runtime.engines.anthropic_messages import _encode_request as encode_anthropic
 from provider_runtime.engines.gemini_generate import _encode as encode_gemini
 from provider_runtime.engines.openai_chat import _encode as encode_openai_chat
@@ -48,10 +40,10 @@ from provider_runtime.tool_adapter import (
 )
 from provider_runtime.types import (
     GenerateIntent,
+    Present,
     ProviderTarget,
     TextOutput,
     ToolCall,
-    freeze_json_object,
 )
 
 _ANNOTATIONS = frozenset({"description", "examples", "title"})
@@ -107,11 +99,12 @@ def _semantic_projection(value: Any) -> Any:
 
 def _intent(row_ref: str, tools: tuple):
     row = resolve(row_ref)
+    assert isinstance(row.source_default_reasoning, Present)
     return row, GenerateIntent(
         target=ProviderTarget(provider=row.provider, model=row.model_id),
         messages=(),
         max_output_tokens=64,
-        reasoning="none",
+        reasoning=row.source_default_reasoning.value.value,
         tools=tools,
         tool_choice="auto",
         output=TextOutput(),
@@ -340,7 +333,7 @@ def test_all_engine_encoders_preserve_the_frozen_portable_schema_semantics() -> 
     tool = published.tools[2]
     expected = WEB_SEARCH_SPEC.input_schema.semantic
 
-    openai_row, openai_intent = _intent("openai:gpt-5.6-sol", (tool,))
+    openai_row, openai_intent = _intent("openai:gpt-6-sol", (tool,))
     openai_tools = encode_openai_responses(openai_row, openai_intent).params["tools"]
     assert isinstance(openai_tools, list)
     openai = openai_tools[0]
@@ -352,15 +345,15 @@ def test_all_engine_encoders_preserve_the_frozen_portable_schema_semantics() -> 
     anthropic = anthropic_tools[0]
     assert isinstance(anthropic, Mapping)
 
-    chat_row, chat_intent = _intent("moonshot:kimi-k3", (tool,))
-    chat_tools = encode_openai_chat("moonshot", chat_row, chat_intent).body["tools"]
+    chat_row, chat_intent = _intent("deepseek:deepseek-flash", (tool,))
+    chat_tools = encode_openai_chat("deepseek", chat_row, chat_intent).body["tools"]
     assert isinstance(chat_tools, list)
     chat_definition = chat_tools[0]
     assert isinstance(chat_definition, Mapping)
     chat_function = chat_definition["function"]
     assert isinstance(chat_function, Mapping)
 
-    gemini_row, gemini_intent = _intent("gemini:gemini-3.5-flash", (tool,))
+    gemini_row, gemini_intent = _intent("gemini:gemini-3.8-flash", (tool,))
     gemini_config = encode_gemini(gemini_row, gemini_intent).config
     assert gemini_config.tools is not None
     declarations = getattr(gemini_config.tools[0], "function_declarations", None)
@@ -400,117 +393,4 @@ def test_all_engine_encoders_preserve_the_frozen_portable_schema_semantics() -> 
         wire_schema = json.loads(json.dumps(schema))
         assert _semantic_projection(wire_schema) == expected, (
             f"{engine} changed the portable semantic input schema: {schema!r}"
-        )
-
-
-def test_one_frozen_plan_lowers_to_exact_mcp_publication_and_observation() -> None:
-    plan = _plan(Native())
-    bearer = CredentialRef(
-        kind="secret_reference",
-        profile_key="personal",
-        name="run-scoped-mcp-bearer",
-    )
-    published = lower_mcp_tools(
-        McpToolPublication(
-            plan=plan,
-            server_name="nexus",
-            url="https://nexus.example.test/private/mcp",
-            bearer=bearer,
-        )
-    )
-
-    assert published.server.name == "nexus"
-    assert published.server.transport == "streamable_http"
-    assert published.server.required is True
-    assert published.server.allowed_tools == (
-        "tool__search",
-        "tool__read",
-        "web__search",
-        "web__read",
-    )
-    assert published.server.denied_tools == ()
-    assert published.server.header_refs[0].name == "Authorization"
-    assert published.server.header_refs[0].source is bearer
-
-    observed = published.observe(
-        AgentToolUse(
-            tool_call_id="call-1",
-            name="nexus/web__search",
-            phase="started",
-            payload=freeze_json_object({"query": "cats"}),
-        )
-    )
-    assert observed == CanonicalMcpToolObservation(
-        tool_call_id="call-1",
-        tool_id=WEB_SEARCH_SPEC.id,
-        phase="started",
-        payload=freeze_json_object({"query": "cats"}),
-        succeeded=None,
-    )
-
-    rejected = published.observe(
-        AgentToolUse(
-            tool_call_id="call-2",
-            name="other/private_tool",
-            phase="completed",
-            payload=freeze_json_object({"secret": "discarded with the observation"}),
-            succeeded=False,
-        )
-    )
-    assert isinstance(rejected, RejectedMcpToolObservation)
-    assert rejected.tool_call_id == "call-2"
-    assert not hasattr(rejected, "payload")
-
-
-def test_mcp_projection_uses_the_same_exposure_owner_as_function_publication() -> None:
-    plan = _plan(
-        Discoverable(
-            targets=(WEB_SEARCH_SPEC.id, WEB_READ_SPEC.id),
-            max_target_tools_published=1,
-        )
-    )
-    revealed = (WEB_SEARCH_SPEC.id, WEB_READ_SPEC.id)
-    function_names = tuple(
-        tool.name
-        for tool in lower_tools(ToolPublication(plan=plan, revealed_targets=revealed)).tools
-    )
-    mcp = lower_mcp_tools(
-        McpToolPublication(
-            plan=plan,
-            server_name="nexus",
-            url="https://nexus.example.test/private/mcp",
-            bearer=CredentialRef(
-                kind="secret_reference",
-                profile_key="personal",
-                name="run-bearer",
-            ),
-            revealed_targets=revealed,
-        )
-    )
-
-    assert mcp.server.allowed_tools == function_names
-    with pytest.raises(ValueError, match="unique"):
-        McpToolPublication(
-            plan=plan,
-            server_name="nexus",
-            url="https://nexus.example.test/private/mcp",
-            bearer=CredentialRef(
-                kind="secret_reference",
-                profile_key="personal",
-                name="run-bearer",
-            ),
-            revealed_targets=(WEB_SEARCH_SPEC.id, WEB_SEARCH_SPEC.id),
-        )
-    with pytest.raises(ValueError, match="HostTable"):
-        lower_mcp_tools(
-            McpToolPublication(
-                plan=_plan(HostTable()),
-                server_name="nexus",
-                url="https://nexus.example.test/private/mcp",
-                bearer=CredentialRef(
-                    kind="secret_reference",
-                    profile_key="personal",
-                    name="run-bearer",
-                ),
-            )
         )

@@ -1,22 +1,14 @@
-"""Chat Completions compat engine (openai SDK) — deepseek, moonshot, xai, openrouter.
+"""Chat Completions engine (openai SDK) — deepseek and xai.
 
-One engine, four provider quirk-sets, dispatched flat on `row.provider`:
+One engine, two provider dialects, dispatched on `row.provider`:
 
 - deepseek: `max_tokens`; `reasoning_content` preserved in and replayed from
   the continuation artifact. Default-auto thinking-mode tool calls omit
   `tool_choice` and rely on DeepSeek's documented default; an explicit
   nondefault choice is rejected before dispatch.
-- moonshot: `max_completion_tokens`; continuation = the COMPLETE native
-  assistant message replayed verbatim, including `reasoning_content`
-  (Preserved Thinking).
 - xai: `max_completion_tokens`; native structured outputs (`response_format`
   json_schema) on `structured="native"` rows; `reasoning_content` continuity
   as deepseek (strip on resend).
-- openrouter: `max_tokens`; the row's full routing pins as `provider` on EVERY
-  call (no unpinned passthrough); ordered `reasoning_details` preserved
-  verbatim into the artifact and replayed on assistant messages; upstream
-  provider name from the response body; no `stream_options` (conflicts with
-  require_parameters); in-band error objects on an HTTP-200 body.
 
 Reasoning is NOT a quirk-set: the engine carries zero per-provider reasoning
 shape knowledge. `row.reasoning[level]` is a self-describing request fragment
@@ -41,7 +33,6 @@ from typing import Final, Literal, assert_never, cast
 
 import httpx
 import openai
-from openai import omit
 from openai.types.chat import (
     ChatCompletion,
     ChatCompletionChunk,
@@ -125,7 +116,7 @@ from provider_runtime.types import (
 )
 
 # The compat quirk-sets this engine serves.
-type _Served = Literal["deepseek", "moonshot", "xai", "openrouter"]
+type _Served = Literal["deepseek", "xai"]
 
 # Every request key this engine writes itself: the body fields it maps from
 # core intent fields (both output-cap spellings — the provider decides which),
@@ -147,23 +138,16 @@ _OWNED_KEYS: Final[frozenset[str]] = frozenset(
         "tool_choice",
         "stream",
         "stream_options",
-        "provider",
     }
 )
 
 
 def _served_provider(row: ModelRow) -> _Served:
     match row.provider:
-        case "deepseek" | "moonshot" | "xai" | "openrouter" as provider:
+        case "deepseek" | "xai" as provider:
             return provider
         case other:
             raise registry_invalid(row, f"openai_chat engine does not serve provider {other!r}")
-
-
-def _sequence_or_none(value: object) -> Sequence[object] | None:
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
-        return value
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -190,10 +174,9 @@ def _encode(provider: _Served, row: ModelRow, intent: GenerateIntent) -> _Encode
         )
     body: dict[str, object] = dict(reasoning.fragment)
     match provider:
-        case "moonshot" | "xai":
+        case "xai":
             body["max_completion_tokens"] = intent.max_output_tokens
-        case "deepseek" | "openrouter":
-            # deepseek documents max_tokens; openrouter routes max_tokens.
+        case "deepseek":
             body["max_tokens"] = intent.max_output_tokens
         case _:
             assert_never(provider)
@@ -243,8 +226,6 @@ def _encode(provider: _Served, row: ModelRow, intent: GenerateIntent) -> _Encode
                     assert_never(row.structured)
         case _:
             assert_never(intent.output)
-    if provider == "openrouter":
-        body["provider"] = _routing_pins(row)
     owned = _OWNED_KEYS | reasoning.owned_keys
     for key in intent.provider_options:
         if key in owned:
@@ -258,24 +239,6 @@ def _encode(provider: _Served, row: ModelRow, intent: GenerateIntent) -> _Encode
         body=body,
         native_reasoning=reasoning.native_reasoning,
     )
-
-
-def _routing_pins(row: ModelRow) -> dict[str, object]:
-    match row.routing:
-        case Present(value=routing):
-            return {
-                "only": list(routing.only),
-                "order": list(routing.order),
-                "allow_fallbacks": routing.allow_fallbacks,
-                "require_parameters": routing.require_parameters,
-                "data_collection": routing.data_collection,
-                "zdr": routing.zdr,
-                "quantizations": list(routing.quantizations),
-            }
-        case Absent():
-            raise registry_invalid(row, "openrouter rows must pin routing")
-        case _:
-            assert_never(row.routing)
 
 
 def _tool_definition(tool: CanonicalTool) -> dict[str, object]:
@@ -357,28 +320,40 @@ def _assistant_wire(
             return _assistant_from_fields(message)
         case Present(value=artifact):
             validate_continuation(artifact, row, intent)
+            payload = dict(artifact.opaque_payload)
+            native_calls = payload.get("tool_calls", ())
+            if not isinstance(native_calls, Sequence) or isinstance(native_calls, str | bytes):
+                raise InvalidRequest(message="native assistant tool calls are malformed")
+            try:
+                calls = tuple(
+                    ToolCall(
+                        id=call["id"],
+                        name=call["function"]["name"],
+                        arguments=json.loads(call["function"]["arguments"]),
+                    )
+                    for call in native_calls
+                )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                raise InvalidRequest(message="native assistant tool calls are malformed") from None
+            if (
+                payload.get("role") != "assistant"
+                or (payload.get("content") or "") != message.text
+                or calls != message.tool_calls
+            ):
+                raise InvalidRequest(
+                    message="native assistant turn differs from normalized content"
+                )
             match provider:
-                case "moonshot":
-                    # Complete-native-message replay, verbatim — including
-                    # reasoning_content (Preserved Thinking).
-                    return dict(artifact.opaque_payload)
                 case "deepseek":
                     # DeepSeek thinking-mode tool continuations require the
                     # complete native assistant message, including
                     # reasoning_content, on every subsequent request.
-                    return dict(artifact.opaque_payload)
+                    return payload
                 case "xai":
                     # xAI accepts the same payload shape but reasoning_content
                     # is not replayable there.
-                    payload = dict(artifact.opaque_payload)
                     payload.pop("reasoning_content", None)
                     return payload
-                case "openrouter":
-                    # Typed fields supply content/tool_calls; the artifact only
-                    # carries the ordered reasoning_details, replayed verbatim.
-                    encoded = _assistant_from_fields(message)
-                    encoded["reasoning_details"] = _payload_reasoning_details(artifact)
-                    return encoded
                 case _:
                     assert_never(provider)
         case _:
@@ -405,23 +380,6 @@ def _tool_call_wire(call: ToolCall) -> dict[str, object]:
             ),
         },
     }
-
-
-def _payload_reasoning_details(artifact: ContinuationArtifact) -> list[dict[str, object]]:
-    details = _sequence_or_none(artifact.opaque_payload.get("reasoning_details"))
-    if details is None:
-        raise InvalidRequest(
-            message="openrouter continuation payload carries no reasoning_details array"
-        )
-    entries: list[dict[str, object]] = []
-    for detail in details:
-        entry = mapping_or_none(detail)
-        if entry is None:
-            raise InvalidRequest(
-                message="openrouter continuation reasoning_details entry is not an object"
-            )
-        entries.append(dict(entry))
-    return entries
 
 
 # ---------------------------------------------------------------------------
@@ -451,12 +409,11 @@ def _fold_usage(
 def _usage_from_raw(provider: _Served, raw: Mapping[str, object]) -> TokenUsage:
     prompt_details = mapping_or_none(raw.get("prompt_tokens_details")) or {}
     completion_details = mapping_or_none(raw.get("completion_tokens_details")) or {}
-    # cached_tokens nests under prompt_tokens_details or sits flat on the usage
-    # object (Moonshot's form) — both surfaced; prompt_tokens is cache-inclusive
-    # on this wire, so no ingress normalization is needed.
-    cache_read = int_or_none(prompt_details.get("cached_tokens"))
-    if cache_read is None:
-        cache_read = int_or_none(raw.get("cached_tokens"))
+    cache_read = int_or_none(
+        raw.get("prompt_cache_hit_tokens")
+        if provider == "deepseek"
+        else prompt_details.get("cached_tokens")
+    )
     try:
         return TokenUsage.from_components(
             input_tokens=int_or_none(raw.get("prompt_tokens")) or 0,
@@ -632,23 +589,12 @@ def _terminal_outcome(
 
 
 def _continuation_from_message(
-    provider: _Served, row: ModelRow, intent: GenerateIntent, message: ChatCompletionMessage
+    row: ModelRow, intent: GenerateIntent, message: ChatCompletionMessage
 ) -> Presence[ContinuationArtifact]:
     extra = message.model_extra or {}
-    match provider:
-        case "openrouter":
-            details = _sequence_or_none(extra.get("reasoning_details"))
-            if not details:
-                return Absent()
-            # Verbatim preservation: entries stored exactly as received, in order.
-            payload: Mapping[str, object] = {"reasoning_details": list(details)}
-        case "deepseek" | "moonshot" | "xai":
-            if not str_or_none(extra.get("reasoning_content")) and not message.tool_calls:
-                return Absent()
-            # The payload is the complete native assistant message, verbatim.
-            payload = message.to_dict()
-        case _:
-            assert_never(provider)
+    if not str_or_none(extra.get("reasoning_content")) and not message.tool_calls:
+        return Absent()
+    payload = message.to_dict()
     return Present(
         ContinuationArtifact(
             target=intent.target, codec_id=row.continuation_codec, opaque_payload=payload
@@ -657,31 +603,23 @@ def _continuation_from_message(
 
 
 def _stream_continuation(
-    provider: _Served,
     row: ModelRow,
     intent: GenerateIntent,
     *,
     text: str,
     reasoning: str,
-    details: Sequence[object],
     finished: tuple[_FinishedToolCall, ...],
 ) -> Presence[ContinuationArtifact]:
-    match provider:
-        case "openrouter":
-            if not details:
-                return Absent()
-            payload: dict[str, object] = {"reasoning_details": list(details)}
-        case "deepseek" | "moonshot" | "xai":
-            if not reasoning and not finished:
-                return Absent()
-            # Reconstruct the complete native assistant message for replay.
-            payload = {"role": "assistant", "content": text if (text or not finished) else None}
-            if reasoning:
-                payload["reasoning_content"] = reasoning
-            if finished:
-                payload["tool_calls"] = [dict(call.native) for call in finished]
-        case _:
-            assert_never(provider)
+    if not reasoning and not finished:
+        return Absent()
+    payload: dict[str, object] = {
+        "role": "assistant",
+        "content": text if (text or not finished) else None,
+    }
+    if reasoning:
+        payload["reasoning_content"] = reasoning
+    if finished:
+        payload["tool_calls"] = [dict(call.native) for call in finished]
     return Present(
         ContinuationArtifact(
             target=intent.target, codec_id=row.continuation_codec, opaque_payload=payload
@@ -707,12 +645,6 @@ def _classify_status(provider: _Served, exc: openai.APIStatusError) -> ProviderC
     detail = f": {snippet}" if snippet else ""
     request_id = presence_of(exc.request_id)
 
-    if status == 403 and provider == "openrouter" and _is_moderation_flagged(error):
-        raise RuntimeDefect(
-            origin="provider_response",
-            code="input_moderation_flagged",
-            message=f"openrouter flagged the input for moderation (HTTP {status}){detail}",
-        )
     if status in (401, 403):
         raise CredentialRejected(
             message=f"{provider} rejected the platform credential (HTTP {status}){detail}"
@@ -751,17 +683,6 @@ def _classify_status(provider: _Served, exc: openai.APIStatusError) -> ProviderC
     )
 
 
-def _is_moderation_flagged(error: Mapping[str, object] | None) -> bool:
-    """A 403 body carrying moderation metadata is a per-request content failure,
-    not a rejected platform credential."""
-    if error is None:
-        return False
-    metadata = mapping_or_none(error.get("metadata"))
-    if metadata is None:
-        return False
-    return _sequence_or_none(metadata.get("reasons")) is not None or "flagged_input" in metadata
-
-
 def _mentions_quota(error: Mapping[str, object] | None) -> bool:
     if error is None:
         return False
@@ -779,12 +700,7 @@ def _is_context_overflow(error: Mapping[str, object] | None) -> bool:
 
 
 def _classify_inband_error(provider: _Served, error: object) -> TransientCause:
-    """Classify an in-band error object carried by an HTTP-200 body — the
-    OpenRouter shape for an upstream that failed after the gateway accepted
-    the request. 429-shaped → ProviderRateLimit; a DEFINITE 4xx code names a
-    request the provider will refuse identically next time, so it raises.
-    Everything else — including the upstream-failure envelopes that carry only
-    a message and metadata — is an upstream that fell over: retryable."""
+    """Classify a provider error embedded in an otherwise successful envelope."""
     parsed = mapping_or_none(error)
     raw_code = parsed.get("code") if parsed is not None else None
     code = int_or_none(raw_code)
@@ -878,9 +794,7 @@ class OpenAIChatEngine:
                     model=row.model_id,
                     messages=cast("list[ChatCompletionMessageParam]", encoded.messages),
                     stream=True,
-                    # openrouter: include_usage conflicts with require_parameters;
-                    # the final chunk carries top-level usage anyway.
-                    stream_options=(omit if provider == "openrouter" else {"include_usage": True}),
+                    stream_options={"include_usage": True},
                     extra_body=encoded.body,
                 )
             except openai.APIStatusError as exc:
@@ -901,11 +815,9 @@ class OpenAIChatEngine:
             semantic = False
             request_id: str | None = None
             model: str | None = None
-            upstream: str | None = None
             finish_reason: str | None = None
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
-            details: list[object] = []
             accumulator = _ToolCallAccumulator()
             finished: tuple[_FinishedToolCall, ...] = ()
             failure: InvalidToolArguments | None = None
@@ -931,14 +843,9 @@ class OpenAIChatEngine:
                         )
                     request_id = request_id or (str_or_none(chunk.id) or None)
                     model = model or (str_or_none(chunk.model) or None)
-                    if provider == "openrouter":
-                        upstream = (
-                            str_or_none((chunk.model_extra or {}).get("provider")) or upstream
-                        )
 
                     choice = chunk.choices[0] if chunk.choices else None
-                    # Usage may ride top-level frames (all four) or choices[0]
-                    # of the finish chunk (Moonshot) — fold whichever appear.
+                    # Fold usage from either top-level or finish frames.
                     top_usage = (
                         chunk.usage.to_dict() if isinstance(chunk.usage, CompletionUsage) else None
                     )
@@ -969,9 +876,6 @@ class OpenAIChatEngine:
                         reasoning = str_or_none(delta_extra.get("reasoning_content")) or ""
                         if reasoning:
                             reasoning_parts.append(reasoning)
-                        delta_details = _sequence_or_none(delta_extra.get("reasoning_details"))
-                        if delta_details:
-                            details.extend(delta_details)  # verbatim, in sequence
 
                     chunk_finish = str_or_none(choice.finish_reason)
                     # The FIRST terminal frame decides: a provider that repeats
@@ -979,8 +883,6 @@ class OpenAIChatEngine:
                     # accumulator or re-emit ToolCallDone.
                     if chunk_finish is not None and finish_reason is None:
                         if chunk_finish == "error":
-                            # Off-spec openrouter shape: transient by contract
-                            # even without a top-level error object.
                             raise interrupted(ProviderHttpUnavailable())
                         finish_reason = chunk_finish
                         finished_or_failure = accumulator.finish()
@@ -1016,7 +918,6 @@ class OpenAIChatEngine:
                     provider=row.provider,
                     model=meta_model,
                     provider_request_id=presence_of(request_id),
-                    upstream_provider=presence_of(upstream),
                     usage=Present(_usage_from_raw(provider, raw_usage))
                     if raw_usage is not None
                     else Absent(),
@@ -1054,12 +955,10 @@ class OpenAIChatEngine:
 
             text = "".join(text_parts)
             continuation = _stream_continuation(
-                provider,
                 row,
                 intent,
                 text=text,
                 reasoning="".join(reasoning_parts),
-                details=details,
                 finished=finished,
             )
             if isinstance(continuation, Present):
@@ -1094,7 +993,6 @@ class OpenAIChatEngine:
             provider=row.provider,
             model=row.model_id,
             provider_request_id=presence_of(exc.request_id),
-            upstream_provider=Absent(),
             usage=Absent(),
             attempt_trace=(
                 AttemptRecord(
@@ -1149,16 +1047,10 @@ class OpenAIChatEngine:
             raise ProtocolDefect(
                 code="missing_message", message=f"{provider} choice has no message object"
             )
-        upstream: Presence[str] = (
-            presence_of(str_or_none((completion.model_extra or {}).get("provider")))
-            if provider == "openrouter"
-            else Absent()
-        )
         meta = CallMeta(
             provider=row.provider,
             model=model,
             provider_request_id=presence_of(str_or_none(completion.id) or None),
-            upstream_provider=upstream,
             usage=(
                 Present(_usage_from_raw(provider, completion.usage.to_dict()))
                 if isinstance(completion.usage, CompletionUsage)
@@ -1186,5 +1078,5 @@ class OpenAIChatEngine:
             intent=intent,
             text=str_or_none(message.content) or "",
             tool_calls=tool_calls,
-            continuation=_continuation_from_message(provider, row, intent, message),
+            continuation=_continuation_from_message(row, intent, message),
         )
