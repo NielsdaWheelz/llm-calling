@@ -60,6 +60,7 @@ class Peer:
         self.turn_entered = asyncio.Event()
         self.start_request: dict[str, object] | None = None
         self.session_requests: list[dict[str, object]] = []
+        self.initializations: list[dict[str, object]] = []
         self._sessions = 0
         self.connections: list[ServerConnection] = []
         self._callback_start: dict[str, object] | None = None
@@ -112,6 +113,7 @@ class Peer:
             if method == "initialized":
                 continue
             if method == "initialize":
+                self.initializations.append(request)
                 result = {"userAgent": "loopback-codex"}
             elif method == "account/read":
                 result = {"account": {"type": "chatgpt"}}
@@ -338,13 +340,14 @@ async def terminal(runtime: AgentRuntime, handle) -> AgentTerminal:
     return events[-1]
 
 
+@pytest.mark.parametrize("declared_tools", (False, True))
 async def test_n014_contained_request_overrides_model_and_inherited_native_authority(
-    peer: Peer, tmp_path: Path
+    peer: Peer, tmp_path: Path, declared_tools: bool
 ) -> None:
     async with AgentRuntime(
         AgentRuntimeConfig(state_root_base=tmp_path, codex_endpoints={"loopback": peer.socket})
     ) as runtime:
-        owner = await session(runtime, tmp_path, tools=True)
+        owner = await session(runtime, tmp_path, tools=declared_tools)
         turn = runtime.prepare_turn(
             owner,
             TurnRequest(input=(TextContent("verify the contained route"),)),
@@ -355,6 +358,7 @@ async def test_n014_contained_request_overrides_model_and_inherited_native_autho
         assert thaw_json_value(turn.submitted_request)["params"]["environments"] == []
         assert (await turn.close()).local_closed
     assert peer.starts == 0
+    assert peer.initializations[-1]["params"]["capabilities"] == {"experimentalApi": True}
     params = peer.session_requests[0]["params"]
     assert isinstance(params, dict)
     assert params["environments"] == []

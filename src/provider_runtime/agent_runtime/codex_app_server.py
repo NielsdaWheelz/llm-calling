@@ -79,6 +79,7 @@ class CodexAppServerConfig:
     client_name: str = "provider_runtime"
     client_title: str = "provider-runtime"
     client_version: str = "0.1.0"
+    experimental_api: bool = False
     callbacks: bool = False
 
     def __post_init__(self) -> None:
@@ -86,10 +87,14 @@ class CodexAppServerConfig:
             raise ValueError("Codex app-server socket must be absolute")
         if self.request_policy not in ("deny_owned", "observe_only"):
             raise ValueError("Codex app-server request policy is invalid")
+        if type(self.experimental_api) is not bool:
+            raise ValueError("Codex experimental API selection must be boolean")
         if type(self.callbacks) is not bool or (
             self.callbacks and self.request_policy == "observe_only"
         ):
             raise ValueError("owned callbacks require an owned connection")
+        if self.callbacks and not self.experimental_api:
+            raise ValueError("owned callbacks require the experimental protocol")
         if any(
             type(value) is not str or not value or "\0" in value or "\n" in value
             for value in (
@@ -199,7 +204,7 @@ class CodexAppServerClient:
             initialized = await self.request(
                 "initialize",
                 {
-                    "capabilities": {"experimentalApi": self.config.callbacks},
+                    "capabilities": {"experimentalApi": self.config.experimental_api},
                     "clientInfo": {
                         "name": self.config.client_name,
                         "title": self.config.client_title,

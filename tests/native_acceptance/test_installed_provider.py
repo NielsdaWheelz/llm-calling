@@ -35,7 +35,8 @@ from provider_runtime.types import CanonicalTool, thaw_json_value
 @pytest.mark.skipif(
     "NATIVE_PROVIDER_RECEIPT" not in os.environ, reason="explicit isolated live host"
 )
-async def test_actual_personal_selected_model_structured_callback() -> None:
+@pytest.mark.parametrize("declared_tools", (False, True))
+async def test_actual_personal_selected_model_structured_callback(declared_tools: bool) -> None:
     receipt_path = Path(os.environ["NATIVE_PROVIDER_RECEIPT"])
     host = json.loads(receipt_path.read_text())
     auth = CredentialRef("local_account", "codex-personal")
@@ -80,7 +81,9 @@ async def test_actual_personal_selected_model_structured_callback() -> None:
                             "additionalProperties": False,
                         },
                     ),
-                ),
+                )
+                if declared_tools
+                else (),
             )
         )
         turn = runtime.prepare_turn(
@@ -90,6 +93,8 @@ async def test_actual_personal_selected_model_structured_callback() -> None:
                     TextContent(
                         'call probe__echo with {"text":"owned live callback result"}. '
                         'then return the tool result as {"answer":"owned live callback result"}.'
+                        if declared_tools
+                        else 'return {"answer":"owned live callback result"} without using tools.'
                     ),
                 ),
                 timeout_seconds=300,
@@ -112,7 +117,7 @@ async def test_actual_personal_selected_model_structured_callback() -> None:
                 )
             if isinstance(event, AgentTerminal):
                 terminal = event
-        assert calls == 1
+        assert calls == int(declared_tools)
         assert terminal is not None
         assert terminal.status == "succeeded"
         assert isinstance(terminal.evidence, NativeTerminalEvidence)
@@ -120,7 +125,7 @@ async def test_actual_personal_selected_model_structured_callback() -> None:
             "answer": "owned live callback result"
         }
         qualified = {
-            "kind": "actual_native_echo_callback",
+            "kind": "actual_native_echo_callback" if declared_tools else "actual_native_no_tools",
             "actual_research": False,
             "native_version": host["native_version"],
             "credential_profile": auth.profile_key,
@@ -131,8 +136,8 @@ async def test_actual_personal_selected_model_structured_callback() -> None:
             "terminal": terminal_to_json(terminal),
             "calls": calls,
         }
-        receipt_path.with_name("native-callback.json").write_text(
-            json.dumps(qualified, indent=2) + "\n"
-        )
+        receipt_path.with_name(
+            "native-callback.json" if declared_tools else "native-no-tools.json"
+        ).write_text(json.dumps(qualified, indent=2) + "\n")
         closed = await turn.close()
         assert closed.local_closed

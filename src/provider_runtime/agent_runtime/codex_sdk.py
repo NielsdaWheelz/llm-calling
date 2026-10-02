@@ -606,15 +606,16 @@ class CodexSdkAdapter:
         self._validate_mcp_filters(request)
         state_root = self._endpoint(environment)
         native = request.native
-        if isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled":
+        contained = isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled"
+        if contained:
             self._validate_strict_native_containment(request)
-        if request.tools and not (
-            isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled"
-        ):
+        if request.tools and not contained:
             raise UnsupportedCapability(
                 "declared native callbacks require disabled Codex built-ins"
             )
-        client = await self._open_client(environment=environment, callbacks=bool(request.tools))
+        client = await self._open_client(
+            environment=environment, experimental_api=contained, callbacks=bool(request.tools)
+        )
         try:
             await self._verify_auth(client)
             kwargs: dict[str, object] = {
@@ -624,11 +625,7 @@ class CodexSdkAdapter:
                 "sandbox": self._sandbox(request.policy),
             }
             kwargs["model"] = request.dispatch_model
-            if (
-                isinstance(request.open, NewSession)
-                and isinstance(native, CodexNativeOptions)
-                and native.builtin_tools == "disabled"
-            ):
+            if isinstance(request.open, NewSession) and contained:
                 kwargs["environments"] = []
             if request.tools:
                 kwargs["dynamicTools"] = [
@@ -864,10 +861,18 @@ class CodexSdkAdapter:
             )
 
     async def _open_client(
-        self, *, environment: Mapping[str, str], callbacks: bool = False
+        self,
+        *,
+        environment: Mapping[str, str],
+        experimental_api: bool = False,
+        callbacks: bool = False,
     ) -> CodexAppServerClient:
         client = CodexAppServerClient(
-            CodexAppServerConfig(socket_path=self._endpoint(environment), callbacks=callbacks)
+            CodexAppServerConfig(
+                socket_path=self._endpoint(environment),
+                experimental_api=experimental_api,
+                callbacks=callbacks,
+            )
         )
         try:
             async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):

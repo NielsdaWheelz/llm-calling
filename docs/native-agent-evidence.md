@@ -43,7 +43,8 @@ until integrated final acceptance authorizes deletion.
 .venv/bin/python -m pytest tests --ignore=tests/live -q
 ```
 
-final-tree deterministic conformance: 971 cases pass, three explicitly skip,
+deterministic conformance before the experimental-protocol followup: 987 cases
+pass, three explicitly skip,
 one intentional invalid-sdk-fixture serializer warning. source pyright reports
 zero errors. raw conformance: 482 cases pass after adopting the exact prerequisite. existing
 linux-only pidfd descriptor and process checks remain explicitly platform-bound;
@@ -60,8 +61,16 @@ the first actual run failed closed on newly installed
 `thread/settings/updated`. the installed experimental json schema supplied
 the exact public shape. validation now checks selected model, reasoning, cwd,
 provider, approval posture, and read-only/no-network sandbox settings; the
-prepared native callback and strict-json turn then passed. the final-tree repeat
+prepared native callback and strict-json turn then passed. the earlier repeat
 passed again in 4.75 seconds after reply/cancellation refinements.
+
+the containment followup opts into the supported experimental protocol even
+when no callbacks are declared, because `environments=[]` requires it. the
+controlled request probe first failed that exact no-tools initialization.
+163 affected cases now pass, pyright remains clean, and the actual stock
+server repeated strict-json turns both with one callback and with no tools:
+two cases passed in 6.55 seconds. these results do not prove absent hidden
+native authority; the adversarial qualification below remains separate.
 
 ```sh
 NATIVE_PROVIDER_RECEIPT=/private/tmp/native-provider-live-d23kkjjt/isolation.json \
@@ -131,7 +140,12 @@ the focused loopback check failed first on absent agents/environment overrides.
 96 affected provider/model-catalog cases pass after the repair. original actual
 red receipt and content-free native history projection are retained at
 `/private/tmp/nexus-native-topology-zcDlUE/containment-baseline.json` and
-`failed-thread-read.json`. actual final-code adversarial repeat is pending.
+`failed-thread-read.json`. actual source-overlay delegation and inherited-policy
+repeats passed in `containment-delegation.json` and
+`containment-inherited-final.json`. a separate forced native clock probe proved
+that model-forced code mode and clock still bypass feature flags and ordinary
+v2 item visibility. **N014 remains incomplete** pending the supported startup
+model-catalog restriction and raw-event qualification.
 
 the actual inherited-host probe supplied permissive sandbox/web/shell defaults,
 one harmless configured MCP server, and a private harmless canary. its worker
