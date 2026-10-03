@@ -27,6 +27,11 @@ there is one engine for contained and callback-bearing codex turns.
    storage or a callback handler waits. messages and recorded input drain in
    order before the terminal. pending callbacks and pending transport buffers
    are bounded; controlled turns have no cumulative event or transcript quota.
+   completed item ids are not retained. exact live callback identity is checked;
+   durable host journals own completed callback/input/message identities and
+   reject changed replay. written replies and completed callbacks retire pending
+   request state; input ids retire only after their native recording. unresolved
+   writer-entered input and callback requests remain bounded and tracked.
 5. `reply(call, AgentToolReply(...))` accepts only a fresh opaque token issued
    by that handle. each delivery needs its own reply. repeated call ids retain
    identical native name and arguments; durable replay belongs to the host.
@@ -44,6 +49,15 @@ state. a prior native terminal can remain authoritative on an unusable
 connection. the host must cold-bootstrap when that session cannot be reused.
 `TurnRequest.timeout_seconds=None` imposes no whole-turn deadline on prepared
 native turns; finite rpc timeouts still bound stuck operations.
+
+`prepare_observed_turn` accepts the same arguments and evidence contract as
+`prepare_turn`, rejects declared callbacks before submission, and preserves
+bounded whole-turn event/text and completed-item validation for isolated calls.
+its whole-turn deadline is the lesser of `AgentRuntimeConfig.max_turn_seconds`
+and any explicit request timeout; that config does not limit native preparation.
+`stream_turn` selects this observational behavior. both public preparation
+contracts use the same provider engine; the selection is explicit, never inferred
+from output schemas or an empty tool plan.
 
 ## terminal and recovery
 

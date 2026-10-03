@@ -48,6 +48,7 @@ from provider_runtime.agent_runtime.codex_app_server import (
     CodexAppServerResponseError,
     CodexConnectionUnavailable,
 )
+from provider_runtime.agent_runtime.codex_sdk import _CodexAgentTurn
 from provider_runtime.types import CanonicalTool, canonical_json_bytes, thaw_json_value
 
 
@@ -447,10 +448,16 @@ async def test_n014_contained_request_overrides_model_and_inherited_native_autho
             input_id="contained-config-input",
             controls=AgentTurnControls(rpc_seconds=1, pending_calls=1, pending_call_bytes=1024),
         )
-        assert thaw_json_value(turn.submitted_request)["params"]["environments"] == []
+        prepared_request = thaw_json_value(turn.submitted_request)
+        assert isinstance(prepared_request, dict)
+        params = prepared_request["params"]
+        assert isinstance(params, dict)
+        assert params["environments"] == []
         assert (await turn.close()).local_closed
     assert peer.starts == 0
-    assert peer.initializations[-1]["params"]["capabilities"] == {"experimentalApi": True}
+    initialized = peer.initializations[-1]["params"]
+    assert isinstance(initialized, dict)
+    assert initialized["capabilities"] == {"experimentalApi": True}
     params = peer.session_requests[0]["params"]
     assert isinstance(params, dict)
     assert params["environments"] == []
@@ -595,13 +602,15 @@ async def test_n004_native_terminal_survives_post_terminal_failure(
 
 
 def prepare(runtime: AgentRuntime, owner):
-    return runtime.prepare_turn(
+    turn = runtime.prepare_turn(
         owner,
         TurnRequest(input=(TextContent("return the answer"),)),
         attempt_id="attempt-owned",
         input_id="input-owned",
         controls=AgentTurnControls(rpc_seconds=1, pending_calls=2, pending_call_bytes=8192),
     )
+    assert isinstance(turn, _CodexAgentTurn)
+    return turn
 
 
 async def test_n001_prepare_reserves_freezes_and_revoked_submission_is_proven(
@@ -618,7 +627,9 @@ async def test_n001_prepare_reserves_freezes_and_revoked_submission_is_proven(
             turn.attempt.request_digest
             == hashlib.sha256(canonical_json_bytes(turn.submitted_request)).hexdigest()
         )
-        assert turn.submitted_request["params"]["approvalPolicy"] == "never"
+        params = thaw_json_value(turn.submitted_request["params"])
+        assert isinstance(params, dict)
+        assert params["approvalPolicy"] == "never"
         turn.revoke()
         assert isinstance(await turn.submit(), AgentNotSubmitted)
         assert peer.starts == 0
@@ -684,6 +695,7 @@ async def test_n001_deadline_before_writer_entry_preserves_original_safe_failure
             input_id="deadline-before-entry-input",
             controls=AgentTurnControls(rpc_seconds=1, pending_calls=2, pending_call_bytes=8192),
         )
+        assert isinstance(turn, _CodexAgentTurn)
         lock = turn._state.client._write_lock
         await lock.acquire()
         try:
@@ -710,10 +722,12 @@ async def test_n009_callback_before_start_ack_executes_exact_reply_then_seals(
         assert isinstance(submission, AgentAccepted)
         assert peer.received.empty()
         events = turn.events()
+        call = None
         async for event in events:
             if isinstance(event, AgentToolCall):
                 call = event
                 break
+        assert isinstance(call, AgentToolCall)
         assert call.name == "research__read"
         assert call.arguments == {"query": "known source"}
         assert call.turn == submission.turn

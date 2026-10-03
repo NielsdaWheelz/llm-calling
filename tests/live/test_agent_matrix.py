@@ -70,6 +70,7 @@ from provider_runtime.agent_runtime import (
     TextAgentOutput,
     TextContent,
     TurnRequest,
+    decode_agent_output,
 )
 from provider_runtime.agent_runtime.codex_sdk import CodexSdkAdapter
 from provider_runtime.agent_runtime.types import AGENT_ROUTES
@@ -526,9 +527,8 @@ async def _certify_route(route: LiveRoute, model: str | None) -> dict[str, objec
         assert structured.status == "succeeded", (
             f"structured live turn failed: {structured.failure!r} {structured.diagnostics}"
         )
-        assert structured.structured_output == {"ok": True}, (
-            f"structured output mismatch: {structured.structured_output!r}"
-        )
+        payload = decode_agent_output(_STRUCTURED_OUTPUT, structured)
+        assert payload == {"ok": True}, f"structured output mismatch: {payload!r}"
         structured_evidence: dict[str, object] = {"status": structured.status, "ok": True}
         if observer is not None:
             selections = observer.message_selection_by_thread[

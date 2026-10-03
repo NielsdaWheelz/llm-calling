@@ -484,7 +484,6 @@ class _CodexSessionState:
     active_tool_calls: dict[str, str] = field(default_factory=dict)
     custom_item_calls: dict[str, str] = field(default_factory=dict)
     server_request_ids: set[tuple[type[object], object]] = field(default_factory=set)
-    ended_callback_request_ids: set[tuple[type[object], object]] = field(default_factory=set)
     authority_seen: bool = False
     quota_exhausted: bool = False
     user_message_id: str | None = None
@@ -731,6 +730,7 @@ class CodexSdkAdapter:
         controls: AgentTurnControls,
         release: Callable[[], None],
         validate_input: Callable[[tuple[ContentPart, ...]], None] | None = None,
+        controlled: bool = True,
     ) -> AgentTurn:
         state = self._state(session)
         if request.policy is not None:
@@ -762,7 +762,7 @@ class CodexSdkAdapter:
         state.turn_id = None
         state.user_message_id = input_id
         state.attempt = attempt
-        state.controlled = True
+        state.controlled = controlled
         state.message_count = 0
         state.output_bytes = 0
         state.streamed_text_bytes = 0
@@ -775,7 +775,6 @@ class CodexSdkAdapter:
         state.active_tool_calls.clear()
         state.custom_item_calls.clear()
         state.server_request_ids.clear()
-        state.ended_callback_request_ids.clear()
         state.authority_seen = False
         state.quota_exhausted = False
         handle = _CodexAgentTurn(
@@ -822,6 +821,7 @@ class CodexSdkAdapter:
             input_id=str(uuid4()),
             controls=AgentTurnControls(_OPERATION_TIMEOUT_SECONDS, 16, 1_048_576),
             release=lambda: None,
+            controlled=False,
         )
         try:
             submission = await handle.submit()
@@ -1067,12 +1067,13 @@ class CodexSdkAdapter:
                 f"{method} native payload exceeded its ingress bound",
             )
             raise
-        state.message_count += 1
-        if not state.controlled and state.message_count > _MAX_EVENT_COUNT:
-            raise OutputLimitExceeded(_MAX_EVENT_COUNT)
-        if not state.controlled and state.output_bytes + size > _MAX_TURN_OUTPUT_BYTES:
-            raise OutputLimitExceeded(_MAX_TURN_OUTPUT_BYTES)
-        state.output_bytes += size
+        if not state.controlled:
+            state.message_count += 1
+            if state.message_count > _MAX_EVENT_COUNT:
+                raise OutputLimitExceeded(_MAX_EVENT_COUNT)
+            if state.output_bytes + size > _MAX_TURN_OUTPUT_BYTES:
+                raise OutputLimitExceeded(_MAX_TURN_OUTPUT_BYTES)
+            state.output_bytes += size
         params = self._mapping(raw_params, f"Codex app-server {method} notification")
         self._validate_notification_identity(state, method, params)
         if self._strict_native_containment(state) and method in ("item/started", "item/completed"):
@@ -1103,12 +1104,13 @@ class CodexSdkAdapter:
             )
         except OutputLimitExceeded:
             raise ProtocolDefect("Codex server request exceeded its ingress bound") from None
-        state.message_count += 1
-        if not state.controlled and state.message_count > _MAX_EVENT_COUNT:
-            raise OutputLimitExceeded(_MAX_EVENT_COUNT)
-        if not state.controlled and state.output_bytes + size > _MAX_TURN_OUTPUT_BYTES:
-            raise OutputLimitExceeded(_MAX_TURN_OUTPUT_BYTES)
-        state.output_bytes += size
+        if not state.controlled:
+            state.message_count += 1
+            if state.message_count > _MAX_EVENT_COUNT:
+                raise OutputLimitExceeded(_MAX_EVENT_COUNT)
+            if state.output_bytes + size > _MAX_TURN_OUTPUT_BYTES:
+                raise OutputLimitExceeded(_MAX_TURN_OUTPUT_BYTES)
+            state.output_bytes += size
         identity = (type(request.request_id), request.request_id)
         if request.method == "item/tool/call" and state.controlled and state.request.tools:
             self._validate_notification_identity(state, request.method, request.params)
@@ -1357,13 +1359,9 @@ class CodexSdkAdapter:
             if type(request_id) not in (str, int) or request_id == "":
                 raise ProtocolDefect("serverRequest/resolved had a malformed identity")
             identity = (type(request_id), request_id)
-            if (
-                identity not in state.server_request_ids
-                and identity not in state.ended_callback_request_ids
-            ):
+            if identity not in state.server_request_ids and not state.controlled:
                 raise ProtocolDefect("serverRequest/resolved did not match a server request")
             state.server_request_ids.discard(identity)
-            state.ended_callback_request_ids.discard(identity)
             return AgentNative(native_type=method, payload=redact_native_payload(params))
         if method == "turn/diff/updated":
             state.authority_seen = True
@@ -1433,8 +1431,12 @@ class CodexSdkAdapter:
         if item_type == "custom_tool_call_output":
             raise ProtocolDefect("custom tool output started as an independent item")
         item_id = self._non_empty_string(item, "id", method)
-        if item_id in state.started_item_types or item_id in state.completed_item_ids:
+        if item_id in state.started_item_types or (
+            not state.controlled and item_id in state.completed_item_ids
+        ):
             raise ProtocolDefect("Codex item identity started more than once")
+        if len(state.started_item_types) >= _MAX_MESSAGE_ITEMS:
+            raise ProtocolDefect("Codex active item count exceeded its finite bound")
         state.started_item_types[item_id] = item_type
         if item_type in _INERT_ITEM_TYPES:
             return None
@@ -1535,9 +1537,10 @@ class CodexSdkAdapter:
         if item_type == "custom_tool_call_output":
             call_id = self._non_empty_string(item, "call_id", method)
             completion_id = f"custom-output:{call_id}"
-            if completion_id in state.completed_item_ids:
-                raise ProtocolDefect("Codex custom tool output completed more than once")
-            state.completed_item_ids.add(completion_id)
+            if not state.controlled:
+                if completion_id in state.completed_item_ids:
+                    raise ProtocolDefect("Codex custom tool output completed more than once")
+                state.completed_item_ids.add(completion_id)
             name = state.active_tool_calls.pop(call_id, None)
             if name is None:
                 raise ProtocolDefect("custom tool output completed before its call started")
@@ -1550,9 +1553,10 @@ class CodexSdkAdapter:
                 succeeded=True,
             )
         item_id = self._non_empty_string(item, "id", method)
-        if item_id in state.completed_item_ids:
-            raise ProtocolDefect("Codex item identity completed more than once")
-        state.completed_item_ids.add(item_id)
+        if not state.controlled:
+            if item_id in state.completed_item_ids:
+                raise ProtocolDefect("Codex item identity completed more than once")
+            state.completed_item_ids.add(item_id)
         started_type = state.started_item_types.pop(item_id, None)
         if (
             item_type not in _INERT_ITEM_TYPES
@@ -1581,8 +1585,7 @@ class CodexSdkAdapter:
                 if state.turn_id is None or state.handle is None:
                     raise ProtocolDefect("recorded input omitted its controlled native turn")
                 input_id = self._non_empty_string(item, "clientId", method)
-                if not state.handle.accepts_input(input_id):
-                    raise ProtocolDefect("native user item has no prepared input delivery")
+                state.handle.record_input(input_id)
                 return AgentInputRecorded(AgentTurnRef(state.ref, state.turn_id), input_id, item_id)
             return None
         if started_type is None:
@@ -1830,6 +1833,8 @@ class CodexSdkAdapter:
     def _start_tool(state: _CodexSessionState, item_id: str, name: str) -> None:
         if item_id in state.active_tool_calls:
             raise ProtocolDefect("Codex authority identity started more than once")
+        if len(state.active_tool_calls) >= _MAX_MESSAGE_ITEMS:
+            raise ProtocolDefect("Codex active authority count exceeded its finite bound")
         state.active_tool_calls[item_id] = name
 
     @staticmethod
@@ -2161,9 +2166,10 @@ class CodexSdkAdapter:
         size = len(text.encode("utf-8"))
         if size > _MAX_EVENT_TEXT_BYTES:
             raise OutputLimitExceeded(_MAX_EVENT_TEXT_BYTES)
-        if not state.controlled and state.streamed_text_bytes + size > _MAX_FINAL_TEXT_BYTES:
-            raise OutputLimitExceeded(_MAX_FINAL_TEXT_BYTES)
-        state.streamed_text_bytes += size
+        if not state.controlled:
+            if state.streamed_text_bytes + size > _MAX_FINAL_TEXT_BYTES:
+                raise OutputLimitExceeded(_MAX_FINAL_TEXT_BYTES)
+            state.streamed_text_bytes += size
 
     def _record_completed_agent_message(
         self,
@@ -2209,15 +2215,7 @@ class CodexSdkAdapter:
 
     @staticmethod
     def _append_diagnostic(state: _CodexSessionState, message: str) -> None:
-        """Append one deduplicated turn diagnostic, failing the turn past the bound.
-
-        These come from the turn's own `error`/`warning` notifications, so they are part of
-        the turn's output budget like its text and its frames: exceeding the bound ends the
-        turn as `output_limit_exceeded` through `stream_turn`'s existing handler rather than
-        reporting a silently truncated diagnostic record. Claude's `_record_diagnostic`
-        drops instead, because there the callers are teardown paths with an outcome of their
-        own that must not be replaced by a bound.
-        """
+        """Keep recent native diagnostics; bounded observation fails past the limit."""
         if message in state.diagnostics:
             return
         if len(state.diagnostics) >= _MAX_DIAGNOSTICS:
@@ -2287,11 +2285,18 @@ class CodexSdkAdapter:
 
 
 @dataclass(slots=True)
+class _ActiveCall:
+    name: str
+    arguments: JsonValue
+    size: int
+    reply_written: bool = False
+
+
+@dataclass(slots=True)
 class _PendingReply:
     call: AgentToolCall
     request_id: CodexRequestId
     attempted: bool = False
-    sent: bool = False
 
 
 class _CodexAgentTurn:
@@ -2329,7 +2334,8 @@ class _CodexAgentTurn:
         self._closed = False
         self._consumer_open = False
         self._input_ids = {state.user_message_id}
-        self._calls: dict[str, tuple[str, JsonValue, int]] = {}
+        self._pending_input_bytes = len(state.user_message_id.encode("utf-8"))
+        self._calls: dict[str, _ActiveCall] = {}
         self._reply_tokens: dict[str, _PendingReply] = {}
         self._pending_call_bytes = 0
         self._events: asyncio.Queue[tuple[AgentEvent, int]] = asyncio.Queue(maxsize=256)
@@ -2567,6 +2573,12 @@ class _CodexAgentTurn:
     def accepts_input(self, input_id: object) -> bool:
         return type(input_id) is str and input_id in self._input_ids
 
+    def record_input(self, input_id: str) -> None:
+        if not self.accepts_input(input_id):
+            raise ProtocolDefect("native user item has no prepared input delivery")
+        self._input_ids.remove(input_id)
+        self._pending_input_bytes -= len(input_id.encode("utf-8"))
+
     def tool_started(self, call_id: str, name: str, arguments: object) -> None:
         if name not in {tool.name for tool in self._state.request.tools}:
             raise ProtocolDefect("native callback named an undeclared tool")
@@ -2579,7 +2591,7 @@ class _CodexAgentTurn:
             or self._pending_call_bytes + size > self._controls.pending_call_bytes
         ):
             raise ProtocolDefect("native pending callback buffer exceeded its finite bound")
-        self._calls[call_id] = (name, frozen, size)
+        self._calls[call_id] = _ActiveCall(name, frozen, size)
         self._pending_call_bytes += size
 
     def tool_call(self, request: CodexServerRequest) -> AgentToolCall:
@@ -2591,13 +2603,15 @@ class _CodexAgentTurn:
         if original is None:
             raise ProtocolDefect("native callback preceded its declared tool item")
         arguments = freeze_json_value(params.get("arguments"))
-        if original[:2] != (name, arguments):
+        if (original.name, original.arguments) != (name, arguments):
             raise ProtocolDefect("native callback changed its item name or arguments")
         turn = self._turn_ref()
         if turn is None:
             raise ProtocolDefect("native callback omitted its owned turn")
+        if len(self._reply_tokens) >= self._controls.pending_calls:
+            raise ProtocolDefect("native pending callback requests exceeded their finite bound")
         token = str(uuid4())
-        call = AgentToolCall(turn, call_id, token, name, arguments)
+        call = AgentToolCall(turn, call_id, token, name, original.arguments)
         self._reply_tokens[token] = _PendingReply(call, request.request_id)
         return call
 
@@ -2612,15 +2626,14 @@ class _CodexAgentTurn:
             for token, pending in self._reply_tokens.items()
             if pending.call.call_id == call_id
         ]
-        if status == "completed" and not any(self._reply_tokens[token].sent for token in tokens):
+        if status == "completed" and not original.reply_written:
             raise ProtocolDefect("native callback succeeded without an owned delivered reply")
-        self._pending_call_bytes -= original[2]
+        self._pending_call_bytes -= original.size
         for token in tokens:
             pending = self._reply_tokens.pop(token)
             identity = (type(pending.request_id), pending.request_id)
-            if identity in self._state.server_request_ids:
-                self._state.server_request_ids.remove(identity)
-                self._state.ended_callback_request_ids.add(identity)
+            self._state.server_request_ids.discard(identity)
+            self._state.client.complete_callback(pending.request_id)
 
     async def reply(self, call: AgentToolCall, result: AgentToolReply) -> None:
         self._require_authority()
@@ -2633,7 +2646,10 @@ class _CodexAgentTurn:
 
         def enter() -> None:
             self._require_authority()
-            pending.sent = True
+            original = self._calls.get(call.call_id)
+            if original is None:
+                raise ProtocolDefect("native callback reply outlived its owned item")
+            original.reply_written = True
 
         async with asyncio.timeout(self._controls.rpc_seconds):
             await self._state.client.respond(
@@ -2644,6 +2660,8 @@ class _CodexAgentTurn:
                 },
                 on_write=enter,
             )
+        self._state.server_request_ids.discard((type(pending.request_id), pending.request_id))
+        self._reply_tokens.pop(call.reply_token, None)
 
     async def steer(self, *, input_id: str, input: tuple[ContentPart, ...]) -> AgentControlReceipt:
         validated = TurnRequest(input=input)
@@ -2703,7 +2721,16 @@ class _CodexAgentTurn:
                 self._require_authority()
                 if input_id is None or input_id in self._input_ids:
                     raise InvalidAgentRequest("steering input id already entered its native writer")
+                size = len(input_id.encode("utf-8"))
+                if (
+                    len(self._input_ids) >= _MAX_MESSAGE_ITEMS
+                    or self._pending_input_bytes + size > _MAX_MESSAGE_BYTES
+                ):
+                    raise ProtocolDefect(
+                        "native pending input identities exceeded their finite bound"
+                    )
                 self._input_ids.add(input_id)
+                self._pending_input_bytes += size
             elif self._closed or self._terminal is not None:
                 raise SessionUnavailable("native interrupt target already ended")
             entered = True

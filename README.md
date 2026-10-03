@@ -184,7 +184,8 @@ commentary remains observable but is never executable structured output. Child
 environments are runtime-owned and scrubbed. Under
 `CodexNativeOptions(builtin_tools="disabled")`, every known native authority
 event is first-class and poisons the turn; unknown protocol messages fail closed.
-This contains/detects Code Mode but does not prove it absent before execution.
+contained codex requires the qualified dedicated host's startup catalog policy;
+per-thread tool declarations alone do not establish containment.
 The full
 living contract is [docs/agent-runtime.md](docs/agent-runtime.md).
 
@@ -196,10 +197,23 @@ those facts before opening a session and never accepts a free-form Codex model.
 Claude uses the separate `ClaudeNativeSessionRequest` arm and reports model
 catalog discovery as `UnsupportedCapability`.
 
-Prepared Codex turns use `prepare_turn` → host arm → `submit`, with explicit
-non-submission, accepted, or uncertain evidence. Native callbacks, steering,
+prepared codex turns use `prepare_turn` → host arm → `submit`, with explicit
+non-submission, accepted, or uncertain evidence. native callbacks, steering,
 interrupt, reader-latched terminals, per-handle cleanup, and the canonical
-terminal codec share that engine. See
+terminal codec share that engine. `prepare_turn` retains only active protocol
+state, latest usage, eligible final text, and bounded pending requests;
+completed callback, input, and message identities belong to durable host journals.
+the provider checks exact live callback identity but does not retain completed
+inert item ids to detect their later reuse. hosts must record repeated progress
+and reject changed completed callback proposals.
+
+`prepare_observed_turn` has the same arguments and evidence contract, rejects
+declared callbacks before submission, and retains bounded whole-turn event/text
+and completed-item validation. its turn deadline is the lesser of
+`AgentRuntimeConfig.max_turn_seconds` and any explicit request timeout.
+`stream_turn` selects that observational behavior.
+both preparation methods share one engine; native turns have no cumulative
+transcript quota. see
 [docs/provider-native-turns.md](docs/provider-native-turns.md) and
 [docs/native-agent-evidence.md](docs/native-agent-evidence.md).
 

@@ -503,9 +503,52 @@ class AgentRuntime:
         controls: AgentTurnControls,
     ) -> AgentTurn:
         """Finalize one exclusive native request without inference or transport work."""
+        return self._prepare_turn(
+            session,
+            request,
+            attempt_id=attempt_id,
+            input_id=input_id,
+            controls=controls,
+            controlled=True,
+        )
+
+    def prepare_observed_turn(
+        self,
+        session: AgentSession,
+        request: TurnRequest,
+        *,
+        attempt_id: str,
+        input_id: str,
+        controls: AgentTurnControls,
+    ) -> AgentTurn:
+        """Prepare bounded observation without declared callbacks or inference."""
+        return self._prepare_turn(
+            session,
+            request,
+            attempt_id=attempt_id,
+            input_id=input_id,
+            controls=controls,
+            controlled=False,
+        )
+
+    def _prepare_turn(
+        self,
+        session: AgentSession,
+        request: TurnRequest,
+        *,
+        attempt_id: str,
+        input_id: str,
+        controls: AgentTurnControls,
+        controlled: bool,
+    ) -> AgentTurn:
         self._require_open()
         if not isinstance(request, TurnRequest) or not isinstance(controls, AgentTurnControls):
             raise InvalidAgentRequest("prepare_turn requires TurnRequest and AgentTurnControls")
+        if not controlled:
+            timeout_seconds = self._config.max_turn_seconds
+            if request.timeout_seconds is not None:
+                timeout_seconds = min(timeout_seconds, request.timeout_seconds)
+            request = replace(request, timeout_seconds=timeout_seconds)
         binding = self._sessions.get(session)
         if binding is None:
             raise SessionMismatch("AgentSession does not belong to this AgentRuntime")
@@ -514,6 +557,12 @@ class AgentRuntime:
             raise SessionUnavailable("AgentSession is no longer usable")
         if not isinstance(adapter, CodexSdkAdapter):
             raise UnsupportedCapability("controlled prepared turns currently support Codex only")
+        if (
+            not controlled
+            and isinstance(binding.request, CodexCatalogSessionRequest)
+            and binding.request.tools
+        ):
+            raise UnsupportedCapability("declared callbacks require native prepare_turn")
         policy = (
             binding.request.policy
             if request.policy is None
@@ -539,6 +588,7 @@ class AgentRuntime:
                 validate_input=lambda content: self._validate_content_files(
                     content, binding.request, policy
                 ),
+                controlled=controlled,
             )
         except BaseException:
             release()

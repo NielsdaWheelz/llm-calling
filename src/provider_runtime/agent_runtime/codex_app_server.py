@@ -472,6 +472,8 @@ class CodexAppServerClient:
             previous = self._dynamic_requests.get(identity)
             if previous is not None and previous != params:
                 raise ProtocolDefect("Codex dynamic request changed bytes under one identity")
+            if previous is None and len(self._dynamic_requests) >= _MAX_MESSAGE_ITEMS:
+                raise ProtocolDefect("Codex pending callback requests exceeded their finite bound")
             self._dynamic_requests[identity] = params
             self._server_request_ids.add(identity)
             self._enqueue(
@@ -577,6 +579,11 @@ class CodexAppServerClient:
         if identity not in self._dynamic_requests:
             raise ProtocolDefect("Codex callback reply does not identify a pending owned request")
         await self._write({"id": request_id, "result": result}, on_write=on_write)
+        self.complete_callback(request_id)
+
+    def complete_callback(self, request_id: CodexRequestId) -> None:
+        """Retire a written reply or a natively completed owned callback; send nothing."""
+        identity = (type(request_id), request_id)
         self._dynamic_requests.pop(identity, None)
         self._server_request_ids.discard(identity)
 
