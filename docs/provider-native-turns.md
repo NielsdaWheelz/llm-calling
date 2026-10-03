@@ -69,6 +69,45 @@ values. there are no legacy decoders or invented evidence defaults.
 
 ## native capability
 
+contained codex sessions require a dedicated stock `0.160.0` host. host
+operations call `materialize_codex_containment_catalog(private_directory)`
+and launch the stock process with `-c model_catalog_json="<returned-path>"`.
+`qualify_codex_containment_host(socket_path)` checks the public `config/read`
+declaration. session preparation repeats this check before creating a native
+thread: the canonical catalog basename and `sessionFlags` startup origin must
+match; the initialize user-agent build version must be exactly `0.160.0`.
+per-thread catalog overrides are documented upstream no-ops and are
+never used to claim containment. the trusted host owns the materialized bytes;
+this declaration is not remote attestation against a hostile local operator.
+
+the provider retains the complete official catalog from
+[`rust-v0.160.0`](https://github.com/openai/codex/blob/a956835d020762cb2b570053af06f643a11c0ecc/codex-rs/models-manager/models.json).
+source hash: `fd219bd9f061278275f528939f82f54d2eb97df4b25c23b022adbe48813d920b`.
+restricted hash: `b8b588f4b03c8e08fdb7e2994c03578d9b94bbc01665b7adb6490bd234b3cf54`.
+the compiler preserves every field except `tool_mode=direct` and removal of
+the established native clock/async-user selectors. unknown selectors or tool
+modes fail before materialization. the original apache license and notice
+accompany the asset. this policy changes the whole endpoint: native code mode,
+clock and async-user interactions are unavailable; model inventory updates
+require an explicit provider/binary/catalog upgrade. exact model identifiers,
+efforts, instructions, context metadata and account routing remain intact.
+ordinary coding sessions use a separate endpoint.
+
+the stock static catalog manager does not replace this catalog during network
+refresh. catalog revision participates in the provider definition identity.
+the official [`model_catalog_json` setting](https://developers.openai.com/codex/config-reference)
+describes this startup seam. model listing is source metadata, not a promise
+that every listed model is entitled or successfully qualified for the account.
+
+new contained threads opt into the installed raw response event stream.
+declared direct function calls remain host callbacks. unexpected raw custom
+tools or undeclared functions become typed native authority events and poison
+terminal acceptance; unknown raw item types fail closed. the reader does not
+parse javascript or treat code-mode wrappers as declared callback authority.
+loaded threads retain the raw-event selection; stock resume/fork exposes no
+new raw-event opt-in, so the pinned startup policy remains the authority ceiling
+after a cold server restart.
+
 session tool declarations use frozen `CanonicalTool` values. native callback
 names are valid request-local aliases, while canonical portable identity stays
 with `llm-tools` and the kernel. undeclared authority, rerouted models, changed

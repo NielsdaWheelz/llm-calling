@@ -16,6 +16,7 @@ from provider_runtime.types import (
     freeze_json_object,
 )
 
+from .codex_containment import CODEX_CONTAINMENT_CATALOG_REVISION
 from .errors import ProtocolDefect
 
 AGENT_BACKEND_CONTRACT_REVISION = "provider-runtime.agent-model-catalog.v1"
@@ -168,7 +169,7 @@ async def read_codex_model_catalog(
         b"provider-runtime.agent-model-catalog.v1",
         {
             "row_fingerprints": tuple(row.row_fingerprint for row in facts),
-            "native_containment_revision": "codex-contained-native-tools.v2",
+            "native_containment_revision": CODEX_CONTAINMENT_CATALOG_REVISION,
         },
     )
     return AgentModelCatalog(

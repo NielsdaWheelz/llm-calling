@@ -38,6 +38,7 @@ from .codex_app_server import (
     CodexRequestId,
     CodexServerRequest,
 )
+from .codex_containment import _validate_codex_containment_config
 from .errors import (
     CredentialRejected,
     CredentialUnavailable,
@@ -183,6 +184,8 @@ _TURN_SCOPED_METHODS = frozenset(
         "error",
         "turn/started",
         "turn/completed",
+        "rawResponseItem/completed",
+        "rawResponse/completed",
         "thread/tokenUsage/updated",
         "item/started",
         "item/completed",
@@ -618,6 +621,15 @@ class CodexSdkAdapter:
         )
         try:
             await self._verify_auth(client)
+            if contained:
+                _validate_codex_containment_config(
+                    await self._call(
+                        client.request("config/read", {"includeLayers": False}),
+                        operation="native host startup catalog",
+                        failure="session",
+                    ),
+                    client.metadata,
+                )
             kwargs: dict[str, object] = {
                 "approval_mode": self._approval_mode(request.policy),
                 "config": self._codex_config(request),
@@ -627,6 +639,7 @@ class CodexSdkAdapter:
             kwargs["model"] = request.dispatch_model
             if isinstance(request.open, NewSession) and contained:
                 kwargs["environments"] = []
+                kwargs["experimentalRawEvents"] = True
             if request.tools:
                 kwargs["dynamicTools"] = [
                     {
@@ -1183,6 +1196,30 @@ class CodexSdkAdapter:
         method: str,
         params: Mapping[str, object],
     ) -> AgentEvent | None:
+        if method == "rawResponse/completed":
+            return None
+        if method == "rawResponseItem/completed":
+            item = self._mapping(params.get("item"), "raw Responses item")
+            kind = self._non_empty_string(item, "type", method)
+            if kind in ("message", "reasoning", "function_call_output"):
+                return None
+            if kind in ("function_call", "custom_tool_call"):
+                name = self._non_empty_string(item, "name", method)
+                namespace = item.get("namespace")
+                if namespace not in (None, "functions"):
+                    if type(namespace) is not str or not namespace:
+                        raise ProtocolDefect("raw Responses tool namespace is malformed")
+                    name = f"{namespace}/{name}"
+                if kind == "function_call" and name in {tool.name for tool in state.request.tools}:
+                    return None
+                state.authority_seen = True
+                return AgentToolUse(
+                    tool_call_id=self._non_empty_string(item, "call_id", method),
+                    name=name,
+                    phase="started",
+                    payload=redact_native_payload(item),
+                )
+            raise ProtocolDefect(f"Codex raw Responses item has unknown type {kind}")
         if method == "thread/started":
             thread = self._mapping(params.get("thread"), "thread/started thread")
             if self._string(thread, "id", method) != state.ref.native_session_id:

@@ -22,6 +22,7 @@ from provider_runtime.agent_runtime import (
     AgentTerminal,
     AgentToolCall,
     AgentToolReply,
+    AgentToolUse,
     AgentTurnControls,
     AgentUncertain,
     CodexCatalogSessionRequest,
@@ -38,6 +39,7 @@ from provider_runtime.agent_runtime import (
     TextContent,
     TurnNotStarted,
     TurnRequest,
+    UnsupportedCapability,
     decode_agent_output,
     terminal_from_json,
     terminal_to_json,
@@ -53,6 +55,7 @@ class Peer:
     def __init__(self, socket: Path) -> None:
         self.socket = socket
         self.answer = '{"answer":"ok"}'
+        self.user_agent = "loopback-provider/0.160.0 (controlled peer)"
         self.tail: str | None = None
         self.starts = 0
         self.mode = "normal"
@@ -64,6 +67,14 @@ class Peer:
         self._sessions = 0
         self.connections: list[ServerConnection] = []
         self._callback_start: dict[str, object] | None = None
+        self.host_configuration = {
+            "config": {
+                "model_catalog_json": "/host/codex-contained-models-0.160.0-b8b588f4b03c8e08fdb7e2994c03578d9b94bbc01665b7adb6490bd234b3cf54.json"
+            },
+            "origins": {
+                "model_catalog_json": {"name": {"type": "sessionFlags"}, "version": "fixture"}
+            },
+        }
 
     async def handle(self, connection: ServerConnection) -> None:
         self.connections.append(connection)
@@ -114,9 +125,11 @@ class Peer:
                 continue
             if method == "initialize":
                 self.initializations.append(request)
-                result = {"userAgent": "loopback-codex"}
+                result = {"userAgent": self.user_agent}
             elif method == "account/read":
                 result = {"account": {"type": "chatgpt"}}
+            elif method == "config/read":
+                result = self.host_configuration
             elif method == "model/list":
                 result = {
                     "data": [
@@ -239,6 +252,34 @@ class Peer:
                 continue
             if self.mode == "hold":
                 continue
+            if self.mode == "raw_native":
+                await connection.send(
+                    json.dumps(
+                        {
+                            "method": "turn/started",
+                            "params": {
+                                "threadId": thread_id,
+                                "turn": {"id": "turn-loopback", "status": "inProgress"},
+                            },
+                        }
+                    )
+                )
+                await connection.send(
+                    json.dumps(
+                        {
+                            "method": "rawResponseItem/completed",
+                            "params": {
+                                **scope,
+                                "item": {
+                                    "type": "custom_tool_call",
+                                    "name": "exec",
+                                    "call_id": "raw-native-1",
+                                    "input": "text(await tools.clock__curr_time({}));",
+                                },
+                            },
+                        }
+                    )
+                )
             await self.finish(connection, scope)
 
     async def finish(
@@ -338,6 +379,57 @@ async def terminal(runtime: AgentRuntime, handle) -> AgentTerminal:
     ]
     assert isinstance(events[-1], AgentTerminal)
     return events[-1]
+
+
+@pytest.mark.parametrize(
+    "violation", ("absent", "wrong_catalog", "relative", "user_origin", "old_native")
+)
+async def test_n014_rejects_unqualified_stock_host_before_session_io(
+    peer: Peer, tmp_path: Path, violation: str
+) -> None:
+    if violation == "absent":
+        peer.host_configuration["config"].pop("model_catalog_json")
+    elif violation == "wrong_catalog":
+        peer.host_configuration["config"]["model_catalog_json"] = "/host/unrestricted-models.json"
+    elif violation == "relative":
+        peer.host_configuration["config"]["model_catalog_json"] = "relative/models.json"
+    elif violation == "user_origin":
+        peer.host_configuration["origins"]["model_catalog_json"]["name"]["type"] = "user"
+    else:
+        peer.user_agent = "provider-runtime/0.159.2 (old stock host)"
+    async with AgentRuntime(
+        AgentRuntimeConfig(state_root_base=tmp_path, codex_endpoints={"loopback": peer.socket})
+    ) as runtime:
+        with pytest.raises(UnsupportedCapability, match="startup.*catalog"):
+            await session(runtime, tmp_path, tools=True)
+    assert peer.session_requests == [] and peer.starts == 0
+
+
+async def test_n014_raw_custom_exec_is_authority_not_a_permitted_callback(
+    peer: Peer, tmp_path: Path
+) -> None:
+    peer.mode = "raw_native"
+    async with AgentRuntime(
+        AgentRuntimeConfig(state_root_base=tmp_path, codex_endpoints={"loopback": peer.socket})
+    ) as runtime:
+        owner = await session(runtime, tmp_path, tools=True)
+        turn = runtime.prepare_turn(
+            owner,
+            TurnRequest(input=(TextContent("attempt native clock"),)),
+            attempt_id="raw-authority",
+            input_id="raw-authority-input",
+            controls=AgentTurnControls(5, 4, 4096),
+        )
+        assert isinstance(await turn.submit(), AgentAccepted)
+        observed = []
+        with pytest.raises(ProtocolDefect):
+            async for event in turn.events():
+                observed.append(event)
+        authority = [event for event in observed if isinstance(event, AgentToolUse)]
+        assert len(authority) == 1
+        assert authority[0].name == "exec" and authority[0].phase == "started"
+        assert turn.terminal is None
+        assert (await turn.close()).local_closed
 
 
 @pytest.mark.parametrize("declared_tools", (False, True))

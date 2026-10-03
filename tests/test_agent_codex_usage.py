@@ -12,6 +12,7 @@ import pytest
 from websockets.asyncio.server import ServerConnection, unix_serve
 
 from provider_runtime.agent_runtime import (
+    CODEX_CONTAINMENT_CATALOG_FILENAME,
     AgentRuntime,
     AgentRuntimeConfig,
     AgentTerminal,
@@ -57,9 +58,14 @@ class UsagePeer:
             if method == "initialized":
                 continue
             if method == "initialize":
-                result = {"userAgent": "synthetic-codex"}
+                result = {"userAgent": "fixture/0.160.0 (controlled peer)"}
             elif method == "account/read":
                 result = {"account": {"type": "chatgpt"}}
+            elif method == "config/read":
+                result = {
+                    "config": {"model_catalog_json": f"/host/{CODEX_CONTAINMENT_CATALOG_FILENAME}"},
+                    "origins": {"model_catalog_json": {"name": {"type": "sessionFlags"}}},
+                }
             elif method == "model/list":
                 result = {
                     "data": [

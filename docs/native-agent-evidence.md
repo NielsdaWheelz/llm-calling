@@ -144,8 +144,9 @@ red receipt and content-free native history projection are retained at
 repeats passed in `containment-delegation.json` and
 `containment-inherited-final.json`. a separate forced native clock probe proved
 that model-forced code mode and clock still bypass feature flags and ordinary
-v2 item visibility. **N014 remains incomplete** pending the supported startup
-model-catalog restriction and raw-event qualification.
+v2 item visibility. the supported startup model-catalog restriction and
+raw-event qualification below address this defect; final frozen-consumer
+integration remains separate.
 
 the actual inherited-host probe supplied permissive sandbox/web/shell defaults,
 one harmless configured MCP server, and a private harmless canary. its worker
@@ -153,3 +154,41 @@ mounted only the shared socket volume. no inherited MCP process/call marker,
 native execution marker, cwd write, or private-canary leakage occurred. this
 source-overlay linux aarch64 evidence is separate from frozen-lock consumer
 installation and actual research qualification.
+
+## qualified stock startup policy
+
+the exact public `model_catalog_json` startup seam keeps the full vendor
+`ModelsResponse`, changes tool mode to direct, and removes known native
+clock/async-user selectors. the actual direct-mode callback is a raw
+`function_call`; the original ordinary-mode host callback and clock were both
+wrapped in separate raw `custom_tool_call` values named `exec`. receipts
+`raw-callback-baseline.json`, `raw-clock-baseline.json`,
+`raw-callback-restricted.json` and `raw-clock-restricted.json` preserve that
+distinction. no javascript parsing or private-cache dependency is used.
+
+five transport regressions first failed: four unqualified startup declarations
+were admitted and a raw native exec lacked a typed authority event. all now
+pass. an older native-version peer failed rejection first, then was rejected
+before session creation. 119 affected cases pass including that version
+check; source pyright reports zero errors. the full final deterministic suite
+passes 998 cases, skips four explicit platform/live prerequisites and deselects
+40 live-provider cases; its one warning is the intentional malformed-sdk-input
+fixture. exact installed source shows the
+public initialize user-agent prefix includes the binary's cargo version.
+
+the product nexus host now materializes the provider-owned catalog and passes
+its path as a startup CLI flag. public host qualification requires the exact
+native version, canonical artifact basename and `sessionFlags` origin. a
+materializer/source-preservation check proves only the two policy fields
+changed; unknown selectors fail before writing. the actual final product-host
+source-overlay adversarial run succeeded with exact gpt-6-luna/xhigh, one host
+callback, strict json, no native authority events and no fixture effects.
+receipt: `/private/tmp/nexus-native-topology-zcDlUE/containment-final-restricted.json`.
+this is native containment evidence, **not research**, cross-uid jarvis access,
+or final installed-consumer acceptance.
+
+`uv build --wheel --out-dir /private/tmp/nexus-native-topology-zcDlUE/provider-dist`
+packaged the complete exact source asset and original apache license/notice.
+`provider-wheel-assets.json` records wheel and asset hashes. this startup
+policy restricts the whole dedicated endpoint and freezes model inventory to
+the pinned catalog. ordinary coding hosts remain separate.

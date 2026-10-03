@@ -8,6 +8,15 @@ surface.
 from provider_runtime.types import JsonScalar, thaw_json_value
 
 from ._structured_output import OutputSchemaMismatch, decode_agent_output
+from .codex_containment import (
+    CODEX_CONTAINMENT_CATALOG_FILENAME,
+    CODEX_CONTAINMENT_CATALOG_REVISION,
+    CODEX_CONTAINMENT_CATALOG_SHA256,
+    CODEX_CONTAINMENT_SOURCE_SHA256,
+    CODEX_CONTAINMENT_VERSION,
+    materialize_codex_containment_catalog,
+    qualify_codex_containment_host,
+)
 from .codex_control import (
     CodexBounded,
     CodexComplete,
@@ -231,6 +240,11 @@ __all__ = [
     "ApprovalMode",
     "ApprovalRequest",
     "Backend",
+    "CODEX_CONTAINMENT_CATALOG_FILENAME",
+    "CODEX_CONTAINMENT_CATALOG_REVISION",
+    "CODEX_CONTAINMENT_CATALOG_SHA256",
+    "CODEX_CONTAINMENT_SOURCE_SHA256",
+    "CODEX_CONTAINMENT_VERSION",
     "CapturedAgentCall",
     "ClaudeNativeOptions",
     "ClaudeNativeSessionRequest",
@@ -326,6 +340,8 @@ __all__ = [
     "decode_agent_output",
     "freeze_json_object",
     "freeze_json_value",
+    "materialize_codex_containment_catalog",
+    "qualify_codex_containment_host",
     "ref_from_json",
     "ref_to_json",
     "submission_from_json",
