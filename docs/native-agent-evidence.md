@@ -221,7 +221,10 @@ checks. the dependency lock remains identical to the qualified ancestor.
 native qualification does not satisfy the raw-provider matrix gate in
 [the pivot specification](pivot-spec.md#11-testing). the retained raw receipt
 uses registry `2026-08-10.2`; it does not qualify current registry
-`2026-09-25.2`. raw matrix acceptance must be resolved before merging this
-delivery; native receipts and controlled peers cannot replace it.
-the exact missing-row inventory and resolution command are in
-[the open merge gate](issues/raw-provider-matrix-unqualified.md).
+`2026-09-25.2`. on 2026-10-03 the user explicitly waived that inherited
+all-five api matrix/key gate for this native pr: "skip these i don't care".
+the raw matrix remains NOT_RUN and unqualified; no raw api calls were launched.
+this waiver permits this merge, preserves the future gate, and leaves native
+sdk/consumer qualification required. native receipts and controlled peers
+cannot replace raw evidence. the missing-row inventory and qualification
+command remain in [the scoped disposition](issues/raw-provider-matrix-unqualified.md).
