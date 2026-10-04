@@ -20,8 +20,8 @@ current nine-model/five-provider catalog and native continuation v2.
 
 ## controlled red / green
 
-temporary acceptance cases are in `tests/native_acceptance/`; they remain
-until integrated final acceptance authorizes deletion.
+temporary acceptance cases lived in `tests/native_acceptance/`. they were
+deleted after integrated final acceptance; the receipts below retain their proof.
 
 - first native boundary run: two failures and one pass demonstrated premature
   structured-output rewriting and lost terminal proof after disconnect.
@@ -192,3 +192,36 @@ packaged the complete exact source asset and original apache license/notice.
 `provider-wheel-assets.json` records wheel and asset hashes. this startup
 policy restricts the whole dedicated endpoint and freezes model inventory to
 the pinned catalog. ordinary coding hosts remain separate.
+
+## delivery composition
+
+the native branch composes main `4d270abd48dd61240b22b9d741ce737fa611f67b`
+with qualified native ancestor `e1498d8382f192ae664ae9790b682a8e8a8b0d38`.
+main's terminal-control cli, naming/resume, profile usage and portable process
+checks remain present. prepared-turn runtime, callback supervisor, terminal
+codec and containment assets are byte-identical to the qualified ancestor.
+the shared transport additionally resolves its socket alias before connecting.
+existing consumers retain their exact immutable pins.
+
+two temporary actual unix-peer checks first rejected an overlong unresolved
+alias, then passed with the resolved physical socket. the owned connection
+replied to its application callback exactly once; the observe-only connection
+left that request unanswered. this is transport proof, not model research.
+receipts: `/private/tmp/provider-native-merge-rendezvous-{red,green}.log`.
+
+after deleting those probes, the final existing suite passes 979 cases, skips
+the explicitly separate no-sdk node and deselects 40 paid live cases. the
+isolated no-sdk environment passed its full suite including both wire probes;
+the mandatory absent-sdk node executed separately without skipping. ruff,
+pyright, dependency audit, source/wheel build, base-wheel isolation and
+claude-extra wheel imports pass. logs use
+`/private/tmp/provider-native-merge-*`; no paid provider was invoked by these
+checks. the dependency lock remains identical to the qualified ancestor.
+
+native qualification does not satisfy the raw-provider matrix gate in
+[the pivot specification](pivot-spec.md#11-testing). the retained raw receipt
+uses registry `2026-08-10.2`; it does not qualify current registry
+`2026-09-25.2`. raw matrix acceptance must be resolved before merging this
+delivery; native receipts and controlled peers cannot replace it.
+the exact missing-row inventory and resolution command are in
+[the open merge gate](issues/raw-provider-matrix-unqualified.md).

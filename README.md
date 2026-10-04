@@ -217,6 +217,23 @@ transcript quota. see
 [docs/provider-native-turns.md](docs/provider-native-turns.md) and
 [docs/native-agent-evidence.md](docs/native-agent-evidence.md).
 
+## Existing terminal agents
+
+`provider-runtime-control` provides one bounded JSON request/reply for
+`inspect`, `read`, `send`, `interrupt`, and `stop` on existing Codex/Claude
+sessions. it is a command, not a daemon; it never owns the shared server or
+copies history. callers select the profile environment before starting it.
+Codex uses the existing observe-only control client; Claude uses its native
+agent listing/stop commands and the optional SDK saved-message reader.
+
+this boundary is separate from isolated cognition: terminal agents retain the
+host user's existing authority. the host owns tmux discovery, process identity,
+terminal fallback, and final terminal closure. read coverage and uncertain
+writes are explicit; absent expected Codex turn identity never selects a newer
+turn for cancellation. installation must use the committed dependency lock
+with the `claude-sdk` extra. Claude's public reader loads the saved file before
+slicing; bounded output does not imply bounded transcript memory.
+
 ## Development
 
 ```bash

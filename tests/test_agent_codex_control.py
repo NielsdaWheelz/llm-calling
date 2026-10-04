@@ -91,6 +91,8 @@ class ProtocolPeer:
         self.emit_approval = False
         self.foreign_noise = False
         self.turn_status = "inProgress"
+        self.turn_id = TURN
+        self.turn_id_after_interrupt: str | None = None
         self.drop_method: str | None = None
         self.close_code = 1000
         self.errors: dict[str, str] = {}
@@ -173,10 +175,12 @@ class ProtocolPeer:
                     result = {
                         "data": [
                             {
-                                "id": TURN,
+                                "id": self.turn_id,
                                 "status": self.turn_status,
                                 "itemsView": view,
                                 "items": [] if view == "notLoaded" else self.turn_items(),
+                                "startedAt": 1,
+                                "completedAt": None if self.turn_status == "inProgress" else 2,
                             }
                         ],
                         "nextCursor": None,
@@ -204,6 +208,9 @@ class ProtocolPeer:
                 elif method == "turn/interrupt":
                     if self.interrupt_settles:
                         self.turn_status = "interrupted"
+                    if self.turn_id_after_interrupt:
+                        self.turn_id = self.turn_id_after_interrupt
+                        self.turn_status = "inProgress"
                     result = {}
                 else:
                     raise AssertionError(f"unexpected fixture request: {method}")
@@ -1090,5 +1097,11 @@ async def test_create_delegates_cwd_existence_to_the_external_server(
     created = [message for message in peer.messages if message.get("method") == "thread/start"]
     assert len(created) == 1
     params = created[0]["params"]
-    assert isinstance(params, dict) and params["cwd"] == str(server_cwd)
+    assert params == {
+        "cwd": str(server_cwd),
+        "sandbox": "workspace-write",
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "config": {"sandbox_workspace_write": {"network_access": False}},
+    }
     assert any(message.get("method") == "thread/unsubscribe" for message in peer.messages)
