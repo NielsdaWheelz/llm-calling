@@ -1,15 +1,12 @@
-"""Indicative cost estimation over the vendored genai-prices snapshot.
+"""Indicative cost estimation from the current-model official-price snapshot.
 
-`estimate_cost` is pure: it reads `prices_snapshot.json` (vendored by
-`tools/refresh_prices.py`; the library never fetches) and derives a
+`estimate_cost` is pure: it reads `prices_snapshot.json` and derives a
 `CostEstimate` from a call's `CallMeta` on demand — indicative, never
 authoritative, never stored on `CallMeta`.
 
-Matching rule (genai-prices' match clauses, simplified): rows are keyed by
-(provider, model); an exact model match wins, else the row whose model key is
-the LONGEST prefix of `meta.model` (so a dated wire id like
-"claude-fable-5-20260301" matches its base row, while
-"gemini-3.5-flash-lite-…" picks flash-lite over flash). No row → `Absent()`.
+Only exact current model identities receive a price; an unknown response model
+is unpriceable. Rates are standard short-context estimates. DeepSeek uses its
+peak price as a conservative estimate; its actual off-peak price is lower.
 
 Money: snapshot rates are USD per million tokens — numerically identical to
 micros per token — carried as `Decimal` end to end; the total rounds half up
@@ -52,7 +49,7 @@ class _Rates:
     cache_write_surcharge_mtok: Decimal
 
 
-def _load_snapshot() -> tuple[date, dict[tuple[str, str], _Rates]]:
+def _load_snapshot() -> tuple[date, str, dict[tuple[str, str], _Rates]]:
     text = resources.files("provider_runtime").joinpath("prices_snapshot.json").read_text("utf-8")
     snapshot = json.loads(text)
     rates = {
@@ -64,24 +61,16 @@ def _load_snapshot() -> tuple[date, dict[tuple[str, str], _Rates]]:
         )
         for row in snapshot["rows"]
     }
-    return date.fromisoformat(snapshot["snapshot_date"]), rates
+    return date.fromisoformat(snapshot["snapshot_date"]), snapshot["upstream"], rates
 
 
-_SNAPSHOT_DATE, _RATES = _load_snapshot()
-_SOURCE = f"genai-prices@{_SNAPSHOT_DATE.isoformat()}"
+_SNAPSHOT_DATE, _UPSTREAM, _RATES = _load_snapshot()
+_SOURCE = f"{_UPSTREAM}@{_SNAPSHOT_DATE.isoformat()}"
 
 
 def _match_rates(provider: str, model: str) -> Presence[_Rates]:
     exact = _RATES.get((provider, model))
-    if exact is not None:
-        return Present(exact)
-    best: tuple[int, _Rates] | None = None
-    for (row_provider, row_model), rates in _RATES.items():
-        if row_provider != provider or not model.startswith(row_model):
-            continue
-        if best is None or len(row_model) > best[0]:
-            best = (len(row_model), rates)
-    return Absent() if best is None else Present(best[1])
+    return Absent() if exact is None else Present(exact)
 
 
 # ---------------------------------------------------------------------------
@@ -119,9 +108,8 @@ def _amount_usd_micros(usage: TokenUsage, rates: _Rates) -> int:
 def estimate_cost(meta: CallMeta) -> Presence[CostEstimate]:
     """Estimate the USD cost of a terminal call; Absent when unpriceable.
 
-    Absent when the snapshot has no row for (meta.provider, meta.model) — all
-    openrouter calls, deliberately: upstream pricing depends on the routed
-    endpoint — or when `meta.usage` is Absent.
+    Absent when the snapshot has no exact model row, usage is absent, or the
+    request crosses a published higher-price context tier.
     """
     match meta.usage:
         case Absent():
@@ -131,6 +119,10 @@ def estimate_cost(meta: CallMeta) -> Presence[CostEstimate]:
         case _:
             assert_never(meta.usage)
     matched = _match_rates(meta.provider, meta.model)
+    if meta.provider == "openai" and usage.input_tokens > 272_000:
+        return Absent()
+    if meta.provider == "xai" and usage.input_tokens > 200_000:
+        return Absent()
     match matched:
         case Absent():
             return Absent()

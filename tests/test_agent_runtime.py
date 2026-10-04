@@ -52,6 +52,12 @@ from provider_runtime.agent_runtime.sessions import (
     SessionSnapshot,
     fingerprint_path,
 )
+from provider_runtime.agent_runtime.turn import (
+    AgentAttempt,
+    AgentResultRef,
+    AgentTurnRef,
+    NativeTerminalEvidence,
+)
 from provider_runtime.agent_runtime.types import (
     AgentSessionRef,
     AgentSessionRequest,
@@ -74,6 +80,17 @@ from provider_runtime.agent_runtime.types import (
 from provider_runtime.types import Absent, Present, TokenUsage
 
 pytestmark = pytest.mark.anyio
+
+
+def _terminal_evidence(ref: AgentSessionRef) -> NativeTerminalEvidence:
+    native = (
+        AgentTurnRef(ref, "turn-fixture") if ref.backend == "codex" else AgentResultRef(ref, None)
+    )
+    return NativeTerminalEvidence(
+        AgentAttempt("attempt-fixture", "f" * 64),
+        native,
+        "codex-turn-completed.v1" if ref.backend == "codex" else "claude-result.v1",
+    )
 
 
 def usage() -> TokenUsage:
@@ -341,6 +358,7 @@ class ScriptedAdapter:
                     failure=AgentFailure("approval_unanswered"),
                     final_text="",
                     session_ref=ref,
+                    evidence=_terminal_evidence(ref),
                     diagnostics=("approval handler failed",),
                 )
                 return
@@ -359,6 +377,7 @@ class ScriptedAdapter:
                 failure=AgentQuotaExhausted(),
                 final_text="",
                 session_ref=ref,
+                evidence=_terminal_evidence(ref),
             )
             return
         yield AgentText(session_request.cwd)
@@ -368,6 +387,7 @@ class ScriptedAdapter:
             failure=None,
             final_text="done",
             session_ref=ref,
+            evidence=_terminal_evidence(ref),
         )
 
     async def interrupt(self, session: AgentSession) -> None:

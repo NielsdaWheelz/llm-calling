@@ -336,7 +336,9 @@ def _encode_messages(
     # prefix, the final (new) turn excluded — falling back to the end of the
     # system prompt on a first turn. Thinking blocks cannot carry cache_control
     # on this wire, so the marker lands on the last block that can.
-    prefix_blocks = [block for _, content in turns[:-1] for block in content]
+    prefix_blocks = [
+        block for role, content in turns[:-1] if role != "assistant" for block in content
+    ]
     for block in reversed(prefix_blocks):
         if block.get("type") not in _UNCACHEABLE_BLOCK_TYPES:
             block["cache_control"] = {"type": "ephemeral"}
@@ -374,8 +376,22 @@ def _assistant_content(
     match message.continuation:
         case Present(value=artifact):
             validate_continuation(artifact, row, intent)
-            # Thinking/redacted_thinking blocks lead the assistant turn VERBATIM.
-            content.extend(_continuation_blocks(artifact))
+            content = _continuation_blocks(artifact)
+            native_calls = [
+                (block.get("id"), block.get("name"))
+                for block in content
+                if block.get("type") == "tool_use"
+            ]
+            if native_calls != [(call.id, call.name) for call in message.tool_calls]:
+                raise InvalidRequest(
+                    message="anthropic native tool calls differ from normalized calls"
+                )
+            native_text = "".join(
+                str(block.get("text", "")) for block in content if block.get("type") == "text"
+            )
+            if native_text != message.text:
+                raise InvalidRequest(message="anthropic native text differs from normalized text")
+            return content
         case Absent():
             pass
         case _:
@@ -397,7 +413,7 @@ def _assistant_content(
 
 
 def _continuation_blocks(artifact: ContinuationArtifact) -> list[dict[str, object]]:
-    """Replay the payload's ordered thinking blocks verbatim — never parsed."""
+    """Replay the complete ordered assistant content verbatim."""
     blocks = artifact.opaque_payload.get("blocks")
     if (
         not isinstance(blocks, Sequence)
@@ -406,8 +422,7 @@ def _continuation_blocks(artifact: ContinuationArtifact) -> list[dict[str, objec
         or not all(isinstance(block, Mapping) for block in blocks)
     ):
         raise InvalidRequest(
-            message="anthropic continuation artifact payload must carry the prior turn's "
-            "ordered thinking blocks under 'blocks'"
+            message="anthropic continuation artifact payload must carry complete ordered blocks"
         )
     return [dict(block) for block in blocks]
 
@@ -430,7 +445,6 @@ def _meta(
         provider="anthropic",
         model=model,
         provider_request_id=presence_of(request_id),
-        upstream_provider=Absent(),
         usage=usage,
         attempt_trace=(
             AttemptRecord(
@@ -729,8 +743,9 @@ def _decode_response(
 
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
-    thinking_blocks: list[Mapping[str, object]] = []
+    native_blocks: list[Mapping[str, object]] = []
     for block in message.content:
+        native_blocks.append(block.model_dump(mode="json", exclude_unset=True))
         if isinstance(block, TextBlock):
             text_parts.append(str_or_none(block.text) or "")
         elif isinstance(block, ToolUseBlock):
@@ -742,7 +757,7 @@ def _decode_response(
             # Verbatim wire capture: construct-time field sets hold exactly the
             # wire keys, so exclude_unset dumps reproduce the block as it
             # arrived (signature intact).
-            thinking_blocks.append(block.model_dump(mode="json", exclude_unset=True))
+            pass
         else:
             raise ProtocolDefect(
                 code="unknown_content_block",
@@ -753,7 +768,7 @@ def _decode_response(
     content = response_content(intent, text="".join(text_parts), tool_calls=tuple(tool_calls))
     if isinstance(content, InvalidStructuredOutput):
         return Failed(meta=meta, failure=content)
-    continuation = _continuation_of(row, intent, thinking_blocks)
+    continuation = _continuation_of(row, intent, native_blocks)
     return Succeeded(
         meta=meta, response=ResponsePayload(content=content, continuation=continuation)
     )
@@ -784,8 +799,7 @@ class _StreamState:
     text_parts: list[str] = field(default_factory=list, repr=False)
     open_tools: dict[int, _OpenToolCall] = field(default_factory=dict)
     tool_calls: list[ToolCall] = field(default_factory=list, repr=False)
-    thinking_by_index: dict[int, dict[str, object]] = field(default_factory=dict, repr=False)
-    thinking_blocks: list[Mapping[str, object]] = field(default_factory=list, repr=False)
+    native_by_index: dict[int, dict[str, object]] = field(default_factory=dict, repr=False)
     semantic_emitted: bool = False
 
 
@@ -805,14 +819,16 @@ def _start_content_block(
     index = _require_index(frame.index)
     block = frame.content_block
     if isinstance(block, TextBlock):
+        state.native_by_index[index] = block.model_dump(mode="json", exclude_unset=True)
         return None
     if isinstance(block, ToolUseBlock):
+        state.native_by_index[index] = block.model_dump(mode="json", exclude_unset=True)
         call_id = str_or_none(block.id) or ""
         name = str_or_none(block.name) or ""
         state.open_tools[index] = _OpenToolCall(call_id=call_id, name=name)
         return ToolCallStart(call_id=call_id, name=name)
     if isinstance(block, ThinkingBlock | RedactedThinkingBlock):
-        state.thinking_by_index[index] = block.model_dump(mode="json", exclude_unset=True)
+        state.native_by_index[index] = block.model_dump(mode="json", exclude_unset=True)
         return None
     raise ProtocolDefect(
         code="unknown_content_block",
@@ -828,6 +844,12 @@ def _absorb_delta(
     if isinstance(delta, NativeTextDelta):
         text = str_or_none(delta.text) or ""
         state.text_parts.append(text)
+        block = state.native_by_index.get(index)
+        if block is None or block.get("type") != "text":
+            raise ProtocolDefect(
+                code="malformed_stream_event", message="text delta has no text block"
+            )
+        block["text"] = str(block.get("text", "")) + text
         return TextDelta(text=text) if text else None
     if isinstance(delta, InputJSONDelta):
         open_tool = state.open_tools.get(index)
@@ -842,7 +864,7 @@ def _absorb_delta(
             ToolCallDelta(call_id=open_tool.call_id, arguments_delta=partial) if partial else None
         )
     if isinstance(delta, ThinkingDelta | SignatureDelta):
-        block = state.thinking_by_index.get(index)
+        block = state.native_by_index.get(index)
         if block is None:
             raise ProtocolDefect(
                 code="malformed_stream_event",
@@ -880,10 +902,8 @@ def _finish_content_block(
             )
         tool_call = ToolCall(id=open_tool.call_id, name=open_tool.name, arguments=arguments)
         state.tool_calls.append(tool_call)
+        state.native_by_index[index]["input"] = arguments
         return ToolCallDone(tool_call=tool_call)
-    thinking = state.thinking_by_index.pop(index, None)
-    if thinking is not None:
-        state.thinking_blocks.append(thinking)
     return None
 
 
@@ -966,7 +986,9 @@ def _terminal_events(
     )
     if isinstance(content, InvalidStructuredOutput):
         return [TerminalEvent(outcome=Failed(meta=meta, failure=content))]
-    continuation = _continuation_of(row, intent, state.thinking_blocks)
+    continuation = _continuation_of(
+        row, intent, [state.native_by_index[index] for index in sorted(state.native_by_index)]
+    )
     events: list[CodecStreamEvent] = []
     match continuation:
         case Present(value=artifact):

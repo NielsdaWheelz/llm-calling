@@ -226,8 +226,12 @@ async def test_paused_consumer_overflow_preserves_authority_then_rejects_termina
         with pytest.raises(ProtocolDefect, match="queue exceeded"):
             await pending
         assert isinstance(await client.next_message(), CodexServerRequest)
+        # Transport preserves ingress order. Typed containment decides whether
+        # this raw completion can become authoritative native terminal evidence.
+        assert (await client.next_message()).method == "turn/completed"
         with pytest.raises(ProtocolDefect, match="queue exceeded"):
-            await client.next_message()
+            while True:
+                await client.next_message()
     finally:
         producer.cancel()
         await asyncio.gather(producer, return_exceptions=True)

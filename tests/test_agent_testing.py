@@ -18,6 +18,7 @@ from provider_runtime.agent_runtime.testing import (
     NoNetworkAgentRuntime,
     ScriptedAgentRuntime,
 )
+from provider_runtime.agent_runtime.turn import AgentAttempt, AgentTurnRef, NativeTerminalEvidence
 from provider_runtime.agent_runtime.types import (
     AgentSessionRef,
     AgentSessionRequest,
@@ -77,6 +78,11 @@ def _terminal(text: str = "done") -> AgentTerminal:
         failure=None,
         final_text=text,
         session_ref=_ref(),
+        evidence=NativeTerminalEvidence(
+            AgentAttempt("attempt-fixture", "f" * 64),
+            AgentTurnRef(_ref(), "turn-fixture"),
+            "codex-turn-completed.v1",
+        ),
     )
 
 

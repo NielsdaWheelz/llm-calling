@@ -10,14 +10,13 @@ Environment contract (read by this test module only — the library reads none):
 
 - ``LLM_RUNTIME_LIVE=1`` is required — anything else fails, never skips;
 - one key per provider: ``OPENAI_API_KEY``, ``ANTHROPIC_API_KEY``,
-  ``GEMINI_API_KEY``, ``MOONSHOT_API_KEY``, ``OPENROUTER_API_KEY``,
-  ``DEEPSEEK_API_KEY``, ``XAI_API_KEY``. A missing key skips that provider's
+  ``GEMINI_API_KEY``, ``DEEPSEEK_API_KEY``, ``XAI_API_KEY``. A missing key skips that provider's
   rows with a loud reason and the skip is recorded in evidence;
 - narrowing (``-k``) is a debugging aid — release evidence runs unfiltered.
 
 Per registry row the matrix probes: plain chat, streaming (envelope grammar +
 exactly one terminal), one tool round trip, ``json_out`` (typed reply), and a
-two-turn reasoning continuation replay — each probe skipping cleanly when the
+native tool continuation replay — each probe skipping cleanly when the
 row's capabilities say unsupported. DeepSeek additionally proves its
 thinking-mode tool continuation: reasoning + tool call + native continuation
 replay + tool result + final answer. Every run writes one evidence file into
@@ -33,7 +32,6 @@ import json
 import os
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import assert_never
@@ -56,17 +54,16 @@ from provider_runtime.registry import (
     _ModelRow as ModelRow,
 )
 from provider_runtime.types import (
-    Absent,
-    AssistantMessage,
     CallMeta,
     CanonicalTool,
     ContinuationDelta,
+    ContinueGeneration,
     GenerateIntent,
     Present,
     PromptBlock,
     ProviderName,
     ProviderTarget,
-    ReasoningLevel,
+    ReasoningKey,
     StreamStart,
     StructuredReply,
     Succeeded,
@@ -89,24 +86,9 @@ _PROVIDER_ENV: Mapping[ProviderName, str] = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "gemini": "GEMINI_API_KEY",
-    "moonshot": "MOONSHOT_API_KEY",
-    "openrouter": "OPENROUTER_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "xai": "XAI_API_KEY",
 }
-
-# Cheapest-first probe order over the closed level vocabulary; a row declares a
-# subset and each probe picks from what the row declares, never inventing one.
-_LEVEL_ORDER: tuple[ReasoningLevel, ...] = (
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "max",
-)
-
 
 # ---------------------------------------------------------------------------
 # Selection helpers
@@ -125,10 +107,6 @@ def _credentials(provider: ProviderName, key: str) -> Credentials:
             return Credentials(anthropic=key)
         case "gemini":
             return Credentials(gemini=key)
-        case "moonshot":
-            return Credentials(moonshot=key)
-        case "openrouter":
-            return Credentials(openrouter=key)
         case "deepseek":
             return Credentials(deepseek=key)
         case "xai":
@@ -146,41 +124,17 @@ def _runtime_for(row: ModelRow) -> ProviderRuntime:
     return ProviderRuntime(credentials=_credentials(row.provider, key))
 
 
-def _declared_levels(row: ModelRow) -> tuple[ReasoningLevel, ...]:
-    match row.reasoning:
-        case Present(value=levels):
-            return tuple(level for level in _LEVEL_ORDER if level in levels)
-        case Absent():
-            return ()
-        case _:
-            assert_never(row.reasoning)
-
-
-def _chat_reasoning(row: ModelRow) -> ReasoningLevel:
-    """The cheapest level the row can express ("none" when it has no knob)."""
-    declared = _declared_levels(row)
-    return declared[0] if declared else "none"
-
-
-def _replay_reasoning(row: ModelRow) -> ReasoningLevel | None:
-    """The declared level that reliably reasons; None when the row has none.
-
-    "high" over the cheapest declared level: certified live that claude-sonnet-5
-    at "low" effort completes without emitting a thinking signature, so a cheap
-    level can leave nothing for the continuation probe to replay."""
-    declared: tuple[ReasoningLevel, ...] = tuple(
-        level for level in _declared_levels(row) if level != "none"
-    )
-    if not declared:
-        return None
-    return "high" if "high" in declared else declared[-1]
+def _chat_reasoning(row: ModelRow) -> ReasoningKey:
+    if not isinstance(row.reasoning, Present) or not row.reasoning.value:
+        raise AssertionError(f"row {row.ref} has no reasoning configurations")
+    return next(iter(row.reasoning.value))
 
 
 def _intent(
     row: ModelRow,
     *,
     user: str,
-    reasoning: ReasoningLevel | None = None,
+    reasoning: ReasoningKey | None = None,
     tools: tuple[CanonicalTool, ...] = (),
 ) -> GenerateIntent:
     return GenerateIntent(
@@ -232,9 +186,6 @@ def _meta_evidence(meta: CallMeta) -> dict[str, object]:
             meta.provider_request_id.value
             if isinstance(meta.provider_request_id, Present)
             else None
-        ),
-        "upstream_provider": (
-            meta.upstream_provider.value if isinstance(meta.upstream_provider, Present) else None
         ),
         "attempts": len(meta.attempt_trace),
     }
@@ -376,16 +327,12 @@ async def test_tools_probe(row: ModelRow, evidence: _EvidenceRecorder) -> None:
         call = content.tool_calls[0]
         assert call.name == tool.name, f"unexpected tool called: {call.name!r}"
 
-        second_intent = replace(
-            intent,
-            messages=(
-                *intent.messages,
-                AssistantMessage(
-                    text=content.text,
-                    tool_calls=content.tool_calls,
-                    continuation=first.response.continuation,
-                ),
-                ToolResultMessage(call_id=call.id, output='{"temperature_c": 21}', is_error=False),
+        assert isinstance(first.response.continuation, Present), "tool turn omitted continuation"
+        second_intent = ContinueGeneration(
+            continuation=first.response.continuation.value,
+            tool_results=tuple(
+                ToolResultMessage(call_id=item.id, output='{"temperature_c": 21}', is_error=False)
+                for item in content.tool_calls
             ),
         )
         second = await runtime.generate(second_intent)
@@ -427,10 +374,6 @@ async def test_deepseek_thinking_tool_continuation_probe(
         assert isinstance(first, Succeeded), f"thinking tool turn did not succeed: {first!r}"
         continuation = first.response.continuation
         assert isinstance(continuation, Present), "thinking tool turn returned no continuation"
-        reasoning = continuation.value.opaque_payload.get("reasoning_content")
-        assert isinstance(reasoning, str) and reasoning.strip(), (
-            "DeepSeek thinking tool continuation omitted reasoning_content"
-        )
         content = first.response.content
         assert isinstance(content, TextContent), (
             f"thinking tool turn decoded {type(content).__name__}"
@@ -440,18 +383,13 @@ async def test_deepseek_thinking_tool_continuation_probe(
         assert call.name == tool.name, f"unexpected tool called: {call.name!r}"
 
         second = await runtime.generate(
-            replace(
-                intent,
-                messages=(
-                    *intent.messages,
-                    AssistantMessage(
-                        text=content.text,
-                        tool_calls=content.tool_calls,
-                        continuation=continuation,
-                    ),
+            ContinueGeneration(
+                continuation=continuation.value,
+                tool_results=tuple(
                     ToolResultMessage(
-                        call_id=call.id, output='{"temperature_c": 21}', is_error=False
-                    ),
+                        call_id=item.id, output='{"temperature_c": 21}', is_error=False
+                    )
+                    for item in content.tool_calls
                 ),
             )
         )
@@ -496,50 +434,3 @@ async def test_json_out_probe(row: ModelRow, evidence: _EvidenceRecorder) -> Non
         )
         record["structured"] = row.structured
         record.update(_meta_evidence(reply.outcome.meta))
-
-
-@pytest.mark.parametrize("row", ROWS, ids=_ROW_IDS)
-async def test_continuation_probe(row: ModelRow, evidence: _EvidenceRecorder) -> None:
-    with evidence.probe(row, "continuation") as record:
-        runtime = _runtime_for(row)
-        level = _replay_reasoning(row)
-        if level is None:
-            pytest.skip(f"row {row.ref} declares no reasoning level to replay")
-        intent = _intent(
-            row,
-            user="What is 17 * 23? Think it through, then answer with just the number.",
-            reasoning=level,
-        )
-        first = await runtime.generate(intent)
-        assert isinstance(first, Succeeded), f"first reasoning turn did not succeed: {first!r}"
-        continuation = first.response.continuation
-        assert isinstance(continuation, Present), (
-            "the first reasoning turn returned no continuation artifact to replay"
-        )
-        content = first.response.content
-        assert isinstance(content, TextContent), (
-            f"first reasoning turn decoded {type(content).__name__}"
-        )
-
-        second_intent = replace(
-            intent,
-            messages=(
-                *intent.messages,
-                AssistantMessage(
-                    text=content.text,
-                    tool_calls=content.tool_calls,
-                    continuation=continuation,
-                ),
-                UserMessage(
-                    blocks=(
-                        PromptBlock(
-                            text="Add 9 to your previous answer and reply with just the number."
-                        ),
-                    )
-                ),
-            ),
-        )
-        second = await runtime.generate(second_intent)
-        assert isinstance(second, Succeeded), f"continuation replay did not succeed: {second!r}"
-        record["replayed_level"] = level
-        record.update(_meta_evidence(second.meta))

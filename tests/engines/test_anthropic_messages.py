@@ -53,7 +53,7 @@ from provider_runtime.types import (
     ProviderStreamInterrupted,
     ProviderTarget,
     ProviderTimeout,
-    ReasoningLevel,
+    ReasoningKey,
     Refused,
     StreamStart,
     StrictJsonOutput,
@@ -90,7 +90,7 @@ POISON_ENV = {
 # Real registry shapes (canonical reasoning convention): an anthropic row's
 # reasoning value is the self-describing wire fragment
 # {"output_config": {"effort": "<level>"}} — never a synthetic stand-in.
-REASONING_LEVELS: Mapping[ReasoningLevel, object] = {
+REASONING_LEVELS: Mapping[ReasoningKey, object] = {
     "low": {"output_config": {"effort": "low"}},
     "high": {"output_config": {"effort": "high"}},
 }
@@ -111,9 +111,8 @@ ROW = ModelRow(
     source_default_reasoning=Absent(),
     upgrade=Absent(),
     retirement=Absent(),
-    continuation_codec="anthropic.v1",
+    continuation_codec="anthropic.v2",
     correlation="header",
-    routing=Absent(),
 )
 
 TARGET = ProviderTarget(provider="anthropic", model="claude-test-1")
@@ -149,7 +148,7 @@ def make_intent(
     *,
     messages: tuple[PromptMessage, ...] = (SYSTEM, USER),
     max_output_tokens: int = 128,
-    reasoning: ReasoningLevel = "high",
+    reasoning: ReasoningKey = "high",
     tools: tuple[CanonicalTool, ...] = (),
     tool_choice: ToolChoice = "auto",
     output: OutputSpec = TEXT_OUTPUT,
@@ -349,7 +348,6 @@ def assert_meta(
     assert meta.provider_request_id == Present(request_id), (
         f"meta.provider_request_id: {meta.provider_request_id!r}"
     )
-    assert meta.upstream_provider == Absent(), f"meta.upstream_provider: {meta.upstream_provider!r}"
     expected_usage = Absent() if usage is None else Present(usage)
     assert meta.usage == expected_usage, f"meta.usage: {meta.usage!r} != {expected_usage!r}"
     expected_native = Absent() if native_reasoning is None else Present(native_reasoning)
@@ -441,18 +439,18 @@ async def test_generate_multi_turn_places_cache_breakpoint_before_final_turn() -
     outcome = await AnthropicMessagesEngine().generate(ROW, intent, CREDENTIAL)
     assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
     body = request_body(route)
-    # The stable prefix ends at the prior assistant turn; the system fallback
-    # and the final (new) user turn stay unmarked.
+    # The native assistant turn stays untouched; cache the prior user turn.
     assert body["system"] == [{"type": "text", "text": "You are terse."}], (
         f"system: {body.get('system')!r}"
     )
     assert body["messages"] == [
-        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}],
+        },
         {
             "role": "assistant",
-            "content": [
-                {"type": "text", "text": "hello back", "cache_control": {"type": "ephemeral"}}
-            ],
+            "content": [{"type": "text", "text": "hello back"}],
         },
         {"role": "user", "content": [{"type": "text", "text": "and again"}]},
     ], f"messages: {body.get('messages')!r}"
@@ -464,7 +462,7 @@ async def test_generate_cache_breakpoint_skips_thinking_blocks() -> None:
         return_value=mock_response(envelope(content=[TEXT_BLOCK], usage=usage_body()))
     )
     artifact = ContinuationArtifact(
-        target=TARGET, codec_id="anthropic.v1", opaque_payload={"blocks": (THINKING_BLOCK,)}
+        target=TARGET, codec_id="anthropic.v2", opaque_payload={"blocks": (THINKING_BLOCK,)}
     )
     intent = make_intent(
         messages=(
@@ -564,42 +562,16 @@ async def test_generate_merges_reasoning_fragment_for_intent_level() -> None:
     )
 
 
-@respx.mock
-async def test_generate_row_without_reasoning_knob_sends_nothing() -> None:
-    route = respx.post(MESSAGES_URL).mock(
-        return_value=mock_response(envelope(content=[TEXT_BLOCK], usage=usage_body()))
-    )
+async def test_generate_rejects_row_without_reasoning_configurations() -> None:
     row = replace(ROW, reasoning=Absent())
-    outcome = await AnthropicMessagesEngine().generate(
-        row, make_intent(reasoning="none"), CREDENTIAL
-    )
-    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
-    body = request_body(route)
-    assert "output_config" not in body, f"no reasoning keys may be sent; body: {body!r}"
-    assert outcome.meta.native_reasoning == Absent(), (
-        f"native_reasoning: {outcome.meta.native_reasoning!r}"
-    )
+    with pytest.raises(InvalidRequest, match="no reasoning configurations"):
+        await AnthropicMessagesEngine().generate(row, make_intent(reasoning="none"), CREDENTIAL)
 
 
-@respx.mock
-async def test_generate_reasoning_none_on_a_row_declaring_no_none_sends_nothing() -> None:
-    """spec §14: "none" is the facade default, so it is callable on every row —
-    a row that declares no "none" level sends no reasoning field and lets the
-    provider's own default apply. Anthropic effort has no "off" value, so every
-    real anthropic row is exactly this shape."""
-    route = respx.post(MESSAGES_URL).mock(
-        return_value=mock_response(envelope(content=[TEXT_BLOCK], usage=usage_body()))
-    )
+async def test_generate_rejects_undeclared_none_key() -> None:
     assert "none" not in REASONING_LEVELS, "fixture premise: the row declares no 'none' level"
-    outcome = await AnthropicMessagesEngine().generate(
-        ROW, make_intent(reasoning="none"), CREDENTIAL
-    )
-    assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
-    body = request_body(route)
-    assert "output_config" not in body, f"nothing may be sent; body: {body!r}"
-    assert outcome.meta.native_reasoning == Absent(), (
-        f"native_reasoning: {outcome.meta.native_reasoning!r}"
-    )
+    with pytest.raises(InvalidRequest, match="reasoning key 'none'"):
+        await AnthropicMessagesEngine().generate(ROW, make_intent(reasoning="none"), CREDENTIAL)
 
 
 async def test_generate_non_mapping_reasoning_value_is_registry_defect() -> None:
@@ -616,7 +588,7 @@ async def test_generate_rejects_reasoning_fragment_colliding_with_an_engine_set_
     field the engine sets itself silently overrides it — here the caller's own
     output cap. (`output_config` is exempt by design: the effort knob and the
     strict-output format key share it and merge one level deep.)"""
-    poisoned: Mapping[ReasoningLevel, object] = {
+    poisoned: Mapping[ReasoningKey, object] = {
         "high": {"output_config": {"effort": "high"}, "max_tokens": 8}
     }
     row = replace(ROW, reasoning=Present(poisoned))
@@ -626,13 +598,13 @@ async def test_generate_rejects_reasoning_fragment_colliding_with_an_engine_set_
 
 
 async def test_generate_rejects_undeclared_reasoning_level() -> None:
-    with pytest.raises(InvalidRequest, match="reasoning level 'max'"):
+    with pytest.raises(InvalidRequest, match="reasoning key 'max'"):
         await AnthropicMessagesEngine().generate(ROW, make_intent(reasoning="max"), CREDENTIAL)
 
 
 async def test_generate_rejects_reasoning_level_on_knobless_row() -> None:
     row = replace(ROW, reasoning=Absent())
-    with pytest.raises(InvalidRequest, match="no reasoning knob"):
+    with pytest.raises(InvalidRequest, match="no reasoning configurations"):
         await AnthropicMessagesEngine().generate(row, make_intent(reasoning="high"), CREDENTIAL)
 
 
@@ -762,8 +734,20 @@ async def test_generate_replays_continuation_blocks_verbatim_and_groups_tool_res
     )
     artifact = ContinuationArtifact(
         target=TARGET,
-        codec_id="anthropic.v1",
-        opaque_payload={"blocks": (THINKING_BLOCK, REDACTED_BLOCK)},
+        codec_id="anthropic.v2",
+        opaque_payload={
+            "blocks": (
+                THINKING_BLOCK,
+                REDACTED_BLOCK,
+                {"type": "text", "text": "checking"},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "search_library",
+                    "input": {"query": "cats"},
+                },
+            )
+        },
     )
     intent = make_intent(
         messages=(
@@ -784,10 +768,12 @@ async def test_generate_replays_continuation_blocks_verbatim_and_groups_tool_res
     outcome = await AnthropicMessagesEngine().generate(ROW, intent, CREDENTIAL)
     assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
     body = request_body(route)
-    # The final turn is the tool_results user message, so the inferred cache
-    # breakpoint lands on the assistant turn's last block (the tool_use).
+    # Native assistant blocks stay verbatim; cache the earlier user turn.
     assert body["messages"] == [
-        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}],
+        },
         {
             "role": "assistant",
             "content": [
@@ -799,7 +785,6 @@ async def test_generate_replays_continuation_blocks_verbatim_and_groups_tool_res
                     "id": "toolu_1",
                     "name": "search_library",
                     "input": {"query": "cats"},
-                    "cache_control": {"type": "ephemeral"},
                 },
             ],
         },
@@ -828,7 +813,7 @@ async def test_generate_replays_continuation_blocks_verbatim_and_groups_tool_res
     [
         ContinuationArtifact(
             target=ProviderTarget(provider="anthropic", model="claude-other"),
-            codec_id="anthropic.v1",
+            codec_id="anthropic.v2",
             opaque_payload={"blocks": (THINKING_BLOCK,)},
         ),
         ContinuationArtifact(
@@ -854,7 +839,7 @@ async def test_generate_rejects_continuation_bound_elsewhere(
 
 
 async def test_generate_rejects_continuation_without_blocks() -> None:
-    artifact = ContinuationArtifact(target=TARGET, codec_id="anthropic.v1", opaque_payload={})
+    artifact = ContinuationArtifact(target=TARGET, codec_id="anthropic.v2", opaque_payload={})
     intent = make_intent(
         messages=(
             SYSTEM,
@@ -936,10 +921,14 @@ async def test_generate_decodes_success_usage_meta_and_continuation() -> None:
     assert isinstance(continuation, Present), f"continuation: {continuation!r}"
     artifact = continuation.value
     assert artifact.target == TARGET, f"artifact.target: {artifact.target!r}"
-    assert artifact.codec_id == "anthropic.v1", f"artifact.codec_id: {artifact.codec_id!r}"
-    assert list(artifact.opaque_payload["blocks"]) == [THINKING_BLOCK, REDACTED_BLOCK], (  # type: ignore[arg-type]
-        f"payload blocks must be the verbatim ordered wire blocks: {artifact.opaque_payload!r}"
-    )
+    assert artifact.codec_id == "anthropic.v2", f"artifact.codec_id: {artifact.codec_id!r}"
+    blocks = artifact.opaque_payload["blocks"]
+    assert isinstance(blocks, tuple)
+    assert list(blocks) == [
+        THINKING_BLOCK,
+        REDACTED_BLOCK,
+        TEXT_BLOCK,
+    ], f"payload blocks must be the verbatim ordered wire blocks: {artifact.opaque_payload!r}"
 
 
 @respx.mock
@@ -1383,10 +1372,14 @@ async def test_stream_decodes_thinking_text_tool_usage_and_terminal() -> None:
     continuation_delta = events[8]
     assert isinstance(continuation_delta, ContinuationDelta), f"{continuation_delta!r}"
     artifact = continuation_delta.artifact
-    assert artifact.target == TARGET and artifact.codec_id == "anthropic.v1", f"{artifact!r}"
-    assert list(artifact.opaque_payload["blocks"]) == [THINKING_BLOCK], (  # type: ignore[arg-type]
-        f"payload blocks must be the assembled thinking block: {artifact.opaque_payload!r}"
-    )
+    assert artifact.target == TARGET and artifact.codec_id == "anthropic.v2", f"{artifact!r}"
+    blocks = artifact.opaque_payload["blocks"]
+    assert isinstance(blocks, tuple)
+    assert list(blocks) == [
+        THINKING_BLOCK,
+        {"type": "text", "text": "Hi there"},
+        {"type": "tool_use", "id": "toolu_1", "name": "search_library", "input": {"query": "cats"}},
+    ], f"payload blocks must be the assembled thinking block: {artifact.opaque_payload!r}"
 
     terminal = events[9]
     assert isinstance(terminal, TerminalEvent), f"{terminal!r}"
@@ -1573,7 +1566,12 @@ async def test_stream_assembles_redacted_thinking_into_continuation() -> None:
     respx.post(MESSAGES_URL).mock(return_value=mock_stream(frames))
     events = await collect_stream(AnthropicMessagesEngine(), make_intent())
     continuation_delta = next(event for event in events if isinstance(event, ContinuationDelta))
-    assert list(continuation_delta.artifact.opaque_payload["blocks"]) == [REDACTED_BLOCK], (  # type: ignore[arg-type]
+    blocks = continuation_delta.artifact.opaque_payload["blocks"]
+    assert isinstance(blocks, tuple)
+    assert list(blocks) == [
+        REDACTED_BLOCK,
+        {"type": "text", "text": "hi"},
+    ], (
         f"payload blocks must be the verbatim redacted block: "
         f"{continuation_delta.artifact.opaque_payload!r}"
     )
@@ -1804,7 +1802,10 @@ async def test_continuation_round_trip_replays_decoded_blocks_verbatim() -> None
     assert isinstance(second, Succeeded), f"second outcome: {second!r}"
     body = request_body(route)
     assert body["messages"] == [
-        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}],
+        },
         {
             "role": "assistant",
             "content": [
@@ -1814,9 +1815,6 @@ async def test_continuation_round_trip_replays_decoded_blocks_verbatim() -> None
                     "id": "toolu_1",
                     "name": "search_library",
                     "input": {"query": "cats"},
-                    # The inferred breakpoint: last cacheable block before the
-                    # final (tool_results) turn.
-                    "cache_control": {"type": "ephemeral"},
                 },
             ],
         },

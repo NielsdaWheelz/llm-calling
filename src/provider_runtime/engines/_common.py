@@ -89,26 +89,10 @@ class RowReasoning:
 
 
 def row_reasoning(row: ModelRow, intent: GenerateIntent) -> RowReasoning:
-    """Resolve the row's self-describing reasoning knob for the intent's level.
-
-    Two rulings live here (spec §14). ``reasoning="none"`` is callable on every
-    row: a row declaring a ``"none"`` fragment sends it, a row that declares
-    none sends nothing and the provider's own default applies — "none" never
-    raises, because it is the facade default. Any OTHER undeclared level does
-    raise: silently downgrading an explicit effort request is banned.
-
-    And ``owned_keys`` spans every declared level, not the selected one, so
-    provider_options can never smuggle in a knob the row expresses elsewhere
-    (deepseek's ``reasoning_effort`` under level "none", say).
-    """
+    """Resolve one declared model-scoped key and its complete native fragment."""
     match row.reasoning:
         case Absent():
-            if intent.reasoning != "none":
-                raise InvalidRequest(
-                    message=f"row {row.ref!r} has no reasoning knob; "
-                    f"level {intent.reasoning!r} is not expressible"
-                )
-            return RowReasoning(fragment={}, native_reasoning=Absent(), owned_keys=frozenset())
+            raise InvalidRequest(message=f"row {row.ref!r} has no reasoning configurations")
         case Present(value=levels):
             pass
         case _:
@@ -125,11 +109,9 @@ def row_reasoning(row: ModelRow, intent: GenerateIntent) -> RowReasoning:
 
     selected = fragments.get(intent.reasoning)
     if selected is None:
-        if intent.reasoning != "none":
-            raise InvalidRequest(
-                message=f"reasoning level {intent.reasoning!r} is not declared for {row.ref!r}"
-            )
-        return RowReasoning(fragment={}, native_reasoning=Absent(), owned_keys=frozenset(owned))
+        raise InvalidRequest(
+            message=f"reasoning key {intent.reasoning!r} is not declared for {row.ref!r}"
+        )
     return RowReasoning(
         fragment=selected,
         native_reasoning=Present(json.dumps(selected, sort_keys=True, separators=(",", ":"))),
@@ -158,12 +140,15 @@ def validate_continuation(
 def response_content(
     intent: GenerateIntent, *, text: str, tool_calls: tuple[ToolCall, ...]
 ) -> ResponseContent | InvalidStructuredOutput:
-    """The output arm is the intent's OutputSpec, never re-inferred from the wire.
+    """The final output arm is the intent's OutputSpec, never inferred from the wire.
 
-    Strict JSON parse only; NO repair. A provider that answers a strict-JSON
-    intent with unparseable output is an expected model failure — the value the
-    caller folds into Failed — not a wire-protocol defect.
+    Tool-bearing turns are intermediate; only a final answer must satisfy the
+    requested output. Strict JSON parse only; NO repair. A provider that
+    answers a strict-JSON intent with unparseable final output is an expected
+    model failure — the value the caller folds into Failed, not a wire defect.
     """
+    if tool_calls:
+        return TextContent(text=text, tool_calls=tool_calls)
     match intent.output:
         case TextOutput():
             return TextContent(text=text, tool_calls=tool_calls)

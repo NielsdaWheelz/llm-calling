@@ -29,7 +29,7 @@ llm-tools = [
 
 [tool.uv.sources]
 llm-tools = [
-    { git = "https://github.com/NielsdaWheelz/llm-tools.git", rev = "9e6d155f3b64f03495911435b7cae8b8d131f9a2", extra = "llm-tools" },
+    { git = "https://github.com/NielsdaWheelz/llm-tools.git", rev = "2adb9790fc7a54de5342effaca9391c2f3d24ff9", extra = "llm-tools" },
 ]
 
 [build-system]

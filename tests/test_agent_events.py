@@ -19,12 +19,32 @@ from provider_runtime.agent_runtime.events import (
     AgentUsage,
     validate_event_stream,
 )
+from provider_runtime.agent_runtime.turn import (
+    AgentAttempt,
+    AgentInputRecorded,
+    AgentMessage,
+    AgentResultRef,
+    AgentToolCall,
+    AgentTurnRef,
+    NativeTerminalEvidence,
+)
 from provider_runtime.agent_runtime.types import (
     AgentSessionRef,
     ApprovalRequest,
     freeze_json_object,
 )
 from provider_runtime.types import Absent, Present, TokenUsage
+
+
+def _terminal_evidence(ref: AgentSessionRef) -> NativeTerminalEvidence:
+    native = (
+        AgentTurnRef(ref, "turn-fixture") if ref.backend == "codex" else AgentResultRef(ref, None)
+    )
+    return NativeTerminalEvidence(
+        AgentAttempt("attempt-fixture", "f" * 64),
+        native,
+        "codex-turn-completed.v1" if ref.backend == "codex" else "claude-result.v1",
+    )
 
 
 def ref() -> AgentSessionRef:
@@ -56,6 +76,7 @@ def terminal() -> AgentTerminal:
         failure=None,
         final_text="hello world",
         session_ref=ref(),
+        evidence=_terminal_evidence(ref()),
         usage=Present(usage()),
     )
 
@@ -69,7 +90,7 @@ async def collect(*events: AgentEvent) -> list[AgentEvent]:
     return [item async for item in validate_event_stream(source(*events))]
 
 
-def test_the_event_union_is_exactly_six_kinds() -> None:
+def test_the_event_union_is_closed() -> None:
     assert AGENT_EVENT_KINDS == (
         AgentText,
         AgentToolUse,
@@ -77,6 +98,9 @@ def test_the_event_union_is_exactly_six_kinds() -> None:
         AgentPermissionRequest,
         AgentNative,
         AgentTerminal,
+        AgentToolCall,
+        AgentMessage,
+        AgentInputRecorded,
     ), f"the closed event vocabulary changed: {AGENT_EVENT_KINDS}"
 
 
@@ -122,6 +146,7 @@ def test_terminal_failures_are_typed_values() -> None:
         failure=AgentQuotaExhausted(),
         final_text="",
         session_ref=ref(),
+        evidence=_terminal_evidence(ref()),
     )
     assert quota.failure == AgentQuotaExhausted(), (
         "pool exhaustion must be the named AgentQuotaExhausted value"
@@ -131,16 +156,24 @@ def test_terminal_failures_are_typed_values() -> None:
         failure=AgentFailure("backend_failed"),
         final_text="",
         session_ref=ref(),
+        evidence=_terminal_evidence(ref()),
     )
     assert failed.failure == AgentFailure("backend_failed")
     with pytest.raises(ProtocolDefect, match="typed failure"):
-        AgentTerminal(status="failed", failure=None, final_text="", session_ref=ref())
+        AgentTerminal(
+            status="failed",
+            failure=None,
+            final_text="",
+            session_ref=ref(),
+            evidence=_terminal_evidence(ref()),
+        )
     with pytest.raises(ProtocolDefect, match="only a failed"):
         AgentTerminal(
             status="succeeded",
             failure=AgentFailure("backend_failed"),
             final_text="",
             session_ref=ref(),
+            evidence=_terminal_evidence(ref()),
         )
     with pytest.raises(ProtocolDefect, match="cause"):
         AgentFailure("quota_exhausted")  # type: ignore[arg-type]
@@ -150,6 +183,7 @@ def test_terminal_failures_are_typed_values() -> None:
             failure=None,
             final_text="",
             session_ref=ref(),
+            evidence=_terminal_evidence(ref()),
             diagnostics=("same", "same"),
         )
 

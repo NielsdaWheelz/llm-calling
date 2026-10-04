@@ -11,9 +11,11 @@ from provider_runtime.types import (
     AttemptRecord,
     CallMeta,
     Cancelled,
+    ContinuationTooLarge,
     CostEstimate,
     ExpectedModelFailure,
     Failed,
+    FailureCode,
     FinalAttempt,
     GenerateIntent,
     ImageBlock,
@@ -57,6 +59,7 @@ def test_the_failure_taxonomy_is_closed_and_provider_side_only() -> None:
     # — is the only context-overflow signal.
     assert set(get_args(ExpectedModelFailure.__value__)) == {
         ProviderContextTooLarge,
+        ContinuationTooLarge,
         InvalidToolArguments,
         InvalidStructuredOutput,
         TransientExhausted,
@@ -68,22 +71,21 @@ def test_the_failure_taxonomy_is_closed_and_provider_side_only() -> None:
         TransportUnavailable,
         ProviderStreamInterrupted,
     }
+    assert "continuation_too_large" in get_args(FailureCode.__value__)
 
 
 # ---------------------------------------------------------------------------
 # Provider identity
 
 
-def test_provider_name_covers_the_seven_v2_providers() -> None:
+def test_provider_name_covers_the_five_current_providers() -> None:
     assert set(get_args(ProviderName.__value__)) == {
         "openai",
         "anthropic",
         "gemini",
-        "moonshot",
-        "openrouter",
         "deepseek",
         "xai",
-    }, "ProviderName must cover all seven v2 providers, including deepseek and xai"
+    }, "ProviderName must cover the five current providers"
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +236,6 @@ def _sample_meta() -> CallMeta:
         provider="anthropic",
         model="claude-fable-5",
         provider_request_id=Present("req_123"),
-        upstream_provider=Absent(),
         usage=Present(
             TokenUsage.from_components(
                 input_tokens=12,

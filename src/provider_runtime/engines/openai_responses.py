@@ -266,7 +266,7 @@ def _encode_input(row: ModelRow, intent: GenerateIntent) -> list[dict[str, objec
                 match continuation:
                     case Present(value=artifact):
                         validate_continuation(artifact, row, intent)
-                        items.extend(_artifact_input_items(artifact))
+                        items.extend(_artifact_input_items(artifact, text, tool_calls))
                     case Absent():
                         if tool_calls:
                             raise InvalidRequest(
@@ -308,7 +308,9 @@ def _encode_user_block(block: PromptBlock | ImageBlock) -> dict[str, object]:
             assert_never(block)
 
 
-def _artifact_input_items(artifact: ContinuationArtifact) -> list[dict[str, object]]:
+def _artifact_input_items(
+    artifact: ContinuationArtifact, text: str, tool_calls: tuple[ToolCall, ...]
+) -> list[dict[str, object]]:
     """Splice the payload's ordered output items back verbatim — never parsed."""
     items = artifact.opaque_payload.get("output")
     if (
@@ -323,6 +325,29 @@ def _artifact_input_items(artifact: ContinuationArtifact) -> list[dict[str, obje
                 "complete ordered response.output item list under 'output'"
             )
         )
+    native_text: list[str] = []
+    native_calls: list[ToolCall] = []
+    for item in items:
+        if item.get("type") == "function_call":
+            try:
+                arguments = json.loads(item["arguments"])
+                if not isinstance(arguments, dict):
+                    raise ValueError("arguments must be an object")
+                native_calls.append(ToolCall(item["call_id"], item["name"], arguments))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                raise InvalidRequest(message="openai native function call is malformed") from None
+        elif item.get("type") == "message":
+            content = item.get("content")
+            if isinstance(content, Sequence) and not isinstance(content, str | bytes):
+                native_text.extend(
+                    part["text"]
+                    for part in content
+                    if isinstance(part, Mapping)
+                    and part.get("type") == "output_text"
+                    and isinstance(part.get("text"), str)
+                )
+    if tuple(native_calls) != tool_calls or "".join(native_text) != text:
+        raise InvalidRequest(message="openai native assistant turn differs from normalized content")
     return [dict(item) for item in items]
 
 
@@ -345,7 +370,6 @@ def _meta(
         provider="openai",
         model=model,
         provider_request_id=presence_of(request_id),
-        upstream_provider=Absent(),
         usage=usage,
         attempt_trace=(
             AttemptRecord(

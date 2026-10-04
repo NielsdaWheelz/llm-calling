@@ -24,9 +24,8 @@ Engine decisions (wire-observable):
   payload is the SOLE wire source for that turn and is never inspected beyond
   the `parts` shape check (the SDK revalidates it; base64 signature strings
   round-trip byte-exact, verified against the installed SDK).
-- Call ids: the wire has none; decode synthesizes deterministic `call_<index>`
-  ids in functionCall order (restarting per response, re-indexed across a
-  stream). Those ids recur across turns, so `ToolResultMessage.call_id`
+- Call ids: preserve each provider functionCall.id, including on streams.
+  `ToolResultMessage.call_id`
   resolves against ONLY the most recent preceding assistant turn, and
   consecutive tool results coalesce into ONE `role: "user"` turn.
 - Blocked content: Gemini has no refusal contract. Blocked finish reasons
@@ -321,9 +320,7 @@ def _encode_contents(
     system_parts: list[dict[str, object]] = []
     contents: list[genai_types.Content] = []
     pending_results: list[dict[str, object]] = []
-    # Turn-scoped: reset on every AssistantMessage — synthesized call ids
-    # recur across turns, so an intent-wide map would let a later turn's
-    # call_0 shadow an earlier one.
+    # Turn-scoped: a later turn may reuse a provider call id.
     turn_call_names: dict[str, str] = {}
 
     def flush_results() -> None:
@@ -360,6 +357,7 @@ def _encode_contents(
                 pending_results.append(
                     {
                         "function_response": {
+                            "id": call_id,
                             "name": name,
                             "response": {"error": output} if is_error else {"output": output},
                         }
@@ -395,7 +393,7 @@ def _assistant_content(
 ) -> genai_types.Content:
     match message.continuation:
         case Present(value=artifact):
-            return _replay_content(artifact, row, intent)
+            return _replay_content(artifact, row, intent, message)
         case Absent():
             parts: list[dict[str, object]] = []
             if message.text:
@@ -410,7 +408,10 @@ def _assistant_content(
 
 
 def _replay_content(
-    artifact: ContinuationArtifact, row: ModelRow, intent: GenerateIntent
+    artifact: ContinuationArtifact,
+    row: ModelRow,
+    intent: GenerateIntent,
+    message: AssistantMessage,
 ) -> genai_types.Content:
     validate_continuation(artifact, row, intent)
     parts = artifact.opaque_payload.get("parts")
@@ -422,11 +423,19 @@ def _replay_content(
         # The payload is the sole wire source for this turn (the provider
         # requires the entire prior response's parts back, signatures and
         # all); the SDK revalidates it — never this engine.
-        return genai_types.Content.model_validate({"role": "model", "parts": list(parts)})
+        content = genai_types.Content.model_validate({"role": "model", "parts": list(parts)})
     except pydantic.ValidationError:
         raise InvalidRequest(
             message="gemini continuation payload parts do not validate as native parts"
         ) from None
+    native_calls = [
+        (part.function_call.id, part.function_call.name)
+        for part in content.parts or ()
+        if part.function_call is not None
+    ]
+    if native_calls != [(call.id, call.name) for call in message.tool_calls]:
+        raise InvalidRequest(message="gemini native tool calls differ from normalized calls")
+    return content
 
 
 # ---------------------------------------------------------------------------
@@ -506,11 +515,13 @@ def _decode_parts(
                 raise ProtocolDefect(
                     code="malformed_candidate", message="functionCall.name is missing"
                 )
-            # No wire ids on generateContent: ids are synthesized
-            # deterministically in functionCall order.
+            if not function_call.id:
+                raise ProtocolDefect(
+                    code="malformed_candidate", message="functionCall.id is missing"
+                )
             calls.append(
                 ToolCall(
-                    id=f"call_{len(calls)}",
+                    id=function_call.id,
                     name=function_call.name,
                     arguments=dict(function_call.args or {}),
                 )
@@ -849,11 +860,7 @@ class GeminiGenerateEngine:
                         yield TextDelta(text=chunk_text)
                         semantic = True
                     for call in chunk_calls:
-                        # functionCall parts arrive whole; re-index across the
-                        # whole stream (chunk-local indices restart at 0).
-                        stream_call = ToolCall(
-                            id=f"call_{len(tool_calls)}", name=call.name, arguments=call.arguments
-                        )
+                        stream_call = call
                         tool_calls.append(stream_call)
                         yield ToolCallStart(call_id=stream_call.id, name=stream_call.name)
                         yield ToolCallDone(tool_call=stream_call)
@@ -931,7 +938,6 @@ def _meta(
         provider=row.provider,
         model=model,
         provider_request_id=Absent(),  # ALWAYS: correlation "none" on this wire
-        upstream_provider=Absent(),
         usage=usage,
         attempt_trace=(
             AttemptRecord(

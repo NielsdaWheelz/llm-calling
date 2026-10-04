@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
 from pathlib import Path
@@ -80,6 +80,7 @@ class CodexAppServerConfig:
     client_title: str = "provider-runtime"
     client_version: str = "0.1.0"
     experimental_api: bool = False
+    callbacks: bool = False
 
     def __post_init__(self) -> None:
         if not self.socket_path.is_absolute():
@@ -87,7 +88,13 @@ class CodexAppServerConfig:
         if self.request_policy not in ("deny_owned", "observe_only"):
             raise ValueError("Codex app-server request policy is invalid")
         if type(self.experimental_api) is not bool:
-            raise ValueError("Codex app-server experimental capability must be boolean")
+            raise ValueError("Codex experimental API selection must be boolean")
+        if type(self.callbacks) is not bool or (
+            self.callbacks and self.request_policy == "observe_only"
+        ):
+            raise ValueError("owned callbacks require an owned connection")
+        if self.callbacks and not self.experimental_api:
+            raise ValueError("owned callbacks require the experimental protocol")
         if any(
             type(value) is not str or not value or "\0" in value or "\n" in value
             for value in (
@@ -160,6 +167,7 @@ class CodexAppServerClient:
         self._queued_bytes = 0
         self._next_request_id = 1
         self._server_request_ids: set[tuple[type[object], object]] = set()
+        self._dynamic_requests: dict[tuple[type[object], object], dict[str, object]] = {}
         self._failure: ProtocolDefect | CodexConnectionUnavailable | None = None
         self._closing = False
         self._closed = False
@@ -216,7 +224,14 @@ class CodexAppServerClient:
     async def __aexit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
         await self.close()
 
-    async def request(self, method: str, params: Mapping[str, object] | None) -> object:
+    async def request(
+        self,
+        method: str,
+        params: Mapping[str, object] | None,
+        *,
+        on_write: Callable[[], None] | None = None,
+        timeout_seconds: float = _OPERATION_TIMEOUT_SECONDS,
+    ) -> object:
         self._require_method(method)
         self._require_live()
         if len(self._pending) >= 128:
@@ -227,13 +242,14 @@ class CodexAppServerClient:
         self._next_request_id += 1
         self._pending[request_id] = (method, future)
         try:
-            async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
+            async with asyncio.timeout(timeout_seconds):
                 await self._write(
                     {
                         "id": request_id,
                         "method": method,
                         **({} if params is None else {"params": params}),
-                    }
+                    },
+                    on_write=on_write,
                 )
         except TimeoutError:
             self._pending.pop(request_id, None)
@@ -245,7 +261,7 @@ class CodexAppServerClient:
                 future.cancel()
             raise
         try:
-            async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
+            async with asyncio.timeout(timeout_seconds):
                 return await asyncio.shield(future)
         except TimeoutError:
             future.add_done_callback(self._consume_future)
@@ -266,12 +282,6 @@ class CodexAppServerClient:
         self._queued_bytes -= size
         if isinstance(message, _TransportFailure):
             raise message.error
-        if (
-            self._failure is not None
-            and isinstance(message, CodexNotification)
-            and message.method == "turn/completed"
-        ):
-            raise self._failure
         return message
 
     def take_pending_messages(self) -> tuple[CodexServerMessage, ...]:
@@ -298,6 +308,7 @@ class CodexAppServerClient:
     async def _close_connection(self) -> None:
         self._closed = True
         self._closing = True
+        self._fail(CodexConnectionUnavailable())
         connection = self._connection
         if connection is not None:
             await connection.close()
@@ -445,6 +456,11 @@ class CodexAppServerClient:
         if not self._belongs_to_thread(params):
             return
         if "id" not in message:
+            if method == "serverRequest/resolved":
+                resolved = params.get("requestId")
+                identity = (type(resolved), resolved)
+                self._dynamic_requests.pop(identity, None)
+                self._server_request_ids.discard(identity)
             self._enqueue(CodexNotification(method=method, params=params), size=size)
             return
         if self._thread_id is None or params.get("threadId") != self._thread_id:
@@ -452,6 +468,24 @@ class CodexAppServerClient:
         request_id = message["id"]
         self._require_request_id(request_id)
         identity = (type(request_id), request_id)
+        if method == "item/tool/call" and self.config.callbacks:
+            previous = self._dynamic_requests.get(identity)
+            if previous is not None and previous != params:
+                raise ProtocolDefect("Codex dynamic request changed bytes under one identity")
+            if previous is None and len(self._dynamic_requests) >= _MAX_MESSAGE_ITEMS:
+                raise ProtocolDefect("Codex pending callback requests exceeded their finite bound")
+            self._dynamic_requests[identity] = params
+            self._server_request_ids.add(identity)
+            self._enqueue(
+                CodexServerRequest(
+                    request_id=cast(CodexRequestId, request_id),
+                    method=method,
+                    params=params,
+                    kind="tool",
+                ),
+                size=size,
+            )
+            return
         if identity in self._server_request_ids:
             raise ProtocolDefect("Codex app-server repeated a server request identity")
         self._server_request_ids.add(identity)
@@ -534,7 +568,32 @@ class CodexAppServerClient:
         future.set_result(message["result"])
         self._pending.pop(request_id)
 
-    async def _write(self, message: Mapping[str, object]) -> None:
+    async def respond(
+        self,
+        request_id: CodexRequestId,
+        result: Mapping[str, object],
+        *,
+        on_write: Callable[[], None] | None = None,
+    ) -> None:
+        identity = (type(request_id), request_id)
+        if identity not in self._dynamic_requests:
+            raise ProtocolDefect("Codex callback reply does not identify a pending owned request")
+        await self._write({"id": request_id, "result": result}, on_write=on_write)
+        self.complete_callback(request_id)
+
+    def complete_callback(self, request_id: CodexRequestId) -> None:
+        """Retire a written reply or a natively completed owned callback; send nothing."""
+        identity = (type(request_id), request_id)
+        self._dynamic_requests.pop(identity, None)
+        self._server_request_ids.discard(identity)
+
+    @property
+    def usable(self) -> bool:
+        return self._connection is not None and not self._closed and self._failure is None
+
+    async def _write(
+        self, message: Mapping[str, object], *, on_write: Callable[[], None] | None = None
+    ) -> None:
         from websockets.exceptions import ConnectionClosed
 
         connection = self._connection
@@ -549,6 +608,9 @@ class CodexAppServerClient:
         if len(encoded) > _MAX_MESSAGE_BYTES:
             raise ProtocolDefect("Codex app-server outbound message exceeded its byte bound")
         async with self._write_lock:
+            self._require_live()
+            if on_write is not None:
+                on_write()
             try:
                 await connection.send(encoded.decode("utf-8"))
             except (OSError, ConnectionClosed):

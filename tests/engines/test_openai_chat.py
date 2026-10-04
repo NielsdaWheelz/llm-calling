@@ -1,11 +1,11 @@
 """openai_chat engine conformance + fault injection (respx at the HTTP boundary).
 
-One engine, four provider quirk-sets (deepseek, moonshot, xai, openrouter) over
+One engine, two provider dialects (deepseek, xai) over
 the openai SDK as a compat client. Fixture rows are constructed locally — tests
 never depend on registry ROWS content. Covered per the freeze: exact request
 body/header shapes, response decode, and stream decode from raw SSE bytes.
 Continuation round-trips cover verbatim replay, `reasoning_content` replay,
-and verbatim `reasoning_details`; the suite also covers the row's reasoning
+; the suite also covers the row's reasoning
 fragment merged verbatim, provider_options passthrough versus collision, and
 the full fault-injection table.
 """
@@ -33,9 +33,6 @@ from provider_runtime.registry import (
 from provider_runtime.registry import (
     _ModelRow as ModelRow,
 )
-from provider_runtime.registry import (
-    _OpenRouterRouting as OpenRouterRouting,
-)
 from provider_runtime.types import (
     Absent,
     AssistantMessage,
@@ -62,7 +59,7 @@ from provider_runtime.types import (
     ProviderStreamInterrupted,
     ProviderTarget,
     ProviderTimeout,
-    ReasoningLevel,
+    ReasoningKey,
     StreamStart,
     StrictJsonOutput,
     StructuredContent,
@@ -90,36 +87,25 @@ from provider_runtime.types import (
 # A row's reasoning value is a self-describing wire fragment merged verbatim
 # into the request; these are the real per-provider shapes, never synthetic
 # stand-ins (an engine that cannot build a callable request must fail here).
-DEEPSEEK_REASONING: Mapping[ReasoningLevel, object] = {
+DEEPSEEK_REASONING: Mapping[ReasoningKey, object] = {
     # Two parameters, and only the enabling levels carry the effort knob — the
     # real registry shape, and the reason the collision set cannot be read off
     # the SELECTED level alone.
     "none": {"thinking": {"type": "disabled"}},
     "high": {"thinking": {"type": "enabled"}, "reasoning_effort": "high"},
 }
-MOONSHOT_REASONING: Mapping[ReasoningLevel, object] = {
-    # Moonshot's model always reasons: there is no "off" level to declare.
-    "low": {"reasoning_effort": "low"},
-    "high": {"reasoning_effort": "high"},
-    "max": {"reasoning_effort": "max"},
-}
-XAI_REASONING: Mapping[ReasoningLevel, object] = {
+XAI_REASONING: Mapping[ReasoningKey, object] = {
     "low": {"reasoning_effort": "low"},
     "high": {"reasoning_effort": "high"},
 }
-OPENROUTER_REASONING: Mapping[ReasoningLevel, object] = {
-    "low": {"reasoning": {"effort": "low"}},
-    "high": {"reasoning": {"effort": "high"}},
-}
-
 DEEPSEEK_ROW = ModelRow(
-    ref="deepseek:reasoner",
+    ref="deepseek:deepseek-flash",
     provider="deepseek",
-    model_id="deepseek-reasoner",
+    model_id="deepseek-flash",
     engine="openai_chat",
     base_url=Present("https://api.deepseek.com/v1"),
-    context_window=131_072,
-    max_output_tokens=65_536,
+    context_window=1_000_000,
+    max_output_tokens=384_000,
     modalities=frozenset({"text"}),
     tools=True,
     streaming=True,
@@ -128,36 +114,14 @@ DEEPSEEK_ROW = ModelRow(
     source_default_reasoning=Absent(),
     upgrade=Absent(),
     retirement=Absent(),
-    continuation_codec="deepseek.v1",
+    continuation_codec="deepseek.v2",
     correlation="in_band",
-    routing=Absent(),
-)
-
-MOONSHOT_ROW = ModelRow(
-    ref="moonshot:kimi-k3",
-    provider="moonshot",
-    model_id="kimi-k3",
-    engine="openai_chat",
-    base_url=Present("https://api.moonshot.ai/v1"),
-    context_window=1_048_576,
-    max_output_tokens=131_072,
-    modalities=frozenset({"text"}),
-    tools=True,
-    streaming=True,
-    structured="json_mode",
-    reasoning=Present(MOONSHOT_REASONING),
-    source_default_reasoning=Absent(),
-    upgrade=Absent(),
-    retirement=Absent(),
-    continuation_codec="moonshot.v1",
-    correlation="in_band",
-    routing=Absent(),
 )
 
 XAI_ROW = ModelRow(
-    ref="xai:grok-4",
+    ref="xai:grok-4.7",
     provider="xai",
-    model_id="grok-4",
+    model_id="grok-4.7",
     engine="openai_chat",
     base_url=Present("https://api.x.ai/v1"),
     context_window=256_000,
@@ -170,42 +134,18 @@ XAI_ROW = ModelRow(
     source_default_reasoning=Absent(),
     upgrade=Absent(),
     retirement=Absent(),
-    continuation_codec="xai.v1",
+    continuation_codec="xai.v2",
     correlation="in_band",
-    routing=Absent(),
-)
-
-OPENROUTER_ROW = ModelRow(
-    ref="openrouter:kimi-k3",
-    provider="openrouter",
-    model_id="moonshotai/kimi-k3",
-    engine="openai_chat",
-    base_url=Present("https://openrouter.ai/api/v1"),
-    context_window=1_048_576,
-    max_output_tokens=131_072,
-    modalities=frozenset({"text"}),
-    tools=True,
-    streaming=True,
-    structured="json_mode",
-    reasoning=Present(OPENROUTER_REASONING),
-    source_default_reasoning=Absent(),
-    upgrade=Absent(),
-    retirement=Absent(),
-    continuation_codec="openrouter.v1",
-    correlation="in_band",
-    routing=Present(
-        OpenRouterRouting(only=("moonshotai",), order=("moonshotai",), quantizations=("int4",))
-    ),
 )
 
 # A model with no reasoning knob at all (row.reasoning Absent).
 KNOBLESS_ROW = ModelRow(
-    ref="deepseek:chat",
+    ref="deepseek:deepseek-flash",
     provider="deepseek",
-    model_id="deepseek-chat",
+    model_id="deepseek-flash",
     engine="openai_chat",
     base_url=Present("https://api.deepseek.com/v1"),
-    context_window=131_072,
+    context_window=1_000_000,
     max_output_tokens=8_192,
     modalities=frozenset({"text"}),
     tools=True,
@@ -215,9 +155,8 @@ KNOBLESS_ROW = ModelRow(
     source_default_reasoning=Absent(),
     upgrade=Absent(),
     retirement=Absent(),
-    continuation_codec="deepseek.v1",
+    continuation_codec="deepseek.v2",
     correlation="in_band",
-    routing=Absent(),
 )
 
 # Every request-affecting environment variable the openai SDK reads on its own.
@@ -227,16 +166,6 @@ POISON_ENV = {
     "OPENAI_PROJECT_ID": "proj-poison",
     "OPENAI_WEBHOOK_SECRET": "whsec-poison",
     "OPENAI_CUSTOM_HEADERS": "X-Poison: pwned",
-}
-
-EXPECTED_PINS = {
-    "only": ["moonshotai"],
-    "order": ["moonshotai"],
-    "allow_fallbacks": False,
-    "require_parameters": True,
-    "data_collection": "deny",
-    "zdr": True,
-    "quantizations": ["int4"],
 }
 
 SEARCH_TOOL = CanonicalTool(
@@ -266,7 +195,7 @@ def intent_for(
     row: ModelRow,
     *,
     messages: tuple[PromptMessage, ...] | None = None,
-    reasoning: ReasoningLevel = "high",
+    reasoning: ReasoningKey = "high",
     tools: tuple[CanonicalTool, ...] = (),
     tool_choice: ToolChoice = "auto",
     output: TextOutput | StrictJsonOutput | None = None,
@@ -373,35 +302,10 @@ def engine() -> OpenAIChatEngine:
 
 
 @respx.mock
-async def test_moonshot_request_uses_max_completion_tokens_and_reasoning_effort(
-    engine: OpenAIChatEngine,
-) -> None:
-    route = mock_completion(MOONSHOT_ROW, completion_body(model="kimi-k3"))
-    await engine.generate(
-        MOONSHOT_ROW, intent_for(MOONSHOT_ROW, reasoning="max"), credential_for(MOONSHOT_ROW)
-    )
-    body = last_request_json(route)
-    assert body["model"] == "kimi-k3", f"body: {body}"
-    assert body["max_completion_tokens"] == 512, (
-        f"moonshot must use max_completion_tokens; body: {body}"
-    )
-    assert "max_tokens" not in body, f"moonshot must not send deprecated max_tokens; body: {body}"
-    assert body["reasoning_effort"] == "max", (
-        f"the row's max fragment merges verbatim; body: {body}"
-    )
-    assert body["messages"] == [
-        {"role": "system", "content": "be brief"},
-        {"role": "user", "content": "hi"},
-    ], f"body: {body}"
-    auth = route.calls.last.request.headers["authorization"]
-    assert auth == "Bearer test-key", f"credential must ride the Authorization header, got {auth!r}"
-
-
-@respx.mock
 async def test_deepseek_request_uses_max_tokens_and_row_reasoning_fragment(
     engine: OpenAIChatEngine,
 ) -> None:
-    route = mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-reasoner"))
+    route = mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-flash"))
     outcome = await engine.generate(
         DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW, reasoning="high"), credential_for(DEEPSEEK_ROW)
     )
@@ -423,7 +327,7 @@ async def test_deepseek_request_uses_max_tokens_and_row_reasoning_fragment(
 async def test_deepseek_reasoning_none_sends_the_disabling_fragment(
     engine: OpenAIChatEngine,
 ) -> None:
-    route = mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-reasoner"))
+    route = mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-flash"))
     outcome = await engine.generate(
         DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW, reasoning="none"), credential_for(DEEPSEEK_ROW)
     )
@@ -437,29 +341,8 @@ async def test_deepseek_reasoning_none_sends_the_disabling_fragment(
     )
 
 
-@respx.mock
-async def test_reasoning_none_on_a_row_declaring_no_none_sends_nothing(
-    engine: OpenAIChatEngine,
-) -> None:
-    """spec §14: "none" is the facade default, so it is callable on every row —
-    a row that declares no "none" level sends no reasoning field and lets the
-    provider's own default apply. Contrast deepseek above, whose declared
-    "none" fragment IS sent."""
-    assert "none" not in MOONSHOT_REASONING, "fixture premise: the row declares no 'none' level"
-    route = mock_completion(MOONSHOT_ROW, completion_body(model="kimi-k3"))
-    outcome = await engine.generate(
-        MOONSHOT_ROW, intent_for(MOONSHOT_ROW, reasoning="none"), credential_for(MOONSHOT_ROW)
-    )
-    body = last_request_json(route)
-    assert "reasoning_effort" not in body, f"nothing may be sent; body: {body}"
-    assert isinstance(outcome, Succeeded)
-    assert outcome.meta.native_reasoning == Absent(), (
-        f"nothing was sent, so native_reasoning must be Absent, got {outcome.meta.native_reasoning}"
-    )
-
-
 async def test_non_mapping_reasoning_value_is_a_registry_defect(engine: OpenAIChatEngine) -> None:
-    row = replace(MOONSHOT_ROW, reasoning=Present({"high": "high"}))
+    row = replace(DEEPSEEK_ROW, reasoning=Present({"high": "high"}))
     with pytest.raises(RuntimeDefect) as excinfo:
         await engine.generate(row, intent_for(row), credential_for(row))
     assert excinfo.value.code == "registry_invalid", f"got {excinfo.value.code}"
@@ -471,10 +354,10 @@ async def test_reasoning_fragment_naming_an_engine_set_field_is_a_registry_defec
     """The body is built ON TOP of the fragment, so a row naming a field the
     engine writes itself loses its knob to the engine's value while
     CallMeta.native_reasoning still reports the fragment as sent."""
-    poisoned: Mapping[ReasoningLevel, object] = {
+    poisoned: Mapping[ReasoningKey, object] = {
         "high": {"reasoning_effort": "high", "max_completion_tokens": 8}
     }
-    row = replace(MOONSHOT_ROW, reasoning=Present(poisoned))
+    row = replace(DEEPSEEK_ROW, reasoning=Present(poisoned))
     with pytest.raises(RuntimeDefect, match="max_completion_tokens") as excinfo:
         await engine.generate(row, intent_for(row), credential_for(row))
     assert excinfo.value.code == "registry_invalid", f"got {excinfo.value.code}"
@@ -487,7 +370,7 @@ async def test_xai_request_native_structured_output_and_reasoning_effort(
     route = mock_completion(
         XAI_ROW,
         completion_body(
-            model="grok-4",
+            model="grok-4.7",
             message={"role": "assistant", "content": '{"answer": "42"}'},
         ),
     )
@@ -512,15 +395,15 @@ async def test_xai_request_native_structured_output_and_reasoning_effort(
 @respx.mock
 async def test_json_mode_row_sends_json_object_response_format(engine: OpenAIChatEngine) -> None:
     route = mock_completion(
-        MOONSHOT_ROW,
+        DEEPSEEK_ROW,
         completion_body(
-            model="kimi-k3", message={"role": "assistant", "content": '{"answer": "x"}'}
+            model="deepseek-flash", message={"role": "assistant", "content": '{"answer": "x"}'}
         ),
     )
     await engine.generate(
-        MOONSHOT_ROW,
-        intent_for(MOONSHOT_ROW, output=StrictJsonOutput("answer", ANSWER_SCHEMA)),
-        credential_for(MOONSHOT_ROW),
+        DEEPSEEK_ROW,
+        intent_for(DEEPSEEK_ROW, output=StrictJsonOutput("answer", ANSWER_SCHEMA)),
+        credential_for(DEEPSEEK_ROW),
     )
     body = last_request_json(route)
     assert body["response_format"] == {"type": "json_object"}, (
@@ -535,7 +418,7 @@ async def test_json_mode_compiles_the_schema_into_a_protocol_system_message(
     route = mock_completion(
         DEEPSEEK_ROW,
         completion_body(
-            model="deepseek-reasoner", message={"role": "assistant", "content": '{"answer":"x"}'}
+            model="deepseek-flash", message={"role": "assistant", "content": '{"answer":"x"}'}
         ),
     )
     await engine.generate(
@@ -566,43 +449,10 @@ async def test_json_mode_compiles_the_schema_into_a_protocol_system_message(
 
 
 @respx.mock
-async def test_openrouter_request_sends_pins_reasoning_and_max_tokens(
-    engine: OpenAIChatEngine,
-) -> None:
-    route = mock_completion(OPENROUTER_ROW, completion_body(model="moonshotai/kimi-k3"))
-    await engine.generate(
-        OPENROUTER_ROW, intent_for(OPENROUTER_ROW, reasoning="high"), credential_for(OPENROUTER_ROW)
-    )
-    body = last_request_json(route)
-    assert body["provider"] == EXPECTED_PINS, (
-        f"the full routing pins object must ride EVERY openrouter call; body: {body}"
-    )
-    assert body["reasoning"] == {"effort": "high"}, (
-        f"the row's unified-reasoning fragment merges verbatim; body: {body}"
-    )
-    assert "reasoning_effort" not in body, f"body: {body}"
-    assert body["max_tokens"] == 512, f"openrouter must use routed max_tokens; body: {body}"
-
-
-@respx.mock
-async def test_openrouter_pins_ride_plain_text_calls_too(engine: OpenAIChatEngine) -> None:
-    route = mock_completion(OPENROUTER_ROW, completion_body(model="moonshotai/kimi-k3"))
-    await engine.generate(
-        OPENROUTER_ROW,
-        intent_for(OPENROUTER_ROW, reasoning="low", output=TextOutput()),
-        credential_for(OPENROUTER_ROW),
-    )
-    body = last_request_json(route)
-    assert body["provider"] == EXPECTED_PINS, (
-        f"no unpinned passthrough — pins must be present even on minimal calls; body: {body}"
-    )
-
-
-@respx.mock
 async def test_tools_and_tool_results_encode_to_chat_completions_wire(
     engine: OpenAIChatEngine,
 ) -> None:
-    route = mock_completion(MOONSHOT_ROW, completion_body(model="kimi-k3"))
+    route = mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-flash"))
     messages: tuple[PromptMessage, ...] = (
         UserMessage((PromptBlock("find it"),)),
         AssistantMessage(
@@ -613,9 +463,9 @@ async def test_tools_and_tool_results_encode_to_chat_completions_wire(
         ToolResultMessage(call_id="call-1", output="found", is_error=False),
     )
     await engine.generate(
-        MOONSHOT_ROW,
-        intent_for(MOONSHOT_ROW, messages=messages, tools=(SEARCH_TOOL,)),
-        credential_for(MOONSHOT_ROW),
+        DEEPSEEK_ROW,
+        intent_for(DEEPSEEK_ROW, messages=messages, tools=(SEARCH_TOOL,), reasoning="none"),
+        credential_for(DEEPSEEK_ROW),
     )
     body = last_request_json(route)
     assert body["tools"] == [
@@ -651,9 +501,9 @@ async def test_tools_and_tool_results_encode_to_chat_completions_wire(
 async def test_request_without_tools_omits_tools_and_tool_choice(
     engine: OpenAIChatEngine,
 ) -> None:
-    route = mock_completion(MOONSHOT_ROW, completion_body(model="kimi-k3"))
+    route = mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-flash"))
     outcome = await engine.generate(
-        MOONSHOT_ROW, intent_for(MOONSHOT_ROW), credential_for(MOONSHOT_ROW)
+        DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW)
     )
     assert isinstance(outcome, Succeeded), f"outcome: {outcome}"
     body = last_request_json(route)
@@ -664,7 +514,7 @@ async def test_request_without_tools_omits_tools_and_tool_choice(
 
 @respx.mock
 async def test_image_blocks_encode_as_data_url_content_parts(engine: OpenAIChatEngine) -> None:
-    route = mock_completion(XAI_ROW, completion_body(model="grok-4"))
+    route = mock_completion(XAI_ROW, completion_body(model="grok-4.7"))
     png = b"\x89PNG"
     messages: tuple[PromptMessage, ...] = (
         UserMessage((PromptBlock("look:"), ImageBlock(media_type="image/png", data=png))),
@@ -694,9 +544,9 @@ async def test_ambient_openai_sdk_env_never_reaches_the_wire(
     into every request — on a compat provider's host too."""
     for name, value in POISON_ENV.items():
         monkeypatch.setenv(name, value)
-    route = mock_completion(MOONSHOT_ROW, completion_body(model="kimi-k3"))
+    route = mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-flash"))
     outcome = await engine.generate(
-        MOONSHOT_ROW, intent_for(MOONSHOT_ROW), credential_for(MOONSHOT_ROW)
+        DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW)
     )
     assert isinstance(outcome, Succeeded), f"outcome: {outcome!r}"
     assert route.call_count == 1, "request must hit the row's pinned host"
@@ -712,7 +562,7 @@ async def test_ambient_openai_sdk_env_never_reaches_the_wire(
 
 @respx.mock
 async def test_provider_options_unknown_keys_are_forwarded(engine: OpenAIChatEngine) -> None:
-    route = mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-reasoner"))
+    route = mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-flash"))
     await engine.generate(
         DEEPSEEK_ROW,
         intent_for(DEEPSEEK_ROW, provider_options={"temperature": 0.2, "top_p": 0.9}),
@@ -726,16 +576,14 @@ async def test_provider_options_unknown_keys_are_forwarded(engine: OpenAIChatEng
 @pytest.mark.parametrize(
     ("row", "key"),
     [
-        (MOONSHOT_ROW, "max_completion_tokens"),
-        (OPENROUTER_ROW, "provider"),
-        (OPENROUTER_ROW, "max_tokens"),
+        (DEEPSEEK_ROW, "max_completion_tokens"),
+        (DEEPSEEK_ROW, "max_tokens"),
         (DEEPSEEK_ROW, "response_format"),
         (XAI_ROW, "messages"),
         # Row-mapped reasoning fragment keys are owned exactly like the
         # structural ones — whatever shape the row happens to use.
-        (MOONSHOT_ROW, "reasoning_effort"),
+        (DEEPSEEK_ROW, "reasoning_effort"),
         (XAI_ROW, "reasoning_effort"),
-        (OPENROUTER_ROW, "reasoning"),
         (DEEPSEEK_ROW, "thinking"),
     ],
 )
@@ -755,9 +603,6 @@ async def test_provider_options_owned_key_collision_raises_invalid_request(
         # deepseek level "none" sends only `thinking`; `reasoning_effort` is
         # still the row's knob at every enabling level.
         (DEEPSEEK_ROW, "reasoning_effort"),
-        # moonshot declares no "none" level at all, so nothing is sent — the
-        # row still owns `reasoning_effort`.
-        (MOONSHOT_ROW, "reasoning_effort"),
     ],
 )
 async def test_provider_options_collide_with_a_key_the_row_owns_at_another_level(
@@ -784,7 +629,7 @@ async def test_provider_options_cannot_silently_override_the_reasoning_fragment(
     # The regression this guards: a passthrough key that happens to be the
     # row's reasoning key would win the merge, leaving native_reasoning
     # describing something that never reached the wire.
-    route = mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-reasoner"))
+    route = mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-flash"))
     with pytest.raises(InvalidRequest, match="thinking"):
         await engine.generate(
             DEEPSEEK_ROW,
@@ -807,29 +652,24 @@ async def test_reasoning_level_outside_row_mapping_raises_invalid_request(
 ) -> None:
     with pytest.raises(InvalidRequest, match="minimal"):
         await engine.generate(
-            MOONSHOT_ROW,
-            intent_for(MOONSHOT_ROW, reasoning="minimal"),
-            credential_for(MOONSHOT_ROW),
+            DEEPSEEK_ROW,
+            intent_for(DEEPSEEK_ROW, reasoning="minimal"),
+            credential_for(DEEPSEEK_ROW),
         )
 
 
 async def test_reasoning_on_knobless_row_raises_invalid_request(engine: OpenAIChatEngine) -> None:
     row = KNOBLESS_ROW
-    with pytest.raises(InvalidRequest, match="no reasoning knob"):
+    with pytest.raises(InvalidRequest, match="no reasoning configurations"):
         await engine.generate(row, intent_for(row, reasoning="high"), credential_for(row))
 
 
-@respx.mock
-async def test_knobless_row_with_reasoning_none_sends_no_reasoning_field(
+async def test_knobless_row_with_reasoning_none_is_rejected(
     engine: OpenAIChatEngine,
 ) -> None:
     row = KNOBLESS_ROW
-    route = mock_completion(row, completion_body(model="deepseek-chat"))
-    outcome = await engine.generate(row, intent_for(row, reasoning="none"), credential_for(row))
-    body = last_request_json(route)
-    assert "reasoning" not in body and "reasoning_effort" not in body, f"body: {body}"
-    assert isinstance(outcome, Succeeded)
-    assert outcome.meta.native_reasoning == Absent()
+    with pytest.raises(InvalidRequest, match="no reasoning configurations"):
+        await engine.generate(row, intent_for(row, reasoning="none"), credential_for(row))
 
 
 # ---------------------------------------------------------------------------
@@ -839,38 +679,39 @@ async def test_knobless_row_with_reasoning_none_sends_no_reasoning_field(
 @respx.mock
 async def test_success_decode_populates_meta_and_usage(engine: OpenAIChatEngine) -> None:
     mock_completion(
-        MOONSHOT_ROW,
+        DEEPSEEK_ROW,
         completion_body(
-            model="kimi-k3",
+            model="deepseek-flash",
             usage={
                 "prompt_tokens": 100,
                 "completion_tokens": 20,
                 "total_tokens": 120,
-                "cached_tokens": 64,
+                "prompt_cache_hit_tokens": 64,
                 "completion_tokens_details": {"reasoning_tokens": 7},
             },
         ),
     )
     outcome = await engine.generate(
-        MOONSHOT_ROW, intent_for(MOONSHOT_ROW), credential_for(MOONSHOT_ROW)
+        DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW)
     )
     assert isinstance(outcome, Succeeded), f"got {outcome}"
     assert outcome.response.content == TextContent(text="hello", tool_calls=())
     meta = outcome.meta
-    assert meta.provider == "moonshot"
-    assert meta.model == "kimi-k3"
+    assert meta.provider == "deepseek"
+    assert meta.model == "deepseek-flash"
     assert meta.provider_request_id == Present("resp-1"), (
         f"in-band id is the request id, got {meta.provider_request_id}"
     )
-    assert meta.upstream_provider == Absent(), "only openrouter reports an upstream provider"
     assert meta.registry_revision == REGISTRY_REVISION
-    assert meta.native_reasoning == Present('{"reasoning_effort":"high"}')
+    assert meta.native_reasoning == Present(
+        '{"reasoning_effort":"high","thinking":{"type":"enabled"}}'
+    )
     assert meta.billability == PossiblyBillable()
     assert isinstance(meta.usage, Present)
     usage = meta.usage.value
     assert (usage.input_tokens, usage.output_tokens, usage.total_tokens) == (100, 20, 120)
     assert usage.cache_read_input_tokens == Present(64), (
-        f"moonshot flat cached_tokens must map to cache_read, got {usage.cache_read_input_tokens}"
+        f"deepseek prompt_cache_hit_tokens must map to cache_read, got {usage.cache_read_input_tokens}"
     )
     assert usage.reasoning_tokens == Present(7)
     assert len(meta.attempt_trace) == 1, f"trace: {meta.attempt_trace}"
@@ -881,42 +722,11 @@ async def test_success_decode_populates_meta_and_usage(engine: OpenAIChatEngine)
 
 
 @respx.mock
-async def test_openrouter_upstream_provider_and_cache_details_decode(
-    engine: OpenAIChatEngine,
-) -> None:
-    mock_completion(
-        OPENROUTER_ROW,
-        completion_body(
-            model="moonshotai/kimi-k3",
-            provider="Moonshot",
-            usage={
-                "prompt_tokens": 50,
-                "completion_tokens": 5,
-                "total_tokens": 55,
-                "cost": 0.0012,
-                "prompt_tokens_details": {"cached_tokens": 30, "cache_write_tokens": 10},
-            },
-        ),
-    )
-    outcome = await engine.generate(
-        OPENROUTER_ROW, intent_for(OPENROUTER_ROW), credential_for(OPENROUTER_ROW)
-    )
-    assert isinstance(outcome, Succeeded), f"got {outcome}"
-    assert outcome.meta.upstream_provider == Present("Moonshot"), (
-        f"upstream provider comes from the response body, got {outcome.meta.upstream_provider}"
-    )
-    assert isinstance(outcome.meta.usage, Present)
-    usage = outcome.meta.usage.value
-    assert usage.cache_read_input_tokens == Present(30)
-    assert usage.cache_write_input_tokens == Present(10)
-
-
-@respx.mock
 async def test_tool_call_decode_strict_parses_arguments(engine: OpenAIChatEngine) -> None:
     mock_completion(
         XAI_ROW,
         completion_body(
-            model="grok-4",
+            model="grok-4.7",
             finish_reason="tool_calls",
             message={
                 "role": "assistant",
@@ -946,7 +756,7 @@ async def test_invalid_tool_arguments_return_failed_value(engine: OpenAIChatEngi
     mock_completion(
         XAI_ROW,
         completion_body(
-            model="grok-4",
+            model="grok-4.7",
             finish_reason="tool_calls",
             message={
                 "role": "assistant",
@@ -974,9 +784,7 @@ async def test_invalid_tool_arguments_return_failed_value(engine: OpenAIChatEngi
 async def test_finish_reason_length_and_content_filter_map_to_incomplete(
     engine: OpenAIChatEngine,
 ) -> None:
-    mock_completion(
-        DEEPSEEK_ROW, completion_body(model="deepseek-reasoner", finish_reason="length")
-    )
+    mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-flash", finish_reason="length"))
     outcome = await engine.generate(
         DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW)
     )
@@ -986,7 +794,7 @@ async def test_finish_reason_length_and_content_filter_map_to_incomplete(
 
     respx.clear()
     mock_completion(
-        DEEPSEEK_ROW, completion_body(model="deepseek-reasoner", finish_reason="content_filter")
+        DEEPSEEK_ROW, completion_body(model="deepseek-flash", finish_reason="content_filter")
     )
     outcome = await engine.generate(
         DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW)
@@ -997,7 +805,7 @@ async def test_finish_reason_length_and_content_filter_map_to_incomplete(
 
 @respx.mock
 async def test_unknown_finish_reason_raises_protocol_defect(engine: OpenAIChatEngine) -> None:
-    mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-reasoner", finish_reason="weird"))
+    mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-flash", finish_reason="weird"))
     with pytest.raises(ProtocolDefect, match="finish_reason"):
         await engine.generate(DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW))
 
@@ -1007,13 +815,15 @@ async def test_json_mode_text_that_is_not_json_fails_invalid_structured_output(
     engine: OpenAIChatEngine,
 ) -> None:
     mock_completion(
-        MOONSHOT_ROW,
-        completion_body(model="kimi-k3", message={"role": "assistant", "content": "not json"}),
+        DEEPSEEK_ROW,
+        completion_body(
+            model="deepseek-flash", message={"role": "assistant", "content": "not json"}
+        ),
     )
     outcome = await engine.generate(
-        MOONSHOT_ROW,
-        intent_for(MOONSHOT_ROW, output=StrictJsonOutput("answer", ANSWER_SCHEMA)),
-        credential_for(MOONSHOT_ROW),
+        DEEPSEEK_ROW,
+        intent_for(DEEPSEEK_ROW, output=StrictJsonOutput("answer", ANSWER_SCHEMA)),
+        credential_for(DEEPSEEK_ROW),
     )
     assert isinstance(outcome, Failed), f"got {outcome}"
     assert isinstance(outcome.failure, InvalidStructuredOutput), f"got {outcome.failure}"
@@ -1024,15 +834,13 @@ async def test_missing_choices_and_missing_model_raise_protocol_defect(
     engine: OpenAIChatEngine,
 ) -> None:
     respx.post(chat_url(DEEPSEEK_ROW)).mock(
-        return_value=httpx.Response(
-            200, json={"id": "x", "model": "deepseek-reasoner", "choices": []}
-        )
+        return_value=httpx.Response(200, json={"id": "x", "model": "deepseek-flash", "choices": []})
     )
     with pytest.raises(ProtocolDefect):
         await engine.generate(DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW))
 
     respx.clear()
-    body = completion_body(model="deepseek-reasoner")
+    body = completion_body(model="deepseek-flash")
     del body["model"]
     respx.post(chat_url(DEEPSEEK_ROW)).mock(return_value=httpx.Response(200, json=body))
     with pytest.raises(ProtocolDefect):
@@ -1061,7 +869,7 @@ async def test_deepseek_reasoning_content_preserved_and_replayed_on_resend(
     mock_completion(
         DEEPSEEK_ROW,
         completion_body(
-            model="deepseek-reasoner",
+            model="deepseek-flash",
             message={"role": "assistant", "content": "hello", "reasoning_content": "let me think"},
         ),
     )
@@ -1073,13 +881,13 @@ async def test_deepseek_reasoning_content_preserved_and_replayed_on_resend(
     assert isinstance(continuation, Present), "reasoning_content must produce an artifact"
     artifact = continuation.value
     assert artifact.codec_id == DEEPSEEK_ROW.continuation_codec
-    assert artifact.target == ProviderTarget(provider="deepseek", model="deepseek-reasoner")
+    assert artifact.target == ProviderTarget(provider="deepseek", model="deepseek-flash")
     assert artifact.opaque_payload.get("reasoning_content") == "let me think", (
         "the artifact preserves reasoning_content"
     )
 
     respx.clear()
-    route = mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-reasoner"))
+    route = mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-flash"))
     replay: tuple[PromptMessage, ...] = (
         UserMessage((PromptBlock("hi"),)),
         AssistantMessage(text="hello", tool_calls=(), continuation=Present(artifact)),
@@ -1105,7 +913,7 @@ async def test_deepseek_thinking_tool_continuation_replays_reasoning_and_omits_t
     first_route = mock_completion(
         DEEPSEEK_ROW,
         completion_body(
-            model="deepseek-reasoner",
+            model="deepseek-flash",
             finish_reason="tool_calls",
             message={
                 "role": "assistant",
@@ -1137,9 +945,7 @@ async def test_deepseek_thinking_tool_continuation_replays_reasoning_and_omits_t
     respx.clear()
     second_route = mock_completion(
         DEEPSEEK_ROW,
-        completion_body(
-            model="deepseek-reasoner", message={"role": "assistant", "content": "done"}
-        ),
+        completion_body(model="deepseek-flash", message={"role": "assistant", "content": "done"}),
     )
     second_intent = replace(
         first_intent,
@@ -1179,7 +985,7 @@ async def test_deepseek_thinking_tool_continuation_replays_reasoning_and_omits_t
 async def test_deepseek_nonthinking_tools_keep_explicit_tool_choice(
     engine: OpenAIChatEngine,
 ) -> None:
-    route = mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-reasoner"))
+    route = mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-flash"))
     await engine.generate(
         DEEPSEEK_ROW,
         intent_for(DEEPSEEK_ROW, tools=(SEARCH_TOOL,), reasoning="none"),
@@ -1192,7 +998,7 @@ async def test_deepseek_nonthinking_tools_keep_explicit_tool_choice(
 async def test_deepseek_thinking_tools_reject_explicit_nondefault_tool_choice(
     engine: OpenAIChatEngine,
 ) -> None:
-    route = mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-reasoner"))
+    route = mock_completion(DEEPSEEK_ROW, completion_body(model="deepseek-flash"))
     with pytest.raises(InvalidRequest, match="tool_choice"):
         await engine.generate(
             DEEPSEEK_ROW,
@@ -1212,7 +1018,7 @@ async def test_xai_reasoning_content_stripped_on_resend(engine: OpenAIChatEngine
     mock_completion(
         XAI_ROW,
         completion_body(
-            model="grok-4",
+            model="grok-4.7",
             message={"role": "assistant", "content": "hey", "reasoning_content": "hmm"},
         ),
     )
@@ -1222,7 +1028,7 @@ async def test_xai_reasoning_content_stripped_on_resend(engine: OpenAIChatEngine
     assert isinstance(continuation, Present)
 
     respx.clear()
-    route = mock_completion(XAI_ROW, completion_body(model="grok-4"))
+    route = mock_completion(XAI_ROW, completion_body(model="grok-4.7"))
     replay: tuple[PromptMessage, ...] = (
         UserMessage((PromptBlock("hi"),)),
         AssistantMessage(text="hey", tool_calls=(), continuation=continuation),
@@ -1236,99 +1042,12 @@ async def test_xai_reasoning_content_stripped_on_resend(engine: OpenAIChatEngine
     )
 
 
-@respx.mock
-async def test_moonshot_continuation_replays_complete_native_message_verbatim(
-    engine: OpenAIChatEngine,
-) -> None:
-    native_message = {
-        "role": "assistant",
-        "content": "done",
-        "reasoning_content": "preserved thinking",
-        "tool_calls": [
-            {
-                "id": "call-1",
-                "type": "function",
-                "function": {"name": "search", "arguments": '{"query": "x"}'},
-            }
-        ],
-    }
-    mock_completion(
-        MOONSHOT_ROW,
-        completion_body(model="kimi-k3", finish_reason="tool_calls", message=native_message),
-    )
-    first = await engine.generate(
-        MOONSHOT_ROW, intent_for(MOONSHOT_ROW, tools=(SEARCH_TOOL,)), credential_for(MOONSHOT_ROW)
-    )
-    assert isinstance(first, Succeeded)
-    continuation = first.response.continuation
-    assert isinstance(continuation, Present), "reasoning + tool calls must produce an artifact"
-
-    respx.clear()
-    route = mock_completion(MOONSHOT_ROW, completion_body(model="kimi-k3"))
-    replay: tuple[PromptMessage, ...] = (
-        UserMessage((PromptBlock("go"),)),
-        AssistantMessage(text="done", tool_calls=(), continuation=continuation),
-        ToolResultMessage(call_id="call-1", output="found", is_error=False),
-    )
-    await engine.generate(
-        MOONSHOT_ROW,
-        intent_for(MOONSHOT_ROW, messages=replay, tools=(SEARCH_TOOL,)),
-        credential_for(MOONSHOT_ROW),
-    )
-    messages = last_request_json(route)["messages"]
-    assert isinstance(messages, list)
-    assert messages[1] == native_message, (
-        "moonshot replays the COMPLETE native assistant message verbatim, including "
-        f"reasoning_content (Preserved Thinking); got: {messages[1]}"
-    )
-
-
-@respx.mock
-async def test_openrouter_reasoning_details_round_trip_verbatim(engine: OpenAIChatEngine) -> None:
-    details = [
-        {"type": "reasoning.encrypted", "data": "opaque-1", "index": 0},
-        {"type": "reasoning.text", "text": "step two", "index": 1},
-    ]
-    mock_completion(
-        OPENROUTER_ROW,
-        completion_body(
-            model="moonshotai/kimi-k3",
-            message={"role": "assistant", "content": "ok", "reasoning_details": details},
-        ),
-    )
-    first = await engine.generate(
-        OPENROUTER_ROW, intent_for(OPENROUTER_ROW), credential_for(OPENROUTER_ROW)
-    )
-    assert isinstance(first, Succeeded)
-    continuation = first.response.continuation
-    assert isinstance(continuation, Present)
-    assert thaw_json_value(continuation.value.opaque_payload) == {"reasoning_details": details}, (
-        f"ordered reasoning_details must be preserved verbatim; got {continuation.value.opaque_payload}"
-    )
-
-    respx.clear()
-    route = mock_completion(OPENROUTER_ROW, completion_body(model="moonshotai/kimi-k3"))
-    replay: tuple[PromptMessage, ...] = (
-        UserMessage((PromptBlock("hi"),)),
-        AssistantMessage(text="ok", tool_calls=(), continuation=continuation),
-        UserMessage((PromptBlock("next"),)),
-    )
-    await engine.generate(
-        OPENROUTER_ROW, intent_for(OPENROUTER_ROW, messages=replay), credential_for(OPENROUTER_ROW)
-    )
-    messages = last_request_json(route)["messages"]
-    assert isinstance(messages, list)
-    assert messages[1] == {"role": "assistant", "content": "ok", "reasoning_details": details}, (
-        f"reasoning_details replay verbatim on the assistant message; got {messages[1]}"
-    )
-
-
 async def test_continuation_bound_to_other_codec_or_target_raises_invalid_request(
     engine: OpenAIChatEngine,
 ) -> None:
     wrong_codec = ContinuationArtifact(
-        target=ProviderTarget(provider="deepseek", model="deepseek-reasoner"),
-        codec_id="moonshot.v1",
+        target=ProviderTarget(provider="deepseek", model="deepseek-flash"),
+        codec_id="xai.v2",
         opaque_payload={"role": "assistant", "content": "x"},
     )
     messages: tuple[PromptMessage, ...] = (
@@ -1341,8 +1060,8 @@ async def test_continuation_bound_to_other_codec_or_target_raises_invalid_reques
         )
 
     wrong_target = ContinuationArtifact(
-        target=ProviderTarget(provider="moonshot", model="kimi-k3"),
-        codec_id="deepseek.v1",
+        target=ProviderTarget(provider="xai", model="deepseek-flash"),
+        codec_id="deepseek.v2",
         opaque_payload={"role": "assistant", "content": "x"},
     )
     messages = (
@@ -1360,98 +1079,6 @@ async def test_continuation_bound_to_other_codec_or_target_raises_invalid_reques
 
 
 @respx.mock
-async def test_moonshot_stream_decodes_text_usage_and_continuation(
-    engine: OpenAIChatEngine,
-) -> None:
-    route = mock_stream(
-        MOONSHOT_ROW,
-        sse_bytes(
-            {
-                "id": "s-1",
-                "model": "kimi-k3",
-                "choices": [
-                    {"index": 0, "delta": {"role": "assistant", "reasoning_content": "think "}}
-                ],
-            },
-            {"choices": [{"index": 0, "delta": {"reasoning_content": "hard"}}]},
-            {"choices": [{"index": 0, "delta": {"content": "Hello"}}]},
-            {"choices": [{"index": 0, "delta": {"content": " world"}}]},
-            {
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": "stop",
-                        "usage": {
-                            "prompt_tokens": 11,
-                            "completion_tokens": 6,
-                            "total_tokens": 17,
-                            "cached_tokens": 4,
-                        },
-                    }
-                ]
-            },
-            {
-                "choices": [],
-                "usage": {
-                    "prompt_tokens": 11,
-                    "completion_tokens": 6,
-                    "total_tokens": 17,
-                    "completion_tokens_details": {"reasoning_tokens": 3},
-                },
-            },
-            "[DONE]",
-        ),
-    )
-    events = await collect(
-        engine.stream(MOONSHOT_ROW, intent_for(MOONSHOT_ROW), credential_for(MOONSHOT_ROW))
-    )
-    body = last_request_json(route)
-    assert body["stream"] is True, f"body: {body}"
-    assert body["stream_options"] == {"include_usage": True}, (
-        f"moonshot sends include_usage belt-and-braces; body: {body}"
-    )
-
-    kinds = [type(event).__name__ for event in events]
-    assert kinds == [
-        "StreamStart",
-        "TextDelta",
-        "TextDelta",
-        "UsageEvent",
-        "UsageEvent",
-        "ContinuationDelta",
-        "TerminalEvent",
-    ], f"events: {kinds}"
-    assert events[1] == TextDelta(text="Hello")
-    assert events[2] == TextDelta(text=" world")
-
-    continuation_event = events[-2]
-    assert isinstance(continuation_event, ContinuationDelta)
-    artifact = continuation_event.artifact
-    assert artifact.codec_id == "moonshot.v1"
-    assert artifact.opaque_payload == {
-        "role": "assistant",
-        "content": "Hello world",
-        "reasoning_content": "think hard",
-    }, f"reconstructed native message; got {artifact.opaque_payload}"
-
-    terminal = events[-1]
-    assert isinstance(terminal, TerminalEvent)
-    outcome = terminal.outcome
-    assert isinstance(outcome, Succeeded), f"got {outcome}"
-    assert outcome.response.content == TextContent(text="Hello world", tool_calls=())
-    assert outcome.response.continuation == Present(artifact)
-    assert outcome.meta.provider_request_id == Present("s-1")
-    assert isinstance(outcome.meta.usage, Present), "terminal meta must fold all usage frames"
-    usage = outcome.meta.usage.value
-    assert (usage.input_tokens, usage.output_tokens, usage.total_tokens) == (11, 6, 17)
-    assert usage.cache_read_input_tokens == Present(4), f"usage: {usage}"
-    assert usage.reasoning_tokens == Present(3), (
-        f"the fold must merge the trailing usage frame's details; usage: {usage}"
-    )
-
-
-@respx.mock
 async def test_stream_tool_calls_accumulate_by_index_and_strict_parse(
     engine: OpenAIChatEngine,
 ) -> None:
@@ -1460,7 +1087,7 @@ async def test_stream_tool_calls_accumulate_by_index_and_strict_parse(
         sse_bytes(
             {
                 "id": "s-2",
-                "model": "grok-4",
+                "model": "grok-4.7",
                 "choices": [
                     {
                         "index": 0,
@@ -1546,7 +1173,7 @@ async def test_stream_interleaved_tool_calls_stay_separated_by_index(
         sse_bytes(
             {
                 "id": "s-6",
-                "model": "grok-4",
+                "model": "grok-4.7",
                 "choices": [
                     {
                         "index": 0,
@@ -1612,7 +1239,7 @@ async def test_repeated_finish_reason_frame_does_not_erase_accumulated_tool_call
         sse_bytes(
             {
                 "id": "s-7",
-                "model": "grok-4",
+                "model": "grok-4.7",
                 "choices": [
                     {
                         "index": 0,
@@ -1670,7 +1297,7 @@ async def test_streamed_tool_arguments_that_never_parse_fail_the_terminal(
         sse_bytes(
             {
                 "id": "s-8",
-                "model": "grok-4",
+                "model": "grok-4.7",
                 "choices": [
                     {
                         "index": 0,
@@ -1704,7 +1331,7 @@ async def test_streamed_tool_arguments_that_never_parse_fail_the_terminal(
     outcome = terminal.outcome
     assert isinstance(outcome, Failed), f"strict parse, no repair — got {outcome}"
     assert isinstance(outcome.failure, InvalidToolArguments), f"got {outcome.failure}"
-    assert outcome.meta.model == "grok-4"
+    assert outcome.meta.model == "grok-4.7"
     assert outcome.meta.billability == PossiblyBillable()
 
 
@@ -1717,7 +1344,7 @@ async def test_streamed_tool_call_without_id_or_name_is_a_protocol_defect(
         sse_bytes(
             {
                 "id": "s-9",
-                "model": "grok-4",
+                "model": "grok-4.7",
                 "choices": [{"index": 0, "delta": {"role": "assistant"}}],
             },
             tool_call_frame(0, arguments='{"query": "x"}'),
@@ -1735,96 +1362,11 @@ async def test_streamed_tool_call_without_id_or_name_is_a_protocol_defect(
 
 
 @respx.mock
-async def test_openrouter_finish_reason_error_is_transient(engine: OpenAIChatEngine) -> None:
-    mock_stream(
-        OPENROUTER_ROW,
-        sse_bytes(
-            {
-                "id": "gen-3",
-                "model": "moonshotai/kimi-k3",
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
-            },
-        ),
-    )
-    with pytest.raises(TransientAttempt) as excinfo:
-        await collect(
-            engine.stream(
-                OPENROUTER_ROW, intent_for(OPENROUTER_ROW), credential_for(OPENROUTER_ROW)
-            )
-        )
-    assert excinfo.value.cause == ProviderHttpUnavailable(), f"got {excinfo.value.cause}"
-    assert excinfo.value.provider_request_id == Present("gen-3")
-
-
-@respx.mock
-async def test_openrouter_stream_collects_reasoning_details_and_upstream(
-    engine: OpenAIChatEngine,
-) -> None:
-    route = mock_stream(
-        OPENROUTER_ROW,
-        sse_bytes(
-            {
-                "id": "gen-1",
-                "model": "moonshotai/kimi-k3",
-                "provider": "Moonshot",
-                "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Hi"}}],
-            },
-            {
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {
-                            "reasoning_details": [{"type": "reasoning.encrypted", "data": "a"}]
-                        },
-                    }
-                ]
-            },
-            {
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"reasoning_details": [{"type": "reasoning.text", "text": "b"}]},
-                        "finish_reason": "stop",
-                    }
-                ]
-            },
-            {
-                "choices": [],
-                "usage": {"prompt_tokens": 9, "completion_tokens": 2, "total_tokens": 11},
-            },
-            "[DONE]",
-        ),
-    )
-    events = await collect(
-        engine.stream(OPENROUTER_ROW, intent_for(OPENROUTER_ROW), credential_for(OPENROUTER_ROW))
-    )
-    body = last_request_json(route)
-    assert body["provider"] == EXPECTED_PINS, f"pins must ride stream calls too; body: {body}"
-    assert "stream_options" not in body, (
-        f"openrouter must not send stream_options (conflicts with require_parameters); body: {body}"
-    )
-
-    continuation_events = [event for event in events if isinstance(event, ContinuationDelta)]
-    assert len(continuation_events) == 1, f"events: {[type(e).__name__ for e in events]}"
-    assert thaw_json_value(continuation_events[0].artifact.opaque_payload) == {
-        "reasoning_details": [
-            {"type": "reasoning.encrypted", "data": "a"},
-            {"type": "reasoning.text", "text": "b"},
-        ]
-    }, "reasoning_details accumulate verbatim, in order"
-    terminal = events[-1]
-    assert isinstance(terminal, TerminalEvent)
-    assert isinstance(terminal.outcome, Succeeded)
-    assert terminal.outcome.meta.upstream_provider == Present("Moonshot")
-    assert terminal.outcome.meta.provider_request_id == Present("gen-1")
-
-
-@respx.mock
 async def test_stream_start_only_after_provider_acceptance(engine: OpenAIChatEngine) -> None:
-    respx.post(chat_url(MOONSHOT_ROW)).mock(
+    respx.post(chat_url(DEEPSEEK_ROW)).mock(
         return_value=httpx.Response(429, json={"error": {"message": "slow down"}})
     )
-    stream = engine.stream(MOONSHOT_ROW, intent_for(MOONSHOT_ROW), credential_for(MOONSHOT_ROW))
+    stream = engine.stream(DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW))
     with pytest.raises(TransientAttempt) as excinfo:
         await anext(stream)
     assert isinstance(excinfo.value.cause, ProviderRateLimit), f"got {excinfo.value.cause}"
@@ -1837,16 +1379,16 @@ async def test_stream_cut_before_semantic_output_is_interrupted_not_partial(
     # The stream opens (role-only delta = not semantic) then ends with no
     # finish_reason and no [DONE].
     mock_stream(
-        MOONSHOT_ROW,
+        DEEPSEEK_ROW,
         sse_bytes(
             {
                 "id": "s-3",
-                "model": "kimi-k3",
+                "model": "deepseek-flash",
                 "choices": [{"index": 0, "delta": {"role": "assistant"}}],
             },
         ),
     )
-    stream = engine.stream(MOONSHOT_ROW, intent_for(MOONSHOT_ROW), credential_for(MOONSHOT_ROW))
+    stream = engine.stream(DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW))
     events: list[CodecStreamEvent] = [await anext(stream)]
     assert isinstance(events[0], StreamStart)
     with pytest.raises(TransientAttempt) as excinfo:
@@ -1862,16 +1404,20 @@ async def test_stream_transport_cut_reports_the_transport_cause(
     engine: OpenAIChatEngine,
 ) -> None:
     first = sse_bytes(
-        {"id": "s-4", "model": "kimi-k3", "choices": [{"index": 0, "delta": {"content": "Hel"}}]}
+        {
+            "id": "s-4",
+            "model": "deepseek-flash",
+            "choices": [{"index": 0, "delta": {"content": "Hel"}}],
+        }
     )
-    respx.post(chat_url(MOONSHOT_ROW)).mock(
+    respx.post(chat_url(DEEPSEEK_ROW)).mock(
         return_value=httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
             stream=CutByteStream((first,)),
         )
     )
-    stream = engine.stream(MOONSHOT_ROW, intent_for(MOONSHOT_ROW), credential_for(MOONSHOT_ROW))
+    stream = engine.stream(DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW))
     seen: list[CodecStreamEvent] = []
     with pytest.raises(TransientAttempt) as excinfo:
         async for event in stream:
@@ -1891,16 +1437,16 @@ async def test_stream_cut_after_semantic_output_is_interrupted_with_partial_outp
     # Text was delivered, then the stream ended with no finish_reason: the
     # engine is the only party that can flag the partial output.
     mock_stream(
-        MOONSHOT_ROW,
+        DEEPSEEK_ROW,
         sse_bytes(
             {
                 "id": "s-5",
-                "model": "kimi-k3",
+                "model": "deepseek-flash",
                 "choices": [{"index": 0, "delta": {"content": "Hel"}}],
             },
         ),
     )
-    stream = engine.stream(MOONSHOT_ROW, intent_for(MOONSHOT_ROW), credential_for(MOONSHOT_ROW))
+    stream = engine.stream(DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW))
     seen: list[CodecStreamEvent] = []
     with pytest.raises(TransientAttempt) as excinfo:
         async for event in stream:
@@ -1911,57 +1457,10 @@ async def test_stream_cut_after_semantic_output_is_interrupted_with_partial_outp
     )
 
 
-@respx.mock
-async def test_openrouter_inband_stream_error_pre_semantic_classifies_rate_limit(
-    engine: OpenAIChatEngine,
-) -> None:
-    mock_stream(
-        OPENROUTER_ROW,
-        sse_bytes({"error": {"code": 429, "message": "rate limited"}}),
-    )
-    stream = engine.stream(
-        OPENROUTER_ROW, intent_for(OPENROUTER_ROW), credential_for(OPENROUTER_ROW)
-    )
-    seen: list[CodecStreamEvent] = []
-    with pytest.raises(TransientAttempt) as excinfo:
-        async for event in stream:
-            seen.append(event)
-    assert seen == [StreamStart()], f"only the envelope may precede the failure; got {seen}"
-    assert excinfo.value.cause == ProviderRateLimit(retry_after=Absent()), (
-        f"429-shaped in-band errors classify as rate limit; got {excinfo.value.cause}"
-    )
-
-
-@respx.mock
-async def test_openrouter_inband_stream_error_post_semantic_reports_the_upstream_cause(
-    engine: OpenAIChatEngine,
-) -> None:
-    mock_stream(
-        OPENROUTER_ROW,
-        sse_bytes(
-            {
-                "id": "gen-2",
-                "model": "moonshotai/kimi-k3",
-                "choices": [{"index": 0, "delta": {"content": "par"}}],
-            },
-            {"error": {"code": 502, "message": "upstream died"}},
-        ),
-    )
-    stream = engine.stream(
-        OPENROUTER_ROW, intent_for(OPENROUTER_ROW), credential_for(OPENROUTER_ROW)
-    )
-    seen: list[CodecStreamEvent] = []
-    with pytest.raises(TransientAttempt) as excinfo:
-        async for event in stream:
-            seen.append(event)
-    assert any(isinstance(event, TextDelta) for event in seen), f"events: {seen}"
-    assert excinfo.value.cause == ProviderHttpUnavailable(), f"got {excinfo.value.cause}"
-
-
 # In-band HTTP-200 error objects that name no definite 4xx: the gateway
 # accepted the request and the upstream then failed, so a retry can succeed.
 INDEFINITE_INBAND_ERRORS: list[dict[str, object]] = [
-    {"message": "Provider returned error", "metadata": {"provider_name": "Moonshot"}},
+    {"message": "Provider returned error", "metadata": {"provider_name": "DeepSeek"}},
     {"code": "upstream_error", "message": "Provider returned error"},
 ]
 
@@ -1971,10 +1470,8 @@ INDEFINITE_INBAND_ERRORS: list[dict[str, object]] = [
 async def test_inband_stream_error_without_a_definite_4xx_code_is_transient(
     engine: OpenAIChatEngine, error: dict[str, object]
 ) -> None:
-    mock_stream(OPENROUTER_ROW, sse_bytes({"error": error}))
-    stream = engine.stream(
-        OPENROUTER_ROW, intent_for(OPENROUTER_ROW), credential_for(OPENROUTER_ROW)
-    )
+    mock_stream(DEEPSEEK_ROW, sse_bytes({"error": error}))
+    stream = engine.stream(DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW))
     seen: list[CodecStreamEvent] = []
     with pytest.raises(TransientAttempt) as excinfo:
         async for event in stream:
@@ -1991,12 +1488,10 @@ async def test_inband_stream_error_without_a_transient_code_is_a_protocol_defect
     engine: OpenAIChatEngine,
 ) -> None:
     mock_stream(
-        OPENROUTER_ROW,
+        DEEPSEEK_ROW,
         sse_bytes({"error": {"code": 400, "message": "no endpoints found sk-live-abcdefghij"}}),
     )
-    stream = engine.stream(
-        OPENROUTER_ROW, intent_for(OPENROUTER_ROW), credential_for(OPENROUTER_ROW)
-    )
+    stream = engine.stream(DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW))
     with pytest.raises(ProtocolDefect) as excinfo:
         async for _ in stream:
             pass
@@ -2012,13 +1507,13 @@ async def test_inband_stream_error_without_a_transient_code_is_a_protocol_defect
 
 @respx.mock
 async def test_429_with_retry_after_raises_transient_rate_limit(engine: OpenAIChatEngine) -> None:
-    respx.post(chat_url(MOONSHOT_ROW)).mock(
+    respx.post(chat_url(DEEPSEEK_ROW)).mock(
         return_value=httpx.Response(
             429, headers={"retry-after": "7"}, json={"error": {"message": "slow down"}}
         )
     )
     with pytest.raises(TransientAttempt) as excinfo:
-        await engine.generate(MOONSHOT_ROW, intent_for(MOONSHOT_ROW), credential_for(MOONSHOT_ROW))
+        await engine.generate(DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW))
     attempt = excinfo.value
     assert attempt.cause == ProviderRateLimit(retry_after=Present(7.0)), f"got {attempt.cause}"
     assert attempt.status_code == Present(429)
@@ -2030,13 +1525,13 @@ async def test_429_with_infinite_retry_after_has_absent_delay(engine: OpenAIChat
     """`float()` accepts "Infinity" but ProviderRateLimit only holds a finite
     delay: a provider- or proxy-controlled header must never reach that
     constructor with a value it rejects."""
-    respx.post(chat_url(MOONSHOT_ROW)).mock(
+    respx.post(chat_url(DEEPSEEK_ROW)).mock(
         return_value=httpx.Response(
             429, headers={"retry-after": "Infinity"}, json={"error": {"message": "slow down"}}
         )
     )
     with pytest.raises(TransientAttempt) as excinfo:
-        await engine.generate(MOONSHOT_ROW, intent_for(MOONSHOT_ROW), credential_for(MOONSHOT_ROW))
+        await engine.generate(DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW))
     assert excinfo.value.cause == ProviderRateLimit(retry_after=Absent()), (
         f"got {excinfo.value.cause}"
     )
@@ -2081,13 +1576,11 @@ async def test_timeouts_raise_transient_provider_timeout(engine: OpenAIChatEngin
 
 @respx.mock
 async def test_5xx_raises_transient_provider_unavailable(engine: OpenAIChatEngine) -> None:
-    respx.post(chat_url(OPENROUTER_ROW)).mock(
+    respx.post(chat_url(DEEPSEEK_ROW)).mock(
         return_value=httpx.Response(503, json={"error": {"message": "down"}})
     )
     with pytest.raises(TransientAttempt) as excinfo:
-        await engine.generate(
-            OPENROUTER_ROW, intent_for(OPENROUTER_ROW), credential_for(OPENROUTER_ROW)
-        )
+        await engine.generate(DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW))
     assert excinfo.value.cause == ProviderHttpUnavailable(), f"got {excinfo.value.cause}"
     assert excinfo.value.status_code == Present(503)
 
@@ -2120,7 +1613,7 @@ async def test_mid_request_transport_error_is_possibly_billable(engine: OpenAICh
 async def test_context_overflow_400_returns_failed_value_with_meta(
     engine: OpenAIChatEngine,
 ) -> None:
-    respx.post(chat_url(MOONSHOT_ROW)).mock(
+    respx.post(chat_url(DEEPSEEK_ROW)).mock(
         return_value=httpx.Response(
             400,
             json={
@@ -2132,13 +1625,13 @@ async def test_context_overflow_400_returns_failed_value_with_meta(
         )
     )
     outcome = await engine.generate(
-        MOONSHOT_ROW, intent_for(MOONSHOT_ROW), credential_for(MOONSHOT_ROW)
+        DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW)
     )
     assert isinstance(outcome, Failed), f"got {outcome}"
     assert outcome.failure == ProviderContextTooLarge()
     meta = outcome.meta
-    assert meta.provider == "moonshot"
-    assert meta.model == "kimi-k3", "no envelope decoded — the row's model id stands in"
+    assert meta.provider == "deepseek"
+    assert meta.model == "deepseek-flash", "no envelope decoded — the row's model id stands in"
     assert meta.usage == Absent()
     assert meta.billability == PossiblyBillable()
     assert meta.registry_revision == REGISTRY_REVISION
@@ -2148,11 +1641,11 @@ async def test_context_overflow_400_returns_failed_value_with_meta(
 
 @respx.mock
 async def test_unclassified_400_raises_runtime_defect(engine: OpenAIChatEngine) -> None:
-    respx.post(chat_url(MOONSHOT_ROW)).mock(
+    respx.post(chat_url(DEEPSEEK_ROW)).mock(
         return_value=httpx.Response(400, json={"error": {"message": "bad param"}})
     )
     with pytest.raises(RuntimeDefect) as excinfo:
-        await engine.generate(MOONSHOT_ROW, intent_for(MOONSHOT_ROW), credential_for(MOONSHOT_ROW))
+        await engine.generate(DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW))
     assert excinfo.value.code == "unclassified_provider_error", f"got {excinfo.value.code}"
 
 
@@ -2173,43 +1666,17 @@ async def test_401_and_403_raise_credential_rejected(engine: OpenAIChatEngine) -
 
 
 @respx.mock
-async def test_openrouter_403_moderation_flag_is_not_credential_rejection(
-    engine: OpenAIChatEngine,
-) -> None:
-    respx.post(chat_url(OPENROUTER_ROW)).mock(
-        return_value=httpx.Response(
-            403,
-            json={
-                "error": {
-                    "message": "flagged",
-                    "metadata": {"reasons": ["violence"], "flagged_input": "…"},
-                }
-            },
-        )
-    )
-    with pytest.raises(RuntimeDefect) as excinfo:
-        await engine.generate(
-            OPENROUTER_ROW, intent_for(OPENROUTER_ROW), credential_for(OPENROUTER_ROW)
-        )
-    assert excinfo.value.code == "input_moderation_flagged", f"got {excinfo.value.code}"
-    assert not isinstance(excinfo.value, CredentialRejected)
-
-
-@respx.mock
 async def test_inband_error_on_a_200_body_is_transient_not_a_missing_model_defect(
     engine: OpenAIChatEngine,
 ) -> None:
-    # OpenRouter answers 200 with an error object when the upstream fails
-    # after acceptance — the same shape the stream arm already models.
-    respx.post(chat_url(OPENROUTER_ROW)).mock(
+    # An accepted request may still return an in-band upstream error.
+    respx.post(chat_url(DEEPSEEK_ROW)).mock(
         return_value=httpx.Response(
             200, json={"error": {"code": 502, "message": "upstream fell over"}}
         )
     )
     with pytest.raises(TransientAttempt) as excinfo:
-        await engine.generate(
-            OPENROUTER_ROW, intent_for(OPENROUTER_ROW), credential_for(OPENROUTER_ROW)
-        )
+        await engine.generate(DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW))
     assert excinfo.value.cause == ProviderHttpUnavailable(), f"got {excinfo.value.cause}"
     assert excinfo.value.status_code == Present(200)
     assert excinfo.value.billability == PossiblyBillable()
@@ -2219,13 +1686,11 @@ async def test_inband_error_on_a_200_body_is_transient_not_a_missing_model_defec
 async def test_inband_rate_limit_on_a_200_body_classifies_as_rate_limit(
     engine: OpenAIChatEngine,
 ) -> None:
-    respx.post(chat_url(OPENROUTER_ROW)).mock(
+    respx.post(chat_url(DEEPSEEK_ROW)).mock(
         return_value=httpx.Response(200, json={"error": {"code": "429", "message": "slow down"}})
     )
     with pytest.raises(TransientAttempt) as excinfo:
-        await engine.generate(
-            OPENROUTER_ROW, intent_for(OPENROUTER_ROW), credential_for(OPENROUTER_ROW)
-        )
+        await engine.generate(DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW))
     assert excinfo.value.cause == ProviderRateLimit(retry_after=Absent()), (
         f"got {excinfo.value.cause}"
     )
@@ -2236,13 +1701,9 @@ async def test_inband_rate_limit_on_a_200_body_classifies_as_rate_limit(
 async def test_inband_error_without_a_definite_4xx_code_is_transient(
     engine: OpenAIChatEngine, error: dict[str, object]
 ) -> None:
-    respx.post(chat_url(OPENROUTER_ROW)).mock(
-        return_value=httpx.Response(200, json={"error": error})
-    )
+    respx.post(chat_url(DEEPSEEK_ROW)).mock(return_value=httpx.Response(200, json={"error": error}))
     with pytest.raises(TransientAttempt) as excinfo:
-        await engine.generate(
-            OPENROUTER_ROW, intent_for(OPENROUTER_ROW), credential_for(OPENROUTER_ROW)
-        )
+        await engine.generate(DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW))
     assert excinfo.value.cause == ProviderHttpUnavailable(), (
         f"an in-band error with no definite 4xx code is a retryable upstream failure; "
         f"got {excinfo.value.cause}"
@@ -2255,15 +1716,13 @@ async def test_inband_error_without_a_definite_4xx_code_is_transient(
 async def test_inband_error_without_a_transient_code_is_a_protocol_defect(
     engine: OpenAIChatEngine,
 ) -> None:
-    respx.post(chat_url(OPENROUTER_ROW)).mock(
+    respx.post(chat_url(DEEPSEEK_ROW)).mock(
         return_value=httpx.Response(
             200, json={"error": {"code": 403, "message": "key sk-live-abcdefghij is not allowed"}}
         )
     )
     with pytest.raises(ProtocolDefect) as excinfo:
-        await engine.generate(
-            OPENROUTER_ROW, intent_for(OPENROUTER_ROW), credential_for(OPENROUTER_ROW)
-        )
+        await engine.generate(DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW))
     assert excinfo.value.code == "inband_provider_error", f"got {excinfo.value.code}"
     assert "sk-live-abcdefghij" not in excinfo.value.message, (
         f"the provider snippet must be sanitized; got {excinfo.value.message!r}"
@@ -2275,14 +1734,14 @@ async def test_negative_usage_counts_raise_malformed_usage_defect(
     engine: OpenAIChatEngine,
 ) -> None:
     mock_completion(
-        MOONSHOT_ROW,
+        DEEPSEEK_ROW,
         completion_body(
-            model="kimi-k3",
+            model="deepseek-flash",
             usage={"prompt_tokens": -5, "completion_tokens": 20, "total_tokens": 15},
         ),
     )
     with pytest.raises(ProtocolDefect) as excinfo:
-        await engine.generate(MOONSHOT_ROW, intent_for(MOONSHOT_ROW), credential_for(MOONSHOT_ROW))
+        await engine.generate(DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW))
     assert excinfo.value.code == "malformed_usage", f"got {excinfo.value.code}"
 
 
@@ -2291,11 +1750,11 @@ async def test_stream_negative_usage_counts_raise_malformed_usage_defect(
     engine: OpenAIChatEngine,
 ) -> None:
     mock_stream(
-        MOONSHOT_ROW,
+        DEEPSEEK_ROW,
         sse_bytes(
             {
                 "id": "s-usage",
-                "model": "kimi-k3",
+                "model": "deepseek-flash",
                 "choices": [{"index": 0, "delta": {"content": "hi"}}],
             },
             {
@@ -2305,7 +1764,7 @@ async def test_stream_negative_usage_counts_raise_malformed_usage_defect(
             "[DONE]",
         ),
     )
-    stream = engine.stream(MOONSHOT_ROW, intent_for(MOONSHOT_ROW), credential_for(MOONSHOT_ROW))
+    stream = engine.stream(DEEPSEEK_ROW, intent_for(DEEPSEEK_ROW), credential_for(DEEPSEEK_ROW))
     with pytest.raises(ProtocolDefect) as excinfo:
         async for _ in stream:
             pass

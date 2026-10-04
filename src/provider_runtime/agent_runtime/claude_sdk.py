@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import os
 import re
@@ -15,9 +16,17 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal, cast
+from uuid import uuid4
 
 from provider_runtime.errors import sanitize_provider_text
-from provider_runtime.types import Absent, Presence, Present, TokenUsage, thaw_json_value
+from provider_runtime.types import (
+    Absent,
+    Presence,
+    Present,
+    TokenUsage,
+    canonical_json_bytes,
+    thaw_json_value,
+)
 
 from ._claude_launcher import OwnedProcessGroup, ensure_claude_launcher
 from ._limits import (
@@ -34,11 +43,6 @@ from ._limits import (
 )
 from ._process import ProcessLimits, capture_process_output
 from ._sandbox import bubblewrap_network_namespace_available, environment_executable
-from ._structured_output import (
-    OutputSchemaMismatch,
-    freeze_structured_output,
-    parse_structured_output,
-)
 from .auth import (
     credential_environment_names,
     redact_native_payload,
@@ -87,6 +91,14 @@ from .sessions import (
     validate_read_session_auth,
     validate_session_ref,
 )
+from .turn import (
+    AgentAttempt,
+    AgentResultRef,
+    AgentUncertain,
+    LocalStopEvidence,
+    NativeTerminalEvidence,
+    RawAgentOutput,
+)
 from .types import (
     AgentSessionRef,
     AgentSessionRequest,
@@ -97,7 +109,6 @@ from .types import (
     ClaudeNativeSessionRequest,
     CredentialRef,
     ForkSession,
-    FrozenJsonDict,
     JsonSchemaAgentOutput,
     NewSession,
     ResumeSession,
@@ -299,6 +310,7 @@ class _ClaudeSessionState:
     # task the SDK spawns itself — queued here and emitted by the generator in stream order.
     pending_events: list[AgentEvent] = field(default_factory=list)
     approval_defect: AgentRuntimeDefect | None = None
+    attempt: AgentAttempt | None = None
 
 
 class ClaudeSdkAdapter:
@@ -547,6 +559,22 @@ class ClaudeSdkAdapter:
         if state.drain_pending:
             await self._drain_retired_turn(state)
         prompt = self._turn_text(request)
+        state.attempt = AgentAttempt(
+            str(uuid4()),
+            hashlib.sha256(
+                canonical_json_bytes(
+                    freeze_json_object(
+                        {
+                            "method": "ClaudeSDKClient.query",
+                            "prompt": prompt,
+                            "session_id": state.ref.native_session_id
+                            if state.ref is not None
+                            else "default",
+                        }
+                    )
+                )
+            ).hexdigest(),
+        )
         try:
             await state.client.query(
                 prompt,
@@ -634,6 +662,10 @@ class ClaudeSdkAdapter:
                 failure=AgentFailure("output_limit_exceeded"),
                 final_text=state.final_text,
                 session_ref=ref,
+                evidence=LocalStopEvidence(
+                    AgentUncertain(state.attempt, None, "Claude output exceeded its local bound"),
+                    "output_limit_exceeded",
+                ),
                 usage=self._usage_presence(state),
                 diagnostics=tuple(dict.fromkeys(state.diagnostics)),
             )
@@ -660,6 +692,10 @@ class ClaudeSdkAdapter:
                 failure=AgentFailure("backend_failed"),
                 final_text=state.final_text,
                 session_ref=ref,
+                evidence=LocalStopEvidence(
+                    AgentUncertain(state.attempt, None, "Claude SDK stream failed"),
+                    "backend_failed",
+                ),
                 usage=self._usage_presence(state),
                 diagnostics=("Claude SDK stream failed",),
             )
@@ -964,6 +1000,16 @@ class ClaudeSdkAdapter:
         final_text = result if isinstance(result, str) else state.final_text
         self._check_final_text(final_text)
         diagnostics = tuple(dict.fromkeys(state.diagnostics))
+        if state.attempt is None:
+            raise ProtocolDefect("Claude native result omitted its exclusive submitted attempt")
+        native_id = getattr(message, "uuid", None)
+        if native_id is not None and (type(native_id) is not str or not native_id):
+            raise ProtocolDefect("Claude native result uuid was malformed")
+        evidence = NativeTerminalEvidence(
+            state.attempt, AgentResultRef(ref, native_id), "claude-result.v1"
+        )
+        raw = getattr(message, "structured_output", None)
+        structured = None if raw is None else RawAgentOutput(freeze_json_value(raw))
         terminal_reason = getattr(message, "terminal_reason", None)
         if state.approval_failure:
             return AgentTerminal(
@@ -971,6 +1017,8 @@ class ClaudeSdkAdapter:
                 failure=AgentFailure("approval_unanswered"),
                 final_text=final_text,
                 session_ref=ref,
+                evidence=evidence,
+                raw_structured_output=structured,
                 usage=usage,
                 diagnostics=("approval handler failed",),
             )
@@ -980,6 +1028,8 @@ class ClaudeSdkAdapter:
                 failure=None,
                 final_text=final_text,
                 session_ref=ref,
+                evidence=evidence,
+                raw_structured_output=structured,
                 usage=usage,
                 diagnostics=diagnostics,
             )
@@ -1008,36 +1058,19 @@ class ClaudeSdkAdapter:
                 failure=failure,
                 final_text=final_text,
                 session_ref=ref,
+                evidence=evidence,
+                raw_structured_output=structured,
                 usage=usage,
                 diagnostics=diagnostics,
             )
-        structured: FrozenJsonDict | None = None
-        if isinstance(state.request.output, JsonSchemaAgentOutput):
-            # The backend enforces the schema natively; this boundary only strict-parses
-            # and freezes the answer, and a miss is an expected model-output failure.
-            raw = getattr(message, "structured_output", None)
-            try:
-                structured = (
-                    freeze_structured_output(raw)
-                    if raw is not None
-                    else parse_structured_output(final_text)
-                )
-            except OutputSchemaMismatch:
-                return AgentTerminal(
-                    status="failed",
-                    failure=AgentFailure("output_schema_violation"),
-                    final_text=final_text,
-                    session_ref=ref,
-                    usage=usage,
-                    diagnostics=diagnostics,
-                )
         return AgentTerminal(
             status="succeeded",
             failure=None,
             final_text=final_text,
             session_ref=ref,
             usage=usage,
-            structured_output=structured,
+            evidence=evidence,
+            raw_structured_output=structured,
             diagnostics=diagnostics,
         )
 

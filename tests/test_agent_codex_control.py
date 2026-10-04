@@ -15,6 +15,7 @@ pytest.importorskip("websockets.asyncio.server")
 from websockets.asyncio.server import ServerConnection, unix_serve
 
 from provider_runtime.agent_runtime import (
+    CODEX_CONTAINMENT_CATALOG_FILENAME,
     AgentPermissionRequest,
     AgentRuntime,
     AgentRuntimeConfig,
@@ -71,7 +72,7 @@ class ProtocolPeer:
         self.socket = socket
         self.messages: list[dict[str, object]] = []
         self.closed_connections = 0
-        self.initialize: object = {"userAgent": "codex_cli_rs/0.154.0 (Linux synthetic; x86_64)"}
+        self.initialize: object = {"userAgent": "codex_cli_rs/0.160.0 (Linux synthetic; x86_64)"}
         self.account: object = {"type": "chatgpt"}
         self.models = [
             {
@@ -154,6 +155,13 @@ class ProtocolPeer:
                     result = self.initialize
                 elif method == "account/read":
                     result = {"account": self.account}
+                elif method == "config/read":
+                    result = {
+                        "config": {
+                            "model_catalog_json": f"/host/{CODEX_CONTAINMENT_CATALOG_FILENAME}"
+                        },
+                        "origins": {"model_catalog_json": {"name": {"type": "sessionFlags"}}},
+                    }
                 elif method == "model/list":
                     result = {"data": self.models, "nextCursor": None}
                 elif method == "thread/list":

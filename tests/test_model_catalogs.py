@@ -210,34 +210,33 @@ async def test_codex_upgrade_diagnostics_are_typed_and_never_guess() -> None:
 def test_api_catalog_is_exact_immutable_and_the_registry_has_no_public_rows() -> None:
     first = api_model_catalog()
     second = api_model_catalog()
-
     assert first == second
-    assert first.backend_contract_revision == "provider-runtime.api-model-catalog.v1"
+    assert first.backend_contract_revision == "provider-runtime.api-model-catalog.v3"
     assert first.registry_revision == registry.REGISTRY_REVISION
     assert len(first.definition_revision) == 64
     assert tuple(row.model_ref for row in first.models) == (
-        "openai:gpt-5.6-sol",
-        "openai:gpt-5.6-terra",
-        "openai:gpt-5.6-luna",
+        "openai:gpt-6-astra",
+        "openai:gpt-6-sol",
+        "openai:gpt-6-luna",
+        "anthropic:claude-fable-5-1",
+        "anthropic:claude-opus-5-5",
         "anthropic:claude-sonnet-5",
-        "anthropic:claude-fable-5",
-        "gemini:gemini-3.5-flash",
-        "moonshot:kimi-k3",
-        "openrouter:kimi-k3",
-        "deepseek:deepseek-v4-pro",
-        "deepseek:deepseek-v4-flash",
-        "xai:grok-4.5",
+        "gemini:gemini-3.8-flash",
+        "deepseek:deepseek-flash",
+        "xai:grok-4.7",
     )
     assert len({row.row_fingerprint for row in first.models}) == len(first.models)
     assert all(len(row.row_fingerprint) == 64 for row in first.models)
+    assert all(row.label and all(item.label for item in row.reasoning) for row in first.models)
     defaults = {row.model_ref: row.source_default_reasoning for row in first.models}
-    assert defaults["openrouter:kimi-k3"] == Absent()
-    assert defaults["moonshot:kimi-k3"] == Present("max")
+    assert defaults["openai:gpt-6-astra"] == Absent()
+    assert defaults["openai:gpt-6-sol"] == Present("standard/medium")
+    assert defaults["anthropic:claude-opus-5-5"] == Present("adaptive/medium")
     for row in first.models:
         assert row.reasoning
         if isinstance(row.source_default_reasoning, Present):
             assert row.source_default_reasoning.value in tuple(fact.key for fact in row.reasoning)
 
-    assert registry.__all__ == ["api_model_catalog"]
+    assert registry.__all__ == ["GPT6_MODEL_IDS", "api_model_catalog"]
     for deleted in ("ROWS", "ModelRow", "OpenRouterRouting", "resolve", "resolve_target"):
         assert not hasattr(registry, deleted), f"private registry owner leaked as {deleted}"

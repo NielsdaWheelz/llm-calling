@@ -3,18 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import os
 import shutil
 import stat
 import weakref
 from collections.abc import AsyncGenerator, Awaitable, Callable, Collection, Iterable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, assert_never, runtime_checkable
+from uuid import uuid4
 
-from provider_runtime.types import Absent, CancelSignal, Presence, Present, TokenUsage
+from provider_runtime.types import (
+    Absent,
+    CancelSignal,
+    Presence,
+    Present,
+    TokenUsage,
+    canonical_json_bytes,
+)
 
 from .auth import (
     AuthEnvironmentRequest,
@@ -26,6 +35,7 @@ from .auth import (
     resolve_state_root,
 )
 from .codex_control import CodexControl, CodexThreadTarget
+from .codex_sdk import CodexSdkAdapter
 from .errors import (
     CredentialUnavailable,
     InvalidAgentRequest,
@@ -57,6 +67,15 @@ from .sessions import (
     validate_read_session_auth,
     validate_session_ref,
 )
+from .turn import (
+    AgentAccepted,
+    AgentAttempt,
+    AgentTurn,
+    AgentTurnControls,
+    AgentUncertain,
+    LocalStopEvidence,
+    NativeTerminalEvidence,
+)
 from .types import (
     AGENT_ROUTES,
     AgentSessionRef,
@@ -77,6 +96,7 @@ from .types import (
     TextContent,
     TurnRequest,
     _ResolvedCodexSessionRequest,
+    freeze_json_object,
     validate_mcp_network_policy,
 )
 
@@ -226,6 +246,8 @@ class _SessionBinding:
     invalidated: bool = False
     interrupt_requested: bool = False
     close_task: asyncio.Task[tuple[BaseException, ...]] | None = field(default=None, repr=False)
+    prepared_turn: AgentTurn | None = field(default=None, repr=False)
+    observed_attempt: AgentAttempt | None = None
 
 
 class AgentRuntime:
@@ -448,6 +470,7 @@ class AgentRuntime:
             mcp_servers=request.mcp_servers,
             output=request.output,
             native=request.native,
+            tools=request.tools,
             dispatch_model=row.dispatch_model,
             native_reasoning=reasoning[0].native_wire_value,
         )
@@ -469,6 +492,117 @@ class AgentRuntime:
                 code="missing_terminal_projection",
             )
         return terminal
+
+    def prepare_turn(
+        self,
+        session: AgentSession,
+        request: TurnRequest,
+        *,
+        attempt_id: str,
+        input_id: str,
+        controls: AgentTurnControls,
+    ) -> AgentTurn:
+        """Finalize one exclusive native request without inference or transport work."""
+        return self._prepare_turn(
+            session,
+            request,
+            attempt_id=attempt_id,
+            input_id=input_id,
+            controls=controls,
+            controlled=True,
+        )
+
+    def prepare_observed_turn(
+        self,
+        session: AgentSession,
+        request: TurnRequest,
+        *,
+        attempt_id: str,
+        input_id: str,
+        controls: AgentTurnControls,
+    ) -> AgentTurn:
+        """Prepare bounded observation without declared callbacks or inference."""
+        return self._prepare_turn(
+            session,
+            request,
+            attempt_id=attempt_id,
+            input_id=input_id,
+            controls=controls,
+            controlled=False,
+        )
+
+    def _prepare_turn(
+        self,
+        session: AgentSession,
+        request: TurnRequest,
+        *,
+        attempt_id: str,
+        input_id: str,
+        controls: AgentTurnControls,
+        controlled: bool,
+    ) -> AgentTurn:
+        self._require_open()
+        if not isinstance(request, TurnRequest) or not isinstance(controls, AgentTurnControls):
+            raise InvalidAgentRequest("prepare_turn requires TurnRequest and AgentTurnControls")
+        if not controlled:
+            timeout_seconds = self._config.max_turn_seconds
+            if request.timeout_seconds is not None:
+                timeout_seconds = min(timeout_seconds, request.timeout_seconds)
+            request = replace(request, timeout_seconds=timeout_seconds)
+        binding = self._sessions.get(session)
+        if binding is None:
+            raise SessionMismatch("AgentSession does not belong to this AgentRuntime")
+        adapter = binding.adapter
+        if binding.invalidated:
+            raise SessionUnavailable("AgentSession is no longer usable")
+        if not isinstance(adapter, CodexSdkAdapter):
+            raise UnsupportedCapability("controlled prepared turns currently support Codex only")
+        if (
+            not controlled
+            and isinstance(binding.request, CodexCatalogSessionRequest)
+            and binding.request.tools
+        ):
+            raise UnsupportedCapability("declared callbacks require native prepare_turn")
+        policy = (
+            binding.request.policy
+            if request.policy is None
+            else narrow_policy(binding.request.policy, request.policy)
+        )
+        self._validate_content_files(request.input, binding.request, policy)
+        session.begin_turn()
+        binding.turn_active = True
+
+        def release() -> None:
+            if binding.turn_active:
+                binding.turn_active = False
+                session.end_turn()
+
+        try:
+            turn = adapter.prepare_turn(
+                session,
+                request,
+                attempt_id=attempt_id,
+                input_id=input_id,
+                controls=controls,
+                release=release,
+                validate_input=lambda content: self._validate_content_files(
+                    content, binding.request, policy
+                ),
+                controlled=controlled,
+            )
+        except BaseException:
+            release()
+            raise
+        binding.prepared_turn = turn
+        return turn
+
+    def session_usable(self, session: AgentSession) -> bool:
+        binding = self._sessions.get(session)
+        if self._closed or binding is None or binding.invalidated or binding.turn_active:
+            return False
+        return not isinstance(binding.adapter, CodexSdkAdapter) or binding.adapter.session_usable(
+            session
+        )
 
     async def close_session(self, session: AgentSession) -> None:
         """Release one owned native session without affecting sibling sessions.
@@ -520,6 +654,11 @@ class AgentRuntime:
         self, session: AgentSession, binding: _SessionBinding
     ) -> tuple[BaseException, ...]:
         cleanup_errors: list[BaseException] = []
+        if binding.prepared_turn is not None:
+            try:
+                await binding.prepared_turn.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
         if binding.turn_active:
             result = await self._bounded_cleanup_call(
                 self._interrupt_once(binding, session),
@@ -594,6 +733,19 @@ class AgentRuntime:
             binding.interrupt_requested = False
             binding.turn_error = None
             binding.forced_terminal = None
+            binding.observed_attempt = AgentAttempt(
+                str(uuid4()),
+                hashlib.sha256(
+                    canonical_json_bytes(
+                        freeze_json_object(
+                            {
+                                "input": [asdict(part) for part in request.input],
+                                "timeout_seconds": request.timeout_seconds,
+                            }
+                        )
+                    )
+                ).hexdigest(),
+            )
             queue: asyncio.Queue[AgentEvent] = asyncio.Queue(maxsize=256)
             terminal_received = asyncio.Event()
             binding.consumer_terminal_received = terminal_received
@@ -641,15 +793,12 @@ class AgentRuntime:
             except TimeoutError:
                 binding.invalidated = True
                 try:
-                    await binding.adapter.close()
+                    await binding.adapter.close_session(session)
                 except BaseException:
                     binding.turn_error = ProtocolDefect(
                         "agent adapter hard-close failed",
                         code="agent_turn_cleanup_failed",
                     )
-                for candidate in self._sessions.values():
-                    if candidate.adapter is binding.adapter:
-                        candidate.invalidated = True
                 driver.cancel()
                 try:
                     async with asyncio.timeout(_TURN_CLEANUP_TIMEOUT_SECONDS):
@@ -721,6 +870,7 @@ class AgentRuntime:
                     binding.turn_error = TurnNotStarted("cancelled")
                 elif not terminal_enqueued:
                     binding.forced_terminal = self._synthetic_terminal(
+                        binding,
                         session,
                         "cancelled",
                         final_text="".join(text_parts),
@@ -746,12 +896,9 @@ class AgentRuntime:
             if cleanup_errors or hard_teardown:
                 binding.invalidated = True
                 try:
-                    await binding.adapter.close()
+                    await binding.adapter.close_session(session)
                 except BaseException as error:
                     cleanup_errors.append(error)
-                for candidate in self._sessions.values():
-                    if candidate.adapter is binding.adapter:
-                        candidate.invalidated = True
                 if cleanup_errors:
                     binding.turn_error = ProtocolDefect(
                         "agent turn cleanup failed",
@@ -826,6 +973,18 @@ class AgentRuntime:
             binding.invalidated = True
             if binding.consumer_terminal_received is not None:
                 binding.consumer_terminal_received.set()
+        cleanup_errors: list[BaseException] = []
+        prepared_results = await asyncio.gather(
+            *(
+                binding.prepared_turn.close()
+                for binding in self._sessions.values()
+                if binding.prepared_turn is not None
+            ),
+            return_exceptions=True,
+        )
+        cleanup_errors.extend(
+            result for result in prepared_results if isinstance(result, BaseException)
+        )
         active = [
             self._bounded_cleanup_call(
                 self._interrupt_once(binding, session),
@@ -835,7 +994,6 @@ class AgentRuntime:
             for session, binding in self._sessions.items()
             if binding.turn_active
         ]
-        cleanup_errors: list[BaseException] = []
         if active:
             interrupt_results = await asyncio.gather(*active, return_exceptions=True)
             cleanup_errors.extend(
@@ -1136,7 +1294,17 @@ class AgentRuntime:
                 done, _ = await asyncio.wait(
                     {next_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
                 )
-                if stop_task not in done and next_task in done:
+                available_event = (
+                    next_task.result()
+                    if next_task in done
+                    and not next_task.cancelled()
+                    and next_task.exception() is None
+                    else None
+                )
+                native_completed = isinstance(available_event, AgentTerminal) and isinstance(
+                    available_event.evidence, NativeTerminalEvidence
+                )
+                if next_task in done and (stop_task not in done or native_completed):
                     try:
                         event = next_task.result()
                     except StopAsyncIteration:
@@ -1164,6 +1332,7 @@ class AgentRuntime:
                 if isinstance(binding.adapter, _InterruptedFinalTextAdapter):
                     final_text = binding.adapter._interrupted_final_text(session)
                 yield self._synthetic_terminal(
+                    binding,
                     session,
                     cause,
                     final_text=final_text,
@@ -1227,14 +1396,33 @@ class AgentRuntime:
             binding.interrupt_requested = False
             raise
 
-    @staticmethod
     def _synthetic_terminal(
+        self,
+        binding: _SessionBinding,
         session: AgentSession,
         cause: StopCause,
         *,
         final_text: str,
         usage: Presence[TokenUsage],
     ) -> AgentTerminal:
+        submission = (
+            binding.adapter.turn_submission(session)
+            if isinstance(binding.adapter, CodexSdkAdapter)
+            else None
+        )
+        if submission is None:
+            if binding.observed_attempt is None:
+                raise ProtocolDefect("local stop omitted its observed operation identity")
+            submission = AgentUncertain(
+                binding.observed_attempt,
+                None,
+                "provider entry has no authoritative submission evidence",
+            )
+        if not isinstance(submission, AgentAccepted | AgentUncertain):
+            raise ProtocolDefect("a non-submitted operation cannot produce a local-stop terminal")
+        evidence = LocalStopEvidence(
+            submission, "turn_timeout" if cause == "timed_out" else "cancelled"
+        )
         match cause:
             case "cancelled":
                 return AgentTerminal(
@@ -1242,6 +1430,7 @@ class AgentRuntime:
                     failure=None,
                     final_text=final_text,
                     session_ref=session.ref,
+                    evidence=evidence,
                     usage=usage,
                 )
             case "timed_out":
@@ -1250,6 +1439,7 @@ class AgentRuntime:
                     failure=AgentFailure("turn_timeout"),
                     final_text=final_text,
                     session_ref=session.ref,
+                    evidence=evidence,
                     usage=usage,
                 )
             case _:

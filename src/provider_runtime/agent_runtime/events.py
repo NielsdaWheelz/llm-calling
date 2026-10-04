@@ -19,6 +19,14 @@ from .errors import (
     MissingTerminalEvent,
     ProtocolDefect,
 )
+from .turn import (
+    AgentInputRecorded,
+    AgentMessage,
+    AgentToolCall,
+    LocalStopEvidence,
+    NativeTerminalEvidence,
+    RawAgentOutput,
+)
 from .types import (
     AgentSessionRef,
     ApprovalDecision,
@@ -203,7 +211,8 @@ class AgentTerminal:
     failure: AgentTerminalFailure | None
     final_text: str
     session_ref: AgentSessionRef
-    structured_output: JsonValue | None = None
+    evidence: NativeTerminalEvidence | LocalStopEvidence
+    raw_structured_output: RawAgentOutput | None = None
     usage: Presence[TokenUsage] = Absent()
     diagnostics: tuple[str, ...] = ()
 
@@ -219,8 +228,18 @@ class AgentTerminal:
             raise ProtocolDefect("AgentTerminal.final_text must be a string")
         if not isinstance(self.session_ref, AgentSessionRef):
             raise ProtocolDefect("AgentTerminal.session_ref must be AgentSessionRef")
-        if self.structured_output is not None:
-            _validate_frozen_json(self.structured_output, "AgentTerminal.structured_output")
+        if not isinstance(self.evidence, NativeTerminalEvidence | LocalStopEvidence):
+            raise ProtocolDefect("AgentTerminal requires explicit native or local-stop evidence")
+        if isinstance(self.evidence, NativeTerminalEvidence):
+            if self.evidence.native_ref.session_ref != self.session_ref:
+                raise ProtocolDefect("AgentTerminal evidence changed its session identity")
+        elif self.evidence.submission.turn is not None:
+            if self.evidence.submission.turn.session_ref != self.session_ref:
+                raise ProtocolDefect("AgentTerminal local evidence changed its session identity")
+        if self.raw_structured_output is not None and not isinstance(
+            self.raw_structured_output, RawAgentOutput
+        ):
+            raise ProtocolDefect("AgentTerminal.raw_structured_output must be RawAgentOutput")
         match self.usage:
             case Present(value=usage) if not isinstance(usage, TokenUsage):
                 raise ProtocolDefect("AgentTerminal.usage must be Presence[TokenUsage]")
@@ -237,7 +256,15 @@ class AgentTerminal:
 
 
 type AgentEvent = (
-    AgentText | AgentToolUse | AgentUsage | AgentPermissionRequest | AgentNative | AgentTerminal
+    AgentText
+    | AgentToolUse
+    | AgentUsage
+    | AgentPermissionRequest
+    | AgentNative
+    | AgentTerminal
+    | AgentToolCall
+    | AgentMessage
+    | AgentInputRecorded
 )
 
 # The closed kind set, spelled once for isinstance checks and gate tests.
@@ -248,6 +275,9 @@ AGENT_EVENT_KINDS: tuple[type, ...] = (
     AgentPermissionRequest,
     AgentNative,
     AgentTerminal,
+    AgentToolCall,
+    AgentMessage,
+    AgentInputRecorded,
 )
 
 

@@ -11,6 +11,7 @@ from typing import Literal, cast
 from urllib.parse import urlsplit
 
 from provider_runtime.types import (
+    CanonicalTool,
     FrozenJsonDict,
     JsonObject,
     JsonValue,
@@ -215,6 +216,53 @@ class JsonSchemaAgentOutput:
 
 
 type AgentOutputSpec = TextAgentOutput | JsonSchemaAgentOutput
+
+
+def _validate_codex_output_schema(schema: JsonObject) -> None:
+    """Reject established native strict-output restrictions without rewriting."""
+    if schema.get("type") != "object" or "anyOf" in schema:
+        raise InvalidAgentRequest("Codex output schema root must be an object without anyOf")
+    pending = [schema]
+    while pending:
+        node = pending.pop()
+        unsupported = set(node) & {
+            "oneOf",
+            "allOf",
+            "not",
+            "dependentRequired",
+            "dependentSchemas",
+            "if",
+            "then",
+            "else",
+        }
+        if unsupported:
+            raise InvalidAgentRequest(f"Codex output schema forbids {sorted(unsupported)[0]}")
+        node_type = node.get("type")
+        if node_type == "object" or (isinstance(node_type, tuple) and "object" in node_type):
+            if node.get("additionalProperties") is not False:
+                raise InvalidAgentRequest("Codex output objects require additionalProperties=false")
+            properties = node.get("properties", FrozenJsonDict())
+            required = node.get("required", ())
+            if (
+                not isinstance(properties, FrozenJsonDict)
+                or not isinstance(required, tuple)
+                or any(type(key) is not str for key in required)
+                or len(required) != len(set(required))
+                or set(required) != set(properties)
+            ):
+                raise InvalidAgentRequest("Codex output object properties must all be required")
+        for key in ("properties", "$defs", "definitions", "patternProperties"):
+            members = node.get(key)
+            if isinstance(members, FrozenJsonDict):
+                pending.extend(
+                    value for value in members.values() if isinstance(value, FrozenJsonDict)
+                )
+        items = node.get("items")
+        if isinstance(items, FrozenJsonDict):
+            pending.append(items)
+        variants = node.get("anyOf")
+        if isinstance(variants, tuple):
+            pending.extend(value for value in variants if isinstance(value, FrozenJsonDict))
 
 
 @dataclass(frozen=True, slots=True)
@@ -481,11 +529,36 @@ class CodexCatalogSessionRequest(_SessionRequestBase):
     agent_definition_revision: str
     row_fingerprint: str
     native: CodexNativeOptions | None = None
+    tools: tuple[CanonicalTool, ...] = ()
     backend: Literal["codex"] = field(default="codex", init=False)
     transport: Literal["sdk"] = field(default="sdk", init=False)
 
     def __post_init__(self) -> None:
         self._validate_common("CodexCatalogSessionRequest")
+        if isinstance(self.output, JsonSchemaAgentOutput):
+            _validate_codex_output_schema(cast(JsonObject, self.output.schema))
+        require_tuple(self.tools, "CodexCatalogSessionRequest.tools")
+        if any(not isinstance(tool, CanonicalTool) for tool in self.tools):
+            raise InvalidAgentRequest("CodexCatalogSessionRequest.tools must contain CanonicalTool")
+        if len({tool.name for tool in self.tools}) != len(self.tools):
+            raise InvalidAgentRequest("CodexCatalogSessionRequest.tools has duplicate names")
+        owned_tools: list[CanonicalTool] = []
+        for tool in self.tools:
+            if (
+                type(tool.name) is not str
+                or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", tool.name) is None
+            ):
+                raise InvalidAgentRequest("Codex native tool name violates the common grammar")
+            if type(tool.description) is not str:
+                raise InvalidAgentRequest("Codex native tool description must be text")
+            owned_tools.append(
+                CanonicalTool(
+                    tool.name,
+                    tool.description,
+                    freeze_json_object(tool.parameters, context=f"tool {tool.name} schema"),
+                )
+            )
+        object.__setattr__(self, "tools", tuple(owned_tools))
         _require_non_empty(self.model_key, "CodexCatalogSessionRequest.model_key")
         _require_non_empty(self.reasoning, "CodexCatalogSessionRequest.reasoning")
         _require_non_empty(
