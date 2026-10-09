@@ -150,6 +150,9 @@ class CodexOutputLimit(ProtocolDefect):
         super().__init__("Codex app-server output exceeded its ingress bound")
 
 
+_MAX_REQUEST_ID = 2**63 - 1
+
+
 class CodexAppServerClient:
     """One direct connection; disconnecting never terminates its external server."""
 
@@ -239,6 +242,8 @@ class CodexAppServerClient:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[object] = loop.create_future()
         request_id = self._next_request_id
+        if request_id > _MAX_REQUEST_ID:
+            raise ProtocolDefect("Codex app-server request id exceeded its native bound")
         self._next_request_id += 1
         self._pending[request_id] = (method, future)
         try:
@@ -599,6 +604,21 @@ class CodexAppServerClient:
     def usable(self) -> bool:
         return self._connection is not None and not self._closed and self._failure is None
 
+    @staticmethod
+    def _encode(message: Mapping[str, object]) -> bytes:
+        try:
+            return json.dumps(
+                dict(message), separators=(",", ":"), ensure_ascii=False, allow_nan=False
+            ).encode("utf-8")
+        except (TypeError, ValueError, RecursionError):
+            raise ProtocolDefect("Codex app-server outbound message was not JSON") from None
+
+    @classmethod
+    def _request_fits(cls, submitted: Mapping[str, object]) -> bool:
+        # A fresh client does not yet have its RPC count. The largest native id
+        # gives an exact legal-envelope upper bound, including transport encoding.
+        return len(cls._encode({"id": _MAX_REQUEST_ID, **submitted})) <= _MAX_MESSAGE_BYTES
+
     async def _write(
         self, message: Mapping[str, object], *, on_write: Callable[[], None] | None = None
     ) -> None:
@@ -607,12 +627,7 @@ class CodexAppServerClient:
         connection = self._connection
         if connection is None:
             raise ProtocolDefect("Codex app-server connection is not live")
-        try:
-            encoded = json.dumps(
-                dict(message), separators=(",", ":"), ensure_ascii=False, allow_nan=False
-            ).encode("utf-8")
-        except (TypeError, ValueError, RecursionError):
-            raise ProtocolDefect("Codex app-server outbound message was not JSON") from None
+        encoded = self._encode(message)
         if len(encoded) > _MAX_MESSAGE_BYTES:
             raise ProtocolDefect("Codex app-server outbound message exceeded its byte bound")
         async with self._write_lock:
