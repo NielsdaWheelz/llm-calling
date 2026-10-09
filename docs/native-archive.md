@@ -71,8 +71,9 @@ temporary qualification on 2026-10-09:
   missing-thread response was distinct from successful reads of existing archived
   and restarted/unloaded threads.
 - installed claude 2.1.289: actual persisted error/fork transcripts and recognized
-  supplied context mapped successfully. successful inference remains unqualified:
-  the test account's oauth was expired (401).
+  supplied context mapped successfully. successful live claude-work inference
+  was waived by the owner for this run after expired oauth (401); no reauth or
+  production qualification is implied.
 - temporary public transcript integration verified reference-only bodies,
   malformed memory-save suppression, reasoning exclusion, additive metadata,
   consumed-field rejection, branch revisions, empty/internal inventories and
