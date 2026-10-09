@@ -609,6 +609,11 @@ class CodexSdkAdapter:
         state_root = self._endpoint(environment)
         native = request.native
         contained = isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled"
+        internal = isinstance(native, CodexNativeOptions) and native.archive_internal
+        if internal and not isinstance(request.open, NewSession):
+            raise UnsupportedCapability(
+                "internal Codex cognition requires a fresh ephemeral session"
+            )
         if contained:
             self._validate_strict_native_containment(request)
         if request.tools and not contained:
@@ -636,6 +641,11 @@ class CodexSdkAdapter:
                 "sandbox": self._sandbox(request.policy),
             }
             kwargs["model"] = request.dispatch_model
+            if internal:
+                from .archive import INTERNAL_THREAD_SOURCE
+
+                kwargs["thread_source"] = INTERNAL_THREAD_SOURCE
+                kwargs["ephemeral"] = True
             if isinstance(request.open, NewSession) and contained:
                 kwargs["environments"] = []
                 kwargs["experimentalRawEvents"] = True

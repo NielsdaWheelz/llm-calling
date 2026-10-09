@@ -334,6 +334,14 @@ class CodexAppServerClient:
             await self.request("thread/start", self._thread_params(kwargs)),
             "thread/start response",
         )
+        thread = self._mapping(response.get("thread"), "thread/start thread")
+        if kwargs.get("ephemeral") is True and thread.get("ephemeral") is not True:
+            raise ProtocolDefect("Codex did not accept required nonpersistent session semantics")
+        if (
+            kwargs.get("thread_source") is not None
+            and thread.get("threadSource") != kwargs["thread_source"]
+        ):
+            raise ProtocolDefect("Codex did not accept required internal session marking")
         return self._select_thread(self._response_thread_id(response, "thread/start"))
 
     async def thread_resume(self, thread_id: str, **kwargs: object) -> CodexThread:
@@ -709,6 +717,7 @@ class CodexAppServerClient:
         names = {
             "base_instructions": "baseInstructions",
             "developer_instructions": "developerInstructions",
+            "thread_source": "threadSource",
             "output_schema": "outputSchema",
         }
         return {names.get(key, key): value for key, value in params.items()}
