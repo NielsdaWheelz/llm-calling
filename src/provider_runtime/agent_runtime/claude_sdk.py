@@ -403,6 +403,22 @@ class ClaudeSdkAdapter:
         elif not isinstance(request.open, NewSession):
             raise InvalidAgentRequest("unknown Claude SDK session operation")
 
+        internal_session_id: str | None = None
+        if isinstance(request.native, ClaudeNativeOptions) and request.native.archive_internal:
+            if not isinstance(request.open, NewSession):
+                raise UnsupportedCapability(
+                    "internal Claude cognition requires a fresh marked session"
+                )
+            from uuid import uuid4
+
+            from .archive import mark_internal_session
+
+            internal_session_id = str(uuid4())
+            mark_internal_session(state_root, internal_session_id)
+            ref = self._make_ref(
+                internal_session_id, request.auth.profile_key, state_root, request.cwd
+            )
+
         executable = self._require_executable()
         # There is no capability table. The version gates are one warning each plus the
         # behavioral `system/init` verification below, and the only hard host requirement —
@@ -458,6 +474,7 @@ class ClaudeSdkAdapter:
             strict_mcp_config=True,
             permission_mode=_SDK_PERMISSION_MODE,
             resume=resume,
+            session_id=internal_session_id,
             model=request.model,
             output_format=output_format,
             cwd=request.cwd,

@@ -443,8 +443,11 @@ def validate_mcp_network_policy(
 class CodexNativeOptions:
     web_search: bool | None = None
     builtin_tools: Literal["disabled"] | None = None
+    archive_internal: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.archive_internal) is not bool:
+            raise InvalidAgentRequest("CodexNativeOptions.archive_internal must be bool")
         if self.web_search is not None and type(self.web_search) is not bool:
             raise InvalidAgentRequest("CodexNativeOptions.web_search must be bool when present")
         if self.builtin_tools not in (None, "disabled"):
@@ -474,8 +477,11 @@ class CodexSandboxControls:
 @dataclass(frozen=True, slots=True)
 class ClaudeNativeOptions:
     include_partial_messages: bool | None = None
+    archive_internal: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.archive_internal) is not bool:
+            raise InvalidAgentRequest("ClaudeNativeOptions.archive_internal must be bool")
         if (
             self.include_partial_messages is not None
             and type(self.include_partial_messages) is not bool

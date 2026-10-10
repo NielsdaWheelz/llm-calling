@@ -97,6 +97,7 @@ from .turn import (
     NativeTerminalEvidence,
 )
 from .types import (
+    AgentOutputSpec,
     AgentSessionRef,
     AgentSessionRequest,
     ApprovalHandler,
@@ -122,6 +123,28 @@ from .types import (
 )
 
 _REQUIRED_MCP_STARTUP_FAILURE = "required MCP servers failed to initialize"
+
+
+def codex_native_request_fits(
+    text: str, *, output: AgentOutputSpec, reasoning: str, input_id: str
+) -> bool:
+    """Check a contained text request before opening a stock 0.160.0 thread.
+
+    Native threads use canonical UUID strings; the host supplies its input id. This is
+    a transport byte check using the largest legal RPC-id envelope, not a token
+    estimate or inference admission.
+    """
+    submitted = CodexSdkAdapter._turn_request(
+        thread_id="00000000-0000-0000-0000-000000000000",
+        input=(TextContent(text),),
+        approval_mode="deny_all",
+        reasoning=reasoning,
+        input_id=input_id,
+        output=output,
+        contained=True,
+    )
+    return CodexAppServerClient._request_fits(cast(dict[str, object], thaw_json_value(submitted)))
+
 
 # The configurable execution, integration, and local-context features in the
 # Codex runtime. Keep this as one closed vendor mapping behind
@@ -609,6 +632,11 @@ class CodexSdkAdapter:
         state_root = self._endpoint(environment)
         native = request.native
         contained = isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled"
+        internal = isinstance(native, CodexNativeOptions) and native.archive_internal
+        if internal and not isinstance(request.open, NewSession):
+            raise UnsupportedCapability(
+                "internal Codex cognition requires a fresh ephemeral session"
+            )
         if contained:
             self._validate_strict_native_containment(request)
         if request.tools and not contained:
@@ -636,6 +664,11 @@ class CodexSdkAdapter:
                 "sandbox": self._sandbox(request.policy),
             }
             kwargs["model"] = request.dispatch_model
+            if internal:
+                from .archive import INTERNAL_THREAD_SOURCE
+
+                kwargs["thread_source"] = INTERNAL_THREAD_SOURCE
+                kwargs["ephemeral"] = True
             if isinstance(request.open, NewSession) and contained:
                 kwargs["environments"] = []
                 kwargs["experimentalRawEvents"] = True
@@ -740,20 +773,18 @@ class CodexSdkAdapter:
         if type(input_id) is not str or not input_id:
             raise InvalidAgentRequest("prepared input_id must be non-empty")
         self._restored_usage_baseline(state.client, state.ref.native_session_id, state.request)
-        params: dict[str, object] = {
-            "threadId": state.ref.native_session_id,
-            "input": [self._codex_input(part) for part in request.input],
-            "approval_mode": self._approval_mode(state.request.policy),
-            "effort": state.request.native_reasoning,
-            "clientUserMessageId": input_id,
-        }
-        if self._strict_native_containment(state):
-            params["environments"] = []
-        if isinstance(state.request.output, JsonSchemaAgentOutput):
-            params["output_schema"] = thaw_json_value(state.request.output.schema)
-        params = CodexAppServerClient._thread_params(params)
-        submitted = freeze_json_object({"method": "turn/start", "params": params})
-        if len(canonical_json_bytes(submitted)) > _MAX_MESSAGE_BYTES:
+        submitted = self._turn_request(
+            thread_id=state.ref.native_session_id,
+            input=request.input,
+            approval_mode=self._approval_mode(state.request.policy),
+            reasoning=state.request.native_reasoning,
+            input_id=input_id,
+            output=state.request.output,
+            contained=self._strict_native_containment(state),
+        )
+        if not CodexAppServerClient._request_fits(
+            cast(dict[str, object], thaw_json_value(submitted))
+        ):
             raise InvalidAgentRequest("prepared Codex request exceeds its transport byte bound")
         attempt = AgentAttempt(
             attempt_id, hashlib.sha256(canonical_json_bytes(submitted)).hexdigest()
@@ -2089,6 +2120,32 @@ class CodexSdkAdapter:
         if any(not isinstance(part, TextContent) for part in parts):
             raise UnsupportedCapability(f"{context} supports text only")
         return "\n\n".join(part.text for part in parts if isinstance(part, TextContent))
+
+    @staticmethod
+    def _turn_request(
+        *,
+        thread_id: str,
+        input: tuple[ContentPart, ...],
+        approval_mode: str,
+        reasoning: str | None,
+        input_id: str,
+        output: AgentOutputSpec,
+        contained: bool,
+    ) -> JsonObject:
+        params: dict[str, object] = {
+            "threadId": thread_id,
+            "input": [CodexSdkAdapter._codex_input(part) for part in input],
+            "approval_mode": approval_mode,
+            "effort": reasoning,
+            "clientUserMessageId": input_id,
+        }
+        if contained:
+            params["environments"] = []
+        if isinstance(output, JsonSchemaAgentOutput):
+            params["output_schema"] = thaw_json_value(output.schema)
+        return freeze_json_object(
+            {"method": "turn/start", "params": CodexAppServerClient._thread_params(params)}
+        )
 
     @staticmethod
     def _codex_input(part: object) -> object:

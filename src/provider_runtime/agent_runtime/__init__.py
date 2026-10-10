@@ -43,6 +43,7 @@ from .codex_control import (
     CodexTurnTarget,
     CodexUnknown,
 )
+from .codex_sdk import codex_native_request_fits
 from .errors import (
     AgentRuntimeDefect,
     AgentRuntimeError,
@@ -337,6 +338,7 @@ __all__ = [
     "UpgradeTargetUnresolved",
     "attempt_from_json",
     "attempt_to_json",
+    "codex_native_request_fits",
     "decode_agent_output",
     "freeze_json_object",
     "freeze_json_value",

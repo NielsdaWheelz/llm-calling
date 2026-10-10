@@ -59,6 +59,17 @@ and any explicit request timeout; that config does not limit native preparation.
 contracts use the same provider engine; the selection is explicit, never inferred
 from output schemas or an empty tool plan.
 
+`codex_native_request_fits(text, *, output, reasoning, input_id)` checks the exact contained
+text-turn serialization before opening a stock `0.160.0` thread. it uses the same
+serializer and byte bound as `prepare_turn`, including json escaping and output
+schema. native threads use canonical uuid strings; the host supplies its input id. this
+is a pure transport fit check, not token estimation or inference admission. the
+transport's own json encoder measures the complete envelope with the largest legal
+positive rpc id, so a fitting request fits every counter value before a connection
+is opened. stock's
+[`RequestId::Integer(i64)`](https://github.com/openai/codex/blob/a956835d020762cb2b570053af06f643a11c0ecc/codex-rs/app-server-protocol/src/rpc.rs)
+owns that bound; the client enforces it on its actual counter.
+
 ## terminal and recovery
 
 `AgentTerminal.evidence` is required. `NativeTerminalEvidence` binds the
