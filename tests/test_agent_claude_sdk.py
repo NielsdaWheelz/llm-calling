@@ -703,18 +703,32 @@ def stopped(pid: int) -> bool:
     reaped by init and not by this process. `kill(pid, 0)` succeeds against a zombie, so the
     liveness answer comes from the native process state, not signal-zero alone.
     """
+    if sys.platform == "darwin":
+        observed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "stat="],
+            capture_output=True,
+            check=False,
+        )
+        return not observed.stdout.strip() or observed.stdout.lstrip().startswith(b"Z")
     try:
         line = Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
-        observed = subprocess.run(
-            ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False
-        )
-        return not observed.stdout.strip() or observed.stdout.lstrip().startswith("Z")
+    except FileNotFoundError:
+        return True
     return line.rsplit(") ", 1)[1].split(" ", 1)[0] == "Z"
 
 
 def test_importing_adapter_does_not_import_optional_sdk() -> None:
-    assert "claude_agent_sdk" not in sys.modules
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys\n"
+            "import provider_runtime.agent_runtime.claude_sdk\n"
+            "assert 'claude_agent_sdk' not in sys.modules\n",
+        ],
+        check=True,
+        capture_output=True,
+    )
 
 
 async def test_the_launcher_turns_the_sdk_child_into_a_group_this_runtime_can_reap(

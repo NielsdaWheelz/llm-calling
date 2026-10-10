@@ -186,7 +186,7 @@ class CodexAppServerClient:
             raise ProtocolDefect("Codex app-server client was started more than once")
         try:
             self._connection = await unix_connect(
-                str(self.config.socket_path),
+                str(self.config.socket_path.resolve(strict=True)),
                 uri="ws://localhost",
                 open_timeout=_OPERATION_TIMEOUT_SECONDS,
                 close_timeout=2,

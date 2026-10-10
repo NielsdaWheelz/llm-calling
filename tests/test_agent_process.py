@@ -202,12 +202,12 @@ async def test_process_rejects_invalid_environment_before_spawning(tmp_path: Pat
         )
 
 
-@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="Linux pidfd descriptor accounting")
-async def test_owned_process_pins_its_pid_and_releases_the_handle_on_teardown(
+async def test_owned_process_releases_its_handles_on_teardown(
     tmp_path: Path,
 ) -> None:
-    """The group id must stay unrecyclable for the process lifetime, and not leak afterwards."""
-    open_fds = len(os.listdir("/proc/self/fd"))
+    """Process teardown must release its pipes and any platform-owned pid handle."""
+    fd_directory = "/dev/fd" if sys.platform == "darwin" else "/proc/self/fd"
+    open_fds = len(os.listdir(fd_directory))
     for _ in range(4):
         process = await ManagedProcess.spawn(
             (sys.executable, "-c", "import time; time.sleep(10)"),
@@ -218,7 +218,7 @@ async def test_owned_process_pins_its_pid_and_releases_the_handle_on_teardown(
         await process.close()
         assert process.returncode is not None
 
-    assert len(os.listdir("/proc/self/fd")) <= open_fds + 1
+    assert len(os.listdir(fd_directory)) <= open_fds + 1
 
 
 async def test_close_after_the_child_exited_is_safe(tmp_path: Path) -> None:

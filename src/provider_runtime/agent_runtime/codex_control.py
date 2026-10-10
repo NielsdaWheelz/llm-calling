@@ -8,8 +8,9 @@ import os
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, assert_never, cast
 from uuid import UUID
 
 from .codex_app_server import (
@@ -34,6 +35,7 @@ type CodexErrorCode = Literal[
     "auth",
     "quota",
     "output_limit",
+    "history_changed",
 ]
 type CodexNativeStatus = Literal["notLoaded", "idle", "active", "systemError"]
 type CodexTurnStatus = Literal["inProgress", "completed", "interrupted", "failed"]
@@ -151,6 +153,8 @@ class CodexThreadSummary:
     name: str | None
     cwd: str
     source: str
+    can_accept_direct_input: bool | None = None
+    history_mode: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +186,29 @@ class CodexThreadRead:
     turn: CodexTurnSnapshot | None
     last_answer: str | None
     coverage: CodexComplete | CodexBounded
+    history_available: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class CodexOutput:
+    text: str
+    scope: Literal["latest", "history"]
+    truncated: bool
+    state: Literal["partial", "finalized", "unknown", "none"]
+    output_id: str | None
+    turn_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CodexConversationRead:
+    inspection: CodexThreadRead
+    output: CodexOutput
+
+
+@dataclass(frozen=True, slots=True)
+class CodexResultPage:
+    result_ids: tuple[str, ...]
+    next_cursor: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +253,11 @@ class _ItemPagingUnavailable(Exception):
     """Pinned native history cannot provide an item page for this thread."""
 
 
+class _HistoryNotMaterialized(CodexControlError):
+    def __init__(self) -> None:
+        super().__init__("unavailable", "NotSent")
+
+
 class CodexControl:
     """One native control boundary; it owns connections, never servers or workers."""
 
@@ -233,11 +265,50 @@ class CodexControl:
         self,
         endpoints: Mapping[str, Path],
         is_managed: Callable[[CodexThreadTarget], bool],
+        *,
+        native_owners: bool = False,
     ) -> None:
         self._endpoints = endpoints
         self._is_managed = is_managed
+        self._native_owners = native_owners
         self._clients: set[CodexAppServerClient] = set()
         self._closed = False
+
+    async def usage(self, profile_key: str) -> dict[str, object]:
+        """Read the default quota snapshot without loading or creating a thread."""
+        _profile(profile_key)
+        async with self._client(profile_key) as client:
+            result = _object(await self._request(client, "account/rateLimits/read", {}))
+            reported_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        snapshot = _object(result.get("rateLimits"))
+        report: dict[str, object] = {"reportedAt": reported_at}
+        for position in ("primary", "secondary"):
+            value = snapshot.get(position)
+            if value is None:
+                continue
+            window = _object(value)
+            duration = window.get("windowDurationMins")
+            if duration is not None and type(duration) is not int:
+                raise CodexControlError("unavailable", "NotSent")
+            if duration not in (300, 10080):
+                continue
+            key = "fiveHour" if duration == 300 else "sevenDay"
+            used = window.get("usedPercent")
+            if key in report or type(used) is not int or used < 0:
+                raise CodexControlError("unavailable", "NotSent")
+            normalized: dict[str, object] = {"usedPercent": used}
+            reset = window.get("resetsAt")
+            if reset is not None:
+                if type(reset) is not int:
+                    raise CodexControlError("unavailable", "NotSent")
+                try:
+                    normalized["resetsAt"] = (
+                        datetime.fromtimestamp(reset, UTC).isoformat().replace("+00:00", "Z")
+                    )
+                except (OverflowError, OSError, ValueError):
+                    raise CodexControlError("unavailable", "NotSent") from None
+            report[key] = normalized
+        return report
 
     async def list(self, request: CodexListRequest) -> CodexThreadPage:
         async with self._client(request.profile_key) as client:
@@ -269,40 +340,424 @@ class CodexControl:
         async with self._client(target.profile_key) as client:
             return await self._read(client, target, include_items=True)
 
-    async def create(self, request: CodexCreateRequest) -> CodexThreadTarget:
-        # The external server may have a different filesystem view or UID.
-        # CodexCreateRequest validates syntax; the server owns existence checks.
-        async with self._client(request.profile_key) as client:
+    async def inspect(
+        self, targets: tuple[CodexThreadTarget, ...]
+    ) -> tuple[CodexThreadRead | CodexControlError, ...]:
+        """Read one profile's requested states without loading conversation items."""
+        if not targets or any(target.profile_key != targets[0].profile_key for target in targets):
+            raise InvalidAgentRequest("Codex inspection requires targets from one profile")
+        observed: list[CodexThreadRead | CodexControlError] = []
+        async with self._client(
+            targets[0].profile_key, experimental_api=self._native_owners
+        ) as client:
+            for target in targets:
+                try:
+                    observed.append(await self._read(client, target, include_items=False))
+                except CodexControlError as error:
+                    observed.append(error)
+        return tuple(observed)
+
+    async def read_conversation(
+        self, target: CodexThreadTarget, scope: Literal["latest", "history"], max_bytes: int
+    ) -> CodexConversationRead:
+        async with self._client(target.profile_key, experimental_api=True) as client:
+            read = await self._read(client, target, include_items=False)
+            if not read.history_available:
+                raise CodexControlError("unavailable", "NotSent")
+            output = await self._history(client, target, scope, max_bytes, read.thread.history_mode)
+            return CodexConversationRead(read, output)
+
+    async def send_conversation(
+        self,
+        target: CodexThreadTarget,
+        text: str,
+        input_kind: Literal["peer", "user"],
+        delivery: Literal["direct", "queue"],
+    ) -> dict[str, str]:
+        _text(text)
+        if delivery == "queue":
+            raise CodexControlError("unavailable", "NotSent")
+        self._guard(target)
+        async with self._client(target.profile_key, experimental_api=True) as client:
+            observed = await self._read(client, target, include_items=False)
+            if (
+                observed.thread.status not in ("active", "idle")
+                or observed.thread.can_accept_direct_input is not True
+            ):
+                raise CodexControlError("unavailable", "NotSent")
+            params: dict[str, object] = {
+                "threadId": target.thread_handle,
+                "input": [{"type": "text", "text": text}] if input_kind == "user" else [],
+            }
+            if input_kind == "peer":
+                params["toolOutput"] = {
+                    "name": "send_message",
+                    "namespace": "skid",
+                    "output": text,
+                }
             result = _object(
                 await self._request(
-                    client,
-                    "thread/start",
-                    {
-                        "cwd": str(request.cwd),
-                        "sandbox": "workspace-write",
-                        "approvalPolicy": "on-request",
-                        "approvalsReviewer": "user",
-                        "config": {"sandbox_workspace_write": {"network_access": False}},
-                    },
-                    mutation=True,
+                    client, "turn/start", params, mutation=True, known_thread=target
                 )
             )
-            summary = _summary(request.profile_key, _object(result.get("thread")))
-            target = summary.target
-            result = _object(
+            try:
+                turn = _turn_target(target, _object(result.get("turn")).get("id"))
+            except ProtocolDefect:
+                raise CodexControlError("unavailable", "Unknown", target) from None
+        return {
+            "method": "native",
+            "input": input_kind,
+            "delivery": delivery,
+            "outcome": "accepted",
+            "turnId": turn.turn_handle,
+        }
+
+    async def interrupt_conversation(
+        self, target: CodexThreadTarget, turn_handle: str | None
+    ) -> dict[str, str]:
+        self._guard(target)
+        async with self._client(target.profile_key, experimental_api=True) as client:
+            observed = await self._read(client, target, include_items=False)
+            if observed.thread.status == "idle":
+                return {"method": "native", "outcome": "finished"}
+            if (
+                observed.thread.status != "active"
+                or observed.turn is None
+                or observed.turn.status != "inProgress"
+            ):
+                raise CodexControlError("unavailable", "NotSent")
+            if observed.turn.target.turn_handle != turn_handle:
+                raise CodexControlError("stale", "NotSent")
+            turn = observed.turn.target
+            try:
                 await self._request(
                     client,
-                    "thread/unsubscribe",
-                    {
-                        "threadId": target.thread_handle,
-                    },
+                    "turn/interrupt",
+                    {"threadId": target.thread_handle, "turnId": turn.turn_handle},
                     mutation=True,
                     known_thread=target,
                 )
+            except CodexControlError as error:
+                if error.dispatch != "Unknown":
+                    raise
+                return {"method": "native", "outcome": "unknown"}
+            try:
+                after = await self._read(client, target, include_items=False)
+            except CodexControlError:
+                return {"method": "native", "outcome": "unknown", "turnId": turn.turn_handle}
+            settled = _interrupt_outcome(turn, after)
+            outcome = (
+                "interrupted"
+                if isinstance(settled, CodexInterrupted)
+                else "finished"
+                if isinstance(settled, CodexFinished)
+                else "unknown"
             )
-            if result.get("status") not in ("notLoaded", "notSubscribed", "unsubscribed"):
-                raise ProtocolDefect("Codex unsubscribe returned an unknown status")
-            return target
+            return {"method": "native", "outcome": outcome, "turnId": turn.turn_handle}
+
+    async def results(self, target: CodexThreadTarget, cursor: str | None) -> CodexResultPage:
+        try:
+            async with self._client(target.profile_key, experimental_api=True) as client:
+                metadata = _object(
+                    await self._request(
+                        client,
+                        "thread/read",
+                        {"threadId": target.thread_handle, "includeTurns": False},
+                    )
+                )
+                summary = _summary(target.profile_key, _object(metadata.get("thread")))
+                if summary.target != target:
+                    raise ProtocolDefect("Codex read changed the requested thread identity")
+                result = await self._turn_page(
+                    client, target, cursor, "asc", 128, "full", summary.history_mode
+                )
+        except CodexControlError as error:
+            if error.code == "missing":
+                raise CodexControlError(
+                    "history_changed" if cursor else "unavailable", "NotSent"
+                ) from None
+            raise
+        if cursor is not None and not result["data"]:
+            raise CodexControlError("history_changed", "NotSent")
+        ids: list[str] = []
+        for value in cast(list[object], result["data"]):
+            turn = _object(value)
+            if turn.get("itemsView") != "full":
+                raise CodexControlError("unavailable", "NotSent")
+            items = turn.get("items")
+            if not isinstance(items, list):
+                raise ProtocolDefect("Codex turn items were malformed")
+            if _finalized(turn) and any(
+                _object(item).get("type") == "agentMessage"
+                and _object(item).get("phase") == "final_answer"
+                and isinstance(_object(item).get("text"), str)
+                and bool(_object(item).get("text"))
+                for item in items
+            ):
+                handle = cast(str, turn["id"])
+                if handle in ids:
+                    raise ProtocolDefect("Codex result page repeated a turn identity")
+                ids.append(handle)
+        return CodexResultPage(tuple(ids), cast(str | None, result.get("nextCursor")))
+
+    async def _turn_page(
+        self,
+        client: CodexAppServerClient,
+        target: CodexThreadTarget,
+        cursor: str | None,
+        direction: Literal["asc", "desc"],
+        limit: int,
+        items_view: Literal["full", "notLoaded"],
+        history_mode: str | None = None,
+    ) -> dict[str, object]:
+        if self._native_owners and history_mode != "paginated":
+            if history_mode != "legacy":
+                raise CodexControlError("unavailable", "NotSent")
+            result = _object(
+                await self._request(
+                    client, "thread/read", {"threadId": target.thread_handle, "includeTurns": True}
+                )
+            )
+            thread = _object(result.get("thread"))
+            if thread.get("id") != target.thread_handle or thread.get("historyMode") != "legacy":
+                raise CodexControlError("unavailable", "NotSent")
+            turns = thread.get("turns")
+            if not isinstance(turns, list):
+                raise ProtocolDefect("Codex legacy turns were malformed")
+            ordered = turns if direction == "asc" else list(reversed(turns))
+            offset = 0
+            if cursor is not None:
+                try:
+                    anchor = json.loads(cursor)
+                    if (
+                        not isinstance(anchor, dict)
+                        or set(anchor) != {"threadId", "direction", "offset", "turnId"}
+                        or anchor["threadId"] != target.thread_handle
+                        or anchor["direction"] != direction
+                        or type(anchor["offset"]) is not int
+                        or not 1 <= anchor["offset"] <= len(ordered)
+                        or _object(ordered[anchor["offset"] - 1]).get("id") != anchor["turnId"]
+                    ):
+                        raise ValueError
+                    offset = anchor["offset"]
+                except (ValueError, TypeError):
+                    raise CodexControlError("history_changed", "NotSent") from None
+            data = []
+            for value in ordered[offset : offset + limit]:
+                turn = _object(value)
+                if (
+                    not isinstance(turn.get("items"), list)
+                    or turn.get("itemsView", "full") != "full"
+                ):
+                    raise CodexControlError("unavailable", "NotSent")
+                data.append(
+                    {
+                        **turn,
+                        "itemsView": items_view,
+                        "items": [] if items_view == "notLoaded" else turn["items"],
+                    }
+                )
+            following = offset + len(data)
+            return {
+                "data": data,
+                "nextCursor": json.dumps(
+                    {
+                        "threadId": target.thread_handle,
+                        "direction": direction,
+                        "offset": following,
+                        "turnId": data[-1].get("id"),
+                    },
+                    separators=(",", ":"),
+                )
+                if following < len(ordered)
+                else None,
+            }
+        result = _object(
+            await self._request(
+                client,
+                "thread/turns/list",
+                {
+                    "threadId": target.thread_handle,
+                    "cursor": cursor,
+                    "limit": limit,
+                    "sortDirection": direction,
+                    "itemsView": items_view,
+                },
+            )
+        )
+        data = result.get("data")
+        if not isinstance(data, list) or len(data) > limit:
+            raise ProtocolDefect("Codex turn list exceeded its page contract")
+        next_cursor = result.get("nextCursor")
+        if next_cursor is not None and (
+            not isinstance(next_cursor, str) or not next_cursor or len(next_cursor.encode()) > 4096
+        ):
+            raise ProtocolDefect("Codex turn cursor was malformed")
+        if next_cursor is not None and (not data or next_cursor == cursor):
+            raise ProtocolDefect("Codex history page made no progress")
+        return result
+
+    async def _history(
+        self,
+        client: CodexAppServerClient,
+        target: CodexThreadTarget,
+        scope: Literal["latest", "history"],
+        max_bytes: int,
+        history_mode: str | None,
+    ) -> CodexOutput:
+        cursor = None
+        text: list[str] = []
+        latest: tuple[str, dict[str, object], dict[str, object]] | None = None
+        truncated = False
+        while True:
+            page = await self._turn_page(client, target, cursor, "desc", 8, "full", history_mode)
+            for raw in cast(list[object], page["data"]):
+                turn = _object(raw)
+                if turn.get("itemsView") != "full" or not isinstance(turn.get("items"), list):
+                    raise CodexControlError("unavailable", "NotSent")
+                for entry in reversed(cast(list[object], turn["items"])):
+                    item = _object(entry)
+                    if item.get("type") not in ("agentMessage", "userMessage"):
+                        continue
+                    value = item.get("text")
+                    if item.get("type") == "userMessage":
+                        content = item.get("content")
+                        if not isinstance(content, list):
+                            raise ProtocolDefect("Codex user message was malformed")
+                        value = "\n".join(
+                            cast(str, _object(block)["text"])
+                            for block in content
+                            if _object(block).get("type") == "text"
+                            and isinstance(_object(block).get("text"), str)
+                        )
+                    if not isinstance(value, str):
+                        raise ProtocolDefect("Codex message text was malformed")
+                    if value and item.get("type") == "agentMessage" and latest is None:
+                        latest = value, turn, item
+                    if value and scope == "history":
+                        text.append(
+                            ("assistant: " if item.get("type") == "agentMessage" else "user: ")
+                            + value
+                        )
+                if scope == "latest" and latest is not None:
+                    break
+            cursor = cast(str | None, page.get("nextCursor"))
+            if scope == "latest" and latest is not None:
+                break
+            if len("\n\n".join(text).encode()) >= max_bytes:
+                truncated = cursor is not None
+                break
+            if cursor is None:
+                break
+        state: Literal["partial", "finalized", "unknown", "none"] = "none"
+        output_id, turn_id = None, None
+        if latest is not None:
+            value, turn, item = latest
+            try:
+                turn_id = _turn_target(target, turn.get("id")).turn_handle
+            except ProtocolDefect:
+                turn_id = None
+            if _finalized(turn) and item.get("phase") == "final_answer":
+                state, output_id = "finalized", turn_id
+            elif turn.get("status") == "inProgress":
+                state = "partial"
+            else:
+                state = "unknown"
+        value = latest[0] if scope == "latest" and latest else "\n\n".join(reversed(text))
+        encoded = value.encode()
+        if len(encoded) > max_bytes:
+            value, truncated = encoded[-max_bytes:].decode(errors="ignore"), True
+        return CodexOutput(value, scope, truncated, state, output_id, turn_id)
+
+    async def create(
+        self,
+        request: CodexCreateRequest,
+        *,
+        native_bypass_permissions: bool = False,
+        native_name: str | None = None,
+    ) -> CodexThreadTarget:
+        # The external server may have a different filesystem view or UID.
+        # CodexCreateRequest validates syntax; the server owns existence checks.
+        if self._native_owners and (not native_name or len(native_name.encode()) > 64):
+            raise InvalidAgentRequest("Native Codex creation requires a bounded name")
+        target: CodexThreadTarget | None = None
+        try:
+            async with self._client(request.profile_key) as client:
+                result = _object(
+                    await self._request(
+                        client,
+                        "thread/start",
+                        {
+                            "cwd": str(request.cwd),
+                            **(
+                                {"approvalPolicy": "never", "sandbox": "danger-full-access"}
+                                if native_bypass_permissions
+                                else {}
+                            ),
+                        }
+                        if self._native_owners
+                        else {
+                            "cwd": str(request.cwd),
+                            "sandbox": "workspace-write",
+                            "approvalPolicy": "on-request",
+                            "approvalsReviewer": "user",
+                            "config": {"sandbox_workspace_write": {"network_access": False}},
+                        },
+                        mutation=True,
+                    )
+                )
+                summary = _summary(request.profile_key, _object(result.get("thread")))
+                target = summary.target
+                if self._native_owners:
+                    result = await self._request(
+                        client,
+                        "thread/name/set",
+                        {"threadId": target.thread_handle, "name": native_name},
+                        mutation=True,
+                        known_thread=target,
+                    )
+                    if result != {}:
+                        raise CodexControlError("invalid", "Unknown", target)
+                    result = _object(
+                        await self._request(
+                            client,
+                            "thread/resume",
+                            {"threadId": target.thread_handle},
+                            mutation=True,
+                            known_thread=target,
+                        )
+                    )
+                    prepared = _summary(request.profile_key, _object(result.get("thread")))
+                    if prepared.target != target:
+                        raise CodexControlError("invalid", "Unknown", target)
+                    return target
+                result = _object(
+                    await self._request(
+                        client,
+                        "thread/unsubscribe",
+                        {
+                            "threadId": target.thread_handle,
+                        },
+                        mutation=True,
+                        known_thread=target,
+                    )
+                )
+                if result.get("status") not in ("notLoaded", "notSubscribed", "unsubscribed"):
+                    raise ProtocolDefect("Codex unsubscribe returned an unknown status")
+                return target
+        except CodexControlError:
+            raise
+        except (
+            asyncio.CancelledError,
+            TimeoutError,
+            AgentRuntimeError,
+            ProtocolDefect,
+            OSError,
+            ValueError,
+        ):
+            if not self._native_owners or target is None:
+                raise
+            raise CodexControlError("unavailable", "Unknown", target) from None
 
     async def prompt(self, request: CodexPromptRequest) -> CodexTurnTarget:
         self._guard(request.thread)
@@ -374,25 +829,38 @@ class CodexControl:
             raise CodexControlError("unauthorized", "NotSent", target)
 
     @asynccontextmanager
-    async def _client(self, profile: str) -> AsyncIterator[CodexAppServerClient]:
+    async def _client(
+        self, profile: str, *, experimental_api: bool = False
+    ) -> AsyncIterator[CodexAppServerClient]:
         if self._closed:
             raise CodexControlError("unavailable", "NotSent")
         endpoint = self._endpoints.get(profile)
         if endpoint is None:
             raise CodexControlError("unavailable", "NotSent")
-        client = CodexAppServerClient(CodexAppServerConfig(endpoint, request_policy="observe_only"))
+        client = CodexAppServerClient(
+            CodexAppServerConfig(
+                endpoint, request_policy="observe_only", experimental_api=experimental_api
+            )
+        )
         self._clients.add(client)
         try:
             try:
                 await client.__aenter__()
             except CodexConnectionUnavailable:
                 raise CodexControlError("unavailable", "NotSent") from None
-            account = _object(await self._request(client, "account/read", {"refreshToken": False}))
-            if (
-                account.get("account") is None
-                or _object(account["account"]).get("type") != "chatgpt"
-            ):
-                raise CodexControlError("auth", "NotSent")
+            except CodexAppServerResponseError:
+                if not self._native_owners:
+                    raise
+                raise CodexControlError("unavailable", "NotSent") from None
+            if not self._native_owners:
+                account = _object(
+                    await self._request(client, "account/read", {"refreshToken": False})
+                )
+                if (
+                    account.get("account") is None
+                    or _object(account["account"]).get("type") != "chatgpt"
+                ):
+                    raise CodexControlError("auth", "NotSent")
             yield client
         finally:
             self._clients.discard(client)
@@ -421,12 +889,50 @@ class CodexControl:
             ) from None
         except CodexAppServerResponseError as error:
             if (
+                method == "thread/turns/list"
+                and (not self._native_owners or error.code == -32600)
+                and error.detail.startswith("invalid cursor:")
+            ):
+                raise CodexControlError("history_changed", "NotSent") from None
+            if (
+                self._native_owners
+                and method == "thread/turns/list"
+                and error.code == -32600
+                and error.detail
+                == f"thread {params.get('threadId')} is not materialized yet; "
+                "thread/turns/list is unavailable before first user message"
+            ):
+                raise _HistoryNotMaterialized() from None
+            if (
+                method == "turn/interrupt"
+                and error.code == -32600
+                and error.detail == "expected turn is not active"
+            ):
+                raise CodexControlError("stale", "Rejected", known_thread) from None
+            if (
                 method == "thread/items/list"
                 and error.code == -32601
                 and error.detail == "thread/items/list is not supported yet"
                 and error.data is None
             ):
                 raise _ItemPagingUnavailable() from None
+            if self._native_owners:
+                if (
+                    not mutation
+                    and method in ("thread/read", "thread/turns/list", "thread/items/list")
+                    and error.code == -32600
+                    and error.detail == f"no rollout found for thread id {params.get('threadId')}"
+                ):
+                    raise CodexControlError("missing", "NotSent", known_thread) from None
+                raise CodexControlError(
+                    "unavailable",
+                    "Unknown"
+                    if mutation and error.code not in (-32600, -32601, -32602)
+                    else "Rejected"
+                    if mutation
+                    else "NotSent",
+                    known_thread,
+                ) from None
             raise CodexControlError(
                 _error_code(error), "Rejected" if mutation else "NotSent", known_thread
             ) from None
@@ -452,21 +958,22 @@ class CodexControl:
             summary = replace(summary, name=None)
             if _output_size(summary) > 8 * 1024:
                 raise CodexControlError("output_limit", "NotSent")
-        result = _object(
-            await self._request(
-                client,
-                "thread/turns/list",
-                {
-                    "threadId": target.thread_handle,
-                    "limit": 1,
-                    "sortDirection": "desc",
-                    "itemsView": "notLoaded",
-                },
+        try:
+            result = await self._turn_page(
+                client, target, None, "desc", 1, "notLoaded", summary.history_mode
             )
-        )
+        except CodexControlError as error:
+            if not self._native_owners or error.code not in ("unavailable", "output_limit"):
+                raise
+            return CodexThreadRead(
+                summary,
+                None,
+                None,
+                CodexBounded("native history unavailable"),
+                history_available=False,
+            )
         data = result.get("data")
-        if not isinstance(data, list) or len(data) > 1:
-            raise ProtocolDefect("Codex turn list exceeded its page contract")
+        assert isinstance(data, list)
         if not data:
             return CodexThreadRead(
                 summary,
@@ -480,9 +987,16 @@ class CodexControl:
         status = turn.get("status")
         if status not in ("inProgress", "completed", "interrupted", "failed"):
             raise ProtocolDefect("Codex turn has an unknown status")
-        snapshot = CodexTurnSnapshot(
-            _turn_target(target, turn.get("id")), cast(CodexTurnStatus, status)
-        )
+        try:
+            snapshot = CodexTurnSnapshot(
+                _turn_target(target, turn.get("id")), cast(CodexTurnStatus, status)
+            )
+        except ProtocolDefect:
+            if not self._native_owners or summary.history_mode != "legacy":
+                raise
+            return CodexThreadRead(
+                summary, None, None, CodexBounded("native turn identity unavailable")
+            )
         if turn.get("itemsView") != "notLoaded" or turn.get("items") != []:
             raise ProtocolDefect("Codex turn metadata unexpectedly included items")
         if not include_items:
@@ -553,6 +1067,23 @@ def _object(value: object) -> dict[str, object]:
     return value
 
 
+def _finalized(turn: dict[str, object]) -> bool:
+    handle = turn.get("id")
+    if not isinstance(handle, str):
+        raise ProtocolDefect("Codex turn identity was malformed")
+    try:
+        identity = UUID(handle)
+    except ValueError:
+        return False
+    return (
+        str(identity) == handle
+        and identity.version == 7
+        and turn.get("status") == "completed"
+        and type(turn.get("startedAt")) is int
+        and type(turn.get("completedAt")) is int
+    )
+
+
 def _summary(profile: str, value: dict[str, object]) -> CodexThreadSummary:
     handle = value.get("id")
     try:
@@ -577,8 +1108,18 @@ def _summary(profile: str, value: dict[str, object]) -> CodexThreadSummary:
         source = "subAgent"
     if not isinstance(source, str) or source not in CODEX_THREAD_SOURCES:
         raise ProtocolDefect("Codex thread source is malformed")
+    can_accept = value.get("canAcceptDirectInput")
+    if can_accept is not None and type(can_accept) is not bool:
+        raise ProtocolDefect("Codex direct-input acceptance was malformed")
     return CodexThreadSummary(
-        target, cast(CodexNativeStatus, kind), tuple(flags), name, cwd, source
+        target,
+        cast(CodexNativeStatus, kind),
+        tuple(flags),
+        name,
+        cwd,
+        source,
+        cast(bool | None, can_accept),
+        cast(str, value["historyMode"]) if isinstance(value.get("historyMode"), str) else None,
     )
 
 
@@ -610,6 +1151,8 @@ def _interrupt_outcome(
             return CodexFinished(turn.status)
         case "inProgress":
             return None
+        case unreachable:
+            assert_never(unreachable)
 
 
 def _error_code(error: CodexAppServerResponseError) -> CodexErrorCode:
