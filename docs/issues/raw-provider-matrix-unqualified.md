@@ -59,6 +59,13 @@ extension. native/sdk and consumer qualification remain separate requirements.
 [provider pr 39](https://github.com/NielsdaWheelz/llm-calling/pull/39) changes
 only the codex agent lane's raw-event classification; raw registry and engines
 are unchanged, so its merge is outside the registry/engine gate. the nexus pin
-bump that adopts it is inside the gate, and no waiver covers it: landing that
-pin needs the owner's explicit extension of this waiver or the unfiltered run
-above. no raw api calls were launched.
+bump that adopts it is inside the gate. on 2026-10-13 the owner explicitly
+waived the paid run for it ("waive the paid run of its live test suite"): the
+nexus pin adoption of `e0c30b31b0d507f77f676c2b9e4f18a7c7331815` may land
+without the unfiltered run. evidence instead: provider pr 39's offline
+regressions, and the nexus model-tools harness against the real codex 0.160.0
+binary and a fake model (30 of 30 tool journeys, t4e included).
+
+the raw matrix remains not_run and unqualified. this waiver covers only that
+pin adoption; the general readme/pivot gate and the earlier waivers keep their
+scope. no raw api calls were launched.
