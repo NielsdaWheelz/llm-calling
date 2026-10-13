@@ -606,7 +606,7 @@ wheels = [
 [[package]]
 name = "llm-tools"
 version = "0.1.0"
-source = { git = "https://github.com/NielsdaWheelz/llm-tools.git?rev=2adb9790fc7a54de5342effaca9391c2f3d24ff9#2adb9790fc7a54de5342effaca9391c2f3d24ff9" }
+source = { git = "https://github.com/NielsdaWheelz/llm-tools.git?rev=5a37102bc73c1af0c23e63c5b70df320661f63ed#5a37102bc73c1af0c23e63c5b70df320661f63ed" }
 dependencies = [
     { name = "httpx" },
     { name = "pydantic" },
@@ -880,7 +880,7 @@ requires-dist = [
     { name = "claude-agent-sdk", marker = "extra == 'claude-sdk'", specifier = ">=0.2.130,<1" },
     { name = "google-genai", specifier = ">=1.38,<2" },
     { name = "httpx", specifier = ">=0.28.0" },
-    { name = "llm-tools", marker = "extra == 'llm-tools'", git = "https://github.com/NielsdaWheelz/llm-tools.git?rev=2adb9790fc7a54de5342effaca9391c2f3d24ff9" },
+    { name = "llm-tools", marker = "extra == 'llm-tools'", git = "https://github.com/NielsdaWheelz/llm-tools.git?rev=5a37102bc73c1af0c23e63c5b70df320661f63ed" },
     { name = "openai", specifier = ">=2.0,<3" },
     { name = "opentelemetry-api", specifier = ">=1.36,<2" },
     { name = "pydantic", specifier = ">=2.11,<3" },

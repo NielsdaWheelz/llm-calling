@@ -12,7 +12,7 @@ from typing import Literal
 
 from .errors import AgentRuntimeError, InvalidAgentRequest
 
-ARCHIVE_CONTRACT_REVISION = "native-archive.v1"
+ARCHIVE_CONTRACT_REVISION = "native-archive.v2"
 INTERNAL_THREAD_SOURCE = "jarvis.cognition"
 MEMORY_TOOL_NAMES = frozenset(
     (
