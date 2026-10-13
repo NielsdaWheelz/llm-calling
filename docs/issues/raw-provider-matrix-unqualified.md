@@ -1,5 +1,13 @@
 # raw provider merge gate
 
+## standing waiver, 2026-10-13
+
+status: WAIVED for every change. the owner waived the paid live suites for all
+llm-calling and llm-agent-kernel changes ("waive the paid live test suite for all
+llm-agent-kernel/llm-calling changes"). no paid run gates a merge or a nexus pin
+bump. the raw and agent matrices remain not_run and unqualified; this file records
+that state, not a gate. the dated entries below are history.
+
 ## native supervision, 2026-10-03
 
 status: WAIVED FOR THIS NATIVE PR ONLY, 2026-10-03. the current raw api

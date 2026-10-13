@@ -258,8 +258,10 @@ outcomes, no network, no SDK clients, no credential flows.
 The live matrix is the acceptance gate the deterministic suite cannot be: per
 registry row it probes chat, streaming, a tool round trip, `json_out`, and a
 continuation replay against the real providers, and writes one evidence file
-per run into `tests/live/evidence/`. It never runs in CI and is mandatory
-before merging any registry or engine change and before any Nexus pin bump.
+per run into `tests/live/evidence/`. It never runs in CI. Since the owner waiver, 2026-10-13,
+no paid live run gates any merge or Nexus pin bump: deterministic checks and
+controlled proofs (fake models, the stock binary) qualify a change, and its PR
+says which paid runs were not made.
 
 ```bash
 LLM_RUNTIME_LIVE=1 OPENAI_API_KEY=... ANTHROPIC_API_KEY=... GEMINI_API_KEY=... \
@@ -274,7 +276,9 @@ agent lane has its own matrix (`tests/live/test_agent_matrix.py`) with the
 same opt-in flag and evidence conventions. Its dedicated paid Terra containment
 probe is `tests/live/test_codex_containment.py` and requires an explicit
 test-owned Codex endpoint. Shared worker/TUI control has its own separately
-approved live qualification; deterministic fixtures do not substitute for it.
+approved live qualification. The owner waiver, 2026-10-13 covers every paid run in this
+section: the provider matrix, the agent matrix, the containment probe and the
+shared worker/TUI qualification.
 
 The spec for the current architecture is
 [docs/pivot-spec.md](docs/pivot-spec.md); the engineering rules the code is
