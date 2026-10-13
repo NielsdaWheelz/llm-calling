@@ -506,6 +506,7 @@ class _CodexSessionState:
     active_mcp_calls: dict[str, tuple[str, str]] = field(default_factory=dict)
     active_tool_calls: dict[str, str] = field(default_factory=dict)
     custom_item_calls: dict[str, str] = field(default_factory=dict)
+    unpublished_calls: dict[str, AgentToolUse] = field(default_factory=dict)
     server_request_ids: set[tuple[type[object], object]] = field(default_factory=set)
     authority_seen: bool = False
     quota_exhausted: bool = False
@@ -805,6 +806,7 @@ class CodexSdkAdapter:
         state.active_mcp_calls.clear()
         state.active_tool_calls.clear()
         state.custom_item_calls.clear()
+        state.unpublished_calls.clear()
         state.server_request_ids.clear()
         state.authority_seen = False
         state.quota_exhausted = False
@@ -1234,8 +1236,16 @@ class CodexSdkAdapter:
         if method == "rawResponseItem/completed":
             item = self._mapping(params.get("item"), "raw Responses item")
             kind = self._non_empty_string(item, "type", method)
-            if kind in ("message", "reasoning", "function_call_output"):
+            if kind in ("message", "reasoning"):
                 return None
+            if kind == "function_call_output":
+                held = state.unpublished_calls.pop(
+                    self._non_empty_string(item, "call_id", method), None
+                )
+                if held is None or item.get("output") == f"unsupported call: {held.name}":
+                    return None
+                state.authority_seen = True
+                return held
             if kind in ("function_call", "custom_tool_call"):
                 name = self._non_empty_string(item, "name", method)
                 namespace = item.get("namespace")
@@ -1245,13 +1255,22 @@ class CodexSdkAdapter:
                     name = f"{namespace}/{name}"
                 if kind == "function_call" and name in {tool.name for tool in state.request.tools}:
                     return None
-                state.authority_seen = True
-                return AgentToolUse(
+                event = AgentToolUse(
                     tool_call_id=self._non_empty_string(item, "call_id", method),
                     name=name,
                     phase="started",
                     payload=redact_native_payload(item),
                 )
+                if kind == "function_call":
+                    # A function the session never published: Codex answers the model
+                    # itself and runs nothing. That is a model error, not authority,
+                    # but only Codex's exact refusal of this call proves it.
+                    if len(state.unpublished_calls) >= _MAX_MESSAGE_ITEMS:
+                        raise ProtocolDefect("unpublished Codex calls exceeded their finite bound")
+                    state.unpublished_calls[event.tool_call_id] = event
+                    return None
+                state.authority_seen = True
+                return event
             raise ProtocolDefect(f"Codex raw Responses item has unknown type {kind}")
         if method == "thread/started":
             thread = self._mapping(params.get("thread"), "thread/started thread")
@@ -1718,6 +1737,9 @@ class CodexSdkAdapter:
             raise ProtocolDefect("turn completed with active Codex authority items")
         if state.server_request_ids and not aborted_items:
             raise ProtocolDefect("turn completed with unresolved Codex server requests")
+        if state.unpublished_calls:
+            # No refusal arrived, so nothing proves an unpublished call did not run.
+            state.authority_seen = True
         if state.authority_seen and self._strict_native_containment(state):
             raise ProtocolDefect("turn completed after forbidden Codex native authority activity")
         final_text = self._selected_final_text(state, required=status == "completed")
