@@ -237,8 +237,49 @@ async def history(
     mode = native.get("historyMode", "legacy")
     if mode not in ("legacy", "paginated"):
         raise ArchiveError("unsupported")
-    entries: list[tuple[dict[str, object], str, datetime | None]] = []
-    caught_up = True
+    result: list[ArchiveEvent] = []
+    previous = ""
+    seen: set[str] = set()
+    item_count = 0
+
+    def append_item(item: dict[str, object], turn_id: str, occurred_at: datetime | None) -> bool:
+        nonlocal previous, item_count
+        item_count += 1
+        if item_count > MAX_ARCHIVE_EVENTS:
+            raise ArchiveError("event_too_large")
+        values = item_events(
+            item,
+            home=home,
+            turn_id=turn_id,
+            occurred_at=occurred_at,
+            peer=info.relation == "child",
+            lineage=(info.relation, info.parent_native_id),
+        )
+        if values is None:
+            return False
+        for value in values:
+            if mode == "legacy":
+                # Legacy item-N labels are positional. A chain over consumed content
+                # makes any earlier rewrite invalidate every subsequent boundary.
+                value = event(
+                    value.native_event_id,
+                    turn_id=value.turn_id,
+                    parent_id=value.native_parent_id,
+                    role=value.role,
+                    kind=value.kind,
+                    body=value.text,
+                    attributes=value.attributes,
+                    occurred_at=value.occurred_at,
+                    original=value.native_digest,
+                    legacy_previous=previous,
+                )
+                previous = value.native_event_id
+            if value.native_event_id in seen:
+                raise ArchiveError("source_conflict")
+            seen.add(value.native_event_id)
+            result.append(value)
+        return True
+
     if mode == "legacy":
         response = await request(
             connection, "thread/read", {"threadId": native_id, "includeTurns": True}
@@ -281,8 +322,7 @@ async def history(
         turn_id = string(turn.get("id"), limit=256)
         status = turn.get("status")
         if status == "inProgress":
-            caught_up = False
-            break
+            return result, False
         if status not in ("completed", "interrupted", "failed"):
             raise ArchiveError("unsupported")
         occurred_at = timestamp(turn.get("startedAt"))
@@ -292,7 +332,9 @@ async def history(
             items = turn.get("items")
             if not isinstance(items, list):
                 raise ArchiveError("unsupported")
-            entries.extend((object_value(item), turn_id, occurred_at) for item in items)
+            for item in items:
+                if not append_item(object_value(item), turn_id, occurred_at):
+                    return result, False
         else:
             cursor = None
             while True:
@@ -314,55 +356,19 @@ async def history(
                     entry = object_value(raw_entry)
                     if entry.get("turnId") != turn_id:
                         raise ArchiveError("unsupported")
-                    entries.append(
-                        (
-                            object_value(entry.get("item")),
-                            turn_id,
-                            timestamp(entry.get("startedAtMs"), milliseconds=True) or occurred_at,
-                        )
-                    )
+                    if not append_item(
+                        object_value(entry.get("item")),
+                        turn_id,
+                        timestamp(entry.get("startedAtMs"), milliseconds=True) or occurred_at,
+                    ):
+                        return result, False
                 following = string(page.get("nextCursor"), optional=True)
                 if following is None:
                     break
                 if following == cursor:
                     raise ArchiveError("unsupported")
                 cursor = following
-        if len(entries) > MAX_ARCHIVE_EVENTS:
-            raise ArchiveError("event_too_large")
-    result: list[ArchiveEvent] = []
-    previous = ""
-    seen: set[str] = set()
-    for item, turn_id, occurred_at in entries:
-        values = item_events(
-            item,
-            home=home,
-            turn_id=turn_id,
-            occurred_at=occurred_at,
-            peer=info.relation == "child",
-            lineage=(info.relation, info.parent_native_id),
-        )
-        for value in values:
-            if mode == "legacy":
-                # Legacy item-N labels are positional. A chain over consumed content
-                # makes any earlier rewrite invalidate every subsequent boundary.
-                value = event(
-                    value.native_event_id,
-                    turn_id=value.turn_id,
-                    parent_id=value.native_parent_id,
-                    role=value.role,
-                    kind=value.kind,
-                    body=value.text,
-                    attributes=value.attributes,
-                    occurred_at=value.occurred_at,
-                    original=value.native_digest,
-                    legacy_previous=previous,
-                )
-                previous = value.native_event_id
-            if value.native_event_id in seen:
-                raise ArchiveError("source_conflict")
-            seen.add(value.native_event_id)
-            result.append(value)
-    return result, caught_up
+    return result, True
 
 
 def item_events(
@@ -373,11 +379,25 @@ def item_events(
     occurred_at: datetime | None,
     peer: bool,
     lineage: tuple[str | None, str | None],
-) -> list[ArchiveEvent]:
+) -> list[ArchiveEvent] | None:
     identifier = string(item.get("id"), limit=230)
     kind = string(item.get("type"), limit=256)
     if kind == "reasoning":
         return []
+    if (
+        kind
+        in (
+            "mcpToolCall",
+            "dynamicToolCall",
+            "commandExecution",
+            "fileChange",
+            "collabAgentToolCall",
+        )
+        and item.get("status") == "inProgress"
+    ):
+        # Neither the call nor result is immutable yet. Stop before terminal-only
+        # fields are validated and before any later native item is consumed.
+        return None
     values: list[ArchiveEvent] = []
 
     def append(
@@ -427,9 +447,11 @@ def item_events(
                     if "fileId" in part
                     else "url"
                 )
-                reference = string(part.get(ref_key))
-                if reference.startswith("data:"):
+                native_reference = text(part.get(ref_key))
+                if native_reference.startswith("data:"):
                     reference = f"native:{identifier}:{index}"
+                else:
+                    reference = string(native_reference)
                 attrs: dict[str, object] = {
                     "reference": reference,
                     "media_type": "image/*"
@@ -657,8 +679,6 @@ def item_events(
                 "namespace": item.get("namespace"),
                 "output": output,
             }
-        if status == "inProgress":
-            raise ArchiveError("unsupported")
         if status not in ("completed", "failed", "declined", "interrupted"):
             raise ArchiveError("unsupported")
         if memory:

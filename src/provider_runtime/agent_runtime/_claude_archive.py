@@ -496,6 +496,14 @@ def row_events(
                 "text": body,
                 "data": source.get("data"),
             }
+            if source_kind == "content":
+                if block_kind != "document":
+                    raise ArchiveError("unsupported")
+                body, availability, source_content = document_content(source.get("content"))
+                # The exposed body is derived from this complete source. Bind it
+                # once so duplicated text does not consume the native byte bound.
+                del projection["text"], projection["data"]
+                projection["content"] = source_content
             append(
                 suffix,
                 "owner" if kind == "user" and not peer else "peer" if peer else "assistant",
@@ -507,3 +515,40 @@ def row_events(
         else:
             append(suffix, "unknown", "gap", "", {"reason": "unsupported"}, block)
     return values
+
+
+def document_content(value: object) -> tuple[str, str, object]:
+    """Expose native document text and bind every supported source block."""
+    if type(value) is str:
+        return value, "full", value
+    if not isinstance(value, list):
+        raise ArchiveError("unsupported")
+    texts: list[str] = []
+    blocks: list[dict[str, object]] = []
+    has_images = False
+    for raw in value:
+        block = object_value(raw)
+        kind = block.get("type")
+        if kind == "text":
+            body = text(block.get("text"))
+            texts.append(body)
+            blocks.append({"type": "text", "text": body})
+        elif kind == "image":
+            source = object_value(block.get("source"))
+            source_kind = source.get("type")
+            if source_kind == "base64":
+                image_source = {
+                    "type": "base64",
+                    "media_type": string(source.get("media_type"), limit=256),
+                    "data": text(source.get("data")),
+                }
+            elif source_kind == "url":
+                image_source = {"type": "url", "url": string(source.get("url"))}
+            else:
+                raise ArchiveError("unsupported")
+            blocks.append({"type": "image", "source": image_source})
+            has_images = True
+        else:
+            raise ArchiveError("unsupported")
+    availability = "partial" if has_images and texts else "none" if has_images else "full"
+    return "\n".join(texts), availability, blocks
