@@ -53,3 +53,12 @@ provider calls. this waiver applies only to those two memory-delivery prs; the
 general readme/pivot gate and the earlier native pr 37 waiver retain their scope.
 no raw api calls were launched and no credentials were provisioned for this
 extension. native/sdk and consumer qualification remain separate requirements.
+
+## codex unpublished-call refusal, 2026-10-13 utc
+
+[provider pr 39](https://github.com/NielsdaWheelz/llm-calling/pull/39) changes
+only the codex agent lane's raw-event classification; raw registry and engines
+are unchanged, so its merge is outside the registry/engine gate. the nexus pin
+bump that adopts it is inside the gate, and no waiver covers it: landing that
+pin needs the owner's explicit extension of this waiver or the unfiltered run
+above. no raw api calls were launched.

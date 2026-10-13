@@ -125,9 +125,13 @@ describes this startup seam. model listing is source metadata, not a promise
 that every listed model is entitled or successfully qualified for the account.
 
 new contained threads opt into the installed raw response event stream.
-declared direct function calls remain host callbacks. unexpected raw custom
-tools or undeclared functions become typed native authority events and poison
-terminal acceptance; unknown raw item types fail closed. the reader does not
+declared direct function calls remain host callbacks. a call to an undeclared
+function that codex itself answers with exactly `unsupported call: <name>` ran
+nothing: it is a model error, emits no event, and the turn continues
+([decision](decisions/2026-10-13-codex-refused-unpublished-calls.md)). any
+other answer, or none before turn completion, makes it a typed native
+authority event that poisons terminal acceptance, as unexpected raw custom
+tools always are; unknown raw item types fail closed. the reader does not
 parse javascript or treat code-mode wrappers as declared callback authority.
 loaded threads retain the raw-event selection; stock resume/fork exposes no
 new raw-event opt-in, so the pinned startup policy remains the authority ceiling

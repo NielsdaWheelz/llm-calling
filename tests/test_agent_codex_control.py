@@ -21,6 +21,7 @@ from provider_runtime.agent_runtime import (
     AgentRuntimeConfig,
     AgentTerminal,
     AgentText,
+    AgentToolUse,
     CodexCatalogSessionRequest,
     CodexNativeOptions,
     CodexSandboxControls,
@@ -100,6 +101,7 @@ class ProtocolPeer:
         self.answer = "synthetic answer"
         self.answer_phase = "final_answer"
         self.older_items: list[dict[str, object]] = []
+        self.raw_items: list[dict[str, object]] = []
         self.interrupt_settles = True
         self.status = "idle"
         self.intervene = False
@@ -358,6 +360,10 @@ class ProtocolPeer:
                     "turn/started",
                     {"threadId": THREAD, "turn": {"id": TURN, "status": "inProgress", "items": []}},
                 ),
+                *[
+                    ("rawResponseItem/completed", {**scope, "item": item})
+                    for item in self.raw_items
+                ],
                 ("item/agentMessage/delta", {**scope, "itemId": "answer", "delta": self.answer}),
                 (
                     "item/completed",
@@ -767,6 +773,75 @@ async def test_managed_native_approval_is_denied_and_poisons_the_session(
     assert next(m for m in peer.messages if m.get("id") == "approval")["result"] == {
         "decision": "decline"
     }
+
+
+UNPUBLISHED_CALL: dict[str, object] = {
+    "type": "function_call",
+    "name": "memory__search",
+    "call_id": "unpublished",
+    "arguments": "{}",
+}
+
+
+async def test_codex_refusal_of_an_unpublished_function_is_a_model_error(
+    tmp_path: Path, peer: ProtocolPeer
+) -> None:
+    # Stock Codex answers a call to a function the session never published itself
+    # and runs nothing; the model reads the refusal and the turn goes on.
+    peer.emit_managed = True
+    peer.raw_items = [
+        UNPUBLISHED_CALL,
+        {
+            "type": "function_call_output",
+            "call_id": "unpublished",
+            "output": "unsupported call: memory__search",
+        },
+    ]
+    async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"lab": peer.socket})) as runtime:
+        session = await runtime.open_session(await managed_request(runtime, tmp_path))
+        events = [
+            event
+            async for event in runtime.stream_turn(
+                session, TurnRequest(input=(TextContent("synthetic"),))
+            )
+        ]
+    assert not any(isinstance(event, AgentToolUse) for event in events)
+    assert isinstance(events[-1], AgentTerminal) and events[-1].status == "succeeded"
+
+
+@pytest.mark.parametrize(
+    ("raw_items", "reported"),
+    [
+        ([UNPUBLISHED_CALL], []),
+        (
+            [
+                UNPUBLISHED_CALL,
+                {"type": "function_call_output", "call_id": "unpublished", "output": "ran"},
+            ],
+            ["memory__search"],
+        ),
+        ([{"type": "custom_tool_call", "name": "exec", "call_id": "code", "input": ""}], ["exec"]),
+    ],
+    ids=["unanswered", "answered-by-a-handler", "custom-call"],
+)
+async def test_unpublished_call_without_codex_refusal_remains_native_authority(
+    tmp_path: Path,
+    peer: ProtocolPeer,
+    raw_items: list[dict[str, object]],
+    reported: list[str],
+) -> None:
+    peer.emit_managed = True
+    peer.raw_items = raw_items
+    async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"lab": peer.socket})) as runtime:
+        session = await runtime.open_session(await managed_request(runtime, tmp_path))
+        events = []
+        with pytest.raises(ProtocolDefect, match="forbidden Codex native authority"):
+            async for event in runtime.stream_turn(
+                session, TurnRequest(input=(TextContent("synthetic"),))
+            ):
+                events.append(event)
+    assert [event.name for event in events if isinstance(event, AgentToolUse)] == reported
+    assert not any(isinstance(event, AgentTerminal) for event in events)
 
 
 async def test_observed_foreign_user_input_invalidates_cognition_before_terminal(
