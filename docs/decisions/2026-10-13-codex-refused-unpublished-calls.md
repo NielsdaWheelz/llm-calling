@@ -42,3 +42,14 @@ did not declare, and its answer then differs from the refusal.
   native upgrade must requalify the text.
 - Hosts never see refused proposals. Recording such attempts is a consumer
   concern.
+
+## Evidence
+
+Deterministic protocol-peer cases in `tests/test_agent_codex_control.py` cover
+the exact refusal, an unanswered proposal, a handler-answered proposal and a
+custom call. Stock Codex 0.160.0 with a fake model on a sealed network (nexus
+tools harness, journey T4e): both unpublished calls (`memory__search` for a
+member, `nexus__delete__everything` for the owner) reached the model as Codex's
+refusal and both answers completed; on the previous pin both ended
+`policy_violation`. Paid live matrix and the dedicated containment probe:
+NOT_RUN.
