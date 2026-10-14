@@ -122,6 +122,9 @@ SDK types never cross the contract boundary, and SDK imports are confined to
 `engines/` (plus `embeddings.py`) by a negative gate. Engines make exactly one
 attempt and classify errors against the shared taxonomy; the runtime owns
 retries, sequence numbering, spans, and attempt-trace accumulation.
+The runtime loads only the selected provider's SDK at dispatch. Embedding calls
+load the OpenAI port without loading generation engines. Each provider's first
+call pays its SDK import cost; importing or constructing the runtime does not.
 
 ## Provider catalog and pinning
 
