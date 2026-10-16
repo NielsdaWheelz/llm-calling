@@ -9,6 +9,7 @@ import json
 from base64 import b64encode
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
+from typing import cast
 
 import httpx
 import pytest
@@ -22,7 +23,7 @@ from provider_runtime.errors import (
     ProtocolDefect,
     RuntimeDefect,
 )
-from provider_runtime.registry import REGISTRY_REVISION
+from provider_runtime.registry import REGISTRY_REVISION, _reasoning, _ReasoningRow
 from provider_runtime.registry import _ModelRow as ModelRow
 from provider_runtime.types import (
     Absent,
@@ -90,10 +91,12 @@ POISON_ENV = {
 # Real registry shapes (canonical reasoning convention): an anthropic row's
 # reasoning value is the self-describing wire fragment
 # {"output_config": {"effort": "<level>"}} — never a synthetic stand-in.
-REASONING_LEVELS: Mapping[ReasoningKey, object] = {
-    "low": {"output_config": {"effort": "low"}},
-    "high": {"output_config": {"effort": "high"}},
-}
+REASONING_LEVELS: Mapping[ReasoningKey, _ReasoningRow] = dict(
+    (
+        _reasoning(None, "low", 0, {"output_config": {"effort": "low"}}),
+        _reasoning(None, "high", 1, {"output_config": {"effort": "high"}}),
+    )
+)
 
 ROW = ModelRow(
     ref="anthropic:claude-test",
@@ -577,7 +580,10 @@ async def test_generate_rejects_undeclared_none_key() -> None:
 async def test_generate_non_mapping_reasoning_value_is_registry_defect() -> None:
     # The synthetic int-budget row shape that once masked the uncallable
     # registry/engine mismatch is a registry defect, not an encodable knob.
-    row = replace(ROW, reasoning=Present({"high": 8192}))
+    row = replace(
+        ROW,
+        reasoning=Present(dict((_reasoning(None, "high", 0, cast(Mapping[str, object], 8192)),))),
+    )
     with pytest.raises(RuntimeDefect) as exc_info:
         await AnthropicMessagesEngine().generate(row, make_intent(reasoning="high"), CREDENTIAL)
     assert exc_info.value.code == "registry_invalid", f"code: {exc_info.value.code!r}"
@@ -588,9 +594,9 @@ async def test_generate_rejects_reasoning_fragment_colliding_with_an_engine_set_
     field the engine sets itself silently overrides it — here the caller's own
     output cap. (`output_config` is exempt by design: the effort knob and the
     strict-output format key share it and merge one level deep.)"""
-    poisoned: Mapping[ReasoningKey, object] = {
-        "high": {"output_config": {"effort": "high"}, "max_tokens": 8}
-    }
+    poisoned: Mapping[ReasoningKey, _ReasoningRow] = dict(
+        (_reasoning(None, "high", 0, {"output_config": {"effort": "high"}, "max_tokens": 8}),)
+    )
     row = replace(ROW, reasoning=Present(poisoned))
     with pytest.raises(RuntimeDefect, match="'max_tokens'") as exc_info:
         await AnthropicMessagesEngine().generate(row, make_intent(reasoning="high"), CREDENTIAL)

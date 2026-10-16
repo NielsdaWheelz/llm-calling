@@ -34,7 +34,7 @@ from provider_runtime.errors import (
     ProtocolDefect,
     RuntimeDefect,
 )
-from provider_runtime.registry import REGISTRY_REVISION
+from provider_runtime.registry import REGISTRY_REVISION, _reasoning, _ReasoningRow
 from provider_runtime.registry import _ModelRow as ModelRow
 from provider_runtime.types import (
     Absent,
@@ -90,13 +90,15 @@ from provider_runtime.types import (
 # GenerateContent config params merged verbatim. Gemini 3+ rows carry
 # thinking_config.thinking_level; 2.5-era rows carry thinking_budget. Neither
 # generation can switch thinking off, so no row declares "none".
-LEVEL_REASONING: Mapping[ReasoningKey, object] = {
-    "low": {"thinking_config": {"thinking_level": "LOW"}},
-    "high": {"thinking_config": {"thinking_level": "HIGH"}},
-}
-BUDGET_REASONING: Mapping[ReasoningKey, object] = {
-    "high": {"thinking_config": {"thinking_budget": 24576}},
-}
+LEVEL_REASONING: Mapping[ReasoningKey, _ReasoningRow] = dict(
+    (
+        _reasoning(None, "low", 0, {"thinking_config": {"thinking_level": "LOW"}}),
+        _reasoning(None, "high", 1, {"thinking_config": {"thinking_level": "HIGH"}}),
+    )
+)
+BUDGET_REASONING: Mapping[ReasoningKey, _ReasoningRow] = dict(
+    (_reasoning(None, "high", 0, {"thinking_config": {"thinking_budget": 24576}}),)
+)
 
 LEVEL_ROW = ModelRow(
     ref="gemini:pro",
@@ -377,7 +379,10 @@ async def test_reasoning_fragment_that_is_not_config_is_a_registry_defect(
     """The fragment is validated ALONE so a bad row defects as registry_invalid
     — not as an InvalidRequest blaming the caller's provider_options at the
     merged validation."""
-    row = replace(LEVEL_ROW, reasoning=Present({"high": {"not_a_config_field": 1}}))
+    row = replace(
+        LEVEL_ROW,
+        reasoning=Present(dict((_reasoning(None, "high", 0, {"not_a_config_field": 1}),))),
+    )
     with pytest.raises(RuntimeDefect, match="reasoning fragment") as excinfo:
         await engine.generate(row, intent_for(row, reasoning="high"), CREDENTIAL)
     assert excinfo.value.code == "registry_invalid", f"got {excinfo.value.code}"
@@ -389,9 +394,16 @@ async def test_reasoning_fragment_naming_an_engine_set_config_field_is_a_registr
     """The fragment is merged into the config the engine builds, so a row
     naming a field the engine writes itself either loses its knob or overrides
     the caller — here the caller's own output cap."""
-    poisoned: Mapping[ReasoningKey, object] = {
-        "high": {"thinking_config": {"thinking_level": "HIGH"}, "max_output_tokens": 8}
-    }
+    poisoned: Mapping[ReasoningKey, _ReasoningRow] = dict(
+        (
+            _reasoning(
+                None,
+                "high",
+                0,
+                {"thinking_config": {"thinking_level": "HIGH"}, "max_output_tokens": 8},
+            ),
+        )
+    )
     row = replace(LEVEL_ROW, reasoning=Present(poisoned))
     with pytest.raises(RuntimeDefect, match="max_output_tokens") as excinfo:
         await engine.generate(row, intent_for(row, reasoning="high"), CREDENTIAL)
