@@ -19,8 +19,12 @@ from provider_runtime.types import (
 from .codex_containment import CODEX_CONTAINMENT_CATALOG_REVISION
 from .errors import ProtocolDefect
 
-AGENT_BACKEND_CONTRACT_REVISION = "provider-runtime.agent-model-catalog.v1"
+AGENT_BACKEND_CONTRACT_REVISION = "provider-runtime.agent-model-catalog.v2"
 _MAX_PAGES = 64
+# The pinned native catalog's effort vocabulary; membership still comes from model/list.
+_CODEX_EFFORT_ORDER = {
+    effort: order for order, effort in enumerate(("low", "medium", "high", "xhigh", "max", "ultra"))
+}
 
 type AgentModelKey = str
 type AgentReasoningKey = str
@@ -32,6 +36,9 @@ class AgentReasoningFacts:
     key: AgentReasoningKey
     label: str
     native_wire_value: str
+    mode: str | None
+    effort: str
+    effort_order: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,7 +173,7 @@ async def read_codex_model_catalog(
     if observed_at.tzinfo is None or observed_at.utcoffset() is None:
         raise ProtocolDefect("AgentModelCatalog.observed_at must be timezone-aware")
     definition_revision = _hash(
-        b"provider-runtime.agent-model-catalog.v1",
+        b"provider-runtime.agent-model-catalog.v2",
         {
             "row_fingerprints": tuple(row.row_fingerprint for row in facts),
             "native_containment_revision": CODEX_CONTAINMENT_CATALOG_REVISION,
@@ -206,8 +213,17 @@ def _normalize_row(row: Mapping[str, object]) -> _ObservedModel:
         option = _object_mapping(item, f"Codex model {key!r} reasoning row")
         native = _required_enum_string(option, "reasoningEffort", fallback="reasoning_effort")
         label_value = _required_string(option, "description")
+        if native not in _CODEX_EFFORT_ORDER:
+            raise ProtocolDefect(f"Codex model {key!r} has an unknown reasoning effort {native!r}")
         reasoning.append(
-            AgentReasoningFacts(key=native, label=label_value, native_wire_value=native)
+            AgentReasoningFacts(
+                key=native,
+                label=label_value,
+                native_wire_value=native,
+                mode=None,
+                effort=native,
+                effort_order=_CODEX_EFFORT_ORDER[native],
+            )
         )
     if len({item.key for item in reasoning}) != len(reasoning):
         raise ProtocolDefect(f"Codex model {key!r} has duplicate reasoning keys")
@@ -310,7 +326,7 @@ def _row_fingerprint(
     upgrade: Presence[AgentUpgradeFacts],
 ) -> str:
     return _hash(
-        b"provider-runtime.agent-model-row.v1",
+        b"provider-runtime.agent-model-row.v2",
         {
             "key": row.key,
             "dispatch_model": row.dispatch_model,
@@ -322,6 +338,9 @@ def _row_fingerprint(
                 {
                     "key": item.key,
                     "native_wire_value": item.native_wire_value,
+                    "mode": item.mode,
+                    "effort": item.effort,
+                    "effort_order": item.effort_order,
                 }
                 for item in row.reasoning
             ),

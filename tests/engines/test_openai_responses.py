@@ -9,6 +9,7 @@ import json
 from base64 import b64encode
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
+from typing import cast
 
 import httpx
 import pytest
@@ -23,7 +24,7 @@ from provider_runtime.errors import (
     ProtocolDefect,
     RuntimeDefect,
 )
-from provider_runtime.registry import REGISTRY_REVISION, _resolve_target
+from provider_runtime.registry import REGISTRY_REVISION, _reasoning, _ReasoningRow, _resolve_target
 from provider_runtime.registry import _ModelRow as ModelRow
 from provider_runtime.types import (
     Absent,
@@ -80,11 +81,13 @@ RESPONSES_URL = "https://api.openai.com/v1/responses"
 
 # Registry rows carry the real openai wire fragment per level — a self-describing
 # request-parameter mapping the engine merges verbatim.
-REASONING_LEVELS: Mapping[ReasoningKey, object] = {
-    "none": {"reasoning": {"effort": "none"}},
-    "low": {"reasoning": {"effort": "low"}},
-    "high": {"reasoning": {"effort": "high"}},
-}
+REASONING_LEVELS: Mapping[ReasoningKey, _ReasoningRow] = dict(
+    (
+        _reasoning(None, "none", 0, {"reasoning": {"effort": "none"}}),
+        _reasoning(None, "low", 1, {"reasoning": {"effort": "low"}}),
+        _reasoning(None, "high", 2, {"reasoning": {"effort": "high"}}),
+    )
+)
 
 NATIVE_REASONING_HIGH = '{"reasoning":{"effort":"high"}}'
 
@@ -402,9 +405,9 @@ async def test_generate_merges_row_reasoning_fragment_verbatim() -> None:
     route = respx.post(RESPONSES_URL).mock(
         return_value=mock_response(envelope(output=[TEXT_ITEM], usage=usage_body()))
     )
-    levels: Mapping[ReasoningKey, object] = {
-        "low": {"reasoning": {"effort": "low", "summary": "auto"}}
-    }
+    levels: Mapping[ReasoningKey, _ReasoningRow] = dict(
+        (_reasoning(None, "low", 0, {"reasoning": {"effort": "low", "summary": "auto"}}),)
+    )
     outcome = await OpenAIResponsesEngine().generate(
         replace(ROW, reasoning=Present(levels)), make_intent(reasoning="low"), CREDENTIAL
     )
@@ -417,7 +420,9 @@ async def test_generate_merges_row_reasoning_fragment_verbatim() -> None:
 
 
 async def test_generate_rejects_undeclared_none_key() -> None:
-    levels: Mapping[ReasoningKey, object] = {"low": {"reasoning": {"effort": "low"}}}
+    levels: Mapping[ReasoningKey, _ReasoningRow] = dict(
+        (_reasoning(None, "low", 0, {"reasoning": {"effort": "low"}}),)
+    )
     with pytest.raises(InvalidRequest, match="reasoning key 'none'"):
         await OpenAIResponsesEngine().generate(
             replace(ROW, reasoning=Present(levels)), make_intent(reasoning="none"), CREDENTIAL
@@ -441,7 +446,7 @@ async def test_generate_declared_reasoning_none_still_sends_its_fragment() -> No
 
 
 async def test_generate_rejects_non_mapping_reasoning_value_as_registry_defect() -> None:
-    levels: Mapping[ReasoningKey, object] = {"high": "high"}
+    levels = dict((_reasoning(None, "high", 0, cast(Mapping[str, object], "high")),))
     with pytest.raises(RuntimeDefect, match="request-fragment mappings") as exc_info:
         await OpenAIResponsesEngine().generate(
             replace(ROW, reasoning=Present(levels)), make_intent(), CREDENTIAL
@@ -453,9 +458,9 @@ async def test_generate_rejects_reasoning_fragment_colliding_with_an_engine_set_
     """The fragment is splatted into the params literal: a row naming a field
     the engine sets itself silently rewrites the call — here `store`, whose
     `false` is what makes reasoning replay stateless."""
-    levels: Mapping[ReasoningKey, object] = {
-        "high": {"reasoning": {"effort": "high"}, "store": True}
-    }
+    levels: Mapping[ReasoningKey, _ReasoningRow] = dict(
+        (_reasoning(None, "high", 0, {"reasoning": {"effort": "high"}, "store": True}),)
+    )
     with pytest.raises(RuntimeDefect, match="'store'") as exc_info:
         await OpenAIResponsesEngine().generate(
             replace(ROW, reasoning=Present(levels)), make_intent(), CREDENTIAL

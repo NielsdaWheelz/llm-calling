@@ -99,7 +99,11 @@ def test_options_are_complete_content_and_defaults_are_sourced() -> None:
         for effort in ("low", "medium", "high", "xhigh", "max")
     ]
     assert _resolve_facts("anthropic:claude-sonnet-5").reasoning[-1] == ApiReasoningFacts(
-        key="disabled/max", label="thinking off · max effort"
+        key="disabled/max",
+        label="thinking off · max effort",
+        mode="disabled",
+        effort="max",
+        effort_order=4,
     )
 
 
@@ -167,7 +171,13 @@ def test_catalog_fingerprint_rotates_on_private_native_mapping_change() -> None:
     changed = replace(
         row,
         reasoning=Present(
-            {**row.reasoning.value, "standard/low": {"reasoning": {"mode": "pro", "effort": "low"}}}
+            {
+                **row.reasoning.value,
+                "standard/low": replace(
+                    row.reasoning.value["standard/low"],
+                    fragment={"reasoning": {"mode": "pro", "effort": "low"}},
+                ),
+            }
         ),
     )
     assert _row_fingerprint(changed) != _row_fingerprint(row)

@@ -31,8 +31,8 @@ from provider_runtime.types import (
     freeze_json_object,
 )
 
-REGISTRY_REVISION: Final = "2026-09-25.2"
-_BACKEND_CONTRACT_REVISION: Final = "provider-runtime.api-model-catalog.v3"
+REGISTRY_REVISION: Final = "2026-10-16.1"
+_BACKEND_CONTRACT_REVISION: Final = "provider-runtime.api-model-catalog.v4"
 _KEY = re.compile(r"[a-z0-9]+(?:/[a-z0-9]+)*\Z")
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
 GPT6_MODEL_IDS: Final = ("gpt-6-astra", "gpt-6-sol", "gpt-6-luna")
@@ -42,6 +42,12 @@ GPT6_MODEL_IDS: Final = ("gpt-6-astra", "gpt-6-sol", "gpt-6-luna")
 class _SourcedReasoningDefault:
     value: ReasoningKey
     source: SourceCitation
+
+
+@dataclass(frozen=True, slots=True)
+class _ReasoningRow:
+    facts: ApiReasoningFacts
+    fragment: Mapping[str, object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +63,7 @@ class _ModelRow:
     tools: bool
     streaming: bool
     structured: Literal["native", "json_mode"]
-    reasoning: Presence[Mapping[ReasoningKey, object]]
+    reasoning: Presence[Mapping[ReasoningKey, _ReasoningRow]]
     source_default_reasoning: Presence[_SourcedReasoningDefault]
     upgrade: Presence[UpgradeFacts]
     retirement: Presence[RetirementFacts]
@@ -93,13 +99,26 @@ def _default(key: str, source: SourceCitation) -> Presence[_SourcedReasoningDefa
     return Present(_SourcedReasoningDefault(key, source))
 
 
+def _reasoning(
+    mode: str | None, effort: str, order: int, fragment: Mapping[str, object]
+) -> tuple[str, _ReasoningRow]:
+    key = f"{mode}/{effort}" if mode is not None else effort
+    if mode == "disabled":
+        label = f"thinking off · {effort} effort"
+    elif mode is not None:
+        label = f"{mode} · {effort}"
+    else:
+        label = "off" if effort == "none" else effort
+    return key, _ReasoningRow(ApiReasoningFacts(key, label, mode, effort, order), fragment)
+
+
 def _openai_row(model: str) -> _ModelRow:
     efforts = _EFFORTS if model == "gpt-6-astra" else ("none", *_EFFORTS)
-    reasoning = {
-        f"{mode}/{effort}": {"reasoning": {"mode": mode, "effort": effort}}
+    reasoning = dict(
+        _reasoning(mode, effort, order, {"reasoning": {"mode": mode, "effort": effort}})
         for mode in ("standard", "pro")
-        for effort in efforts
-    }
+        for order, effort in enumerate(efforts)
+    )
     return _ModelRow(
         ref=f"openai:{model}",
         provider="openai",
@@ -126,11 +145,13 @@ def _openai_row(model: str) -> _ModelRow:
 
 def _claude_row(model: str) -> _ModelRow:
     modes = ("adaptive", "disabled") if model == "claude-sonnet-5" else ("adaptive",)
-    reasoning = {
-        f"{mode}/{effort}": {"thinking": {"type": mode}, "output_config": {"effort": effort}}
+    reasoning = dict(
+        _reasoning(
+            mode, effort, order, {"thinking": {"type": mode}, "output_config": {"effort": effort}}
+        )
         for mode in modes
-        for effort in _EFFORTS
-    }
+        for order, effort in enumerate(_EFFORTS)
+    )
     default = "adaptive/medium" if model == "claude-opus-5-5" else "adaptive/high"
     return _ModelRow(
         ref=f"anthropic:{model}",
@@ -171,10 +192,10 @@ _ROWS: Final[tuple[_ModelRow, ...]] = (
         streaming=True,
         structured="native",
         reasoning=Present(
-            {
-                effort: {"thinking_config": {"thinking_level": effort}}
-                for effort in ("low", "medium", "high")
-            }
+            dict(
+                _reasoning(None, effort, order, {"thinking_config": {"thinking_level": effort}})
+                for order, effort in enumerate(("low", "medium", "high"))
+            )
         ),
         source_default_reasoning=_default("medium", _GEMINI_SOURCE),
         upgrade=Absent(),
@@ -197,13 +218,17 @@ _ROWS: Final[tuple[_ModelRow, ...]] = (
         streaming=True,
         structured="json_mode",
         reasoning=Present(
-            {
-                "none": {"thinking": {"type": "disabled"}},
-                **{
-                    effort: {"thinking": {"type": "enabled"}, "reasoning_effort": effort}
-                    for effort in ("low", "high", "max")
-                },
-            }
+            dict(
+                _reasoning(
+                    None,
+                    effort,
+                    order,
+                    {"thinking": {"type": "disabled"}}
+                    if effort == "none"
+                    else {"thinking": {"type": "enabled"}, "reasoning_effort": effort},
+                )
+                for order, effort in enumerate(("none", "low", "high", "max"))
+            )
         ),
         source_default_reasoning=_default("high", _DEEPSEEK_SOURCE),
         upgrade=Absent(),
@@ -225,7 +250,10 @@ _ROWS: Final[tuple[_ModelRow, ...]] = (
         streaming=True,
         structured="native",
         reasoning=Present(
-            {effort: {"reasoning_effort": effort} for effort in ("low", "medium", "high", "xhigh")}
+            dict(
+                _reasoning(None, effort, order, {"reasoning_effort": effort})
+                for order, effort in enumerate(("low", "medium", "high", "xhigh"))
+            )
         ),
         source_default_reasoning=_default("high", _XAI_SOURCE),
         upgrade=Absent(),
@@ -252,15 +280,6 @@ def _resolve_target(target: ProviderTarget) -> _ModelRow:
     )
 
 
-def _option_label(key: str) -> str:
-    mode, sep, effort = key.partition("/")
-    if sep:
-        if mode == "disabled":
-            return f"thinking off · {effort} effort"
-        return f"{mode} · {effort}"
-    return "off" if key == "none" else key
-
-
 def _fingerprint(domain: bytes, value: Mapping[str, object]) -> str:
     return hashlib.sha256(
         domain
@@ -277,7 +296,7 @@ def _row_fingerprint(row: _ModelRow) -> str:
         else None
     )
     return _fingerprint(
-        b"provider-runtime.row.v3",
+        b"provider-runtime.row.v4",
         {
             "ref": row.ref,
             "provider": row.provider,
@@ -296,8 +315,17 @@ def _row_fingerprint(row: _ModelRow) -> str:
             "tools": row.tools,
             "streaming": row.streaming,
             "structured": row.structured,
-            "reasoning": reasoning,
-            "labels": tuple((key, _option_label(key)) for key in reasoning),
+            "reasoning": {key: choice.fragment for key, choice in reasoning.items()},
+            "presentation": tuple(
+                (
+                    key,
+                    choice.facts.label,
+                    choice.facts.mode,
+                    choice.facts.effort,
+                    choice.facts.effort_order,
+                )
+                for key, choice in reasoning.items()
+            ),
             "default": default,
             "continuation_codec": row.continuation_codec,
             "correlation": row.correlation,
@@ -327,7 +355,7 @@ def _api_model_facts(row: _ModelRow) -> ApiModelFacts:
         structured=NativeStructuredOutput()
         if row.structured == "native"
         else JsonModeStructuredOutput(),
-        reasoning=tuple(ApiReasoningFacts(key=key, label=_option_label(key)) for key in reasoning),
+        reasoning=tuple(choice.facts for choice in reasoning.values()),
         source_default_reasoning=(
             Present(row.source_default_reasoning.value.value)
             if isinstance(row.source_default_reasoning, Present)
@@ -344,7 +372,7 @@ def api_model_catalog() -> ApiModelCatalog:
         backend_contract_revision=_BACKEND_CONTRACT_REVISION,
         registry_revision=REGISTRY_REVISION,
         definition_revision=_fingerprint(
-            b"provider-runtime.catalog.v3",
+            b"provider-runtime.catalog.v4",
             {"rows": tuple(model.row_fingerprint for model in models)},
         ),
         models=models,
@@ -396,19 +424,19 @@ def _validate_rows() -> None:
                 code="registry_invalid",
                 message=f"missing configurations for {row.ref}",
             )
-        for key, fragment in row.reasoning.value.items():
+        for key, choice in row.reasoning.value.items():
             if (
                 not 1 <= len(key) <= 64
                 or _KEY.fullmatch(key) is None
-                or not isinstance(fragment, Mapping)
-                or not fragment
+                or choice.facts.key != key
+                or not choice.fragment
             ):
                 raise RuntimeDefect(
                     origin="intent",
                     code="registry_invalid",
                     message=f"invalid configuration for {row.ref}",
                 )
-            freeze_json_object(fragment, context=f"{row.ref}/{key}")
+            freeze_json_object(choice.fragment, context=f"{row.ref}/{key}")
         if (
             isinstance(row.source_default_reasoning, Present)
             and row.source_default_reasoning.value.value not in row.reasoning.value

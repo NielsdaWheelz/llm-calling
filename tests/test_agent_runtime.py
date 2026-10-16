@@ -163,7 +163,14 @@ def codex_catalog() -> AgentModelCatalog:
                 source_max_output_tokens=Absent(),
                 input_modalities=("text", "image"),
                 reasoning=(
-                    AgentReasoningFacts(key="high", label="High", native_wire_value="high"),
+                    AgentReasoningFacts(
+                        key="high",
+                        label="High",
+                        native_wire_value="high",
+                        mode=None,
+                        effort="high",
+                        effort_order=2,
+                    ),
                 ),
                 source_default_reasoning=Present("high"),
                 upgrade=Absent(),
