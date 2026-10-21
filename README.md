@@ -237,6 +237,16 @@ turn for cancellation. installation must use the committed dependency lock
 with the `claude-sdk` extra. Claude's public reader loads the saved file before
 slicing; bounded output does not imply bounded transcript memory.
 
+## account quota subprocess
+
+`python -m provider_runtime.agent_runtime.quota_cli` reads one bounded closed
+stdin document, `{profileKey,endpoint}`, from an already-running codex account
+socket. it reuses observe-only quota transport and emits `{ok,result}` or
+`{ok:false,error:{code}}`. it never starts a provider, loads a thread, reads
+history, writes input or answers approvals. no optional claude SDK is required.
+this narrow consumer boundary leaves the independent public conversation and
+archive APIs above intact.
+
 ## Development
 
 ```bash
