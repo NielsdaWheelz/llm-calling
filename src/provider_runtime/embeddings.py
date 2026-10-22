@@ -8,8 +8,9 @@ runtime wraps in `NonGenerationCallFailed`, and defects raise their own types.
 
 Wire: the SDK's own embeddings lane (``AsyncOpenAI.embeddings.create``,
 ``max_retries=0``, explicit timeout, injectable http_client, and the canonical
-OpenAI host pinned explicitly — this port is openai-only, and the shared
-`zero_env_client` keeps every ambient SDK env read out of the request).
+OpenAI host unless the runtime supplies a validated HTTPS origin; ``/v1`` stays
+fixed). This port is openai-only, and the shared
+`zero_env_client` keeps every ambient SDK env read out of the request.
 ``encoding_format`` is deliberately omitted so the SDK default applies: it
 requests base64 on the wire and decodes the packed float32 payload back to
 plain floats itself; a provider answering JSON float lists passes through that
@@ -129,6 +130,7 @@ async def embed_once(
     credential: ProviderCredential,
     *,
     http_client: httpx.AsyncClient | None,
+    endpoint_origin: str | None = None,
 ) -> EmbeddingResponse | ProviderContextTooLarge:
     """One openai-SDK embeddings attempt; `ProviderRuntime.embed` owns the loop."""
     if credential.provider != "openai":
@@ -137,7 +139,7 @@ async def embed_once(
         )
     client = zero_env_client(
         api_key=credential.key,
-        base_url=CANONICAL_BASE_URL,
+        base_url=CANONICAL_BASE_URL if endpoint_origin is None else f"{endpoint_origin}/v1",
         timeout_s=_TIMEOUT_S,
         http_client=http_client,
     )
