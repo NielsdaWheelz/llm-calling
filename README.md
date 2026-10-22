@@ -47,6 +47,13 @@ environment variables**. Every terminal outcome, success or failure, carries a
 and write included), the full attempt trace, billability, the exact native
 reasoning value sent, and the registry revision.
 
+`endpoint_overrides` maps provider names to canonical https origins for generation
+and openai embedding calls. `provider_runtime.endpoints.normalize_endpoint_overrides`
+validates and freezes that map without loading transports or sdks; `None` preserves
+provider defaults. overrides retain each adapter's api path, including openai's
+`/v1`. custom ca trust belongs to the injected `http_client`, configured with
+`httpx.AsyncClient(verify=ssl_context)`.
+
 Multi-turn: use `ContinueGeneration` with the outcome's opaque
 `ContinuationArtifact` and the corresponding tool results. Use
 `provider_runtime.continuation.encode_continuation` / `decode_continuation`
@@ -95,6 +102,7 @@ types.py       the contract: frozen value vocabulary (intents, outcomes,
                stream events, usage, failures, CallMeta)
 errors.py      RuntimeDefect hierarchy + provider-text redaction; defects
                raise, they are never a returned value
+endpoints.py   import-light HTTPS-origin validation shared with host configuration
 registry.py    private capability rows/resolution; public api_model_catalog()
 continuation.py bounded canonical provider-continuation codec
 retry.py       single retry owner: DEFAULT_RETRY + the attempt iterator

@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from types import MappingProxyType
 from typing import Any, assert_never
 from urllib.parse import urlsplit, urlunsplit
 
@@ -32,6 +31,7 @@ import pydantic
 from opentelemetry.trace import TracerProvider
 
 from provider_runtime.continuation import preflight_generation, resume_generation, seal_generation
+from provider_runtime.endpoints import normalize_endpoint_overrides
 from provider_runtime.engines import Engine, TransientAttempt
 from provider_runtime.engines._common import monotonic_ms, row_reasoning
 from provider_runtime.errors import (
@@ -308,42 +308,6 @@ def _invalid_structured_detail(
 # Runtime
 
 
-_PROVIDERS = frozenset({"openai", "anthropic", "gemini", "deepseek", "xai"})
-
-
-def _endpoint_overrides(
-    values: Mapping[ProviderName, str],
-) -> Mapping[ProviderName, str]:
-    """Freeze canonical HTTPS origins supplied by the embedding application."""
-
-    unknown = set(values) - _PROVIDERS
-    if unknown:
-        raise ValueError(f"endpoint overrides name unknown providers: {sorted(unknown)!r}")
-    checked: dict[ProviderName, str] = {}
-    for provider, value in values.items():
-        try:
-            parsed = urlsplit(value)
-            port = parsed.port
-        except ValueError as error:
-            raise ValueError(f"{provider} endpoint override has an invalid port") from error
-        if (
-            parsed.scheme != "https"
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path not in {"", "/"}
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ValueError(f"{provider} endpoint override must be one HTTPS origin")
-        default_port = port in {None, 443}
-        authority = parsed.hostname if default_port else f"{parsed.hostname}:{port}"
-        if parsed.netloc != authority:
-            raise ValueError(f"{provider} endpoint override is not canonical")
-        checked[provider] = f"https://{authority}"
-    return MappingProxyType(checked)
-
-
 def _dispatch_row(
     row: ModelRow,
     overrides: Mapping[ProviderName, str],
@@ -384,7 +348,7 @@ class ProviderRuntime:
         self._retry = retry
         self._http_client = http_client
         self._tracer_provider = tracer_provider
-        self._endpoint_overrides = _endpoint_overrides(endpoint_overrides or {})
+        self._endpoint_overrides = normalize_endpoint_overrides(endpoint_overrides)
         self._engines = engines
 
     def _engine(self, engine_id: EngineId) -> Engine:
@@ -812,6 +776,7 @@ class ProviderRuntime:
                 credential: ProviderCredential,
                 *,
                 http_client: httpx.AsyncClient | None,
+                endpoint_origin: str | None = None,
             ) -> EmbeddingResponse | ProviderContextTooLarge
 
         — one openai-SDK attempt; context overflow is the one expected
@@ -838,7 +803,10 @@ class ProviderRuntime:
                     try:
                         with as_current(span):
                             result = await embeddings.embed_once(
-                                call, credential, http_client=self._http_client
+                                call,
+                                credential,
+                                http_client=self._http_client,
+                                endpoint_origin=self._endpoint_overrides.get("openai"),
                             )
                     except TransientAttempt as failed:
                         last_cause = failed.cause
