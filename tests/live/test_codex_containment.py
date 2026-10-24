@@ -32,6 +32,7 @@ from provider_runtime.agent_runtime import (
     AgentToolUse,
     CodexCatalogSessionRequest,
     CodexNativeOptions,
+    CodexUnixEndpoint,
     CredentialRef,
     NewSession,
     PermissionPolicy,
@@ -99,7 +100,7 @@ async def _qualify() -> dict[str, object]:
         async with AgentRuntime(
             AgentRuntimeConfig(
                 state_root_base=root,
-                codex_endpoints={_PROFILE: endpoint},
+                codex_endpoints={_PROFILE: CodexUnixEndpoint(endpoint)},
             )
         ) as runtime:
             catalog = await runtime.model_catalog("codex", auth)

@@ -35,6 +35,12 @@ from .auth import (
     resolve_state_root,
 )
 from .codex_control import CodexControl, CodexThreadTarget
+from .codex_endpoint import (
+    CodexEndpoint,
+    CodexUnixEndpoint,
+    CodexWebSocketEndpoint,
+    fingerprint_codex_endpoint,
+)
 from .codex_sdk import CodexSdkAdapter
 from .errors import (
     CredentialUnavailable,
@@ -115,7 +121,7 @@ _STATE_ROOT_MODE = 0o700
 @dataclass(frozen=True, slots=True)
 class AgentRuntimeConfig:
     state_root_base: Path
-    codex_endpoints: Mapping[str, Path] = field(default_factory=dict)
+    codex_endpoints: Mapping[str, CodexEndpoint] = field(default_factory=dict)
     claude_executable: str = "claude"
     max_turn_seconds: float = 3_600.0
     codex_sandbox: CodexSandboxControls | None = None
@@ -124,8 +130,8 @@ class AgentRuntimeConfig:
     def __post_init__(self) -> None:
         for profile, endpoint in self.codex_endpoints.items():
             CredentialRef(kind="local_account", profile_key=profile)
-            if not isinstance(endpoint, Path) or not endpoint.is_absolute():
-                raise InvalidAgentRequest("Codex endpoints must be absolute Unix socket paths")
+            if not isinstance(endpoint, CodexUnixEndpoint | CodexWebSocketEndpoint):
+                raise InvalidAgentRequest("Codex endpoints must be explicit listener values")
         object.__setattr__(self, "codex_endpoints", MappingProxyType(dict(self.codex_endpoints)))
         if not isinstance(self.state_root_base, Path):
             raise InvalidAgentRequest("state_root_base must be a Path")
@@ -346,13 +352,13 @@ class AgentRuntime:
         validate_read_session_auth(ref, options)
         adapter = self._adapter(ref.backend, ref.transport)
         adapter.validate_auth(options.auth)
-        environment, state_root = await self._environment(ref.backend, options.auth, ())
+        environment, state_root_fingerprint = await self._environment(ref.backend, options.auth, ())
         validate_session_ref(
             ref,
             backend=ref.backend,
             transport=ref.transport,
             profile_key=options.auth.profile_key,
-            state_root_fingerprint=fingerprint_path(state_root),
+            state_root_fingerprint=state_root_fingerprint,
             cwd="/",
             cwd_scopes_sessions=False,
         )
@@ -396,10 +402,9 @@ class AgentRuntime:
             )
         adapter = self._adapter(request.backend, request.transport)
         adapter.validate_auth(request.auth)
-        environment, state_root = await self._environment(
+        environment, state_root_fingerprint = await self._environment(
             request.backend, request.auth, request.policy.environment
         )
-        state_root_fingerprint = fingerprint_path(state_root)
         if isinstance(request.open, ResumeSession | ForkSession):
             validate_session_ref(
                 request.open.ref,
@@ -1105,14 +1110,14 @@ class AgentRuntime:
         backend: Backend,
         credential: CredentialRef,
         allowed_environment: tuple[str, ...],
-    ) -> tuple[dict[str, str], Path]:
+    ) -> tuple[dict[str, str], str]:
         if backend == "codex":
             endpoint = self._config.codex_endpoints.get(credential.profile_key)
             if endpoint is None:
                 raise CredentialUnavailable("Codex profile has no configured external endpoint")
             if allowed_environment:
                 raise UnsupportedCapability("shared Codex does not inherit client environment")
-            return {"CODEX_APP_SERVER_SOCKET": str(endpoint)}, endpoint
+            return {"CODEX_PROFILE": credential.profile_key}, fingerprint_codex_endpoint(endpoint)
         try:
             state_root = resolve_state_root(self._config.state_root_base, backend, credential)
         except OSError:
@@ -1127,7 +1132,7 @@ class AgentRuntime:
             )
         )
         self._secure_state_root(state_root)
-        return environment, state_root
+        return environment, fingerprint_path(state_root)
 
     def _secure_state_root(self, state_root: Path) -> None:
         """Create every component the runtime owns at 0700; `mkdir(parents=True)` does not."""
@@ -1559,7 +1564,7 @@ def _default_adapters(config: AgentRuntimeConfig) -> tuple[AgentAdapter, ...]:
     from .codex_sdk import CodexSdkAdapter
 
     return (
-        CodexSdkAdapter(sandbox_controls=config.codex_sandbox),
+        CodexSdkAdapter(endpoints=config.codex_endpoints, sandbox_controls=config.codex_sandbox),
         ClaudeSdkAdapter(executable=_resolve_executable(config.claude_executable)),
     )
 

@@ -19,6 +19,7 @@ from provider_runtime.agent_runtime import (
     AgentUsage,
     CodexCatalogSessionRequest,
     CodexNativeOptions,
+    CodexUnixEndpoint,
     CredentialRef,
     NewSession,
     PermissionPolicy,
@@ -202,7 +203,7 @@ async def test_compaction_estimates_do_not_charge_continuing_or_restored_turns(
         {"total": counts(100, 20), "last": estimate},
         {"total": counts(150, 30), "last": counts(50, 10)},
     ]
-    config = AgentRuntimeConfig(tmp_path, {"fixture": peer.socket})
+    config = AgentRuntimeConfig(tmp_path, {"fixture": CodexUnixEndpoint(peer.socket)})
     async with AgentRuntime(config) as runtime:
         session_request = await request(runtime, tmp_path)
         session = await runtime.open_session(session_request)
@@ -267,7 +268,9 @@ async def test_estimate_shape_does_not_excuse_malformed_usage(
     snapshot = {"total": counts(100, 20), "last": {**counts(0, 0), "totalTokens": 900}}
     snapshot[member][key] = value
     peer.snapshots = [snapshot]
-    async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"fixture": peer.socket})) as runtime:
+    async with AgentRuntime(
+        AgentRuntimeConfig(tmp_path, {"fixture": CodexUnixEndpoint(peer.socket)})
+    ) as runtime:
         session = await runtime.open_session(await request(runtime, tmp_path))
         with pytest.raises(ProtocolDefect):
             await runtime.run_turn(session, TURN)
@@ -281,7 +284,9 @@ async def test_compaction_does_not_reset_cumulative_billing(
         {"total": counts(100, 20), "last": counts(100, 20)},
         {"total": counts(90, 20), "last": {**counts(0, 0), "totalTokens": 900}},
     ]
-    async with AgentRuntime(AgentRuntimeConfig(tmp_path, {"fixture": peer.socket})) as runtime:
+    async with AgentRuntime(
+        AgentRuntimeConfig(tmp_path, {"fixture": CodexUnixEndpoint(peer.socket)})
+    ) as runtime:
         session = await runtime.open_session(await request(runtime, tmp_path))
         events = []
         with pytest.raises(ProtocolDefect):

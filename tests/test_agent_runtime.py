@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from provider_runtime.agent_runtime import CodexUnixEndpoint
+from provider_runtime.agent_runtime.codex_endpoint import fingerprint_codex_endpoint
 from provider_runtime.agent_runtime.errors import (
     ConcurrentTurn,
     CredentialUnavailable,
@@ -109,7 +111,7 @@ def session_ref(
     transport: AgentTransport = "sdk",
     profile: str = "personal",
     *,
-    state_root: Path | None = None,
+    state_root: Path | CodexUnixEndpoint | None = None,
     cwd: Path | None = None,
 ) -> AgentSessionRef:
     return AgentSessionRef(
@@ -118,7 +120,13 @@ def session_ref(
         transport=transport,
         native_session_id="native-session-1",
         profile_key=profile,
-        state_root_fingerprint=fingerprint_path(state_root) if state_root else "a" * 64,
+        state_root_fingerprint=(
+            fingerprint_codex_endpoint(state_root)
+            if isinstance(state_root, CodexUnixEndpoint)
+            else fingerprint_path(state_root)
+            if state_root
+            else "a" * 64
+        ),
         cwd_fingerprint=fingerprint_path(cwd) if cwd else "b" * 64,
     )
 
@@ -211,6 +219,7 @@ class Cancel:
 
 
 class ScriptedAdapter:
+    _test_codex_endpoint: CodexUnixEndpoint
     cwd_scopes_sessions = False
 
     def __init__(
@@ -318,14 +327,16 @@ class ScriptedAdapter:
         self.last_environment = dict(environment)
         if self.fail_open:
             raise ExecutableUnavailable("scripted selected adapter is unavailable")
-        state_root_name = (
-            "CODEX_APP_SERVER_SOCKET" if self.backend == "codex" else "CLAUDE_CONFIG_DIR"
+        state_root = (
+            self._test_codex_endpoint
+            if self.backend == "codex"
+            else Path(environment["CLAUDE_CONFIG_DIR"])
         )
         ref = session_ref(
             self.backend,
             self.transport,
             request.auth.profile_key,
-            state_root=Path(environment[state_root_name]),
+            state_root=state_root,
             cwd=Path(request.cwd),
         )
         if self.bad_ref:
@@ -438,10 +449,12 @@ class ScriptedAdapter:
 def runtime_for(
     tmp_path: Path, *adapters: ScriptedAdapter, max_turn_seconds: float = 5.0
 ) -> AgentRuntime:
+    for adapter in adapters:
+        adapter._test_codex_endpoint = CodexUnixEndpoint(tmp_path / "codex.sock")
     return AgentRuntime(
         AgentRuntimeConfig(
             state_root_base=tmp_path,
-            codex_endpoints={"personal": tmp_path / "codex.sock"},
+            codex_endpoints={"personal": CodexUnixEndpoint(tmp_path / "codex.sock")},
             max_turn_seconds=max_turn_seconds,
         ),
         adapters=adapters,
@@ -1140,7 +1153,7 @@ async def test_absent_codex_transport_dependency_is_sdk_unavailable(
 ) -> None:
     monkeypatch.setitem(sys.modules, "websockets.asyncio.client", None)
     async with AgentRuntime(
-        AgentRuntimeConfig(tmp_path, {"lab": tmp_path / "absent.sock"})
+        AgentRuntimeConfig(tmp_path, {"lab": CodexUnixEndpoint(tmp_path / "absent.sock")})
     ) as runtime:
         with pytest.raises(SdkUnavailable, match="websockets dependency"):
             await runtime.list_sessions(

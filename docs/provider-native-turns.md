@@ -97,7 +97,7 @@ values. there are no legacy decoders or invented evidence defaults.
 contained codex sessions require a dedicated stock `0.160.0` host. host
 operations call `materialize_codex_containment_catalog(private_directory)`
 and launch the stock process with `-c model_catalog_json="<returned-path>"`.
-`qualify_codex_containment_host(socket_path)` checks the public `config/read`
+`qualify_codex_containment_host(endpoint)` checks the public `config/read`
 declaration. session preparation repeats this check before creating a native
 thread: the canonical catalog basename and `sessionFlags` startup origin must
 match; the initialize user-agent build version must be exactly `0.160.0`.

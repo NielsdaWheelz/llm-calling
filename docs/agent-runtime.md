@@ -20,13 +20,13 @@ one terminal outcome per started turn.
 The routing algebra is closed:
 
 ```text
-(codex, sdk)  -> host-owned Codex app-server over WebSocket on a Unix socket
+(codex, sdk)  -> host-owned Codex app-server over Unix or authenticated ws/wss
 (claude, sdk) -> claude-agent-sdk
 ```
 
 There is no `cli` route or automatic fallback. The public route name remains
 `sdk` for stored-reference compatibility. On Codex, provider-runtime owns the
-documented WebSocket client protocol over an externally configured Unix socket.
+documented WebSocket client protocol over an explicit host-owned listener.
 It has no Python Codex SDK, bundled executable, private App Server, or
 `AsyncCodex` path. Claude remains on the official SDK and receives the exact
 vetted Claude Code executable through public `cli_path`.
@@ -75,7 +75,15 @@ does not make the connection reusable. Malformed responses and RPC timeouts
 fail the same connection before another request can start.
 
 `AgentRuntimeConfig.codex_endpoints` maps caller-owned opaque profile keys to
-absolute Unix-socket paths. The runtime has no Codex executable setting. Claude
+frozen `CodexEndpoint` values: `CodexUnixEndpoint(path=absolute_path)` or
+`CodexWebSocketEndpoint(url="ws://host:port", bearer_token=SecretStr(token))`.
+WebSocket URLs reject embedded credentials, queries and fragments; the token is
+required and excluded from representations. WebSocket connections disable proxies
+and redirects, and send the token only in the Authorization header. Unix
+connections carry no token. Endpoints normalize addresses once; session identity
+fingerprints the transport and address, never the bearer token or local state
+root. Changing a token preserves session scope. Old socket-only session
+fingerprints are rejected. The runtime has no Codex executable setting. Claude
 Code remains a local executable selected with
 `AgentRuntimeConfig.claude_executable`.
 
@@ -89,6 +97,7 @@ from provider_runtime.agent_runtime import (
     AgentRuntimeConfig,
     CodexCatalogSessionRequest,
     CodexNativeOptions,
+    CodexUnixEndpoint,
     CredentialRef,
     NewSession,
     PermissionPolicy,
@@ -98,7 +107,7 @@ from provider_runtime.agent_runtime import (
 
 config = AgentRuntimeConfig(
     state_root_base=Path("/private/agent-state"),
-    codex_endpoints={"personal": Path("/run/codex-shared-personal/app-server.sock")},
+    codex_endpoints={"personal": CodexUnixEndpoint(Path("/run/codex-shared-personal/app-server.sock"))},
 )
 auth = CredentialRef(kind="local_account", profile_key="personal")
 
@@ -226,8 +235,9 @@ Codex never creates a profile directory. Runtime-created Claude directories are
 mode `0700`; its child environment is
 rebuilt from a fail-closed allowlist. `HOME`, `PATH`, locale, temp, and
 `CLAUDE_CONFIG_DIR` are runtime-owned there. Codex starts no child and consumes
-no caller environment. Its configured endpoint must be an absolute Unix-socket
-path and the documented `account/read` response must report a ChatGPT account.
+no caller environment. The configured endpoint selects the listener; client
+state and request cwd are separate. The documented `account/read` response must
+report a ChatGPT account even when the transport bearer was accepted.
 No token-refresh or attestation callback is implemented: either request gets a
 JSON-RPC error and terminates the connection.
 

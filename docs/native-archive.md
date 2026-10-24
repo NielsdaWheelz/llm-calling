@@ -2,8 +2,8 @@
 
 `provider_runtime.agent_runtime.archive` reads retained native evidence without
 resuming, subscribing, dispatching tools or opening a model turn. `ArchiveHome`
-selects one provider/state root; codex additionally requires its host-owned unix
-app-server endpoint. `memory_server` is the exact configured mcp server binding.
+selects one provider/state root; codex additionally requires its host-owned
+`CodexEndpoint` (unix or authenticated websocket). `memory_server` is the exact configured mcp server binding.
 
 ```python
 home = ArchiveHome("codex", native_home, codex_endpoint)

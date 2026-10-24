@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
+from .codex_endpoint import CodexEndpoint, CodexUnixEndpoint, CodexWebSocketEndpoint
 from .errors import AgentRuntimeError, InvalidAgentRequest
 
 ARCHIVE_CONTRACT_REVISION = "native-archive.v2"
@@ -65,7 +66,7 @@ class ArchiveMissing(ArchiveError):
 class ArchiveHome:
     provider: ArchiveProvider
     state_root: Path
-    codex_endpoint: Path | None = None
+    codex_endpoint: CodexEndpoint | None = None
     memory_server: str = "jarvis-memory"
 
     def __post_init__(self) -> None:
@@ -76,9 +77,9 @@ class ArchiveHome:
         ):
             raise InvalidAgentRequest("archive home requires a provider and absolute state root")
         if self.provider == "codex" and (
-            self.codex_endpoint is None or not self.codex_endpoint.is_absolute()
+            not isinstance(self.codex_endpoint, CodexUnixEndpoint | CodexWebSocketEndpoint)
         ):
-            raise InvalidAgentRequest("Codex archive requires an absolute app-server endpoint")
+            raise InvalidAgentRequest("Codex archive requires an explicit app-server endpoint")
         if self.provider == "claude" and self.codex_endpoint is not None:
             raise InvalidAgentRequest("Claude archive reads transcripts, not a Codex endpoint")
         if not self.memory_server or len(self.memory_server.encode("utf-8")) > 256:
