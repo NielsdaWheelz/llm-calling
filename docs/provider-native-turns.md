@@ -27,6 +27,8 @@ there is one engine for contained and callback-bearing codex turns.
    storage or a callback handler waits. messages and recorded input drain in
    order before the terminal. pending callbacks and pending transport buffers
    are bounded; controlled turns have no cumulative event or transcript quota.
+   pending event payloads share a 4 mib byte bound, including field names for
+   empty values; stream chunk count does not impose a second quota.
    completed item ids are not retained. exact live callback identity is checked;
    durable host journals own completed callback/input/message identities and
    reject changed replay. written replies and completed callbacks retire pending

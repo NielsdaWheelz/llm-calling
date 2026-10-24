@@ -2422,7 +2422,7 @@ class _CodexAgentTurn:
         self._calls: dict[str, _ActiveCall] = {}
         self._reply_tokens: dict[str, _PendingReply] = {}
         self._pending_call_bytes = 0
-        self._events: asyncio.Queue[tuple[AgentEvent, int]] = asyncio.Queue(maxsize=256)
+        self._events: asyncio.Queue[tuple[AgentEvent, int]] = asyncio.Queue()
         self._queued_bytes = 0
         self._accepted: asyncio.Future[AgentSubmission] = asyncio.get_running_loop().create_future()
         self._finished = asyncio.Event()
@@ -2622,7 +2622,7 @@ class _CodexAgentTurn:
             size = bounded_payload_size(event, _MAX_MESSAGE_BYTES, max_items=_MAX_MESSAGE_ITEMS)
         except OutputLimitExceeded:
             raise ProtocolDefect("native event exceeded its per-message bound") from None
-        if self._events.full() or self._queued_bytes + size > _MAX_MESSAGE_BYTES:
+        if self._queued_bytes + size > _MAX_MESSAGE_BYTES:
             raise ProtocolDefect("native pending event buffer exceeded its finite bound")
         self._queued_bytes += size
         self._events.put_nowait((event, size))
