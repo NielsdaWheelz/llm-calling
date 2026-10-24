@@ -43,7 +43,7 @@ def client(home: ArchiveHome) -> CodexAppServerClient:
     assert home.codex_endpoint is not None
     return CodexAppServerClient(
         CodexAppServerConfig(
-            socket_path=home.codex_endpoint, request_policy="observe_only", experimental_api=True
+            endpoint=home.codex_endpoint, request_policy="observe_only", experimental_api=True
         )
     )
 

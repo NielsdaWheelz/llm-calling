@@ -21,6 +21,7 @@ from .codex_app_server import (
     CodexConnectionUnavailable,
     CodexOutputLimit,
 )
+from .codex_endpoint import CodexEndpoint
 from .errors import AgentRuntimeError, InvalidAgentRequest, ProtocolDefect
 from .types import CredentialRef
 
@@ -263,7 +264,7 @@ class CodexControl:
 
     def __init__(
         self,
-        endpoints: Mapping[str, Path],
+        endpoints: Mapping[str, CodexEndpoint],
         is_managed: Callable[[CodexThreadTarget], bool],
         *,
         native_owners: bool = False,

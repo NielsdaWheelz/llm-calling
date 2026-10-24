@@ -7,7 +7,6 @@ import json
 from collections.abc import AsyncGenerator, Callable, Mapping
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
@@ -24,6 +23,7 @@ from ._limits import (
     OutputLimitExceeded,
     bounded_payload_size,
 )
+from .codex_endpoint import CodexEndpoint, CodexUnixEndpoint, CodexWebSocketEndpoint
 from .errors import AgentRuntimeError, ProtocolDefect, SdkUnavailable
 
 type CodexRequestId = str | int
@@ -74,7 +74,7 @@ _FORBIDDEN_AUTHORITY_REQUESTS: dict[str, tuple[CodexServerRequestKind, str]] = {
 
 @dataclass(frozen=True, slots=True)
 class CodexAppServerConfig:
-    socket_path: Path
+    endpoint: CodexEndpoint
     request_policy: Literal["deny_owned", "observe_only"] = "deny_owned"
     client_name: str = "provider_runtime"
     client_title: str = "provider-runtime"
@@ -83,8 +83,8 @@ class CodexAppServerConfig:
     callbacks: bool = False
 
     def __post_init__(self) -> None:
-        if not self.socket_path.is_absolute():
-            raise ValueError("Codex app-server socket must be absolute")
+        if not isinstance(self.endpoint, CodexUnixEndpoint | CodexWebSocketEndpoint):
+            raise ValueError("Codex app-server requires an explicit endpoint")
         if self.request_policy not in ("deny_owned", "observe_only"):
             raise ValueError("Codex app-server request policy is invalid")
         if type(self.experimental_api) is not bool:
@@ -178,27 +178,44 @@ class CodexAppServerClient:
 
     async def __aenter__(self) -> CodexAppServerClient:
         try:
-            from websockets.asyncio.client import unix_connect
-            from websockets.exceptions import InvalidHandshake
+            from websockets.asyncio.client import connect, unix_connect
+            from websockets.exceptions import InvalidHandshake, InvalidStatus
         except ModuleNotFoundError:
             raise SdkUnavailable("shared Codex requires the websockets dependency") from None
+
+        class DirectConnect(connect):
+            # A configured listener is an identity boundary, not a redirect origin.
+            def process_redirect(self, exc: Exception) -> Exception:
+                return exc
+
         if self._connection is not None or self._closed:
             raise ProtocolDefect("Codex app-server client was started more than once")
         try:
-            self._connection = await unix_connect(
-                str(self.config.socket_path.resolve(strict=True)),
-                uri="ws://localhost",
-                open_timeout=_OPERATION_TIMEOUT_SECONDS,
-                close_timeout=2,
-                max_size=_MAX_MESSAGE_BYTES,
-                max_queue=16,
-                compression=None,
-                proxy=None,
-            )
-        except (OSError, TimeoutError):
+            endpoint = self.config.endpoint
+            options: dict[str, Any] = {
+                "open_timeout": _OPERATION_TIMEOUT_SECONDS,
+                "close_timeout": 2,
+                "max_size": _MAX_MESSAGE_BYTES,
+                "max_queue": 16,
+                "compression": None,
+                "proxy": None,
+            }
+            if isinstance(endpoint, CodexUnixEndpoint):
+                self._connection = await unix_connect(
+                    str(endpoint.path.resolve(strict=True)), uri="ws://localhost", **options
+                )
+            else:
+                self._connection = await DirectConnect(
+                    endpoint.url,
+                    additional_headers={
+                        "Authorization": f"Bearer {endpoint.bearer_token.get_secret_value()}"
+                    },
+                    **options,
+                )
+        except (OSError, TimeoutError, InvalidStatus):
             raise CodexConnectionUnavailable() from None
         except InvalidHandshake:
-            raise ProtocolDefect("Codex socket did not provide the WebSocket protocol") from None
+            raise ProtocolDefect("Codex endpoint did not provide the WebSocket protocol") from None
         if self._closed:
             await self._connection.close()
             raise CodexConnectionUnavailable()

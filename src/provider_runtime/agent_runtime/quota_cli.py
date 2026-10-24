@@ -12,6 +12,7 @@ from typing import Literal, Never
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from .codex_control import CodexControl
+from .codex_endpoint import CodexUnixEndpoint
 from .errors import AgentRuntimeError, InvalidAgentRequest, ProtocolDefect
 from .types import CredentialRef
 
@@ -46,7 +47,7 @@ async def _run(request: _Request) -> dict:
     loop = asyncio.get_running_loop()
     loop.add_signal_handler(signal.SIGTERM, task.cancel)
     control = CodexControl(
-        {request.profileKey: Path(request.endpoint[7:])},
+        {request.profileKey: CodexUnixEndpoint(Path(request.endpoint[7:]))},
         is_managed=lambda _: False,
         native_owners=True,
     )

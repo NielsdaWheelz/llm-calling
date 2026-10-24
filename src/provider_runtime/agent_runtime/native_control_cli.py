@@ -20,6 +20,7 @@ from .codex_control import (
     CodexThreadRead,
     CodexThreadTarget,
 )
+from .codex_endpoint import CodexUnixEndpoint
 from .errors import AgentRuntimeError, InvalidAgentRequest, ProtocolDefect
 
 
@@ -202,7 +203,7 @@ def _bound_read(result: dict) -> dict:
 async def _codex(request: _Request) -> dict:
     assert request.endpoint is not None
     control = CodexControl(
-        {request.profileKey: Path(request.endpoint[7:])},
+        {request.profileKey: CodexUnixEndpoint(Path(request.endpoint[7:]))},
         is_managed=lambda _: False,
         native_owners=True,
     )

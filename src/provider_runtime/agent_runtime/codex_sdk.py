@@ -7,7 +7,6 @@ import hashlib
 import weakref
 from collections.abc import AsyncGenerator, Callable, Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
-from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import uuid4
 
@@ -39,6 +38,7 @@ from .codex_app_server import (
     CodexServerRequest,
 )
 from .codex_containment import _validate_codex_containment_config
+from .codex_endpoint import CodexEndpoint, fingerprint_codex_endpoint
 from .errors import (
     CredentialRejected,
     CredentialUnavailable,
@@ -524,11 +524,17 @@ class CodexSdkAdapter:
     # Codex threads resume from any directory; the ref keeps cwd as provenance only.
     cwd_scopes_sessions: Literal[False] = False
 
-    def __init__(self, *, sandbox_controls: CodexSandboxControls | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        endpoints: Mapping[str, CodexEndpoint],
+        sandbox_controls: CodexSandboxControls | None = None,
+    ) -> None:
         if sandbox_controls is not None and not isinstance(sandbox_controls, CodexSandboxControls):
             raise InvalidAgentRequest(
                 "sandbox_controls must be CodexSandboxControls when configured"
             )
+        self._endpoints = dict(endpoints)
         self._sandbox_controls = sandbox_controls
         self._sessions: dict[AgentSession, _CodexSessionState] = {}
         self._dead_sessions: weakref.WeakSet[AgentSession] = weakref.WeakSet()
@@ -568,12 +574,12 @@ class CodexSdkAdapter:
             data = payload.get("data")
             if not isinstance(data, list):
                 raise ProtocolDefect("Codex SDK thread_list data was not an array")
-            state_root = self._endpoint(environment)
+            endpoint = self._endpoint(environment)
             sessions = tuple(
                 self._session_summary(
                     self._mapping(item, "Codex SDK thread_list thread"),
                     profile_key=query.auth.profile_key,
-                    state_root=state_root,
+                    endpoint=endpoint,
                 )
                 for item in data
             )
@@ -595,7 +601,7 @@ class CodexSdkAdapter:
             raise SessionMismatch("Codex SDK cannot read a different route")
         validate_read_session_auth(ref, options)
         self._require_local_auth(options.auth.kind)
-        if ref.state_root_fingerprint != fingerprint_path(self._endpoint(environment)):
+        if ref.state_root_fingerprint != fingerprint_codex_endpoint(self._endpoint(environment)):
             raise SessionMismatch("session state root does not match the supplied environment")
         client = await self._open_client(environment=environment)
         try:
@@ -630,7 +636,7 @@ class CodexSdkAdapter:
         self._validate_policy_mapping(request.policy)
         validate_mcp_network_policy(request.mcp_servers, request.policy)
         self._validate_mcp_filters(request)
-        state_root = self._endpoint(environment)
+        endpoint = self._endpoint(environment)
         native = request.native
         contained = isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled"
         internal = isinstance(native, CodexNativeOptions) and native.archive_internal
@@ -734,7 +740,7 @@ class CodexSdkAdapter:
             ref = self._make_ref(
                 native_session_id=native_session_id,
                 profile_key=request.auth.profile_key,
-                state_root=state_root,
+                endpoint=endpoint,
                 cwd=request.cwd,
             )
             session = AgentSession(ref)
@@ -915,7 +921,7 @@ class CodexSdkAdapter:
     ) -> CodexAppServerClient:
         client = CodexAppServerClient(
             CodexAppServerConfig(
-                socket_path=self._endpoint(environment),
+                endpoint=self._endpoint(environment),
                 experimental_api=experimental_api,
                 callbacks=callbacks,
             )
@@ -929,12 +935,11 @@ class CodexSdkAdapter:
         self._clients.add(client)
         return client
 
-    @staticmethod
-    def _endpoint(environment: Mapping[str, str]) -> Path:
-        value = environment.get("CODEX_APP_SERVER_SOCKET")
-        if not value or not Path(value).is_absolute():
+    def _endpoint(self, environment: Mapping[str, str]) -> CodexEndpoint:
+        endpoint = self._endpoints.get(environment.get("CODEX_PROFILE", ""))
+        if endpoint is None:
             raise CredentialUnavailable("Codex profile has no configured external endpoint")
-        return Path(value)
+        return endpoint
 
     def _restored_usage_baseline(
         self, client: Any, native_session_id: str, request: _ResolvedCodexSessionRequest
@@ -2026,7 +2031,7 @@ class CodexSdkAdapter:
             backend=self.backend,
             transport=self.transport,
             profile_key=request.auth.profile_key,
-            state_root_fingerprint=fingerprint_path(self._endpoint(environment)),
+            state_root_fingerprint=fingerprint_codex_endpoint(self._endpoint(environment)),
             cwd=request.cwd,
             cwd_scopes_sessions=self.cwd_scopes_sessions,
         )
@@ -2036,13 +2041,13 @@ class CodexSdkAdapter:
         thread: Mapping[str, object],
         *,
         profile_key: str,
-        state_root: Path,
+        endpoint: CodexEndpoint,
     ) -> SessionSummary:
         return SessionSummary(
             ref=self._make_ref(
                 native_session_id=self._string(thread, "id", "thread_list"),
                 profile_key=profile_key,
-                state_root=state_root,
+                endpoint=endpoint,
                 cwd=self._string(thread, "cwd", "thread_list"),
             ),
             metadata=SessionMetadata(name=self._optional_string(thread.get("name"))),
@@ -2050,7 +2055,7 @@ class CodexSdkAdapter:
 
     @staticmethod
     def _make_ref(
-        *, native_session_id: str, profile_key: str, state_root: Path, cwd: str
+        *, native_session_id: str, profile_key: str, endpoint: CodexEndpoint, cwd: str
     ) -> AgentSessionRef:
         return AgentSessionRef(
             schema_version="agent-session-ref.v1",
@@ -2058,7 +2063,7 @@ class CodexSdkAdapter:
             transport="sdk",
             native_session_id=native_session_id,
             profile_key=profile_key,
-            state_root_fingerprint=fingerprint_path(state_root),
+            state_root_fingerprint=fingerprint_codex_endpoint(endpoint),
             cwd_fingerprint=fingerprint_path(cwd),
         )
 

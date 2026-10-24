@@ -11,6 +11,7 @@ from provider_runtime.types import canonical_json_bytes, freeze_json_value
 
 from ._limits import _OPERATION_TIMEOUT_SECONDS
 from .codex_app_server import CodexAppServerClient, CodexAppServerConfig
+from .codex_endpoint import CodexEndpoint
 from .errors import UnsupportedCapability
 
 CODEX_CONTAINMENT_VERSION = "0.160.0"
@@ -99,12 +100,12 @@ def _validate_codex_containment_config(response: object, metadata: dict[str, obj
     )
 
 
-async def qualify_codex_containment_host(socket_path: Path) -> Path:
+async def qualify_codex_containment_host(endpoint: CodexEndpoint) -> Path:
     """Verify the public startup declaration; the trusted host owns file bytes."""
     async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
         async with CodexAppServerClient(
             CodexAppServerConfig(
-                socket_path=socket_path, request_policy="observe_only", experimental_api=True
+                endpoint=endpoint, request_policy="observe_only", experimental_api=True
             )
         ) as client:
             return _validate_codex_containment_config(

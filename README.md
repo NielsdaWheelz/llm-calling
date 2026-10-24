@@ -179,7 +179,7 @@ supervises its shared service. Native version metadata is diagnostic, not an
 admission gate; protocol validation, subscription auth, and containment remain
 fail-closed. Installing a newer version does not certify its live behavior.
 The Codex route retains the `sdk` name and owns the documented
-WebSocket-over-Unix-socket App Server client; Claude remains on its official
+Unix or authenticated WebSocket App Server client; Claude remains on its official
 SDK. This package
 owns the authorization model — a retained security kernel with restrictive permission
 defaults, narrowing-only policy changes, unsafe-action confirmation for
