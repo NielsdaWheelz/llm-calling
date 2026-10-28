@@ -455,6 +455,8 @@ class AgentRuntime:
         if len(rows) != 1:
             raise InvalidAgentRequest("Codex model_key is absent from the current catalog")
         row = rows[0]
+        if not row.offered:
+            raise InvalidAgentRequest("Codex model is no longer offered")
         if row.row_fingerprint != request.row_fingerprint:
             raise InvalidAgentRequest("Codex model row fingerprint is stale")
         reasoning = tuple(item for item in row.reasoning if item.key == request.reasoning)

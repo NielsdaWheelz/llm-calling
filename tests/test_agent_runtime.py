@@ -167,6 +167,7 @@ def codex_catalog() -> AgentModelCatalog:
                 key="codex-test",
                 dispatch_model="codex-test-wire",
                 label="Codex Test",
+                offered=True,
                 source_context_window=Absent(),
                 source_max_output_tokens=Absent(),
                 input_modalities=("text", "image"),
@@ -528,6 +529,23 @@ async def test_codex_catalog_selection_fails_before_adapter_open(
         with pytest.raises(InvalidAgentRequest, match=message):
             await runtime.open_session(selected)
 
+    assert adapter.model_catalog_calls == 1
+    assert adapter.open_calls == 0
+
+
+async def test_unoffered_codex_model_fails_before_native_session(tmp_path: Path) -> None:
+    adapter = ScriptedAdapter(backend="codex")
+    catalog = codex_catalog()
+    unpublished = replace(catalog, models=(replace(catalog.models[0], offered=False),))
+
+    async def model_catalog(*, environment: Mapping[str, str]) -> AgentModelCatalog:
+        adapter.model_catalog_calls += 1
+        return unpublished
+
+    adapter.model_catalog = model_catalog
+    async with runtime_for(tmp_path, adapter) as runtime:
+        with pytest.raises(InvalidAgentRequest, match="no longer offered"):
+            await runtime.open_session(request(tmp_path, backend="codex"))
     assert adapter.model_catalog_calls == 1
     assert adapter.open_calls == 0
 

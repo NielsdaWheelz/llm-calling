@@ -333,13 +333,13 @@ def test_all_engine_encoders_preserve_the_frozen_portable_schema_semantics() -> 
     tool = published.tools[2]
     expected = WEB_SEARCH_SPEC.input_schema.semantic
 
-    openai_row, openai_intent = _intent("openai:gpt-6-sol", (tool,))
+    openai_row, openai_intent = _intent("openai:gpt-6.1-sol", (tool,))
     openai_tools = encode_openai_responses(openai_row, openai_intent).params["tools"]
     assert isinstance(openai_tools, list)
     openai = openai_tools[0]
     assert isinstance(openai, Mapping)
 
-    anthropic_row, anthropic_intent = _intent("anthropic:claude-sonnet-5", (tool,))
+    anthropic_row, anthropic_intent = _intent("anthropic:claude-sonnet-5-5", (tool,))
     anthropic_tools = encode_anthropic(anthropic_row, anthropic_intent).params["tools"]
     assert isinstance(anthropic_tools, list)
     anthropic = anthropic_tools[0]

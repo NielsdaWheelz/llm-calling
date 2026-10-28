@@ -142,7 +142,7 @@ async with AgentRuntime(config) as runtime:
 App Server RPC `model/list` through every page and returns every visible row in native
 order. `AgentModelCatalog` carries a content-derived definition revision;
 each `AgentModelFacts` carries exact model/dispatch identity, ordered reasoning
-facts, modalities, lifecycle/upgrade facts, and a content-derived row
+facts, modalities, lifecycle/upgrade facts, required `offered` membership, and a content-derived row
 fingerprint. The public App Server catalog reports neither context-window nor
 max-output capacity, so both source-capacity fields are honestly `Absent` and
 do not make a row unusable. Product request budgets remain caller-owned.
@@ -150,11 +150,17 @@ do not make a row unusable. Product request budgets remain caller-owned.
 The session request is the closed union
 `CodexCatalogSessionRequest | ClaudeNativeSessionRequest`. The Codex arm must
 carry the selected catalog revision and row fingerprint; `open_session`
-re-reads the catalog, rejects stale or unsupported selections, and resolves
+re-reads the catalog, rejects unoffered, stale or unsupported selections, and resolves
 the server-only dispatch model and reasoning wire value before billable work.
 There is no free-form Codex model path or compatibility constructor. Claude's
 native arm remains separate because that SDK exposes no equivalent public
 catalog; asking the Claude route for one raises `UnsupportedCapability`.
+
+agent catalog and row fingerprint domains are v3. every visible dispatch id in
+the complete pinned source is explicitly classified; an unknown id is a protocol
+defect. authenticated discovery may return a subset. obsolete source rows remain
+intact for host containment, but cannot open new sessions. native upgrade metadata
+is advisory and never substitutes a model.
 
 For streamed UI or telemetry, iterate `runtime.stream_turn(...)` instead of
 calling `run_turn(...)`. `run_turn` is the terminal projection of that same

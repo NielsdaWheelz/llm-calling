@@ -139,14 +139,17 @@ call pays its SDK import cost; importing or constructing the runtime does not.
 `provider_runtime.registry.api_model_catalog()` is the sole public catalog
 oracle. It returns an immutable, ordered `ApiModelCatalog` containing exact
 dispatch, capacity, modality, tool, streaming, structured-output, reasoning,
-default, lifecycle, continuation-codec, revision, and row-fingerprint facts.
+default, lifecycle, publication membership (`offered`), continuation-codec,
+revision, and row-fingerprint facts.
 The hand-curated rows and their resolution functions are private runtime
 owners; consumers select and compare only public catalog facts. Rows are
 verified against provider docs, never a place to remember guesses. Any row
 change bumps the catalog's `registry_revision`, which is also stamped into
 every `CallMeta` and flows into the consumer's ledger.
 
-The catalog contains nine selected models across five providers. Model and
+api contract v5 includes required `offered` in each row fingerprint. only
+published rows resolve for execution; credentials do not decide membership.
+Model and
 reasoning keys are exact catalog facts; unsupported keys fail before dispatch.
 `continuation.pending_tool_calls` exposes the owned pending-call seam without
 consumers interpreting native continuation payloads.
@@ -174,10 +177,10 @@ on `CallMeta`. The snapshot records its sources; the library never fetches.
 ## Agent lane
 
 Exactly two routes ship: `(codex, sdk)` and `(claude, sdk)`. The core package
-declares `websockets`; the host separately installs the latest stable Codex and
-supervises its shared service. Native version metadata is diagnostic, not an
-admission gate; protocol validation, subscription auth, and containment remain
-fail-closed. Installing a newer version does not certify its live behavior.
+declares `websockets`; the host separately installs Codex and supervises its
+shared service. contained sessions require the exact qualified 0.165.0 binary
+and startup catalog. protocol validation, subscription auth, and containment
+remain fail-closed. installing a newer version does not certify its behavior.
 The Codex route retains the `sdk` name and owns the documented
 Unix or authenticated WebSocket App Server client; Claude remains on its official
 SDK. This package
