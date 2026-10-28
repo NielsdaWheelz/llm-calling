@@ -31,7 +31,7 @@ from provider_runtime.types import (
     freeze_json_object,
 )
 
-REGISTRY_REVISION: Final = "2026-10-28.1"
+REGISTRY_REVISION: Final = "2026-10-28.2"
 _BACKEND_CONTRACT_REVISION: Final = "provider-runtime.api-model-catalog.v5"
 _KEY = re.compile(r"[a-z0-9]+(?:[_/][a-z0-9]+)*\Z")
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -80,7 +80,6 @@ _OPENAI_SOURCE = _source("https://developers.openai.com/api/docs/guides/reasonin
 _CLAUDE_SOURCE = _source("https://platform.claude.com/docs/en/build-with-claude/effort")
 _GEMINI_SOURCE = _source("https://ai.google.dev/gemini-api/docs/thinking")
 _DEEPSEEK_SOURCE = _source("https://api-docs.deepseek.com/guides/thinking_mode/")
-_XAI_SOURCE = _source("https://docs.x.ai/developers/models/grok-4.7")
 _VISION: Final[frozenset[Literal["text", "image"]]] = frozenset({"text", "image"})
 _MODEL_LABELS: Final[Mapping[str, str]] = {
     "gpt-6-astra": "GPT-6 Astra",
@@ -97,8 +96,6 @@ _MODEL_LABELS: Final[Mapping[str, str]] = {
     "gemini-3.1-pro-preview": "Gemini 3.1 Pro · preview",
     "deepseek-flash": "DeepSeek V4.1 Flash",
     "deepseek-v4-pro": "DeepSeek V4 Pro",
-    "grok-4.7": "Grok 4.7",
-    "grok-build-0.1": "Grok Build 0.1 · beta",
 }
 
 
@@ -114,8 +111,6 @@ def _reasoning(
         label = f"thinking off · {effort} effort"
     elif mode is not None:
         label = f"{mode} · {effort}"
-    elif effort == "default":
-        label = "provider default"
     else:
         label = "off" if effort == "none" else effort
     return key, _ReasoningRow(ApiReasoningFacts(key, label, mode, effort, order), fragment)
@@ -267,40 +262,6 @@ def _deepseek_row(model: str) -> _ModelRow:
     )
 
 
-def _xai_row(model: str) -> _ModelRow:
-    build = model == "grok-build-0.1"
-    return _ModelRow(
-        ref=f"xai:{model}",
-        provider="xai",
-        model_id=model,
-        engine="openai_chat",
-        base_url=Present("https://api.x.ai/v1"),
-        context_window=256_000 if build else 500_000,
-        max_output_tokens=32_000,
-        source_max_output_tokens=Absent(),
-        modalities=_VISION,
-        tools=True,
-        streaming=True,
-        structured="native",
-        reasoning=Present(
-            dict([_reasoning(None, "default", 0, {})])
-            if build
-            else dict(
-                _reasoning(None, effort, order, {"reasoning_effort": effort})
-                for order, effort in enumerate(("low", "medium", "high", "xhigh"))
-            )
-        ),
-        source_default_reasoning=_default(
-            "default" if build else "high",
-            _source("https://docs.x.ai/developers/models/grok-build-0.1") if build else _XAI_SOURCE,
-        ),
-        upgrade=Absent(),
-        retirement=Absent(),
-        continuation_codec="xai.v2",
-        correlation="in_band",
-    )
-
-
 _ROWS: Final[tuple[_ModelRow, ...]] = (
     *(_openai_row(model) for model in GPT6_MODEL_IDS),
     *(
@@ -322,7 +283,6 @@ _ROWS: Final[tuple[_ModelRow, ...]] = (
         )
     ),
     *(_deepseek_row(model) for model in ("deepseek-flash", "deepseek-v4-pro")),
-    *(_xai_row(model) for model in ("grok-4.7", "grok-build-0.1")),
 )
 
 
@@ -493,18 +453,7 @@ def _validate_rows() -> None:
                 not 1 <= len(key) <= 64
                 or _KEY.fullmatch(key) is None
                 or choice.facts.key != key
-                or (
-                    not choice.fragment
-                    and not (
-                        row.provider == "xai"
-                        and row.model_id == "grok-build-0.1"
-                        and tuple(row.reasoning.value) == ("default",)
-                        and choice.facts
-                        == ApiReasoningFacts("default", "provider default", None, "default", 0)
-                        and isinstance(row.source_default_reasoning, Present)
-                        and row.source_default_reasoning.value.value == "default"
-                    )
-                )
+                or not choice.fragment
             ):
                 raise RuntimeDefect(
                     origin="intent",

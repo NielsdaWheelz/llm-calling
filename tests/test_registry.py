@@ -38,8 +38,6 @@ EXPECTED = {
     "gemini:gemini-3.1-pro-preview": 3,
     "deepseek:deepseek-flash": 4,
     "deepseek:deepseek-v4-pro": 4,
-    "xai:grok-4.7": 4,
-    "xai:grok-build-0.1": 1,
 }
 
 
@@ -65,7 +63,7 @@ def test_exact_current_catalog_and_shared_gpt6_identity() -> None:
     assert {row.dispatch.model_id for row in catalog.models if row.provider == "openai"} == set(
         GPT6_MODEL_IDS
     )
-    assert sum(len(row.reasoning) for row in catalog.models) == 96
+    assert sum(len(row.reasoning) for row in catalog.models) == 91
     assert all(len(rows[ref].reasoning) == count for ref, count in EXPECTED.items())
     assert all(row.offered is True and row.label and row.row_fingerprint for row in catalog.models)
     assert catalog.definition_revision == api_model_catalog().definition_revision
@@ -89,15 +87,12 @@ def test_source_capacity_is_not_inferred_from_a_request_budget() -> None:
         "gemini:gemini-3.1-pro-preview": (1_048_576, Present(65_536)),
         "deepseek:deepseek-flash": (1_048_576, Present(393_216)),
         "deepseek:deepseek-v4-pro": (1_048_576, Present(393_216)),
-        "xai:grok-4.7": (500_000, Absent()),
-        "xai:grok-build-0.1": (256_000, Absent()),
     }
     assert {
         row.model_ref: (row.context_window, row.max_output_tokens)
         for row in api_model_catalog().models
     } == expected
     assert _resolve("deepseek:deepseek-flash").max_output_tokens == 384_000
-    assert _resolve("xai:grok-4.7").max_output_tokens == 32_000
 
 
 def test_options_are_complete_content_and_defaults_are_sourced() -> None:
@@ -134,12 +129,8 @@ def test_every_declared_key_lowers_to_its_exact_native_configuration(ref: str) -
     facts = _resolve_facts(ref)
     for option in facts.reasoning:
         lowered = row_reasoning(row, _intent(ref, option.key))
-        if ref == "xai:grok-build-0.1":
-            assert lowered.fragment == {}
-            assert lowered.native_reasoning == Absent()
-        else:
-            assert lowered.fragment
-            assert isinstance(lowered.native_reasoning, Present)
+        assert lowered.fragment
+        assert isinstance(lowered.native_reasoning, Present)
 
 
 def test_composite_and_single_axis_lowering() -> None:
@@ -164,11 +155,9 @@ def test_composite_and_single_axis_lowering() -> None:
         ("anthropic:claude-sonnet-5-5", "disabled/high"),
         ("anthropic:claude-sonnet-5-5", "between_tools/xhigh"),
         ("anthropic:claude-haiku-5-5", "disabled/xhigh"),
-        ("xai:grok-build-0.1", "high"),
         ("anthropic:claude-opus-5-5", "disabled/high"),
         ("gemini:gemini-3.8-flash", "minimal"),
         ("deepseek:deepseek-flash", "medium"),
-        ("xai:grok-4.7", "max"),
     ],
 )
 def test_undeclared_configuration_rejected(ref: str, key: str) -> None:
@@ -184,6 +173,8 @@ def test_undeclared_configuration_rejected(ref: str, key: str) -> None:
         ProviderTarget("openai", "gpt-6-sol"),
         ProviderTarget("anthropic", "claude-sonnet-5"),
         ProviderTarget("xai", "grok-4.5"),
+        ProviderTarget("xai", "grok-4.7"),
+        ProviderTarget("xai", "grok-build-0.1"),
     ],
 )
 def test_retired_exact_target_rejected(target: ProviderTarget) -> None:

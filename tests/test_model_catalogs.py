@@ -277,8 +277,6 @@ def test_api_catalog_is_exact_immutable_and_the_registry_has_no_public_rows() ->
         "gemini:gemini-3.1-pro-preview",
         "deepseek:deepseek-flash",
         "deepseek:deepseek-v4-pro",
-        "xai:grok-4.7",
-        "xai:grok-build-0.1",
     )
     assert len({row.row_fingerprint for row in first.models}) == len(first.models)
     assert all(row.offered is True for row in first.models)

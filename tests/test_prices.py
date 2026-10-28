@@ -68,7 +68,6 @@ def test_only_current_exact_identity_has_an_estimate() -> None:
 
 def test_unknown_high_context_tier_is_not_mispriced() -> None:
     assert isinstance(estimate_cost(_meta("openai", "gpt-6.1-sol", 272_001, 100)), Absent)
-    assert isinstance(estimate_cost(_meta("xai", "grok-4.7", 200_001, 100)), Absent)
 
 
 def test_deepseek_peak_rate_is_conservative() -> None:
@@ -103,6 +102,6 @@ def test_renamed_models_use_current_cache_prices() -> None:
     assert isinstance(sonnet, Present) and sonnet.value.amount_usd_micros == 100
 
 
-def test_xai_long_context_starts_at_the_published_boundary() -> None:
-    assert isinstance(estimate_cost(_meta("xai", "grok-build-0.1", 199_999, 100)), Present)
-    assert estimate_cost(_meta("xai", "grok-build-0.1", 200_000, 100)) == Absent()
+@pytest.mark.parametrize("model", ["grok-4.7", "grok-build-0.1"])
+def test_omitted_xai_models_have_no_current_price(model: str) -> None:
+    assert estimate_cost(_meta("xai", model, 1000, 100)) == Absent()

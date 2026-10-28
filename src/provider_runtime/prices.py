@@ -121,8 +121,6 @@ def estimate_cost(meta: CallMeta) -> Presence[CostEstimate]:
     matched = _match_rates(meta.provider, meta.model)
     if meta.provider == "openai" and usage.input_tokens > 272_000:
         return Absent()
-    if meta.provider == "xai" and usage.input_tokens >= 200_000:
-        return Absent()
     if (
         meta.provider == "anthropic"
         and meta.model == "claude-haiku-5-5"

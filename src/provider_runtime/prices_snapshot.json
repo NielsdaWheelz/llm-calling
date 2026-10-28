@@ -15,8 +15,6 @@
     {"provider":"gemini","model":"gemini-3.5-flash-lite","input_mtok_usd":"0.3","output_mtok_usd":"2.5","cache_read_mtok_usd":"0.03","cache_write_surcharge_mtok_usd":"0"},
     {"provider":"gemini","model":"gemini-3.1-pro-preview","input_mtok_usd":"2","output_mtok_usd":"12","cache_read_mtok_usd":"0.2","cache_write_surcharge_mtok_usd":"0"},
     {"provider":"deepseek","model":"deepseek-flash","input_mtok_usd":"0.3","output_mtok_usd":"1.2","cache_read_mtok_usd":"0.006","cache_write_surcharge_mtok_usd":"0"},
-    {"provider":"deepseek","model":"deepseek-v4-pro","input_mtok_usd":"1.32","output_mtok_usd":"3.96","cache_read_mtok_usd":"0.044","cache_write_surcharge_mtok_usd":"0"},
-    {"provider":"xai","model":"grok-4.7","input_mtok_usd":"2","output_mtok_usd":"6","cache_read_mtok_usd":"0.5","cache_write_surcharge_mtok_usd":"0"},
-    {"provider":"xai","model":"grok-build-0.1","input_mtok_usd":"1","output_mtok_usd":"2","cache_read_mtok_usd":"0.2","cache_write_surcharge_mtok_usd":"0"}
+    {"provider":"deepseek","model":"deepseek-v4-pro","input_mtok_usd":"1.32","output_mtok_usd":"3.96","cache_read_mtok_usd":"0.044","cache_write_surcharge_mtok_usd":"0"}
   ]
 }
