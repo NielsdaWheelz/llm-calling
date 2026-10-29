@@ -309,7 +309,9 @@ async def test_scripted_chat_returns_outcome_and_captures_args_verbatim() -> Non
     outcome = succeeded()
     runtime = ScriptedRuntime(chat_outcomes=[outcome])
 
-    assert await runtime.chat("openai:gpt-6.1-sol", user="hi", reasoning="standard/medium") is outcome
+    assert (
+        await runtime.chat("openai:gpt-6.1-sol", user="hi", reasoning="standard/medium") is outcome
+    )
     assert runtime.calls == [
         CapturedRuntimeCall(
             operation="chat",

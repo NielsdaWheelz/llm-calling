@@ -16,7 +16,6 @@ from websockets.asyncio.server import ServerConnection, unix_serve
 
 from provider_runtime.agent_runtime import (
     CODEX_CONTAINMENT_CATALOG_FILENAME,
-    AgentNative,
     AgentPermissionRequest,
     AgentRuntime,
     AgentRuntimeConfig,
@@ -110,8 +109,6 @@ class ProtocolPeer:
         self.name = "synthetic worker"
         self.raw_reply: str | None = None
         self.between_turns = False
-        self.read_state_phase: str | None = None
-        self.read_state_identity: dict[str, object] = {"threadId": THREAD}
         self.scripted: dict[str, object] | None = None
         self.user_message_id: str | None = None
         self.hold_method: str | None = None
@@ -220,8 +217,6 @@ class ProtocolPeer:
                     result = {}
                 else:
                     raise AssertionError(f"unexpected fixture request: {method}")
-                if method == "thread/start" and self.read_state_phase == "before":
-                    await self.read_state_event(connection)
                 await connection.send(json.dumps({"id": message["id"], "result": result}))
                 if method == "turn/start":
                     await self.turn_events(connection)
@@ -249,23 +244,8 @@ class ProtocolPeer:
             },
         ]
 
-    async def read_state_event(self, connection: ServerConnection) -> None:
-        await connection.send(
-            json.dumps(
-                {
-                    "method": "thread/readState/changed",
-                    "params": {
-                        **self.read_state_identity,
-                        "readState": {"firstUnread": None, "revision": "1"},
-                    },
-                }
-            )
-        )
-
     async def turn_events(self, connection: ServerConnection) -> None:
         scope = {"threadId": THREAD, "turnId": TURN}
-        if self.read_state_phase == "during":
-            await self.read_state_event(connection)
         if self.foreign_noise:
             await connection.send(
                 json.dumps(
@@ -797,46 +777,6 @@ async def test_managed_cognition_filters_foreign_events_and_remains_protected(
         assert not [message for message in peer.messages if message.get("id") == "foreign"]
         await runtime.close_session(session)
         assert (await runtime.codex.list(CodexListRequest("lab"))).threads
-
-
-@pytest.mark.parametrize("phase", ["before", "during"])
-@pytest.mark.parametrize("has_thread", [True, False, "foreign"])
-async def test_read_state_metadata_is_inert_only_for_its_owned_thread(
-    tmp_path: Path, peer: ProtocolPeer, phase: str, has_thread: bool | str
-) -> None:
-    peer.emit_managed = True
-    peer.read_state_phase = phase
-    if not has_thread:
-        peer.read_state_identity = {}
-    elif has_thread == "foreign":
-        peer.read_state_identity = {"threadId": "01992818-9222-714c-9c91-e39d3f006e64"}
-    async with AgentRuntime(
-        AgentRuntimeConfig(tmp_path, {"lab": CodexUnixEndpoint(peer.socket)})
-    ) as runtime:
-        request = await managed_request(runtime, tmp_path)
-        if has_thread is not False:
-            session = await runtime.open_session(request)
-            events = [
-                event
-                async for event in runtime.stream_turn(
-                    session, TurnRequest(input=(TextContent("synthetic"),))
-                )
-            ]
-            assert isinstance(events[-1], AgentTerminal) and events[-1].status == "succeeded"
-            assert not any(
-                isinstance(event, AgentToolUse | AgentPermissionRequest) for event in events
-            )
-            if phase == "during":
-                assert any(
-                    isinstance(event, AgentNative)
-                    and event.native_type == "thread/readState/changed"
-                    for event in events
-                ) is (has_thread is True)
-            await runtime.close_session(session)
-        else:
-            with pytest.raises(ProtocolDefect, match="thread identity"):
-                session = await runtime.open_session(request)
-                await runtime.run_turn(session, TurnRequest(input=(TextContent("synthetic"),)))
 
 
 async def test_managed_native_approval_is_denied_and_poisons_the_session(

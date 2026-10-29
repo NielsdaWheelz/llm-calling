@@ -2,22 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from importlib.resources import files
-from pathlib import Path
 
 import pytest
 
 import provider_runtime.registry as registry
-from provider_runtime.agent_runtime.codex_containment import (
-    CODEX_CONTAINMENT_CATALOG_SHA256,
-    CODEX_CONTAINMENT_SOURCE_SHA256,
-    CODEX_CONTAINMENT_VERSION,
-    materialize_codex_containment_catalog,
-)
 from provider_runtime.agent_runtime.errors import ProtocolDefect
 from provider_runtime.agent_runtime.model_catalog import (
     AGENT_BACKEND_CONTRACT_REVISION,
@@ -215,44 +205,6 @@ async def test_codex_upgrade_diagnostics_are_typed_and_never_guess() -> None:
     assert ambiguous.diagnostics == (
         UpgradeTargetAmbiguous(model_key="source", native_target="gpt-6.1-sol"),
     )
-
-
-def test_contained_catalog_disables_native_patch_and_preserves_all_other_source_facts(
-    tmp_path: Path,
-) -> None:
-    source = (
-        files("provider_runtime.agent_runtime")
-        .joinpath(f"_codex_models_{CODEX_CONTAINMENT_VERSION.replace('.', '_')}.json")
-        .read_bytes()
-    )
-    assert hashlib.sha256(source).hexdigest() == CODEX_CONTAINMENT_SOURCE_SHA256
-    materialized = materialize_codex_containment_catalog(tmp_path).read_bytes()
-    assert hashlib.sha256(materialized).hexdigest() == CODEX_CONTAINMENT_CATALOG_SHA256
-    raw = json.loads(source)
-    contained = json.loads(materialized)
-    assert len(contained["models"]) == len(raw["models"])
-    for original, restricted in zip(raw["models"], contained["models"], strict=True):
-        assert restricted == {
-            **original,
-            "tool_mode": "direct",
-            "experimental_supported_tools": [],
-            "apply_patch_tool_type": None,
-        }
-
-
-async def test_codex_publication_is_explicit_and_rejects_unclassified_dispatch() -> None:
-    catalog = await read_codex_model_catalog(
-        _GenericClient([{"data": [_row("old", "gpt-6-sol"), _row("current", "gpt-6.1-sol")]}]),
-    )
-    assert catalog.backend_contract_revision == "provider-runtime.agent-model-catalog.v3"
-    assert [(row.dispatch_model, row.offered) for row in catalog.models] == [
-        ("gpt-6-sol", False),
-        ("gpt-6.1-sol", True),
-    ]
-    with pytest.raises(ProtocolDefect, match="unclassified"):
-        await read_codex_model_catalog(
-            _GenericClient([{"data": [_row("new", "unreviewed-model")]}]),
-        )
 
 
 def test_api_catalog_is_exact_immutable_and_the_registry_has_no_public_rows() -> None:

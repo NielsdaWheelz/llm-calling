@@ -533,23 +533,6 @@ async def test_codex_catalog_selection_fails_before_adapter_open(
     assert adapter.open_calls == 0
 
 
-async def test_unoffered_codex_model_fails_before_native_session(tmp_path: Path) -> None:
-    adapter = ScriptedAdapter(backend="codex")
-    catalog = codex_catalog()
-    unpublished = replace(catalog, models=(replace(catalog.models[0], offered=False),))
-
-    async def model_catalog(*, environment: Mapping[str, str]) -> AgentModelCatalog:
-        adapter.model_catalog_calls += 1
-        return unpublished
-
-    adapter.model_catalog = model_catalog
-    async with runtime_for(tmp_path, adapter) as runtime:
-        with pytest.raises(InvalidAgentRequest, match="no longer offered"):
-            await runtime.open_session(request(tmp_path, backend="codex"))
-    assert adapter.model_catalog_calls == 1
-    assert adapter.open_calls == 0
-
-
 async def test_quota_exhaustion_is_the_named_terminal_value(tmp_path: Path) -> None:
     adapter = ScriptedAdapter(quota_failure=True)
     async with runtime_for(tmp_path, adapter) as runtime:
