@@ -36,7 +36,7 @@ from provider_runtime.types import (
 
 
 def test_canonical_codec_requires_current_target_and_codec() -> None:
-    target = ProviderTarget("openai", "gpt-6-sol")
+    target = ProviderTarget("openai", "gpt-6.1-sol")
     artifact = ContinuationArtifact(target, "openai.v2", {"private": [{"signed": "data"}]})
     encoded = encode_continuation(artifact)
     assert encode_continuation(decode_continuation(encoded, target, "openai.v2")) == encoded
@@ -53,7 +53,7 @@ def test_canonical_codec_requires_current_target_and_codec() -> None:
 
 
 def test_continuation_bound_applies_only_to_tool_capable_initial_requests() -> None:
-    row = _resolve("openai:gpt-6-sol")
+    row = _resolve("openai:gpt-6.1-sol")
     target = ProviderTarget("openai", row.model_id)
     prompt = UserMessage((PromptBlock("x" * (16 * 1024 * 1024)),))
     intent = GenerateIntent(target, (prompt,), 64, "standard/medium", (), "auto", TextOutput())

@@ -114,7 +114,11 @@ def row_reasoning(row: ModelRow, intent: GenerateIntent) -> RowReasoning:
         )
     return RowReasoning(
         fragment=selected,
-        native_reasoning=Present(json.dumps(selected, sort_keys=True, separators=(",", ":"))),
+        native_reasoning=(
+            Present(json.dumps(selected, sort_keys=True, separators=(",", ":")))
+            if selected
+            else Absent()
+        ),
         owned_keys=frozenset(owned),
     )
 

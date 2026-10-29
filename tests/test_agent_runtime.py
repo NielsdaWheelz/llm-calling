@@ -167,6 +167,7 @@ def codex_catalog() -> AgentModelCatalog:
                 key="codex-test",
                 dispatch_model="codex-test-wire",
                 label="Codex Test",
+                offered=True,
                 source_context_window=Absent(),
                 source_max_output_tokens=Absent(),
                 input_modalities=("text", "image"),

@@ -550,7 +550,7 @@ async def test_generate_encodes_strict_json_output_as_native_text_format() -> No
 
 @respx.mock
 async def test_generate_strict_json_tool_turn_then_structured_final() -> None:
-    target = ProviderTarget("openai", "gpt-6-sol")
+    target = ProviderTarget("openai", "gpt-6.1-sol")
     row = _resolve_target(target)
     route = respx.post(RESPONSES_URL).mock(
         return_value=mock_response(

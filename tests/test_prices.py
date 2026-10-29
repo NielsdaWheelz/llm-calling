@@ -53,19 +53,18 @@ def test_cache_read_discount_and_write_surcharge() -> None:
     )
     assert isinstance(estimate, Present)
     assert estimate.value.amount_usd_micros == 1_160_000
-    assert estimate.value.as_of == date(2026, 9, 25)
+    assert estimate.value.as_of == date(2026, 10, 28)
     assert "official-provider-docs" in estimate.value.source
 
 
 def test_only_current_exact_identity_has_an_estimate() -> None:
-    assert isinstance(estimate_cost(_meta("openai", "gpt-6-sol", 1000, 100)), Present)
+    assert isinstance(estimate_cost(_meta("openai", "gpt-6.1-sol", 1000, 100)), Present)
     assert isinstance(estimate_cost(_meta("openai", "gpt-5.6-sol", 1000, 100)), Absent)
-    assert isinstance(estimate_cost(_meta("openai", "gpt-6-sol-old", 1000, 100)), Absent)
+    assert isinstance(estimate_cost(_meta("openai", "gpt-6.1-sol-old", 1000, 100)), Absent)
 
 
 def test_unknown_high_context_tier_is_not_mispriced() -> None:
-    assert isinstance(estimate_cost(_meta("openai", "gpt-6-sol", 272_001, 100)), Absent)
-    assert isinstance(estimate_cost(_meta("xai", "grok-4.7", 200_001, 100)), Absent)
+    assert isinstance(estimate_cost(_meta("openai", "gpt-6.1-sol", 272_001, 100)), Absent)
 
 
 def test_deepseek_peak_rate_is_conservative() -> None:

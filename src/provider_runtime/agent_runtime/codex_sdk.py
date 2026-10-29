@@ -128,7 +128,7 @@ _REQUIRED_MCP_STARTUP_FAILURE = "required MCP servers failed to initialize"
 def codex_native_request_fits(
     text: str, *, output: AgentOutputSpec, reasoning: str, input_id: str
 ) -> bool:
-    """Check a contained text request before opening a stock 0.160.0 thread.
+    """Check a contained text request before opening a stock 0.165.0 thread.
 
     Native threads use canonical UUID strings; the host supplies its input id. This is
     a transport byte check using the largest legal RPC-id envelope, not a token
@@ -173,6 +173,7 @@ _DISABLED_BUILTIN_FEATURES = (
     "hooks",
     "image_generation",
     "in_app_browser",
+    "incremental_tools",
     "memories",
     "mentions_v2",
     "multi_agent",
@@ -255,6 +256,7 @@ _INERT_NATIVE_METHODS = frozenset(
         "thread/goal/cleared",
         "thread/goal/updated",
         "thread/name/updated",
+        "thread/readState/changed",
         "serverRequest/resolved",
         "mcpServer/startupStatus/updated",
         "remoteControl/status/changed",
@@ -268,6 +270,7 @@ _THREAD_BOUND_INERT_METHODS = frozenset(
         "thread/goal/cleared",
         "thread/goal/updated",
         "thread/name/updated",
+        "thread/readState/changed",
         "thread/status/changed",
         "thread/settings/updated",
     }
@@ -306,6 +309,7 @@ _PRETURN_INERT_METHODS = frozenset(
         "thread/goal/cleared",
         "thread/goal/updated",
         "thread/name/updated",
+        "thread/readState/changed",
         "thread/status/changed",
         "thread/settings/updated",
         "mcpServer/startupStatus/updated",

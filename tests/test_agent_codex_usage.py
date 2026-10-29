@@ -59,7 +59,7 @@ class UsagePeer:
             if method == "initialized":
                 continue
             if method == "initialize":
-                result = {"userAgent": "fixture/0.160.0 (controlled peer)"}
+                result = {"userAgent": "fixture/0.165.0 (controlled peer)"}
             elif method == "account/read":
                 result = {"account": {"type": "chatgpt"}}
             elif method == "config/read":
@@ -72,7 +72,7 @@ class UsagePeer:
                     "data": [
                         {
                             "id": "fixture",
-                            "model": "fixture",
+                            "model": "gpt-6.1-sol",
                             "displayName": "Fixture",
                             "hidden": False,
                             "inputModalities": ["text"],

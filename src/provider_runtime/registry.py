@@ -31,11 +31,11 @@ from provider_runtime.types import (
     freeze_json_object,
 )
 
-REGISTRY_REVISION: Final = "2026-10-16.1"
-_BACKEND_CONTRACT_REVISION: Final = "provider-runtime.api-model-catalog.v4"
-_KEY = re.compile(r"[a-z0-9]+(?:/[a-z0-9]+)*\Z")
+REGISTRY_REVISION: Final = "2026-10-28.2"
+_BACKEND_CONTRACT_REVISION: Final = "provider-runtime.api-model-catalog.v5"
+_KEY = re.compile(r"[a-z0-9]+(?:[_/][a-z0-9]+)*\Z")
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
-GPT6_MODEL_IDS: Final = ("gpt-6-astra", "gpt-6-sol", "gpt-6-luna")
+GPT6_MODEL_IDS: Final = ("gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna")
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,25 +73,29 @@ class _ModelRow:
 
 
 def _source(url: str) -> SourceCitation:
-    return SourceCitation(url=url, verified_on=date(2026, 9, 25))
+    return SourceCitation(url=url, verified_on=date(2026, 10, 28))
 
 
 _OPENAI_SOURCE = _source("https://developers.openai.com/api/docs/guides/reasoning")
 _CLAUDE_SOURCE = _source("https://platform.claude.com/docs/en/build-with-claude/effort")
-_GEMINI_SOURCE = _source("https://ai.google.dev/gemini-api/docs/latest-model")
+_GEMINI_SOURCE = _source("https://ai.google.dev/gemini-api/docs/thinking")
 _DEEPSEEK_SOURCE = _source("https://api-docs.deepseek.com/guides/thinking_mode/")
-_XAI_SOURCE = _source("https://docs.x.ai/developers/models/grok-4.7")
 _VISION: Final[frozenset[Literal["text", "image"]]] = frozenset({"text", "image"})
 _MODEL_LABELS: Final[Mapping[str, str]] = {
     "gpt-6-astra": "GPT-6 Astra",
-    "gpt-6-sol": "GPT-6 Sol",
+    "gpt-6.1-sol": "GPT-6.1 Sol",
+    "gpt-6.1-terra": "GPT-6.1 Terra",
     "gpt-6-luna": "GPT-6 Luna",
     "claude-fable-5-1": "Claude Fable 5.1",
     "claude-opus-5-5": "Claude Opus 5.5",
-    "claude-sonnet-5": "Claude Sonnet 5",
+    "claude-sonnet-5-5": "Claude Sonnet 5.5",
+    "claude-haiku-5-5": "Claude Haiku 5.5",
+    "gemini-4-argon": "Gemini 4 Argon",
     "gemini-3.8-flash": "Gemini 3.8 Flash",
-    "deepseek-flash": "DeepSeek Flash v4.1",
-    "grok-4.7": "Grok 4.7",
+    "gemini-3.5-flash-lite": "Gemini 3.5 Flash-Lite",
+    "gemini-3.1-pro-preview": "Gemini 3.1 Pro · preview",
+    "deepseek-flash": "DeepSeek V4.1 Flash",
+    "deepseek-v4-pro": "DeepSeek V4 Pro",
 }
 
 
@@ -113,7 +117,7 @@ def _reasoning(
 
 
 def _openai_row(model: str) -> _ModelRow:
-    efforts = _EFFORTS if model == "gpt-6-astra" else ("none", *_EFFORTS)
+    efforts = _EFFORTS if model in ("gpt-6-astra", "gpt-6.1-sol") else ("none", *_EFFORTS)
     reasoning = dict(
         _reasoning(mode, effort, order, {"reasoning": {"mode": mode, "effort": effort}})
         for mode in ("standard", "pro")
@@ -144,15 +148,21 @@ def _openai_row(model: str) -> _ModelRow:
 
 
 def _claude_row(model: str) -> _ModelRow:
-    modes = ("adaptive", "disabled") if model == "claude-sonnet-5" else ("adaptive",)
+    modes: list[tuple[str, tuple[str, ...]]] = [("adaptive", _EFFORTS)]
+    if model == "claude-sonnet-5-5":
+        modes.append(("between_tools", _EFFORTS[:3]))
+    elif model == "claude-haiku-5-5":
+        modes.append(("disabled", _EFFORTS[:3]))
     reasoning = dict(
         _reasoning(
             mode, effort, order, {"thinking": {"type": mode}, "output_config": {"effort": effort}}
         )
-        for mode in modes
-        for order, effort in enumerate(_EFFORTS)
+        for mode, efforts in modes
+        for order, effort in enumerate(efforts)
     )
-    default = "adaptive/medium" if model == "claude-opus-5-5" else "adaptive/high"
+    default = (
+        "adaptive/medium" if model in ("claude-opus-5-5", "claude-haiku-5-5") else "adaptive/high"
+    )
     return _ModelRow(
         ref=f"anthropic:{model}",
         provider="anthropic",
@@ -175,18 +185,29 @@ def _claude_row(model: str) -> _ModelRow:
     )
 
 
-_ROWS: Final[tuple[_ModelRow, ...]] = (
-    *(_openai_row(model) for model in GPT6_MODEL_IDS),
-    *(_claude_row(model) for model in ("claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5")),
-    _ModelRow(
-        ref="gemini:gemini-3.8-flash",
+def _gemini_row(model: str) -> _ModelRow:
+    efforts = (
+        ("minimal", "low", "medium", "high")
+        if model == "gemini-3.5-flash-lite"
+        else ("low", "medium", "high")
+    )
+    default = {
+        "gemini-4-argon": "medium",
+        "gemini-3.8-flash": "medium",
+        "gemini-3.5-flash-lite": "minimal",
+        "gemini-3.1-pro-preview": "high",
+    }[model]
+    return _ModelRow(
+        ref=f"gemini:{model}",
         provider="gemini",
-        model_id="gemini-3.8-flash",
+        model_id=model,
         engine="gemini_generate",
         base_url=Absent(),
         context_window=1_048_576,
-        max_output_tokens=65_536,
-        source_max_output_tokens=Present(65_536),
+        # Argon shares its window across input, thinking and output. Keep one
+        # bounded request below both its streaming and non-streaming hop caps.
+        max_output_tokens=32_768 if model == "gemini-4-argon" else 65_536,
+        source_max_output_tokens=Present(1_048_576 if model == "gemini-4-argon" else 65_536),
         modalities=_VISION,
         tools=True,
         streaming=True,
@@ -194,26 +215,29 @@ _ROWS: Final[tuple[_ModelRow, ...]] = (
         reasoning=Present(
             dict(
                 _reasoning(None, effort, order, {"thinking_config": {"thinking_level": effort}})
-                for order, effort in enumerate(("low", "medium", "high"))
+                for order, effort in enumerate(efforts)
             )
         ),
-        source_default_reasoning=_default("medium", _GEMINI_SOURCE),
+        source_default_reasoning=_default(default, _GEMINI_SOURCE),
         upgrade=Absent(),
         retirement=Absent(),
         continuation_codec="gemini.v2",
         correlation="none",
-    ),
-    _ModelRow(
-        ref="deepseek:deepseek-flash",
+    )
+
+
+def _deepseek_row(model: str) -> _ModelRow:
+    return _ModelRow(
+        ref=f"deepseek:{model}",
         provider="deepseek",
-        model_id="deepseek-flash",
+        model_id=model,
         engine="openai_chat",
         base_url=Present("https://api.deepseek.com"),
         # The /models metadata gives exact binary limits; the request budget stays conservative.
         context_window=1_048_576,
         max_output_tokens=384_000,
         source_max_output_tokens=Present(393_216),
-        modalities=_VISION,
+        modalities=_VISION if model == "deepseek-flash" else frozenset({"text"}),
         tools=True,
         streaming=True,
         structured="json_mode",
@@ -235,32 +259,30 @@ _ROWS: Final[tuple[_ModelRow, ...]] = (
         retirement=Absent(),
         continuation_codec="deepseek.v2",
         correlation="in_band",
+    )
+
+
+_ROWS: Final[tuple[_ModelRow, ...]] = (
+    *(_openai_row(model) for model in GPT6_MODEL_IDS),
+    *(
+        _claude_row(model)
+        for model in (
+            "claude-fable-5-1",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+        )
     ),
-    _ModelRow(
-        ref="xai:grok-4.7",
-        provider="xai",
-        model_id="grok-4.7",
-        engine="openai_chat",
-        base_url=Present("https://api.x.ai/v1"),
-        context_window=500_000,
-        max_output_tokens=4096,
-        source_max_output_tokens=Absent(),
-        modalities=_VISION,
-        tools=True,
-        streaming=True,
-        structured="native",
-        reasoning=Present(
-            dict(
-                _reasoning(None, effort, order, {"reasoning_effort": effort})
-                for order, effort in enumerate(("low", "medium", "high", "xhigh"))
-            )
-        ),
-        source_default_reasoning=_default("high", _XAI_SOURCE),
-        upgrade=Absent(),
-        retirement=Absent(),
-        continuation_codec="xai.v2",
-        correlation="in_band",
+    *(
+        _gemini_row(model)
+        for model in (
+            "gemini-4-argon",
+            "gemini-3.8-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-pro-preview",
+        )
     ),
+    *(_deepseek_row(model) for model in ("deepseek-flash", "deepseek-v4-pro")),
 )
 
 
@@ -296,10 +318,11 @@ def _row_fingerprint(row: _ModelRow) -> str:
         else None
     )
     return _fingerprint(
-        b"provider-runtime.row.v4",
+        b"provider-runtime.row.v5",
         {
             "ref": row.ref,
             "provider": row.provider,
+            "offered": True,
             "model_id": row.model_id,
             "label": _MODEL_LABELS[row.model_id],
             "engine": row.engine,
@@ -339,6 +362,7 @@ def _api_model_facts(row: _ModelRow) -> ApiModelFacts:
         model_ref=row.ref,
         label=_MODEL_LABELS[row.model_id],
         provider=row.provider,
+        offered=True,
         dispatch=ApiDispatchFacts(
             model_id=row.model_id,
             engine=row.engine,
@@ -372,7 +396,7 @@ def api_model_catalog() -> ApiModelCatalog:
         backend_contract_revision=_BACKEND_CONTRACT_REVISION,
         registry_revision=REGISTRY_REVISION,
         definition_revision=_fingerprint(
-            b"provider-runtime.catalog.v4",
+            b"provider-runtime.catalog.v5",
             {"rows": tuple(model.row_fingerprint for model in models)},
         ),
         models=models,

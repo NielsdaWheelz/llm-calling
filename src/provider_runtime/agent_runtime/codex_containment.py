@@ -14,13 +14,13 @@ from .codex_app_server import CodexAppServerClient, CodexAppServerConfig
 from .codex_endpoint import CodexEndpoint
 from .errors import UnsupportedCapability
 
-CODEX_CONTAINMENT_VERSION = "0.160.0"
-CODEX_CONTAINMENT_SOURCE_SHA256 = "fd219bd9f061278275f528939f82f54d2eb97df4b25c23b022adbe48813d920b"
+CODEX_CONTAINMENT_VERSION = "0.165.0"
+CODEX_CONTAINMENT_SOURCE_SHA256 = "1384625c0b6b3e67d3c60da29becea2b017f2c283fc1e2d05b8edafb4698eb10"
 CODEX_CONTAINMENT_CATALOG_SHA256 = (
-    "b8b588f4b03c8e08fdb7e2994c03578d9b94bbc01665b7adb6490bd234b3cf54"
+    "3bb7176bbd2aa37652d94eeca7a2917867350b5ed0a4ecaa684c809d2d55fb72"
 )
 CODEX_CONTAINMENT_CATALOG_REVISION = (
-    f"codex-contained-catalog.v1:{CODEX_CONTAINMENT_CATALOG_SHA256}"
+    f"codex-contained-catalog.v2:{CODEX_CONTAINMENT_CATALOG_SHA256}"
 )
 CODEX_CONTAINMENT_CATALOG_FILENAME = (
     f"codex-contained-models-{CODEX_CONTAINMENT_VERSION}-{CODEX_CONTAINMENT_CATALOG_SHA256}.json"
@@ -52,6 +52,9 @@ def _restrict_catalog(catalog: object) -> bytes:
             for value in selectors
         ):
             raise UnsupportedCapability("Codex source model has unqualified native tool selectors")
+        if model.get("apply_patch_tool_type") not in (None, "freeform"):
+            raise UnsupportedCapability("Codex source model has an unqualified native patch tool")
+        model["apply_patch_tool_type"] = None
         model["tool_mode"] = "direct"
         model["experimental_supported_tools"] = []
     return canonical_json_bytes(freeze_json_value(catalog))
@@ -61,7 +64,7 @@ def materialize_codex_containment_catalog(directory: Path) -> Path:
     """Write the host startup catalog; never touch auth or an existing process."""
     if not directory.is_absolute():
         raise ValueError("Codex host catalog directory must be absolute")
-    source = files(__package__).joinpath("_codex_models_0_160_0.json").read_bytes()
+    source = files(__package__).joinpath("_codex_models_0_165_0.json").read_bytes()
     payload = _restrict_catalog(json.loads(source))
     path = directory / CODEX_CONTAINMENT_CATALOG_FILENAME
     path.write_bytes(payload)

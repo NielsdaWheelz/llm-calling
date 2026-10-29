@@ -25,14 +25,19 @@ from provider_runtime.types import (
 
 EXPECTED = {
     "openai:gpt-6-astra": 10,
-    "openai:gpt-6-sol": 12,
+    "openai:gpt-6.1-sol": 10,
+    "openai:gpt-6.1-terra": 12,
     "openai:gpt-6-luna": 12,
     "anthropic:claude-fable-5-1": 5,
     "anthropic:claude-opus-5-5": 5,
-    "anthropic:claude-sonnet-5": 10,
+    "anthropic:claude-sonnet-5-5": 8,
+    "anthropic:claude-haiku-5-5": 8,
+    "gemini:gemini-4-argon": 3,
     "gemini:gemini-3.8-flash": 3,
+    "gemini:gemini-3.5-flash-lite": 4,
+    "gemini:gemini-3.1-pro-preview": 3,
     "deepseek:deepseek-flash": 4,
-    "xai:grok-4.7": 4,
+    "deepseek:deepseek-v4-pro": 4,
 }
 
 
@@ -54,13 +59,13 @@ def test_exact_current_catalog_and_shared_gpt6_identity() -> None:
     rows = {row.model_ref: row for row in catalog.models}
     assert {row.ref for row in map(_resolve, EXPECTED)} == set(EXPECTED)
     assert set(rows) == set(EXPECTED)
-    assert GPT6_MODEL_IDS == ("gpt-6-astra", "gpt-6-sol", "gpt-6-luna")
+    assert GPT6_MODEL_IDS == ("gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna")
     assert {row.dispatch.model_id for row in catalog.models if row.provider == "openai"} == set(
         GPT6_MODEL_IDS
     )
-    assert sum(len(row.reasoning) for row in catalog.models) == 65
+    assert sum(len(row.reasoning) for row in catalog.models) == 91
     assert all(len(rows[ref].reasoning) == count for ref, count in EXPECTED.items())
-    assert all(row.label and row.row_fingerprint for row in catalog.models)
+    assert all(row.offered is True and row.label and row.row_fingerprint for row in catalog.models)
     assert catalog.definition_revision == api_model_catalog().definition_revision
 
 
@@ -69,18 +74,25 @@ def test_source_capacity_is_not_inferred_from_a_request_budget() -> None:
         **{f"openai:{model}": (1_050_000, Present(128_000)) for model in GPT6_MODEL_IDS},
         **{
             f"anthropic:{model}": (1_000_000, Present(128_000))
-            for model in ("claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5")
+            for model in (
+                "claude-fable-5-1",
+                "claude-opus-5-5",
+                "claude-sonnet-5-5",
+                "claude-haiku-5-5",
+            )
         },
+        "gemini:gemini-4-argon": (1_048_576, Present(1_048_576)),
         "gemini:gemini-3.8-flash": (1_048_576, Present(65_536)),
+        "gemini:gemini-3.5-flash-lite": (1_048_576, Present(65_536)),
+        "gemini:gemini-3.1-pro-preview": (1_048_576, Present(65_536)),
         "deepseek:deepseek-flash": (1_048_576, Present(393_216)),
-        "xai:grok-4.7": (500_000, Absent()),
+        "deepseek:deepseek-v4-pro": (1_048_576, Present(393_216)),
     }
     assert {
         row.model_ref: (row.context_window, row.max_output_tokens)
         for row in api_model_catalog().models
     } == expected
     assert _resolve("deepseek:deepseek-flash").max_output_tokens == 384_000
-    assert _resolve("xai:grok-4.7").max_output_tokens == 4096
 
 
 def test_options_are_complete_content_and_defaults_are_sourced() -> None:
@@ -98,12 +110,12 @@ def test_options_are_complete_content_and_defaults_are_sourced() -> None:
         for mode in ("standard", "pro")
         for effort in ("low", "medium", "high", "xhigh", "max")
     ]
-    assert _resolve_facts("anthropic:claude-sonnet-5").reasoning[-1] == ApiReasoningFacts(
-        key="disabled/max",
-        label="thinking off · max effort",
-        mode="disabled",
-        effort="max",
-        effort_order=4,
+    assert _resolve_facts("anthropic:claude-sonnet-5-5").reasoning[-1] == ApiReasoningFacts(
+        key="between_tools/high",
+        label="between_tools · high",
+        mode="between_tools",
+        effort="high",
+        effort_order=2,
     )
 
 
@@ -112,7 +124,7 @@ def _resolve_facts(ref: str):
 
 
 @pytest.mark.parametrize("ref", EXPECTED)
-def test_every_declared_key_lowers_to_one_nonempty_native_configuration(ref: str) -> None:
+def test_every_declared_key_lowers_to_its_exact_native_configuration(ref: str) -> None:
     row = _resolve(ref)
     facts = _resolve_facts(ref)
     for option in facts.reasoning:
@@ -123,11 +135,12 @@ def test_every_declared_key_lowers_to_one_nonempty_native_configuration(ref: str
 
 def test_composite_and_single_axis_lowering() -> None:
     assert row_reasoning(
-        _resolve("openai:gpt-6-sol"), _intent("openai:gpt-6-sol", "pro/none")
+        _resolve("openai:gpt-6.1-terra"), _intent("openai:gpt-6.1-terra", "pro/none")
     ).fragment == {"reasoning": {"mode": "pro", "effort": "none"}}
     assert row_reasoning(
-        _resolve("anthropic:claude-sonnet-5"), _intent("anthropic:claude-sonnet-5", "disabled/max")
-    ).fragment == {"thinking": {"type": "disabled"}, "output_config": {"effort": "max"}}
+        _resolve("anthropic:claude-sonnet-5-5"),
+        _intent("anthropic:claude-sonnet-5-5", "between_tools/high"),
+    ).fragment == {"thinking": {"type": "between_tools"}, "output_config": {"effort": "high"}}
     assert row_reasoning(
         _resolve("deepseek:deepseek-flash"), _intent("deepseek:deepseek-flash", "none")
     ).fragment == {"thinking": {"type": "disabled"}}
@@ -137,11 +150,14 @@ def test_composite_and_single_axis_lowering() -> None:
     "ref,key",
     [
         ("openai:gpt-6-astra", "standard/none"),
-        ("openai:gpt-6-sol", "high"),
+        ("openai:gpt-6.1-sol", "high"),
+        ("openai:gpt-6.1-sol", "standard/none"),
+        ("anthropic:claude-sonnet-5-5", "disabled/high"),
+        ("anthropic:claude-sonnet-5-5", "between_tools/xhigh"),
+        ("anthropic:claude-haiku-5-5", "disabled/xhigh"),
         ("anthropic:claude-opus-5-5", "disabled/high"),
         ("gemini:gemini-3.8-flash", "minimal"),
         ("deepseek:deepseek-flash", "medium"),
-        ("xai:grok-4.7", "max"),
     ],
 )
 def test_undeclared_configuration_rejected(ref: str, key: str) -> None:
@@ -154,8 +170,11 @@ def test_undeclared_configuration_rejected(ref: str, key: str) -> None:
     [
         ProviderTarget("openai", "gpt-5.6-sol"),
         ProviderTarget("gemini", "gemini-3.5-flash"),
-        ProviderTarget("deepseek", "deepseek-v4-pro"),
+        ProviderTarget("openai", "gpt-6-sol"),
+        ProviderTarget("anthropic", "claude-sonnet-5"),
         ProviderTarget("xai", "grok-4.5"),
+        ProviderTarget("xai", "grok-4.7"),
+        ProviderTarget("xai", "grok-build-0.1"),
     ],
 )
 def test_retired_exact_target_rejected(target: ProviderTarget) -> None:
@@ -166,7 +185,7 @@ def test_retired_exact_target_rejected(target: ProviderTarget) -> None:
 def test_catalog_fingerprint_rotates_on_private_native_mapping_change() -> None:
     from provider_runtime.registry import _row_fingerprint
 
-    row = _resolve("openai:gpt-6-sol")
+    row = _resolve("openai:gpt-6.1-sol")
     assert isinstance(row.reasoning, Present)
     changed = replace(
         row,

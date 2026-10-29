@@ -103,8 +103,8 @@ def test_public_embedding_call_does_not_load_unused_provider_sdks() -> None:
 @pytest.mark.parametrize(
     ("provider", "model", "reasoning", "path"),
     [
-        ("openai", "gpt-6-sol", "standard/medium", "/v1/responses"),
-        ("anthropic", "claude-sonnet-5", "adaptive/high", "/v1/messages"),
+        ("openai", "gpt-6.1-sol", "standard/medium", "/v1/responses"),
+        ("anthropic", "claude-sonnet-5-5", "adaptive/high", "/v1/messages"),
         ("gemini", "gemini-3.8-flash", "medium", "/v1beta/models/gemini-3.8-flash"),
         ("deepseek", "deepseek-flash", "none", "/chat/completions"),
     ],
@@ -244,7 +244,7 @@ async def test_default_runtime_generate_and_stream_use_the_selected_sdk(
 async def test_injected_empty_engine_map_never_falls_back_to_default_dispatch() -> None:
     runtime = ProviderRuntime(Credentials(openai="test-key"), engines={})
     intent = GenerateIntent(
-        target=ProviderTarget(provider="openai", model="gpt-6-sol"),
+        target=ProviderTarget(provider="openai", model="gpt-6.1-sol"),
         messages=(UserMessage((PromptBlock("hi"),)),),
         max_output_tokens=128,
         reasoning="standard/medium",

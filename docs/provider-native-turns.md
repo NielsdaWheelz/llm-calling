@@ -62,7 +62,7 @@ contracts use the same provider engine; the selection is explicit, never inferre
 from output schemas or an empty tool plan.
 
 `codex_native_request_fits(text, *, output, reasoning, input_id)` checks the exact contained
-text-turn serialization before opening a stock `0.160.0` thread. it uses the same
+text-turn serialization before opening a stock `0.165.0` thread. it uses the same
 serializer and byte bound as `prepare_turn`, including json escaping and output
 schema. native threads use canonical uuid strings; the host supplies its input id. this
 is a pure transport fit check, not token estimation or inference admission. the
@@ -96,26 +96,28 @@ values. there are no legacy decoders or invented evidence defaults.
 
 ## native capability
 
-contained codex sessions require a dedicated stock `0.160.0` host. host
+contained codex sessions require a dedicated stock `0.165.0` host. host
 operations call `materialize_codex_containment_catalog(private_directory)`
 and launch the stock process with `-c model_catalog_json="<returned-path>"`.
 `qualify_codex_containment_host(endpoint)` checks the public `config/read`
 declaration. session preparation repeats this check before creating a native
 thread: the canonical catalog basename and `sessionFlags` startup origin must
-match; the initialize user-agent build version must be exactly `0.160.0`.
+match; the initialize user-agent build version must be exactly `0.165.0`.
 per-thread catalog overrides are documented upstream no-ops and are
 never used to claim containment. the trusted host owns the materialized bytes;
 this declaration is not remote attestation against a hostile local operator.
 
 the provider retains the complete official catalog from
-[`rust-v0.160.0`](https://github.com/openai/codex/blob/a956835d020762cb2b570053af06f643a11c0ecc/codex-rs/models-manager/models.json).
-source hash: `fd219bd9f061278275f528939f82f54d2eb97df4b25c23b022adbe48813d920b`.
-restricted hash: `b8b588f4b03c8e08fdb7e2994c03578d9b94bbc01665b7adb6490bd234b3cf54`.
-the compiler preserves every field except `tool_mode=direct` and removal of
-the established native clock/async-user selectors. unknown selectors or tool
-modes fail before materialization. the original apache license and notice
+[`rust-v0.165.0`](https://github.com/openai/codex/blob/rust-v0.165.0/codex-rs/models-manager/models.json).
+source hash: `1384625c0b6b3e67d3c60da29becea2b017f2c283fc1e2d05b8edafb4698eb10`.
+restricted hash: `3bb7176bbd2aa37652d94eeca7a2917867350b5ed0a4ecaa684c809d2d55fb72`.
+the compiler preserves every field except `tool_mode=direct`, removal of
+the established native clock/async-user selectors, and
+`apply_patch_tool_type=null`. containment revision v2 names these three
+restrictions. unknown selectors, patch types or tool modes fail before
+materialization. the original apache license and notice
 accompany the asset. this policy changes the whole endpoint: native code mode,
-clock and async-user interactions are unavailable; model inventory updates
+clock, native patching and async-user interactions are unavailable; model inventory updates
 require an explicit provider/binary/catalog upgrade. exact model identifiers,
 efforts, instructions, context metadata and account routing remain intact.
 ordinary coding sessions use a separate endpoint.
@@ -127,6 +129,10 @@ describes this startup seam. model listing is source metadata, not a promise
 that every listed model is entitled or successfully qualified for the account.
 
 new contained threads opt into the installed raw response event stream.
+their builtin-disabled configuration sets `incremental_tools=false`: declared
+callbacks stay fixed for the thread, and native tool-declaration updates do not
+enter the closed raw-event grammar. responses lite still owns its fixed request
+tool encoding; disabling updates does not change that provider wire format.
 declared direct function calls remain host callbacks. a call to an undeclared
 function that codex itself answers with exactly `unsupported call: <name>` ran
 nothing: it is a model error, emits no event, and the turn continues

@@ -74,12 +74,12 @@ class ProtocolPeer:
         self.socket = socket
         self.messages: list[dict[str, object]] = []
         self.closed_connections = 0
-        self.initialize: object = {"userAgent": "codex_cli_rs/0.160.0 (Linux synthetic; x86_64)"}
+        self.initialize: object = {"userAgent": "codex_cli_rs/0.165.0 (Linux synthetic; x86_64)"}
         self.account: object = {"type": "chatgpt"}
         self.models = [
             {
                 "id": "fixture-model",
-                "model": "fixture-native-model",
+                "model": "gpt-6.1-sol",
                 "displayName": "Fixture Model",
                 "hidden": False,
                 "inputModalities": ["text", "image"],
@@ -492,7 +492,7 @@ async def test_shared_catalog_preserves_exact_generation_and_resolves_native_dis
         catalog = await runtime.model_catalog("codex", auth)
         (row,) = catalog.models
         assert row.key == "fixture-model"
-        assert row.dispatch_model == "fixture-native-model"
+        assert row.dispatch_model == "gpt-6.1-sol"
         assert row.source_context_window == Absent()
         assert row.source_max_output_tokens == Absent()
         assert row.source_default_reasoning == Present("high")
@@ -523,6 +523,10 @@ async def test_shared_catalog_preserves_exact_generation_and_resolves_native_dis
         turn = next(message for message in peer.messages if message.get("method") == "turn/start")
         start_params, turn_params = start["params"], turn["params"]
         assert isinstance(start_params, dict) and start_params["model"] == row.dispatch_model
+        config = start_params["config"]
+        assert isinstance(config, dict)
+        features = config["features"]
+        assert isinstance(features, dict) and features["incremental_tools"] is False
         assert isinstance(turn_params, dict) and turn_params["effort"] == "high"
         await runtime.close_session(session)
         before = sum(message.get("method") == "thread/start" for message in peer.messages)
@@ -533,7 +537,7 @@ async def test_shared_catalog_preserves_exact_generation_and_resolves_native_dis
         ):
             with pytest.raises(InvalidAgentRequest):
                 await runtime.open_session(invalid)
-        peer.models[0]["model"] = "changed-wire-model"
+        peer.models[0]["model"] = "gpt-6.1-terra"
         with pytest.raises(InvalidAgentRequest):
             await runtime.open_session(request)
         assert sum(message.get("method") == "thread/start" for message in peer.messages) == before

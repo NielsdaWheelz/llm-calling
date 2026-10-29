@@ -219,9 +219,12 @@ class ApiReasoningFacts:
 
 @dataclass(frozen=True, slots=True)
 class ApiModelFacts:
+    """Current API membership and sourced capabilities, independent of credentials."""
+
     model_ref: str
     label: str
     provider: ProviderName
+    offered: bool
     dispatch: ApiDispatchFacts
     upgrade: Presence[UpgradeFacts]
     retirement: Presence[RetirementFacts]
@@ -237,6 +240,8 @@ class ApiModelFacts:
     row_fingerprint: str
 
     def __post_init__(self) -> None:
+        if type(self.offered) is not bool:
+            raise ValueError("offered must be a boolean")
         count = len(self.reasoning)
         if (
             len({choice.key for choice in self.reasoning}) != count

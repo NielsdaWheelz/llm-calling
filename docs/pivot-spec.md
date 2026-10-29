@@ -71,7 +71,7 @@ Design stance (binding):
 | `src/provider_runtime/registry.py` | private capability rows/resolution + public immutable `api_model_catalog()` | ex-`catalog.py` contract-facts |
 | `src/provider_runtime/continuation.py` | bounded canonical continuation encode/decode | public persistence boundary |
 | `src/provider_runtime/prices.py` | `estimate_cost(meta) -> Presence[CostEstimate]` over vendored snapshot | indicative, never authoritative |
-| `src/provider_runtime/prices_snapshot.json` | Vendored `pydantic/genai-prices` data | refreshed by script, manually |
+| `src/provider_runtime/prices_snapshot.json` | dated official-provider rates | reviewed and refreshed manually |
 | `src/provider_runtime/retry.py` | Single retry owner (owned explicit loop) | `RetryPolicy(` in one module |
 | `src/provider_runtime/otel.py` | `gen_ai.*` via **`opentelemetry-api` only**, pinned semconv version | no-op without configured SDK |
 | `src/provider_runtime/runtime.py` | `ProviderRuntime`: engines + credentials, dispatch, retry, spans, stream envelope | rewritten |
@@ -83,7 +83,6 @@ Design stance (binding):
 | `src/provider_runtime/embeddings.py` | OpenAI-only embed port (live Nexus consumer) | rewritten on `openai` SDK |
 | `src/provider_runtime/testing.py` | `FakeEngine` + IR-level `ScriptedRuntime` | rewritten |
 | `src/provider_runtime/agent_runtime/…` | Agent lane with retained security kernel (§10) | shrunk in place |
-| `tools/refresh_prices.py` | Pull latest genai-prices JSON into snapshot | new |
 | `docs/decisions/2026-08-09-pivot-council.md` | Council synthesis + review record | provenance |
 
 Deleted: `openai.py`, `anthropic.py`, `gemini.py`, `moonshot.py`, `openrouter.py`,
