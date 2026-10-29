@@ -256,6 +256,7 @@ _INERT_NATIVE_METHODS = frozenset(
         "thread/goal/cleared",
         "thread/goal/updated",
         "thread/name/updated",
+        "thread/readState/changed",
         "serverRequest/resolved",
         "mcpServer/startupStatus/updated",
         "remoteControl/status/changed",
@@ -269,6 +270,7 @@ _THREAD_BOUND_INERT_METHODS = frozenset(
         "thread/goal/cleared",
         "thread/goal/updated",
         "thread/name/updated",
+        "thread/readState/changed",
         "thread/status/changed",
         "thread/settings/updated",
     }
@@ -307,6 +309,7 @@ _PRETURN_INERT_METHODS = frozenset(
         "thread/goal/cleared",
         "thread/goal/updated",
         "thread/name/updated",
+        "thread/readState/changed",
         "thread/status/changed",
         "thread/settings/updated",
         "mcpServer/startupStatus/updated",
