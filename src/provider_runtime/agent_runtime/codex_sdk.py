@@ -173,6 +173,7 @@ _DISABLED_BUILTIN_FEATURES = (
     "hooks",
     "image_generation",
     "in_app_browser",
+    "incremental_tools",
     "memories",
     "mentions_v2",
     "multi_agent",

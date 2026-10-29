@@ -129,6 +129,10 @@ describes this startup seam. model listing is source metadata, not a promise
 that every listed model is entitled or successfully qualified for the account.
 
 new contained threads opt into the installed raw response event stream.
+their builtin-disabled configuration sets `incremental_tools=false`: declared
+callbacks stay fixed for the thread, and native tool-declaration updates do not
+enter the closed raw-event grammar. responses lite still owns its fixed request
+tool encoding; disabling updates does not change that provider wire format.
 declared direct function calls remain host callbacks. a call to an undeclared
 function that codex itself answers with exactly `unsupported call: <name>` ran
 nothing: it is a model error, emits no event, and the turn continues
