@@ -4,6 +4,7 @@ The external supervisor owns process lifetime and authenticates these facts.
 Resolving never reconnects a native session; each result carries the endpoint
 for only its own incarnation. HTTP loss cannot establish retirement. Callers own
 recovery deadlines and retries; this module makes one request and retains no state.
+Protocol types import without loading the HTTP transport, which belongs to requests.
 """
 
 from __future__ import annotations
@@ -15,7 +16,6 @@ from typing import Annotated, Literal
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
-import httpx
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -164,6 +164,8 @@ async def _request(
     path: Literal["resolve", "retire"],
     request: CodexHostResolveRequest | CodexHostRetireRequest,
 ) -> CodexHostResponse:
+    import httpx
+
     if isinstance(endpoint, CodexHostUnix):
         transport = httpx.AsyncHTTPTransport(uds=str(endpoint.control_socket))
         url, headers = f"http://codex-host/{path}", {}
