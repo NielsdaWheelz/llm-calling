@@ -231,6 +231,15 @@ transcript quota. see
 [docs/provider-native-turns.md](docs/provider-native-turns.md) and
 [docs/native-agent-evidence.md](docs/native-agent-evidence.md).
 
+`agent_runtime.codex_host` adds the explicit host-control boundary for consumers
+whose supervisor can retire a whole native incarnation. resolve a
+`CodexHostUnix` or `CodexHostNetwork` configuration once, bind the returned
+`CodexHostTarget` with the fresh native thread, and use only its returned endpoint.
+`resolve_codex_host(config, target)` and `retire_codex_host(config, target)` never
+substitute a replacement incarnation or replay a prompt. the supervisor owns
+retirement proof; the consumer owns job/effect fencing and recovery policy. see
+[the host contract](docs/provider-native-turns.md#host-incarnation-control).
+
 ## Existing terminal agents
 
 `provider-runtime-control` provides one bounded JSON request/reply for

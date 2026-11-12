@@ -5,6 +5,37 @@ callback execution, effects, approvals, and recovery decisions. codex callbacks
 use the configured external app-server socket; workers hold no account state.
 there is one engine for contained and callback-bearing codex turns.
 
+## host incarnation control
+
+`provider_runtime.agent_runtime.codex_host` owns protocol revision 1 and its closed
+request/response models. `resolve_codex_host(endpoint, target=None)` returns
+`CodexHostResolved(target, endpoint, retirement_allowed)`, `CodexHostRetired`, or
+`CodexHostUnavailable`. `retire_codex_host(endpoint, target)` returns only the latter
+two. each call owns one http connection lifetime, has a five-second transport bound,
+and performs no retry. consumers own their encompassing recovery deadline.
+
+`CodexHostUnix(control_socket)` uses http over the private socket; its resolved
+native endpoint is the exact sibling `native-{host_id}-{incarnation}.sock`.
+`CodexHostNetwork(control_url, native_url, control_token)` pairs http/ws or https/wss;
+bootstrap bearer authentication goes only to control. the resolved native endpoint
+holds the host's fresh per-incarnation credential. redirect following and ambient
+http proxies are disabled. credentials remain secret values; the websocket wire
+model deliberately serializes its credential only for an authenticated json reply.
+
+the client requires an exact requested target and native transport. missing or
+malformed responses raise redacted `ProtocolDefect`; protocol-version mismatch and
+unreachable control are distinct unavailable results. http 401/403 raises redacted
+`CredentialRejected`. no response body or credential enters diagnostics.
+
+the supervisor must make incarnation identity inseparable from its actual native
+endpoint, certify retirement only after that execution can no longer submit or
+continue, and reject retirement of a replacement host. the client does not infer
+retirement from process/socket loss or interruption acknowledgement. one successful
+resolve permits opening a fresh thread; it never authorizes reconnecting an existing
+session to a newly resolved endpoint. the consumer persists identity/proof, not
+transport credentials, and independently fences effects/publication. upstream
+compute or billing cessation is not part of this contract.
+
 ## contract
 
 1. select exact model and reasoning from `model_catalog`; open a
