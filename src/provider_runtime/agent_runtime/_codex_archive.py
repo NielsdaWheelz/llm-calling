@@ -156,11 +156,18 @@ async def listing(connection: CodexAppServerClient) -> tuple[list[ArchiveConvers
             if not isinstance(data, list) or len(data) > 100:
                 raise ArchiveError("unsupported")
             for value in data:
-                item, active = conversation(value, archived=archived)
-                complete = complete and not active
-                if item.native_id in seen:
+                identifier = string(object_value(value).get("id"), limit=256)
+                if identifier in seen:
                     complete = False
                     continue
+                response = await request(
+                    connection, "thread/read", {"threadId": identifier, "includeTurns": False}
+                )
+                native = object_value(response.get("thread"))
+                if native.get("id") != identifier:
+                    raise ArchiveError("unsupported")
+                item, active = conversation(native, archived=archived)
+                complete = complete and not active
                 seen.add(item.native_id)
                 result.append(item)
                 if len(result) > MAX_ARCHIVE_EVENTS:
