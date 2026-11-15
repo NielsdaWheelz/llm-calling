@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import cast
@@ -40,6 +42,8 @@ from .codex_app_server import (
     CodexOutputLimit,
 )
 from .errors import ProtocolDefect
+
+_NATIVE_PAGE_ITEMS = 100
 
 
 def client(home: ArchiveHome) -> CodexAppServerClient:
@@ -152,7 +156,7 @@ async def listing(connection: CodexAppServerClient) -> tuple[list[ArchiveConvers
                     {
                         "archived": archived,
                         "cursor": cursor,
-                        "limit": 100,
+                        "limit": _NATIVE_PAGE_ITEMS,
                         "sourceKinds": list(CODEX_THREAD_SOURCES),
                         "sortKey": "created_at",
                         "sortDirection": "asc",
@@ -160,7 +164,7 @@ async def listing(connection: CodexAppServerClient) -> tuple[list[ArchiveConvers
                     },
                 )
                 data = page.get("data")
-                if not isinstance(data, list) or len(data) > 100:
+                if not isinstance(data, list) or len(data) > _NATIVE_PAGE_ITEMS:
                     raise ArchiveError("unsupported")
                 for value in data:
                     identifier = string(object_value(value).get("id"), limit=256)
@@ -352,7 +356,7 @@ async def history(
                 "cursor": cursor,
                 # Legacy history has full-turn paging, not item paging. One
                 # complete native turn is its smallest bounded response unit.
-                "limit": 1 if mode == "legacy" else 100,
+                "limit": 1 if mode == "legacy" else _NATIVE_PAGE_ITEMS,
                 "itemsView": "full" if mode == "legacy" else "notLoaded",
                 "sortDirection": "asc",
             },
@@ -389,25 +393,8 @@ async def history(
                 if not append_item(object_value(item), turn_id, occurred_at):
                     return result, False
         else:
-            cursor = None
-            item_cursors: set[str] = set()
-            while True:
-                page = await request(
-                    connection,
-                    "thread/items/list",
-                    {
-                        "threadId": native_id,
-                        "turnId": turn_id,
-                        "cursor": cursor,
-                        "limit": 1,
-                        "sortDirection": "asc",
-                    },
-                )
-                data = page.get("data")
-                if not isinstance(data, list):
-                    raise ArchiveError("unsupported")
-                for raw_entry in data:
-                    entry = object_value(raw_entry)
+            async with aclosing(item_entries(home, native_id, turn_id)) as entries:
+                async for entry in entries:
                     if entry.get("turnId") != turn_id:
                         raise ArchiveError("unsupported")
                     if not append_item(
@@ -416,14 +403,50 @@ async def history(
                         timestamp(entry.get("startedAtMs"), milliseconds=True) or occurred_at,
                     ):
                         return result, False
-                following = string(page.get("nextCursor"), optional=True)
-                if following is None:
-                    break
-                if following in item_cursors:
-                    raise ArchiveError("unsupported")
-                item_cursors.add(following)
-                cursor = following
     return result, True
+
+
+async def item_entries(
+    home: ArchiveHome, native_id: str, turn_id: str
+) -> AsyncGenerator[dict[str, object], None]:
+    # A rejected frame closes its connection. Retry its exact native cursor on
+    # a fresh connection, reducing only the page, never the ingress bound.
+    limit = _NATIVE_PAGE_ITEMS
+    cursor: str | None = None
+    cursors: set[str] = set()
+    while True:
+        try:
+            async with client(home) as connection:
+                while True:
+                    page = await request(
+                        connection,
+                        "thread/items/list",
+                        {
+                            "threadId": native_id,
+                            "turnId": turn_id,
+                            "cursor": cursor,
+                            "limit": limit,
+                            "sortDirection": "asc",
+                        },
+                    )
+                    data = page.get("data")
+                    if not isinstance(data, list) or len(data) > limit:
+                        raise ArchiveError("unsupported")
+                    for entry in data:
+                        yield object_value(entry)
+                    following = string(page.get("nextCursor"), optional=True)
+                    if following is None:
+                        return
+                    if not data or following in cursors:
+                        raise ArchiveError("unsupported")
+                    cursors.add(following)
+                    cursor = following
+        except ArchiveError as error:
+            if error.code != "event_too_large" or limit == 1:
+                raise
+            limit = max(1, limit // 2)
+        except (CodexConnectionUnavailable, ProtocolDefect):
+            raise ArchiveError("unavailable") from None
 
 
 def item_events(

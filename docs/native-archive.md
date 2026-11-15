@@ -98,12 +98,22 @@ are ignored. legacy codex positional labels receive deterministic prefix-linked
 identities: an earlier content rewrite changes later identities. paginated codex
 uses its native identities and item timestamps. both modes use public turn
 paging: one complete full turn per legacy page; up to 100 metadata turns per
-paginated page, followed by one complete native item per item page. stock
-0.160.0 and 0.169.0 reconstruct the same legacy items before slicing turns.
+paginated page, followed by forward item pages starting at 100 items. an item
+page exceeding the unchanged byte or structural ingress bound emits nothing:
+close that connection, halve its page size and retry the same opaque cursor on
+a fresh connection. retain the reduced size for that turn. a one-item overflow
+remains `event_too_large`; other errors do not reduce the page size or retry.
+consume received items in forward order, stopping at the first unfinished item
+before validating later bodies, including later bodies in the same received page.
+stock 0.160.0 and 0.169.0 reconstruct the same legacy items before slicing turns.
 the digest chain spans pages unchanged;
-there is no aggregate-read fallback or rollout-file reader. legacy paging costs
-extra native reads and server-side history reconstruction; single-item pages
-also increase native roundtrips. broader throughput work remains separate.
+there is no aggregate-read fallback or rollout-file reader. each paginated turn
+owns a connection, closed on completion, error or an unfinished prefix; this adds
+one initialization per turn while reducing per-item roundtrips. oversize pages
+add failed reads and reconnects. all reads and stable-head observations still
+inspect the complete prefix: native reconstruction/normalization work and large
+new backlogs remain. legacy paging costs extra native reads and server-side
+history reconstruction. broader throughput work remains separate.
 
 codex websocket ingress and pre-suppression event projections retain their
 4 mib bounds. claude raw JSONL records permit 8 mib, including excluded native
@@ -270,3 +280,32 @@ partial-baseline source qualification on 2026-11-15:
   pins are unchanged. these checks establish source behavior; installed capture
   and consumer migration require their separate end-to-end qualification.
 - new probes are temporary and removed after qualification; existing tests stay.
+
+adaptive item-page qualification on 2026-11-15:
+
+- 27 temporary public websocket cases pass on both runtime compositions after
+  four failing target cases and 18 passing controls. byte and structural
+  overflow retries preserve the exact opaque cursor, including after an accepted
+  page; rejected pages emit nothing. one-item overflow, unfinished/malformed
+  suffixes, split-item checkpoints, changed digests, cursor cycles, empty
+  nonterminal pages and connection cleanup preserve the closed contract.
+- an isolated stock 0.169.0 server read three synthetic turns: 250 small items,
+  one short item and seven one-million-character items. public resume hydrated
+  this disposable fixture without a model turn. old and new reads returned
+  identical ordered events and digests. item requests fell from 258 to 12;
+  total requests, including initialization, fell from 261 to 23. initialization
+  increased from one to nine, including five overflow reconnects. the large
+  turn reduced pages from 100 through 50/25/12/6 to three items under 4 mib.
+  elapsed time was 0.1405 versus 0.0899 seconds in this warm isolated fixture;
+  this is not a fleet latency or load qualification.
+- a read of the existing macbook synthetic verification conversation returned
+  its exact 77-byte assistant marker and the same previously captured native
+  digest, with an inclusive checkpoint and a complete tail. no model turn or
+  profile mutation was required.
+- current-runtime and compatible 0.160.0 suites pass 1,000 and 983 existing
+  cases. each sdk-present skip passes separately in a clean base wheel. frozen
+  lock, lint, format, typing, audit, source/wheel builds and clean base/extra
+  imports pass. dependency pins, runtime catalogue, v3 wire contract and native
+  event projections are unchanged.
+- the new probes and synthetic fixture are removed after qualification. installed
+  collector convergence remains a separate end-to-end acceptance check.
