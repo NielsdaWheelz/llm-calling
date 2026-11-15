@@ -228,3 +228,37 @@ this waiver permits this merge, preserves the future gate, and leaves native
 sdk/consumer qualification required. native receipts and controlled peers
 cannot replace raw evidence. the missing-row inventory and qualification
 command remain in [the scoped disposition](issues/raw-provider-matrix-unqualified.md).
+
+## inherited http mcp containment repair
+
+the november memory rollout exposed a missing boundary in stock 0.160.0:
+`mcp_servers={}` recursively merges with inherited configuration. a task-owned
+http mcp server received initialize/list requests and exposed its synthetic tool
+inside a restricted thread despite `environments=[]`. no model turn or real
+memory credential was used. the previous stdio-only inheritance evidence did
+not establish http containment.
+
+the existing provider startup read now uses the exact request cwd, requires the
+native effective server map and disables every returned name in the thread
+configuration. actual public `AgentRuntime` creation on stock 0.160.0 then
+exposed zero tools for three user/project http registrations, including a
+literal dotted name, plus one stdio registration. the http server received zero
+requests, every thread connection reported `disabled`, and the stdio process did
+not start. seven temporary unix-protocol
+cases cover empty/populated maps, missing/null/list/boolean refusal before
+thread creation, exact cwd and unchanged ordinary-client behavior. this is
+no-model source qualification; the installed consumer still requires its own
+effective-thread check after native configuration publication.
+the maintenance composition passes 983 existing nonlive cases, skips the
+sdk-present absent-extra case and deselects 40 paid cases; formatting, lint and
+type checks pass. native version, startup catalog and dependency lock are
+unchanged.
+
+the current-runtime forward port independently passed the same four-server
+no-model check on the official stock 0.165.0 darwin binary: every thread
+connection reported `disabled`, with zero http requests and no stdio process.
+the public runtime selected the offered `gpt-6.1-sol` catalog row; no inference
+was requested. seven adapted unix-protocol cases and all 1000 existing nonlive
+cases pass, with one sdk-present skip and 61 paid cases deselected. current
+endpoint types, stock 0.165.0 catalog and dependencies remain unchanged; the
+0.160.0 maintenance consumer retains its separate pin.
