@@ -72,9 +72,9 @@ def canonical(value: object) -> str:
         raise ArchiveError("unsupported") from None
 
 
-def bounded(value: object) -> None:
+def bounded(value: object, *, max_bytes: int = _MAX_MESSAGE_BYTES) -> None:
     try:
-        bounded_payload_size(value, _MAX_MESSAGE_BYTES, max_items=_MAX_MESSAGE_ITEMS)
+        bounded_payload_size(value, max_bytes, max_items=_MAX_MESSAGE_ITEMS)
     except (OutputLimitExceeded, UnicodeError):
         raise ArchiveError("event_too_large") from None
 

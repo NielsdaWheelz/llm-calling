@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import BinaryIO
 
 from ._archive_codec import (
     MAX_ARCHIVE_EVENTS,
@@ -30,6 +32,8 @@ from .archive import (
     ArchiveRead,
 )
 
+MAX_ARCHIVE_RECORD_BYTES = 8 * 1024 * 1024
+
 # These records describe native UI/provider bookkeeping. They are not conversation
 # evidence or replacement history. Unknown persisted records with UUIDs become gaps.
 _BOOKKEEPING = frozenset(
@@ -51,24 +55,86 @@ _BOOKKEEPING = frozenset(
         "api-request-blob",
         "api-request",
         "tools-used",
+        "permission-mode",
+        "session-owner",
+        "ai-title",
+        "file-history-delta",
+        "artifact-comment-monitor",
+        "artifact-autoreact-ledger",
+        "frame-link",
+        "relocated",
+        "worktree-state",
+        "bridge-session",
     )
 )
 
 
-def files(home: ArchiveHome) -> dict[str, Path]:
+@dataclass(frozen=True, slots=True)
+class Transcript:
+    path: Path
+    parent: str | None
+    workflow: bool
+    agent_id: str | None
+
+
+def record(stream: BinaryIO) -> dict[str, object] | None:
+    line = stream.readline(MAX_ARCHIVE_RECORD_BYTES + 1)
+    if len(line) > MAX_ARCHIVE_RECORD_BYTES:
+        raise ArchiveError("event_too_large")
+    if not line.endswith(b"\n"):
+        return None
+    try:
+        native = object_value(json.loads(line))
+    except (ValueError, UnicodeError):
+        raise ArchiveError("unsupported") from None
+    bounded(native, max_bytes=MAX_ARCHIVE_RECORD_BYTES)
+    return native
+
+
+def files(home: ArchiveHome) -> dict[str, Transcript]:
     projects = home.state_root / "projects"
     if not home.state_root.is_dir():
         raise ArchiveError("unavailable")
-    result: dict[str, Path] = {}
+    result: dict[str, Transcript] = {}
     try:
         for path in projects.rglob("*.jsonl"):
-            identifier = (
-                path.stem.removeprefix("agent-") if path.parent.name == "subagents" else path.stem
+            parts = path.relative_to(projects).parts
+            workflow_run = (
+                parts[4] if len(parts) == 6 and parts[2:4] == ("subagents", "workflows") else None
             )
+            workflow = workflow_run is not None
+            if workflow and path.name == "journal.jsonl":
+                continue
+            parent = None
+            agent_id = None
+            identifier = path.stem
+            if len(parts) == 2:
+                pass
+            elif (len(parts) == 4 and parts[2] == "subagents" or workflow) and (
+                path.stem.startswith("agent-")
+            ):
+                identifier = path.stem.removeprefix("agent-")
+                agent_id = identifier
+                parent = parts[1]
+                if workflow:
+                    with path.open("rb") as stream:
+                        header = record(stream)
+                    if header is None:
+                        raise ArchiveError("unavailable")
+                    if header.get("type") != "user" or header.get("isSidechain") is not True:
+                        raise ArchiveError("unsupported")
+                    if string(header.get("agentId"), limit=256) != identifier:
+                        raise ArchiveError("source_conflict")
+                    # Native resume can move this directory into another session.
+                    # The retained message, not its current folder, owns parentage.
+                    parent = string(header.get("sessionId"), limit=256)
+                    identifier = f"workflow/{workflow_run}/{agent_id}"
+            else:
+                raise ArchiveError("unsupported")
             string(identifier, limit=256)
             if identifier in result:
                 raise ArchiveError("source_conflict")
-            result[identifier] = path
+            result[identifier] = Transcript(path, parent, workflow, agent_id)
             if len(result) > MAX_ARCHIVE_EVENTS:
                 raise ArchiveError("event_too_large")
     except OSError:
@@ -76,8 +142,8 @@ def files(home: ArchiveHome) -> dict[str, Path]:
     return result
 
 
-def marked(home: ArchiveHome, identifier: str, path: Path) -> bool:
-    root_id = path.parent.parent.name if path.parent.name == "subagents" else identifier
+def marked(home: ArchiveHome, identifier: str, transcript: Transcript) -> bool:
+    root_id = transcript.parent or identifier
     return (home.state_root / ".provider-runtime" / "archive-internal" / root_id).is_file()
 
 
@@ -88,11 +154,12 @@ def inventory(home: ArchiveHome, *, with_heads: bool) -> ArchiveInventory:
     stats: dict[str, tuple[int, int]] = {}
     complete = True
     try:
-        for identifier, path in sorted(before.items()):
+        for identifier, transcript in sorted(before.items()):
+            path = transcript.path
             metadata = path.stat()
             stats[identifier] = (metadata.st_size, metadata.st_mtime_ns)
-            internal = marked(home, identifier, path)
-            parent = path.parent.parent.name if path.parent.name == "subagents" else None
+            internal = marked(home, identifier, transcript)
+            parent = transcript.parent
             created = datetime.fromtimestamp(metadata.st_ctime, UTC)
             updated = datetime.fromtimestamp(metadata.st_mtime, UTC)
             item = ArchiveConversation(
@@ -105,7 +172,7 @@ def inventory(home: ArchiveHome, *, with_heads: bool) -> ArchiveInventory:
                 parent_native_id=parent,
             )
             if with_heads and not internal:
-                events, caught_up, cwd, native_created = history(home, identifier, path)
+                events, caught_up, cwd, native_created = history(home, identifier, transcript)
                 complete = complete and caught_up
                 item = replace(item, working_directory=cwd, created_at=native_created or created)
                 item = replace(item, head_event_id=events[-1].native_event_id if events else None)
@@ -116,8 +183,8 @@ def inventory(home: ArchiveHome, *, with_heads: bool) -> ArchiveInventory:
                 complete
                 and before == after
                 and all(
-                    (path.stat().st_size, path.stat().st_mtime_ns) == stats[identifier]
-                    for identifier, path in after.items()
+                    (item.path.stat().st_size, item.path.stat().st_mtime_ns) == stats[identifier]
+                    for identifier, item in after.items()
                 )
             )
     except OSError:
@@ -129,19 +196,19 @@ def read(
     home: ArchiveHome, native_id: str, *, after: str | None, checkpoint: str | None
 ) -> ArchiveRead:
     observed_at = datetime.now(UTC)
-    path = files(home).get(native_id)
-    if path is None:
+    transcript = files(home).get(native_id)
+    if transcript is None:
         raise ArchiveMissing()
-    if marked(home, native_id, path):
+    if marked(home, native_id, transcript):
         raise ArchiveError("unsupported")
-    events, caught_up, _, _ = history(home, native_id, path)
+    events, caught_up, _, _ = history(home, native_id, transcript)
     return select(
         events, after=after, checkpoint=checkpoint, caught_up=caught_up, observed_at=observed_at
     )
 
 
 def history(
-    home: ArchiveHome, identifier: str, path: Path
+    home: ArchiveHome, identifier: str, transcript: Transcript
 ) -> tuple[list[ArchiveEvent], bool, str | None, datetime | None]:
     result: list[ArchiveEvent] = []
     seen: dict[str, str] = {}
@@ -151,31 +218,42 @@ def history(
     cwd: str | None = None
     created: datetime | None = None
     caught_up = True
+    path = transcript.path
+    expected_session = transcript.parent or identifier
     try:
         with path.open("rb") as stream:
             prefix = path.stat().st_size
             while stream.tell() < prefix:
-                line = stream.readline(4 * 1024 * 1024 + 1)
-                if len(line) > 4 * 1024 * 1024:
-                    raise ArchiveError("event_too_large")
-                if not line.endswith(b"\n"):
+                native = record(stream)
+                if native is None:
                     caught_up = False
                     break
-                try:
-                    native = object_value(json.loads(line))
-                except (ValueError, UnicodeError):
-                    raise ArchiveError("unsupported") from None
-                bounded(native)
                 kind = string(native.get("type"), limit=256)
                 if kind in _BOOKKEEPING:
                     continue
+                if transcript.workflow and kind in ("user", "assistant"):
+                    if native.get("isSidechain") is not True:
+                        raise ArchiveError("unsupported")
+                    if string(native.get("agentId"), limit=256) != transcript.agent_id:
+                        raise ArchiveError("source_conflict")
                 raw_id = native.get("uuid")
+                if kind == "fork-context-ref":
+                    reference = fork_reference(native)
+                    if (
+                        transcript.parent is None
+                        or reference["agentId"] != transcript.agent_id
+                        or reference["parentSessionId"] != expected_session
+                    ):
+                        raise ArchiveError("source_conflict")
+                    if raw_id is None:
+                        raw_id = (
+                            "context:"
+                            + hashlib.sha256(canonical(reference).encode("utf-8")).hexdigest()
+                        )
                 if raw_id is None:
                     if kind in ("summary", "system-prompt", "system_prompt"):
                         # Stable source identity for complete replacement/context records
                         # that have no native UUID; ignored diagnostics never enter it.
-                        import hashlib
-
                         raw_id = (
                             "context:"
                             + hashlib.sha256(
@@ -194,12 +272,10 @@ def history(
                 raw_id = string(raw_id, limit=230)
                 parent = string(native.get("parentUuid"), optional=True, limit=256)
                 native_session = string(native.get("sessionId"), optional=True, limit=256)
-                if native_session is not None:
-                    expected = (
-                        path.parent.parent.name if path.parent.name == "subagents" else identifier
-                    )
-                    if native_session != expected:
-                        raise ArchiveError("source_conflict")
+                if native_session is not None and native_session != expected_session:
+                    raise ArchiveError("source_conflict")
+                if transcript.workflow and kind in ("user", "assistant") and native_session is None:
+                    raise ArchiveError("unsupported")
                 current_cwd = string(native.get("cwd"), optional=True)
                 if cwd is None and current_cwd is not None:
                     cwd = current_cwd
@@ -212,7 +288,7 @@ def history(
                     parent=parent,
                     occurred_at=occurred_at,
                     home=home,
-                    peer=path.parent.name == "subagents",
+                    peer=transcript.parent is not None,
                     tool_names=tool_names,
                     child_ids=child_ids,
                 )
@@ -247,6 +323,19 @@ def history(
     return result, caught_up, cwd, created
 
 
+def fork_reference(native: dict[str, object]) -> dict[str, object]:
+    length = native.get("contextLength")
+    if type(length) is not int or length < 0:
+        raise ArchiveError("unsupported")
+    return {
+        "type": "fork-context-ref",
+        "agentId": string(native.get("agentId"), limit=256),
+        "parentSessionId": string(native.get("parentSessionId"), limit=256),
+        "parentLastUuid": string(native.get("parentLastUuid"), limit=256),
+        "contextLength": length,
+    }
+
+
 def row_events(
     native: dict[str, object],
     *,
@@ -278,12 +367,28 @@ def row_events(
             )
         )
 
+    if kind == "fork-context-ref":
+        reference = fork_reference(native)
+        append(
+            "",
+            "unknown",
+            "context",
+            "",
+            {
+                "context_kind": "other",
+                "native_name": kind,
+                "native_source_reference": canonical(reference),
+                "body_retention": "reference_only",
+            },
+            reference,
+        )
+        return values
     if kind == "attachment":
         attachment = object_value(native.get("attachment"))
         attachment_kind = string(attachment.get("type"), limit=256)
         context_fields = {
             "environment": ("environment", ("snapshot",)),
-            "prompt_snapshot": ("instructions", ("systemPrompt", "contextRendering")),
+            "prompt_snapshot": ("instructions", ("systemPrompt",)),
             "session_context": ("environment", ("context",)),
             "model": ("other", ("identity", "text")),
             "date": ("environment", ("date",)),
@@ -293,6 +398,8 @@ def row_events(
             context_kind, fields = context_fields[attachment_kind]
             if any(field not in attachment for field in fields):
                 raise ArchiveError("unsupported")
+            if attachment_kind == "prompt_snapshot" and "contextRendering" in attachment:
+                fields += ("contextRendering",)
             append(
                 "",
                 "unknown",
