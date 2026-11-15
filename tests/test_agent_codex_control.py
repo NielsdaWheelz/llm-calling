@@ -620,7 +620,7 @@ async def test_shared_workspace_sandbox_retains_native_tmp_exclusions(
     params = start["params"]
     assert isinstance(params, dict)
     assert params["config"]["sandbox_workspace_write"] == {
-        "writable_roots": [str(tmp_path)],
+        "writable_roots": [],
         "network_access": False,
         "exclude_slash_tmp": True,
         "exclude_tmpdir_env_var": True,

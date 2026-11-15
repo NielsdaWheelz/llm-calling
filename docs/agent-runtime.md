@@ -399,6 +399,8 @@ denial fail closed. ordinary denied permission requests remain validated observa
 before returning a session, the adapter verifies actual thread-start cwd, selected
 model/provider/reasoning, approval and sandbox authority against the frozen request.
 workspace roots, network and scratch exclusions must match, including their types.
+stock's workspace-write projection leaves cwd implicit; `writableRoots` must
+equal the declared additional roots other than cwd, rather than an arbitrary subset.
 ongoing and pre-turn settings updates use the same comparison; missing settings
 fail. native switches and callback declarations have no read-back fields in the
 pinned response; their emitted configuration and actual behavior are qualified

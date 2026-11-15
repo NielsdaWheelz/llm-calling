@@ -2047,7 +2047,8 @@ class CodexSdkAdapter:
             controls = self._sandbox_controls
             expected = {
                 "type": "workspaceWrite",
-                "writableRoots": [request.cwd, *request.additional_dirs],
+                # Stock's public projection leaves the workspace cwd implicit.
+                "writableRoots": [path for path in request.additional_dirs if path != request.cwd],
                 "networkAccess": request.policy.network == "unrestricted",
                 "excludeTmpdirEnvVar": controls.exclude_tmpdir_env_var if controls else False,
                 "excludeSlashTmp": controls.exclude_slash_tmp if controls else False,
@@ -2262,7 +2263,7 @@ class CodexSdkAdapter:
             )
         if request.policy.filesystem == "workspace_write":
             workspace: dict[str, object] = {
-                "writable_roots": [request.cwd, *request.additional_dirs],
+                "writable_roots": [path for path in request.additional_dirs if path != request.cwd],
                 "network_access": request.policy.network == "unrestricted",
                 "exclude_slash_tmp": False,
                 "exclude_tmpdir_env_var": False,
