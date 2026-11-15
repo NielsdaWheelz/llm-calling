@@ -9,6 +9,7 @@ selects one provider/state root; codex additionally requires its host-owned
 home = ArchiveHome("codex", native_home, codex_endpoint)
 capabilities = await archive_capabilities(home)
 inventory = await archive_list(home, with_heads=True)
+head = await archive_head(home, native_id)
 batch = await archive_read(home, native_id, after=activation_head,
                            from_event_id=checkpoint)
 ```
@@ -18,9 +19,13 @@ non-null input page is invalid. both archived and ordinary codex threads are
 enumerated across all declared native source kinds. claude enumerates the native
 project transcripts, including child files and empty ordinary/direct-child files.
 ordinary listing does not decode claude conversation content; workflow child
-identity requires the first bounded complete record. head inventory requires two
-stable observations; active/mutable histories or changed membership leave it
-incomplete. internal entries are marked and their conversation events are never
+identity requires the first bounded complete record. head inventory requires
+stable identity and attribution observations. changed membership or ambiguous
+classification leaves it incomplete; failure to enumerate any required scope
+raises. individual unreadable, active or moving histories retain their identity
+with a content-free `head_error` and null `head_event_id`. they do not invalidate
+otherwise complete membership. null head with null error proves a known empty
+history. internal entries are marked and their conversation events are never
 projected; workflow header inspection reads only the first record for identity.
 codex listing supplies membership and archived state only. each listed identity
 is checked against `thread/read(includeTurns=false)` metadata before internal
@@ -30,7 +35,7 @@ observation rereads that metadata; no cached classification proves stability.
 multiple retained codex rollout versions can list the same native thread id.
 within one archived scope, inventory includes that identity once and reads its
 canonical metadata/history through `thread/read`; listed paths never select an
-original. occurrence in both archived scopes still leaves inventory incomplete.
+original. occurrence in both archived scopes fails with `source_conflict`.
 each archived scope requires two complete native views: `modelProviders=[]`
 for all backends, and the omitted-filter configured-provider view. the current
 native implementation gives those views different storage membership; their
@@ -72,13 +77,19 @@ head. lost boundaries are explicit errors, never a new baseline. `caught_up`
 requires exhaustion of the stable complete prefix observed when reading began.
 native times do not decide eligibility.
 
-the current codec contract is `native-archive.v2`. one implementation replaces
-v1; there is no old-digest fallback or compatibility reader. corrected claude
-`content` document projections change; unaffected projections stay exact. new
-native layouts and record kinds retain that same public contract.
-old corrected-variant checkpoints cannot be silently relabeled or reset. the
-original v2 repair was qualified in isolation; it did not activate production
-capture.
+`archive_head` reads one conversation's stable head with the same rules as head
+inventory. its null head proves empty; unreadable, internal, active or moving
+histories raise `ArchiveError`. successful `ArchiveHead` includes `observed_at`.
+consumers use this narrow read to repair a pending baseline without rereading
+every other conversation. the consumer owns the new activation cut and excluded
+gap; this module never resets a boundary or backfills it.
+
+the current contract is `native-archive.v3`. it adds per-conversation head errors
+and the single-head read; native event projections, identities, digests and
+existing checkpoints stay exact. capture consumers must adopt this contract
+together with its pending-baseline semantics. there is no old-contract fallback
+or compatibility reader. earlier corrected-variant checkpoints cannot be
+silently relabeled or reset.
 
 events carry `native_event_id`, `native_digest`, `turn_id`, `native_parent_id`,
 `role`, `kind`, `text`, closed `attributes` and `occurred_at`. the digest binds the
@@ -242,3 +253,20 @@ and stock 0.165.0 catalogue. its existing suite passes 1,000 cases, with one
 sdk-present skip and 61 paid/live exclusions; the same 54 archive cases pass with
 only the endpoint fixture adapted. lint, format, typing, audit and builds pass.
 jarvis's separately pinned 0.160.0 maintenance release does not adopt this runtime.
+
+partial-baseline source qualification on 2026-11-15:
+
+- 22 temporary public protocol/file cases pass on both runtime compositions.
+  healthy and empty histories remain available beside missing, active, incomplete
+  or moving histories. attribution/internal changes refuse complete inventory;
+  contradictory identity and listing failure refuse it outright. single-head
+  reads preserve the same distinctions. ordinary reads retain exact events.
+  the initial run had 15 failing cases and two passing controls before repair.
+- current-runtime and 0.160.0 suites pass 1,000 and 983 existing cases,
+  respectively. each has one sdk-present skip; the absent-sdk case passes
+  separately from its clean base wheel. lint, formatting, typing, dependency
+  audit, source/wheel builds and base/extra wheel imports pass.
+- only the archive contract changes. native runtime/catalogue and dependency
+  pins are unchanged. these checks establish source behavior; installed capture
+  and consumer migration require their separate end-to-end qualification.
+- new probes are temporary and removed after qualification; existing tests stay.

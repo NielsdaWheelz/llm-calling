@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, cast
 
 from ._archive_codec import (
     MAX_ARCHIVE_EVENTS,
@@ -25,7 +25,9 @@ from .archive import (
     MEMORY_TOOL_NAMES,
     ArchiveConversation,
     ArchiveError,
+    ArchiveErrorCode,
     ArchiveEvent,
+    ArchiveHead,
     ArchiveHome,
     ArchiveInventory,
     ArchiveMissing,
@@ -148,7 +150,6 @@ def marked(home: ArchiveHome, identifier: str, transcript: Transcript) -> bool:
 
 
 def inventory(home: ArchiveHome, *, with_heads: bool) -> ArchiveInventory:
-    observed_at = datetime.now(UTC)
     before = files(home)
     items: list[ArchiveConversation] = []
     stats: dict[str, tuple[int, int]] = {}
@@ -172,24 +173,63 @@ def inventory(home: ArchiveHome, *, with_heads: bool) -> ArchiveInventory:
                 parent_native_id=parent,
             )
             if with_heads and not internal:
-                events, caught_up, cwd, native_created = history(home, identifier, transcript)
-                complete = complete and caught_up
-                item = replace(item, working_directory=cwd, created_at=native_created or created)
-                item = replace(item, head_event_id=events[-1].native_event_id if events else None)
+                try:
+                    head_id, cwd, native_created = stable_head(home, identifier, transcript)
+                    item = replace(
+                        item,
+                        working_directory=cwd,
+                        created_at=native_created or created,
+                        head_event_id=head_id,
+                    )
+                except ArchiveError as error:
+                    item = replace(item, head_error=cast(ArchiveErrorCode, error.code))
             items.append(item)
         after = files(home)
         if with_heads:
-            complete = (
-                complete
-                and before == after
-                and all(
-                    (item.path.stat().st_size, item.path.stat().st_mtime_ns) == stats[identifier]
-                    for identifier, item in after.items()
-                )
-            )
+            complete = before == after
+            for index, item in enumerate(items):
+                transcript = after.get(item.native_id)
+                if transcript is None:
+                    continue
+                if marked(home, item.native_id, transcript) != item.internal:
+                    complete = False
+                metadata = transcript.path.stat()
+                if (
+                    not item.internal
+                    and (metadata.st_size, metadata.st_mtime_ns) != stats[item.native_id]
+                ):
+                    items[index] = replace(item, head_event_id=None, head_error="unavailable")
     except OSError:
         raise ArchiveError("unavailable") from None
-    return ArchiveInventory(tuple(items), None, complete if with_heads else True, observed_at)
+    return ArchiveInventory(tuple(items), None, complete if with_heads else True, datetime.now(UTC))
+
+
+def stable_head(
+    home: ArchiveHome, native_id: str, transcript: Transcript
+) -> tuple[str | None, str | None, datetime | None]:
+    if marked(home, native_id, transcript):
+        raise ArchiveError("unsupported")
+    try:
+        before = transcript.path.stat()
+        events, caught_up, cwd, created = history(home, native_id, transcript)
+        after = transcript.path.stat()
+    except OSError:
+        raise ArchiveError("unavailable") from None
+    if (
+        not caught_up
+        or (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns)
+        or marked(home, native_id, transcript)
+    ):
+        raise ArchiveError("unavailable")
+    return events[-1].native_event_id if events else None, cwd, created
+
+
+def head(home: ArchiveHome, native_id: str) -> ArchiveHead:
+    transcript = files(home).get(native_id)
+    if transcript is None:
+        raise ArchiveMissing()
+    identifier, _, _ = stable_head(home, native_id, transcript)
+    return ArchiveHead(identifier, datetime.now(UTC))
 
 
 def read(

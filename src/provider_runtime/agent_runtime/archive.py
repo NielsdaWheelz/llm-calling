@@ -13,7 +13,7 @@ from typing import Literal
 from .codex_endpoint import CodexEndpoint, CodexUnixEndpoint, CodexWebSocketEndpoint
 from .errors import AgentRuntimeError, InvalidAgentRequest
 
-ARCHIVE_CONTRACT_REVISION = "native-archive.v2"
+ARCHIVE_CONTRACT_REVISION = "native-archive.v3"
 INTERNAL_THREAD_SOURCE = "jarvis.cognition"
 MEMORY_TOOL_NAMES = frozenset(
     (
@@ -108,6 +108,17 @@ class ArchiveConversation:
     inherited_through: str | None = None
     working_directory: str | None = None
     head_event_id: str | None = None
+    head_error: ArchiveErrorCode | None = None
+
+    def __post_init__(self) -> None:
+        if self.head_error is not None and self.head_event_id is not None:
+            raise InvalidAgentRequest("an unreadable archive head has no event identity")
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveHead:
+    head_event_id: str | None
+    observed_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,3 +227,16 @@ async def archive_read(
     from ._claude_archive import read
 
     return await asyncio.to_thread(read, home, native_id, after=after, checkpoint=from_event_id)
+
+
+async def archive_head(home: ArchiveHome, native_id: str) -> ArchiveHead:
+    """Read one stable baseline; null is proved empty, errors never imply empty."""
+    if not native_id or len(native_id.encode("utf-8")) > 256:
+        raise InvalidAgentRequest("native conversation identity must be bounded and nonempty")
+    if home.provider == "codex":
+        from ._codex_archive import head
+
+        return await head(home, native_id)
+    from ._claude_archive import head
+
+    return await asyncio.to_thread(head, home, native_id)

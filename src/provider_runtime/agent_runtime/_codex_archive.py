@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime
+from typing import cast
 
 from ._archive_codec import (
     MAX_ARCHIVE_EVENTS,
@@ -22,7 +23,9 @@ from .archive import (
     ArchiveCapabilities,
     ArchiveConversation,
     ArchiveError,
+    ArchiveErrorCode,
     ArchiveEvent,
+    ArchiveHead,
     ArchiveHome,
     ArchiveInventory,
     ArchiveMissing,
@@ -132,10 +135,10 @@ def conversation(value: object, *, archived: bool) -> tuple[ArchiveConversation,
     ), active
 
 
-async def listing(connection: CodexAppServerClient) -> tuple[list[ArchiveConversation], bool]:
+async def listing(connection: CodexAppServerClient) -> tuple[list[ArchiveConversation], set[str]]:
     result: list[ArchiveConversation] = []
     seen: dict[str, bool] = {}
-    complete = True
+    active_ids: set[str] = set()
     for archived in (False, True):
         # Native all-provider and configured-provider views have complementary
         # membership. Both must complete; neither substitutes for a failed view.
@@ -162,7 +165,8 @@ async def listing(connection: CodexAppServerClient) -> tuple[list[ArchiveConvers
                 for value in data:
                     identifier = string(object_value(value).get("id"), limit=256)
                     if identifier in seen:
-                        complete = complete and seen[identifier] == archived
+                        if seen[identifier] != archived:
+                            raise ArchiveError("source_conflict")
                         continue
                     response = await request(
                         connection, "thread/read", {"threadId": identifier, "includeTurns": False}
@@ -171,7 +175,8 @@ async def listing(connection: CodexAppServerClient) -> tuple[list[ArchiveConvers
                     if native.get("id") != identifier:
                         raise ArchiveError("unsupported")
                     item, active = conversation(native, archived=archived)
-                    complete = complete and not active
+                    if active:
+                        active_ids.add(identifier)
                     seen[item.native_id] = archived
                     result.append(item)
                     if len(result) > MAX_ARCHIVE_EVENTS:
@@ -183,40 +188,81 @@ async def listing(connection: CodexAppServerClient) -> tuple[list[ArchiveConvers
                     raise ArchiveError("unsupported")
                 cursors.add(cursor)
     result.sort(key=lambda value: value.native_id)
-    return result, complete
+    return result, active_ids
 
 
 async def inventory(home: ArchiveHome, *, with_heads: bool) -> ArchiveInventory:
     observed_at = datetime.now(UTC)
     try:
         async with client(home) as connection:
-            items, quiet = await listing(connection)
+            before, active_ids = await listing(connection)
             if not with_heads:
-                return ArchiveInventory(tuple(items), None, True, observed_at)
-            signatures: dict[str, tuple[str | None, str | None]] = {}
-            for index, item in enumerate(items):
+                return ArchiveInventory(tuple(before), None, True, observed_at)
+            items: list[ArchiveConversation] = []
+            for item in before:
                 if item.internal:
+                    items.append(item)
                     continue
-                events, caught_up = await history(connection, home, item.native_id)
-                quiet = quiet and caught_up
-                head = events[-1] if events else None
-                signatures[item.native_id] = (
-                    (head.native_event_id, head.native_digest) if head else (None, None)
-                )
-                items[index] = replace(item, head_event_id=head.native_event_id if head else None)
-            second, second_quiet = await listing(connection)
-            stable = [replace(value, head_event_id=None) for value in items] == second
-            if stable and quiet and second_quiet:
-                for item in second:
-                    if item.internal:
-                        continue
-                    events, caught_up = await history(connection, home, item.native_id)
-                    head = events[-1] if events else None
-                    signature = (head.native_event_id, head.native_digest) if head else (None, None)
-                    stable = stable and caught_up and signatures[item.native_id] == signature
-            return ArchiveInventory(
-                tuple(items), None, stable and quiet and second_quiet, observed_at
+                try:
+                    if item.native_id in active_ids:
+                        raise ArchiveError("unavailable")
+                    identifier = await stable_head(connection, home, item.native_id)
+                    items.append(replace(item, head_event_id=identifier))
+                except ArchiveError as error:
+                    items.append(replace(item, head_error=cast(ArchiveErrorCode, error.code)))
+            second, active_ids = await listing(connection)
+            after = {item.native_id: item for item in second}
+            complete = {item.native_id for item in before} == after.keys()
+            for index, original in enumerate(before):
+                current = after.get(original.native_id)
+                if current is None:
+                    continue
+                if replace(current, updated_at=original.updated_at) != original:
+                    complete = False
+                if not original.internal and (
+                    current.updated_at != original.updated_at or original.native_id in active_ids
+                ):
+                    items[index] = replace(
+                        items[index], head_event_id=None, head_error="unavailable"
+                    )
+            return ArchiveInventory(tuple(items), None, complete, datetime.now(UTC))
+    except (CodexConnectionUnavailable, ProtocolDefect):
+        raise ArchiveError("unavailable") from None
+
+
+async def stable_head(
+    connection: CodexAppServerClient, home: ArchiveHome, native_id: str
+) -> str | None:
+    first, complete = await history(connection, home, native_id)
+    if not complete:
+        raise ArchiveError("unavailable")
+    second, complete = await history(connection, home, native_id)
+    before = (first[-1].native_event_id, first[-1].native_digest) if first else (None, None)
+    after = (second[-1].native_event_id, second[-1].native_digest) if second else (None, None)
+    if not complete or before != after:
+        raise ArchiveError("unavailable")
+    return after[0]
+
+
+async def head(home: ArchiveHome, native_id: str) -> ArchiveHead:
+    try:
+        async with client(home) as connection:
+            response = await request(
+                connection, "thread/read", {"threadId": native_id, "includeTurns": False}
             )
+            before, active = conversation(response.get("thread"), archived=False)
+            if before.native_id != native_id or before.internal:
+                raise ArchiveError("unsupported")
+            if active:
+                raise ArchiveError("unavailable")
+            identifier = await stable_head(connection, home, native_id)
+            response = await request(
+                connection, "thread/read", {"threadId": native_id, "includeTurns": False}
+            )
+            after, active = conversation(response.get("thread"), archived=False)
+            if before != after or active:
+                raise ArchiveError("unavailable")
+            return ArchiveHead(identifier, datetime.now(UTC))
     except (CodexConnectionUnavailable, ProtocolDefect):
         raise ArchiveError("unavailable") from None
 
