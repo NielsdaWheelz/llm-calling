@@ -1224,14 +1224,16 @@ class CodexSdkAdapter:
         else:
             operation = "tool_use"
             tool_name = request.method
-        item_id = params.get("itemId")
-        if isinstance(item_id, str) and item_id:
-            expected = state.active_tool_calls.get(item_id)
-            if expected is None and request.method not in (
-                "item/permissions/requestApproval",
-                "item/tool/requestUserInput",
-            ):
-                raise ProtocolDefect("Codex approval did not match a started authority item")
+        if request.method in (
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+            "item/permissions/requestApproval",
+            "item/tool/requestUserInput",
+        ):
+            item_id = self._non_empty_string(params, "itemId", request.method)
+            if operation in ("command", "file_change"):
+                name = "commandExecution" if operation == "command" else "fileChange"
+                self._require_active_tool(state, item_id, name, request.method)
         return AgentPermissionRequest(
             request=ApprovalRequest(
                 operation=operation,
