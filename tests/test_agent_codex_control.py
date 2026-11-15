@@ -178,7 +178,11 @@ class ProtocolPeer:
                         if params["sandbox"] == "read-only"
                         else {
                             "type": "workspaceWrite",
-                            "writableRoots": workspace.get("writable_roots", []),
+                            "writableRoots": [
+                                path
+                                for path in workspace.get("writable_roots", [])
+                                if path != params["cwd"]
+                            ],
                             "networkAccess": workspace.get("network_access", False),
                             "excludeTmpdirEnvVar": workspace.get("exclude_tmpdir_env_var", False),
                             "excludeSlashTmp": workspace.get("exclude_slash_tmp", False),
@@ -620,7 +624,7 @@ async def test_shared_workspace_sandbox_retains_native_tmp_exclusions(
     params = start["params"]
     assert isinstance(params, dict)
     assert params["config"]["sandbox_workspace_write"] == {
-        "writable_roots": [],
+        "writable_roots": [str(tmp_path)],
         "network_access": False,
         "exclude_slash_tmp": True,
         "exclude_tmpdir_env_var": True,

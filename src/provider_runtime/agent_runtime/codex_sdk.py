@@ -2263,7 +2263,7 @@ class CodexSdkAdapter:
             )
         if request.policy.filesystem == "workspace_write":
             workspace: dict[str, object] = {
-                "writable_roots": [path for path in request.additional_dirs if path != request.cwd],
+                "writable_roots": [request.cwd, *request.additional_dirs],
                 "network_access": request.policy.network == "unrestricted",
                 "exclude_slash_tmp": False,
                 "exclude_tmpdir_env_var": False,

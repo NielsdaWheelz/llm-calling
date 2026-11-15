@@ -401,6 +401,8 @@ model/provider/reasoning, approval and sandbox authority against the frozen requ
 workspace roots, network and scratch exclusions must match, including their types.
 stock's workspace-write projection leaves cwd implicit; `writableRoots` must
 equal the declared additional roots other than cwd, rather than an arbitrary subset.
+the input `sandbox_workspace_write.writable_roots` still declares cwd explicitly
+alongside the additional roots; input and response projections are distinct.
 ongoing and pre-turn settings updates use the same comparison; missing settings
 fail. native switches and callback declarations have no read-back fields in the
 pinned response; their emitted configuration and actual behavior are qualified
