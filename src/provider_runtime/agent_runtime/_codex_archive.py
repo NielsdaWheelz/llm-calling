@@ -110,7 +110,7 @@ def conversation(value: object, *, archived: bool) -> tuple[ArchiveConversation,
             raise ArchiveError("unsupported")
     else:
         raise ArchiveError("unsupported")
-    if parent is not None and fork is not None:
+    if parent is not None and fork is not None and parent != fork:
         raise ArchiveError("unsupported")
     status = object_value(native.get("status"))
     active = status.get("type") == "active"
@@ -134,50 +134,54 @@ def conversation(value: object, *, archived: bool) -> tuple[ArchiveConversation,
 
 async def listing(connection: CodexAppServerClient) -> tuple[list[ArchiveConversation], bool]:
     result: list[ArchiveConversation] = []
-    seen: set[str] = set()
+    seen: dict[str, bool] = {}
     complete = True
     for archived in (False, True):
-        cursor: str | None = None
-        cursors: set[str] = set()
-        while True:
-            page = await request(
-                connection,
-                "thread/list",
-                {
-                    "archived": archived,
-                    "cursor": cursor,
-                    "limit": 100,
-                    "sourceKinds": list(CODEX_THREAD_SOURCES),
-                    "sortKey": "created_at",
-                    "sortDirection": "asc",
-                },
-            )
-            data = page.get("data")
-            if not isinstance(data, list) or len(data) > 100:
-                raise ArchiveError("unsupported")
-            for value in data:
-                identifier = string(object_value(value).get("id"), limit=256)
-                if identifier in seen:
-                    complete = False
-                    continue
-                response = await request(
-                    connection, "thread/read", {"threadId": identifier, "includeTurns": False}
+        # Native all-provider and configured-provider views have complementary
+        # membership. Both must complete; neither substitutes for a failed view.
+        for all_providers in (True, False):
+            cursor: str | None = None
+            cursors: set[str] = set()
+            while True:
+                page = await request(
+                    connection,
+                    "thread/list",
+                    {
+                        "archived": archived,
+                        "cursor": cursor,
+                        "limit": 100,
+                        "sourceKinds": list(CODEX_THREAD_SOURCES),
+                        "sortKey": "created_at",
+                        "sortDirection": "asc",
+                        **({"modelProviders": []} if all_providers else {}),
+                    },
                 )
-                native = object_value(response.get("thread"))
-                if native.get("id") != identifier:
+                data = page.get("data")
+                if not isinstance(data, list) or len(data) > 100:
                     raise ArchiveError("unsupported")
-                item, active = conversation(native, archived=archived)
-                complete = complete and not active
-                seen.add(item.native_id)
-                result.append(item)
-                if len(result) > MAX_ARCHIVE_EVENTS:
-                    raise ArchiveError("event_too_large")
-            cursor = string(page.get("nextCursor"), optional=True)
-            if cursor is None:
-                break
-            if cursor in cursors:
-                raise ArchiveError("unsupported")
-            cursors.add(cursor)
+                for value in data:
+                    identifier = string(object_value(value).get("id"), limit=256)
+                    if identifier in seen:
+                        complete = complete and seen[identifier] == archived
+                        continue
+                    response = await request(
+                        connection, "thread/read", {"threadId": identifier, "includeTurns": False}
+                    )
+                    native = object_value(response.get("thread"))
+                    if native.get("id") != identifier:
+                        raise ArchiveError("unsupported")
+                    item, active = conversation(native, archived=archived)
+                    complete = complete and not active
+                    seen[item.native_id] = archived
+                    result.append(item)
+                    if len(result) > MAX_ARCHIVE_EVENTS:
+                        raise ArchiveError("event_too_large")
+                cursor = string(page.get("nextCursor"), optional=True)
+                if cursor is None:
+                    break
+                if cursor in cursors:
+                    raise ArchiveError("unsupported")
+                cursors.add(cursor)
     result.sort(key=lambda value: value.native_id)
     return result, complete
 
@@ -241,6 +245,9 @@ async def history(
     info, _ = conversation(native, archived=False)
     if info.native_id != native_id or info.internal:
         raise ArchiveError("unsupported")
+    source = native.get("source")
+    agent = source.get("subAgent") if isinstance(source, dict) else None
+    peer = info.relation == "child" or isinstance(agent, dict) and "thread_spawn" in agent
     mode = native.get("historyMode", "legacy")
     if mode not in ("legacy", "paginated"):
         raise ArchiveError("unsupported")
@@ -259,7 +266,7 @@ async def history(
             home=home,
             turn_id=turn_id,
             occurred_at=occurred_at,
-            peer=info.relation == "child",
+            peer=peer,
             lineage=(info.relation, info.parent_native_id),
         )
         if values is None:
@@ -287,43 +294,36 @@ async def history(
             result.append(value)
         return True
 
-    if mode == "legacy":
-        response = await request(
-            connection, "thread/read", {"threadId": native_id, "includeTurns": True}
+    turns = []
+    cursor = None
+    turn_cursors: set[str] = set()
+    while True:
+        page = await request(
+            connection,
+            "thread/turns/list",
+            {
+                "threadId": native_id,
+                "cursor": cursor,
+                # Legacy history has full-turn paging, not item paging. One
+                # complete native turn is its smallest bounded response unit.
+                "limit": 1 if mode == "legacy" else 100,
+                "itemsView": "full" if mode == "legacy" else "notLoaded",
+                "sortDirection": "asc",
+            },
         )
-        thread = object_value(response.get("thread"))
-        if thread.get("id") != native_id:
+        data = page.get("data")
+        if not isinstance(data, list):
             raise ArchiveError("unsupported")
-        turns = thread.get("turns")
-        if not isinstance(turns, list):
+        turns.extend(data)
+        if len(turns) > MAX_ARCHIVE_EVENTS:
+            raise ArchiveError("event_too_large")
+        following = string(page.get("nextCursor"), optional=True)
+        if following is None:
+            break
+        if following in turn_cursors:
             raise ArchiveError("unsupported")
-    else:
-        turns = []
-        cursor = None
-        while True:
-            page = await request(
-                connection,
-                "thread/turns/list",
-                {
-                    "threadId": native_id,
-                    "cursor": cursor,
-                    "limit": 100,
-                    "itemsView": "notLoaded",
-                    "sortDirection": "asc",
-                },
-            )
-            data = page.get("data")
-            if not isinstance(data, list):
-                raise ArchiveError("unsupported")
-            turns.extend(data)
-            if len(turns) > MAX_ARCHIVE_EVENTS:
-                raise ArchiveError("event_too_large")
-            following = string(page.get("nextCursor"), optional=True)
-            if following is None:
-                break
-            if following == cursor:
-                raise ArchiveError("unsupported")
-            cursor = following
+        turn_cursors.add(following)
+        cursor = following
     for raw_turn in turns:
         turn = object_value(raw_turn)
         turn_id = string(turn.get("id"), limit=256)
@@ -344,6 +344,7 @@ async def history(
                     return result, False
         else:
             cursor = None
+            item_cursors: set[str] = set()
             while True:
                 page = await request(
                     connection,
@@ -352,7 +353,7 @@ async def history(
                         "threadId": native_id,
                         "turnId": turn_id,
                         "cursor": cursor,
-                        "limit": 100,
+                        "limit": 1,
                         "sortDirection": "asc",
                     },
                 )
@@ -372,8 +373,9 @@ async def history(
                 following = string(page.get("nextCursor"), optional=True)
                 if following is None:
                     break
-                if following == cursor:
+                if following in item_cursors:
                     raise ArchiveError("unsupported")
+                item_cursors.add(following)
                 cursor = following
     return result, True
 
