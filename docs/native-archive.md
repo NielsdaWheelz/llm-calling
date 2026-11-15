@@ -20,6 +20,11 @@ project transcripts, including child files and empty files. ordinary listing
 does not need to decode claude conversation bodies. head inventory requires two
 stable observations; active/mutable histories or changed membership leave it
 incomplete. internal entries are marked and their histories are never read.
+codex listing supplies membership and archived state only. each listed identity
+is checked against `thread/read(includeTurns=false)` metadata before internal
+or fork classification; current native listings can omit those fields. this
+adds one content-free metadata read per thread per inventory pass. the second
+observation rereads that metadata; no cached classification proves stability.
 
 reads emit at most 100 complete normalized events. `next` is the final returned
 event identity when another batch remains; reread that identity inclusively with
@@ -80,6 +85,11 @@ echo note prose. child outcomes retain known native child identities. unknown
 event kinds become explicit gaps. broad native ancestry does not prove exact
 original coverage; reads retain inherited copies. no current native mapping
 fabricates an `inherited_origin` proof from matching prose or identifiers.
+
+claude's `api-request-shape`, `api-request-blob` and `api-request` rows are native
+request/cache bookkeeping, not new conversation evidence. their assembled
+request bodies are excluded, including rows without a message uuid. other
+unrecognized rows still follow the existing strict identity and gap rules.
 
 secret normalization, the permanent tool-result head/tail policy and splitting
 into bounded source parts belong to the capture/library layer, after the native

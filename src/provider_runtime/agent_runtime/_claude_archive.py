@@ -47,6 +47,9 @@ _BOOKKEEPING = frozenset(
         "atis-latch",
         "cost-state",
         "mode",
+        "api-request-shape",
+        "api-request-blob",
+        "api-request",
     )
 )
 
