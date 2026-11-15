@@ -86,9 +86,10 @@ event kinds become explicit gaps. broad native ancestry does not prove exact
 original coverage; reads retain inherited copies. no current native mapping
 fabricates an `inherited_origin` proof from matching prose or identifiers.
 
-claude's `api-request-shape`, `api-request-blob` and `api-request` rows are native
-request/cache bookkeeping, not new conversation evidence. their assembled
-request bodies are excluded, including rows without a message uuid. other
+claude's `api-request-shape`, `api-request-blob`, `api-request` and `tools-used`
+rows are native request/cache and tool-name bookkeeping, not new conversation
+evidence. their assembled request bodies and tool inventories are excluded,
+including rows without a message uuid. original tool calls/results remain. other
 unrecognized rows still follow the existing strict identity and gap rules.
 
 secret normalization, the permanent tool-result head/tail policy and splitting

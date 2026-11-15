@@ -50,6 +50,7 @@ _BOOKKEEPING = frozenset(
         "api-request-shape",
         "api-request-blob",
         "api-request",
+        "tools-used",
     )
 )
 
