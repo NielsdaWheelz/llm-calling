@@ -313,6 +313,14 @@ still requires the sentinel `allowed_tools=("*",)`. The additional
 supported feature-off configuration and requires read-only
 filesystem, disabled network, denied approvals, empty copied environment, no
 MCP, and no additional roots. Provider review is refused in this posture.
+the existing startup preflight reads effective configuration at the request's
+exact cwd and explicitly disables every inherited mcp server by name. native
+configuration recursively merges tables: an empty `mcp_servers` table does not
+clear user/project servers, and an empty execution-environment selection does
+not disable http mcp. the pinned public protocol has no session-wide reset, so
+these explicit disables are required. a missing or non-object server map fails
+before thread creation. ordinary native clients retain their existing behavior;
+configuration publication remains stopped host maintenance.
 Claude continues to accept exact tool names, reject glob patterns and its two
 network-reaching built-ins, and verify the reported effective set.
 

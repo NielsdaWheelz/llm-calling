@@ -63,7 +63,10 @@ class UsagePeer:
                 result = {"account": {"type": "chatgpt"}}
             elif method == "config/read":
                 result = {
-                    "config": {"model_catalog_json": f"/host/{CODEX_CONTAINMENT_CATALOG_FILENAME}"},
+                    "config": {
+                        "model_catalog_json": f"/host/{CODEX_CONTAINMENT_CATALOG_FILENAME}",
+                        "mcp_servers": {},
+                    },
                     "origins": {"model_catalog_json": {"name": {"type": "sessionFlags"}}},
                 }
             elif method == "model/list":

@@ -160,7 +160,8 @@ class ProtocolPeer:
                 elif method == "config/read":
                     result = {
                         "config": {
-                            "model_catalog_json": f"/host/{CODEX_CONTAINMENT_CATALOG_FILENAME}"
+                            "model_catalog_json": f"/host/{CODEX_CONTAINMENT_CATALOG_FILENAME}",
+                            "mcp_servers": {},
                         },
                         "origins": {"model_catalog_json": {"name": {"type": "sessionFlags"}}},
                     }

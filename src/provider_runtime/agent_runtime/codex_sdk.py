@@ -649,18 +649,27 @@ class CodexSdkAdapter:
         )
         try:
             await self._verify_auth(client)
+            config = self._codex_config(request)
             if contained:
-                _validate_codex_containment_config(
+                startup = self._mapping(
                     await self._call(
-                        client.request("config/read", {"includeLayers": False}),
-                        operation="native host startup catalog",
+                        client.request("config/read", {"includeLayers": False, "cwd": request.cwd}),
+                        operation="native host startup configuration",
                         failure="session",
                     ),
-                    client.metadata,
+                    "Codex host startup configuration",
                 )
+                _validate_codex_containment_config(startup, client.metadata)
+                effective = self._mapping(startup["config"], "Codex effective configuration")
+                inherited = self._mapping(
+                    effective.get("mcp_servers"), "Codex inherited MCP servers"
+                )
+                # Native config merges tables recursively; an empty table retains
+                # inherited HTTP servers even with no execution environments.
+                config["mcp_servers"] = {name: {"enabled": False} for name in inherited}
             kwargs: dict[str, object] = {
                 "approval_mode": self._approval_mode(request.policy),
-                "config": self._codex_config(request),
+                "config": config,
                 "cwd": request.cwd,
                 "sandbox": self._sandbox(request.policy),
             }
