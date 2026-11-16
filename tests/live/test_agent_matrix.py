@@ -62,6 +62,7 @@ from provider_runtime.agent_runtime import (
     Backend,
     ClaudeNativeSessionRequest,
     CodexCatalogSessionRequest,
+    CodexUnixEndpoint,
     CredentialRef,
     JsonSchemaAgentOutput,
     NewSession,
@@ -116,8 +117,8 @@ class LiveRoute:
 class _ObservedCodexAdapter(CodexSdkAdapter):
     """Live-only witness for the native cumulative values before projection."""
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, endpoints) -> None:
+        super().__init__(endpoints=endpoints)
         self.cumulative_by_thread: dict[str, list[tuple[str, TokenUsage]]] = {}
         self.restored_by_thread: dict[str, list[TokenUsage]] = {}
         self.completed_messages: dict[tuple[str, str], list[tuple[str | None, str]]] = {}
@@ -400,14 +401,16 @@ async def _certify_route(route: LiveRoute, model: str | None) -> dict[str, objec
     profile = _profile()
     config = AgentRuntimeConfig(
         state_root_base=state_root_base,
-        codex_endpoints={profile: _codex_endpoint()} if route.backend == "codex" else {},
+        codex_endpoints={profile: CodexUnixEndpoint(_codex_endpoint())}
+        if route.backend == "codex"
+        else {},
         claude_executable=_claude_executable(),
     )
     auth = CredentialRef(kind="local_account", profile_key=profile)
     workspace = state_root_base / "live-workspace"
     workspace.mkdir(mode=0o700, exist_ok=True)
     evidence: dict[str, object] = {"route": route.name, "model": model or "backend-default"}
-    observer = _ObservedCodexAdapter() if route.backend == "codex" else None
+    observer = _ObservedCodexAdapter(config.codex_endpoints) if route.backend == "codex" else None
     adapters = (observer,) if observer is not None else None
     async with AgentRuntime(config, adapters=adapters) as runtime:
         catalog = (

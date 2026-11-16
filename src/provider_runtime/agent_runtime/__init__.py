@@ -43,6 +43,7 @@ from .codex_control import (
     CodexTurnTarget,
     CodexUnknown,
 )
+from .codex_endpoint import CodexEndpoint, CodexUnixEndpoint, CodexWebSocketEndpoint
 from .codex_sdk import codex_native_request_fits
 from .errors import (
     AgentRuntimeDefect,
@@ -256,6 +257,7 @@ __all__ = [
     "CodexControlError",
     "CodexCreateRequest",
     "CodexDispatch",
+    "CodexEndpoint",
     "CodexErrorCode",
     "CodexFinished",
     "CodexInterruptOutcome",
@@ -275,7 +277,9 @@ __all__ = [
     "CodexTurnSnapshot",
     "CodexTurnStatus",
     "CodexTurnTarget",
+    "CodexUnixEndpoint",
     "CodexUnknown",
+    "CodexWebSocketEndpoint",
     "ConcurrentTurn",
     "ContentPart",
     "CredentialKind",

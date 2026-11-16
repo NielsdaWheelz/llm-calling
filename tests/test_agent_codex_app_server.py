@@ -13,7 +13,7 @@ import pytest
 from websockets.asyncio.server import ServerConnection, unix_serve
 from websockets.exceptions import ConnectionClosed
 
-from provider_runtime.agent_runtime import ProtocolDefect
+from provider_runtime.agent_runtime import CodexUnixEndpoint, ProtocolDefect
 from provider_runtime.agent_runtime.codex_app_server import (
     CodexAppServerClient,
     CodexAppServerConfig,
@@ -60,7 +60,9 @@ async def transport() -> AsyncIterator[Transport]:
     with tempfile.TemporaryDirectory(prefix="codex-wire-", dir="/tmp") as directory:
         socket = Path(directory) / "peer.sock"
         async with await unix_serve(handle, str(socket)):
-            async with CodexAppServerClient(CodexAppServerConfig(socket)) as client:
+            async with CodexAppServerClient(
+                CodexAppServerConfig(CodexUnixEndpoint(socket))
+            ) as client:
                 connection = await connected
                 await client.thread_start(cwd="/synthetic")
                 yield client, connection, incoming

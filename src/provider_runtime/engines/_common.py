@@ -101,9 +101,9 @@ def row_reasoning(row: ModelRow, intent: GenerateIntent) -> RowReasoning:
     fragments: dict[str, dict[str, Any]] = {}
     owned: set[str] = set()
     for level, value in levels.items():
-        if not isinstance(value, Mapping):
+        if not isinstance(value.fragment, Mapping):
             raise registry_invalid(row, "reasoning values must be request-fragment mappings")
-        fragment: dict[str, Any] = dict(value)
+        fragment: dict[str, Any] = dict(value.fragment)
         fragments[level] = fragment
         owned.update(fragment)
 
@@ -114,7 +114,11 @@ def row_reasoning(row: ModelRow, intent: GenerateIntent) -> RowReasoning:
         )
     return RowReasoning(
         fragment=selected,
-        native_reasoning=Present(json.dumps(selected, sort_keys=True, separators=(",", ":"))),
+        native_reasoning=(
+            Present(json.dumps(selected, sort_keys=True, separators=(",", ":")))
+            if selected
+            else Absent()
+        ),
         owned_keys=frozenset(owned),
     )
 

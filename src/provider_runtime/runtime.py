@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from types import MappingProxyType
 from typing import Any, assert_never
 from urllib.parse import urlsplit, urlunsplit
 
@@ -31,14 +30,10 @@ import httpx
 import pydantic
 from opentelemetry.trace import TracerProvider
 
-from provider_runtime import embeddings
 from provider_runtime.continuation import preflight_generation, resume_generation, seal_generation
+from provider_runtime.endpoints import normalize_endpoint_overrides
 from provider_runtime.engines import Engine, TransientAttempt
 from provider_runtime.engines._common import monotonic_ms, row_reasoning
-from provider_runtime.engines.anthropic_messages import AnthropicMessagesEngine
-from provider_runtime.engines.gemini_generate import GeminiGenerateEngine
-from provider_runtime.engines.openai_chat import OpenAIChatEngine
-from provider_runtime.engines.openai_responses import OpenAIResponsesEngine
 from provider_runtime.errors import (
     CredentialMissing,
     InvalidRequest,
@@ -313,42 +308,6 @@ def _invalid_structured_detail(
 # Runtime
 
 
-_PROVIDERS = frozenset({"openai", "anthropic", "gemini", "deepseek", "xai"})
-
-
-def _endpoint_overrides(
-    values: Mapping[ProviderName, str],
-) -> Mapping[ProviderName, str]:
-    """Freeze canonical HTTPS origins supplied by the embedding application."""
-
-    unknown = set(values) - _PROVIDERS
-    if unknown:
-        raise ValueError(f"endpoint overrides name unknown providers: {sorted(unknown)!r}")
-    checked: dict[ProviderName, str] = {}
-    for provider, value in values.items():
-        try:
-            parsed = urlsplit(value)
-            port = parsed.port
-        except ValueError as error:
-            raise ValueError(f"{provider} endpoint override has an invalid port") from error
-        if (
-            parsed.scheme != "https"
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path not in {"", "/"}
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ValueError(f"{provider} endpoint override must be one HTTPS origin")
-        default_port = port in {None, 443}
-        authority = parsed.hostname if default_port else f"{parsed.hostname}:{port}"
-        if parsed.netloc != authority:
-            raise ValueError(f"{provider} endpoint override is not canonical")
-        checked[provider] = f"https://{authority}"
-    return MappingProxyType(checked)
-
-
 def _dispatch_row(
     row: ModelRow,
     overrides: Mapping[ProviderName, str],
@@ -370,7 +329,7 @@ def _dispatch_row(
 
 
 class ProviderRuntime:
-    """Engines + credentials wired once; every call dispatches through a row."""
+    """Credentials and transport wired once; each call loads its selected engine."""
 
     def __init__(
         self,
@@ -382,25 +341,40 @@ class ProviderRuntime:
         endpoint_overrides: Mapping[ProviderName, str] | None = None,
         tracer_provider: TracerProvider | None = None,
     ) -> None:
-        # `engines` is the deterministic-test seam (spec §11: facade tests run
-        # against FakeEngine); the production default wires the four adapters.
+        # An injected engine map is authoritative, including missing keys.
         # `tracer_provider` is the standard OTel library seam: None means the
         # process-global provider (no-op until an SDK configures one).
         self._credentials = credentials
         self._retry = retry
         self._http_client = http_client
         self._tracer_provider = tracer_provider
-        self._endpoint_overrides = _endpoint_overrides(endpoint_overrides or {})
-        self._engines: Mapping[EngineId, Engine] = (
-            engines
-            if engines is not None
-            else {
-                "openai_responses": OpenAIResponsesEngine(http_client=http_client),
-                "openai_chat": OpenAIChatEngine(http_client=http_client),
-                "anthropic_messages": AnthropicMessagesEngine(http_client=http_client),
-                "gemini_generate": GeminiGenerateEngine(http_client=http_client),
-            }
-        )
+        self._endpoint_overrides = normalize_endpoint_overrides(endpoint_overrides)
+        self._engines = engines
+
+    def _engine(self, engine_id: EngineId) -> Engine:
+        if self._engines is not None:
+            return self._engines[engine_id]
+        # Adapters only retain transport settings. Load the chosen SDK at dispatch
+        # so an embedding-only process never retains unused generation SDKs.
+        match engine_id:
+            case "openai_responses":
+                from provider_runtime.engines.openai_responses import OpenAIResponsesEngine
+
+                return OpenAIResponsesEngine(http_client=self._http_client)
+            case "openai_chat":
+                from provider_runtime.engines.openai_chat import OpenAIChatEngine
+
+                return OpenAIChatEngine(http_client=self._http_client)
+            case "anthropic_messages":
+                from provider_runtime.engines.anthropic_messages import AnthropicMessagesEngine
+
+                return AnthropicMessagesEngine(http_client=self._http_client)
+            case "gemini_generate":
+                from provider_runtime.engines.gemini_generate import GeminiGenerateEngine
+
+                return GeminiGenerateEngine(http_client=self._http_client)
+            case _:
+                assert_never(engine_id)
 
     def _credential(self, provider: ProviderName) -> ProviderCredential:
         match provider:
@@ -455,7 +429,7 @@ class ProviderRuntime:
         source_row, intent, state = self._prepare(request, streaming=False)
         row = _dispatch_row(source_row, self._endpoint_overrides)
         credential = self._credential(source_row.provider)
-        engine = self._engines[source_row.engine]
+        engine = self._engine(source_row.engine)
         with call_span(
             "chat",
             provider=row.provider,
@@ -531,7 +505,7 @@ class ProviderRuntime:
         source_row, intent, state = self._prepare(request, streaming=True)
         row = _dispatch_row(source_row, self._endpoint_overrides)
         credential = self._credential(source_row.provider)
-        engine = self._engines[source_row.engine]
+        engine = self._engine(source_row.engine)
         return self._stream_events(source_row, row, intent, state, credential, engine, cancel)
 
     async def _stream_events(
@@ -802,6 +776,7 @@ class ProviderRuntime:
                 credential: ProviderCredential,
                 *,
                 http_client: httpx.AsyncClient | None,
+                endpoint_origin: str | None = None,
             ) -> EmbeddingResponse | ProviderContextTooLarge
 
         — one openai-SDK attempt; context overflow is the one expected
@@ -809,6 +784,8 @@ class ProviderRuntime:
         `TransientAttempt`, defects raise their own types. Retry exhaustion
         and context overflow surface here as `NonGenerationCallFailed`.
         """
+        from provider_runtime import embeddings
+
         last_cause: TransientCause | None = None
         attempt_count = 0
         tries = attempts(self._retry)
@@ -826,7 +803,10 @@ class ProviderRuntime:
                     try:
                         with as_current(span):
                             result = await embeddings.embed_once(
-                                call, credential, http_client=self._http_client
+                                call,
+                                credential,
+                                http_client=self._http_client,
+                                endpoint_origin=self._endpoint_overrides.get("openai"),
                             )
                     except TransientAttempt as failed:
                         last_cause = failed.cause

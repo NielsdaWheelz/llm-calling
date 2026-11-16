@@ -71,7 +71,7 @@ Design stance (binding):
 | `src/provider_runtime/registry.py` | private capability rows/resolution + public immutable `api_model_catalog()` | ex-`catalog.py` contract-facts |
 | `src/provider_runtime/continuation.py` | bounded canonical continuation encode/decode | public persistence boundary |
 | `src/provider_runtime/prices.py` | `estimate_cost(meta) -> Presence[CostEstimate]` over vendored snapshot | indicative, never authoritative |
-| `src/provider_runtime/prices_snapshot.json` | Vendored `pydantic/genai-prices` data | refreshed by script, manually |
+| `src/provider_runtime/prices_snapshot.json` | dated official-provider rates | reviewed and refreshed manually |
 | `src/provider_runtime/retry.py` | Single retry owner (owned explicit loop) | `RetryPolicy(` in one module |
 | `src/provider_runtime/otel.py` | `gen_ai.*` via **`opentelemetry-api` only**, pinned semconv version | no-op without configured SDK |
 | `src/provider_runtime/runtime.py` | `ProviderRuntime`: engines + credentials, dispatch, retry, spans, stream envelope | rewritten |
@@ -83,7 +83,6 @@ Design stance (binding):
 | `src/provider_runtime/embeddings.py` | OpenAI-only embed port (live Nexus consumer) | rewritten on `openai` SDK |
 | `src/provider_runtime/testing.py` | `FakeEngine` + IR-level `ScriptedRuntime` | rewritten |
 | `src/provider_runtime/agent_runtime/…` | Agent lane with retained security kernel (§10) | shrunk in place |
-| `tools/refresh_prices.py` | Pull latest genai-prices JSON into snapshot | new |
 | `docs/decisions/2026-08-09-pivot-council.md` | Council synthesis + review record | provenance |
 
 Deleted: `openai.py`, `anthropic.py`, `gemini.py`, `moonshot.py`, `openrouter.py`,
@@ -242,7 +241,7 @@ capability matrix — validation is behavioral (capability probe), not version-k
 - Facade/runtime: against `FakeEngine`; IR-level `ScriptedRuntime` for consumers.
 - Per adapter: conformance tests via injected `httpx` client (`respx`) asserting request shape, response/stream decode, continuation round-trip, and **fault injection** (rate limit, timeout, mid-stream cut, malformed usage) → correct failure values + `CallMeta`.
 - Negative gates (mechanism ported): SDK imports confined to `engines/` (+ agent SDKs to `agent_runtime/`); `RetryPolicy(` constructed in one module; zero `os.environ` reads in the provider lane; every openrouter registry row has `allow_fallbacks=False`; continuation payloads absent from all `repr`/logs/spans; `__all__` ≤ 40; deleted module names absent.
-- **Live matrix**: paid, evidence-recorded run (per-model capability probes: chat, stream, tools, json_out, continuation round-trip; both agent backends). Not in CI; **mandatory before merging any registry or adapter change and before any Nexus pin bump**. Evidence file checked into `tests/live/evidence/`.
+- **Live matrix**: paid, evidence-recorded run (per-model capability probes: chat, stream, tools, json_out, continuation round-trip; both agent backends). Not in CI. Optional since the owner waiver, 2026-10-13 (previously mandatory before merging any registry or adapter change and before any Nexus pin bump). Evidence file checked into `tests/live/evidence/`.
 
 ## 12. Acceptance criteria
 
@@ -250,7 +249,7 @@ capability matrix — validation is behavioral (capability probe), not version-k
 2. `uv run pytest` green offline; `ruff` clean; `pyright` **standard** clean (strict is a later, separate decision).
 3. `CallMeta` present on every terminal outcome incl. failures; `Billability` semantics unchanged from v1 of the lane (Nexus `chat_runs` logic ports without semantic edits).
 4. Negative gates green; zero imports of deleted modules.
-5. Live matrix evidence recorded for the full registry.
+5. Live matrix evidence recorded for the full registry (waived: owner waiver, 2026-10-13).
 6. `README.md` describes v2 only.
 7. Agent lane ≤ 8k src lines. Provider lane: the council's "~4.5k" was an unsupported
    estimate and is withdrawn (same ruling as §10's withdrawn "~3k"); measured reality after
@@ -308,7 +307,7 @@ only code edits.
 | Cache-affinity hashing | Deleted | owner |
 | Agent lane | Security kernel retained (~300 lines); capability tables deleted | review finding 4 |
 | Claude credit pool | Block at limit; no overflow ever | owner |
-| Live matrix | Evidence-mandatory for registry/adapter changes + pin bumps; never CI | owner pref + review, reconciled |
+| Live matrix | Optional since the owner waiver, 2026-10-13; never CI | owner pref + review, reconciled |
 | Migration | In-place; hygiene + agent-lane PRs, then one atomic provider-lane PR | review finding 6 |
 | Six-month no-rewrite moratorium after WP-L | Stands | council |
 | `docs/rules/` | Kept intact (subtree) | repo fact |

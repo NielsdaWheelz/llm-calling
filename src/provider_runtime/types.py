@@ -204,17 +204,27 @@ type ApiStructuredOutput = NativeStructuredOutput | JsonModeStructuredOutput
 class ApiReasoningFacts:
     key: ReasoningKey
     label: str
+    mode: str | None
+    effort: str
+    effort_order: int
 
     def __post_init__(self) -> None:
         if not 1 <= len(self.key) <= 64 or not self.key.isascii() or not self.label:
             raise ValueError("reasoning options require a bounded ASCII key and label")
+        if (self.mode is not None and not self.mode) or not self.effort:
+            raise ValueError("reasoning mode and effort names must be nonempty")
+        if type(self.effort_order) is not int or self.effort_order < 0:
+            raise ValueError("reasoning effort order must be a nonnegative integer")
 
 
 @dataclass(frozen=True, slots=True)
 class ApiModelFacts:
+    """Current API membership and sourced capabilities, independent of credentials."""
+
     model_ref: str
     label: str
     provider: ProviderName
+    offered: bool
     dispatch: ApiDispatchFacts
     upgrade: Presence[UpgradeFacts]
     retirement: Presence[RetirementFacts]
@@ -228,6 +238,21 @@ class ApiModelFacts:
     source_default_reasoning: Presence[ReasoningKey]
     continuation_codec: str
     row_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if type(self.offered) is not bool:
+            raise ValueError("offered must be a boolean")
+        count = len(self.reasoning)
+        if (
+            len({choice.key for choice in self.reasoning}) != count
+            or len({(choice.mode, choice.effort) for choice in self.reasoning}) != count
+            or len({(choice.mode, choice.effort_order) for choice in self.reasoning}) != count
+        ):
+            raise ValueError("model reasoning keys, efforts and ordinals must be unique")
+        if isinstance(
+            self.source_default_reasoning, Present
+        ) and self.source_default_reasoning.value not in {choice.key for choice in self.reasoning}:
+            raise ValueError("source default must name a reasoning row")
 
 
 @dataclass(frozen=True, slots=True)

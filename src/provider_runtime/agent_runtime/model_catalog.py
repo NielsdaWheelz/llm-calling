@@ -19,8 +19,25 @@ from provider_runtime.types import (
 from .codex_containment import CODEX_CONTAINMENT_CATALOG_REVISION
 from .errors import ProtocolDefect
 
-AGENT_BACKEND_CONTRACT_REVISION = "provider-runtime.agent-model-catalog.v1"
+AGENT_BACKEND_CONTRACT_REVISION = "provider-runtime.agent-model-catalog.v3"
 _MAX_PAGES = 64
+# Reviewed publication membership for every visible dispatch id in the pinned
+# complete vendor catalog. Authenticated discovery may expose any subset.
+_CODEX_OFFERED_MODELS = {
+    "gpt-6-astra": True,
+    "gpt-6.1-sol": True,
+    "gpt-6.1-terra": True,
+    "gpt-6-sol": False,
+    "gpt-6-luna": True,
+    "gpt-5.6-sol": False,
+    "gpt-5.6-terra": False,
+    "gpt-5.6-luna": False,
+    "gpt-5.5": False,
+}
+# The pinned native catalog's effort vocabulary; membership still comes from model/list.
+_CODEX_EFFORT_ORDER = {
+    effort: order for order, effort in enumerate(("low", "medium", "high", "xhigh", "max", "ultra"))
+}
 
 type AgentModelKey = str
 type AgentReasoningKey = str
@@ -32,6 +49,9 @@ class AgentReasoningFacts:
     key: AgentReasoningKey
     label: str
     native_wire_value: str
+    mode: str | None
+    effort: str
+    effort_order: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +90,7 @@ class AgentModelFacts:
     key: AgentModelKey
     dispatch_model: str
     label: str
+    offered: bool
     source_context_window: Presence[int]
     source_max_output_tokens: Presence[int]
     input_modalities: tuple[Literal["text", "image"], ...]
@@ -103,6 +124,7 @@ class _ObservedModel:
     key: str
     dispatch_model: str
     label: str
+    offered: bool
     source_context_window: Presence[int]
     source_max_output_tokens: Presence[int]
     input_modalities: tuple[Literal["text", "image"], ...]
@@ -166,7 +188,7 @@ async def read_codex_model_catalog(
     if observed_at.tzinfo is None or observed_at.utcoffset() is None:
         raise ProtocolDefect("AgentModelCatalog.observed_at must be timezone-aware")
     definition_revision = _hash(
-        b"provider-runtime.agent-model-catalog.v1",
+        b"provider-runtime.agent-model-catalog.v3",
         {
             "row_fingerprints": tuple(row.row_fingerprint for row in facts),
             "native_containment_revision": CODEX_CONTAINMENT_CATALOG_REVISION,
@@ -185,6 +207,10 @@ async def read_codex_model_catalog(
 def _normalize_row(row: Mapping[str, object]) -> _ObservedModel:
     key = _required_string(row, "id")
     dispatch_model = _required_string(row, "model")
+    if dispatch_model not in _CODEX_OFFERED_MODELS:
+        raise ProtocolDefect(
+            f"Codex model {dispatch_model!r} has unclassified publication membership"
+        )
     label = _required_string(row, "displayName", fallback="display_name")
     modalities_value = row.get("inputModalities", row.get("input_modalities"))
     if not isinstance(modalities_value, list) or not modalities_value:
@@ -206,8 +232,17 @@ def _normalize_row(row: Mapping[str, object]) -> _ObservedModel:
         option = _object_mapping(item, f"Codex model {key!r} reasoning row")
         native = _required_enum_string(option, "reasoningEffort", fallback="reasoning_effort")
         label_value = _required_string(option, "description")
+        if native not in _CODEX_EFFORT_ORDER:
+            raise ProtocolDefect(f"Codex model {key!r} has an unknown reasoning effort {native!r}")
         reasoning.append(
-            AgentReasoningFacts(key=native, label=label_value, native_wire_value=native)
+            AgentReasoningFacts(
+                key=native,
+                label=label_value,
+                native_wire_value=native,
+                mode=None,
+                effort=native,
+                effort_order=_CODEX_EFFORT_ORDER[native],
+            )
         )
     if len({item.key for item in reasoning}) != len(reasoning):
         raise ProtocolDefect(f"Codex model {key!r} has duplicate reasoning keys")
@@ -234,6 +269,7 @@ def _normalize_row(row: Mapping[str, object]) -> _ObservedModel:
         key=key,
         dispatch_model=dispatch_model,
         label=label,
+        offered=_CODEX_OFFERED_MODELS[dispatch_model],
         # The pinned public SDK's Model row exposes neither capacity. Do not
         # infer private cache/debug fields into the source contract; a future
         # SDK addition must be adopted here deliberately with conformance.
@@ -292,6 +328,7 @@ def _resolve_upgrades(
                 key=row.key,
                 dispatch_model=row.dispatch_model,
                 label=row.label,
+                offered=row.offered,
                 source_context_window=row.source_context_window,
                 source_max_output_tokens=row.source_max_output_tokens,
                 input_modalities=row.input_modalities,
@@ -310,11 +347,12 @@ def _row_fingerprint(
     upgrade: Presence[AgentUpgradeFacts],
 ) -> str:
     return _hash(
-        b"provider-runtime.agent-model-row.v1",
+        b"provider-runtime.agent-model-row.v3",
         {
             "key": row.key,
             "dispatch_model": row.dispatch_model,
             "label": row.label,
+            "offered": row.offered,
             "source_context_window": _presence_json(row.source_context_window),
             "source_max_output_tokens": _presence_json(row.source_max_output_tokens),
             "input_modalities": row.input_modalities,
@@ -322,6 +360,9 @@ def _row_fingerprint(
                 {
                     "key": item.key,
                     "native_wire_value": item.native_wire_value,
+                    "mode": item.mode,
+                    "effort": item.effort,
+                    "effort_order": item.effort_order,
                 }
                 for item in row.reasoning
             ),

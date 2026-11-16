@@ -2,8 +2,8 @@
 
 `provider_runtime.agent_runtime.archive` reads retained native evidence without
 resuming, subscribing, dispatching tools or opening a model turn. `ArchiveHome`
-selects one provider/state root; codex additionally requires its host-owned unix
-app-server endpoint. `memory_server` is the exact configured mcp server binding.
+selects one provider/state root; codex additionally requires its host-owned
+`CodexEndpoint` (unix or authenticated websocket). `memory_server` is the exact configured mcp server binding.
 
 ```python
 home = ArchiveHome("codex", native_home, codex_endpoint)
@@ -224,7 +224,7 @@ source repair checks on 2026-10-13:
 - all new repair probes are temporary and removed after final qualification;
   existing tests remain. no production activation or source commit is implied.
 
-rollout source qualification on 2026-11-15:
+0.160.0 maintenance source qualification (`97c0475`) on 2026-11-15:
 
 - 54 temporary public protocol/file cases pass, including unchanged prior event
   identities/digests, relocated workflow provenance, run-qualified child streams,
@@ -257,6 +257,12 @@ rollout source qualification on 2026-11-15:
 - production admission and missing native lineage are separate from codec
   support. a native missing-source-rollout error remains unavailable; no empty
   history, new baseline, inferred coverage or silent omission replaces it.
+
+the current-runtime forward port preserves its explicit `CodexEndpoint` contract
+and stock 0.165.0 catalogue. its existing suite passes 1,000 cases, with one
+sdk-present skip and 61 paid/live exclusions; the same 54 archive cases pass with
+only the endpoint fixture adapted. lint, format, typing, audit and builds pass.
+jarvis's separately pinned 0.160.0 maintenance release does not adopt this runtime.
 
 partial-baseline source qualification on 2026-11-15:
 

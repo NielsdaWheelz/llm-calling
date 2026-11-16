@@ -5,12 +5,43 @@ callback execution, effects, approvals, and recovery decisions. codex callbacks
 use the configured external app-server socket; workers hold no account state.
 there is one engine for contained and callback-bearing codex turns.
 
+## host incarnation control
+
+`provider_runtime.agent_runtime.codex_host` owns protocol revision 1 and its closed
+request/response models. `resolve_codex_host(endpoint, target=None)` returns
+`CodexHostResolved(target, endpoint, retirement_allowed)`, `CodexHostRetired`, or
+`CodexHostUnavailable`. `retire_codex_host(endpoint, target)` returns only the latter
+two. each call owns one http connection lifetime, has a five-second transport bound,
+and performs no retry. consumers own their encompassing recovery deadline.
+
+`CodexHostUnix(control_socket)` uses http over the private socket; its resolved
+native endpoint is the exact sibling `native-{host_id}-{incarnation}.sock`.
+`CodexHostNetwork(control_url, native_url, control_token)` pairs http/ws or https/wss;
+bootstrap bearer authentication goes only to control. the resolved native endpoint
+holds the host's fresh per-incarnation credential. redirect following and ambient
+http proxies are disabled. credentials remain secret values; the websocket wire
+model deliberately serializes its credential only for an authenticated json reply.
+
+the client requires an exact requested target and native transport. missing or
+malformed responses raise redacted `ProtocolDefect`; protocol-version mismatch and
+unreachable control are distinct unavailable results. http 401/403 raises redacted
+`CredentialRejected`. no response body or credential enters diagnostics.
+
+the supervisor must make incarnation identity inseparable from its actual native
+endpoint, certify retirement only after that execution can no longer submit or
+continue, and reject retirement of a replacement host. the client does not infer
+retirement from process/socket loss or interruption acknowledgement. one successful
+resolve permits opening a fresh thread; it never authorizes reconnecting an existing
+session to a newly resolved endpoint. the consumer persists identity/proof, not
+transport credentials, and independently fences effects/publication. upstream
+compute or billing cessation is not part of this contract.
+
 ## contract
 
 1. select exact model and reasoning from `model_catalog`; open a
-   `CodexCatalogSessionRequest` with its revision and fingerprint. native
-   built-ins and web remain disabled when portable callbacks are declared.
-   contained codex requests explicitly disable agents and select no native
+   `CodexCatalogSessionRequest` with its revision and fingerprint. declared
+   callbacks may coexist with native built-ins under the explicit frozen
+   permission policy. contained codex requests explicitly disable agents and select no native
    execution environments. provider containment semantics participate in the
    catalog definition revision; a config repair rotates consumer definitions.
 2. `prepare_turn(session, request, *, attempt_id, input_id, controls)` performs
@@ -27,6 +58,8 @@ there is one engine for contained and callback-bearing codex turns.
    storage or a callback handler waits. messages and recorded input drain in
    order before the terminal. pending callbacks and pending transport buffers
    are bounded; controlled turns have no cumulative event or transcript quota.
+   pending event payloads share a 4 mib byte bound, including field names for
+   empty values; stream chunk count does not impose a second quota.
    completed item ids are not retained. exact live callback identity is checked;
    durable host journals own completed callback/input/message identities and
    reject changed replay. written replies and completed callbacks retire pending
@@ -60,7 +93,7 @@ contracts use the same provider engine; the selection is explicit, never inferre
 from output schemas or an empty tool plan.
 
 `codex_native_request_fits(text, *, output, reasoning, input_id)` checks the exact contained
-text-turn serialization before opening a stock `0.160.0` thread. it uses the same
+text-turn serialization before opening a stock `0.165.0` thread. it uses the same
 serializer and byte bound as `prepare_turn`, including json escaping and output
 schema. native threads use canonical uuid strings; the host supplies its input id. this
 is a pure transport fit check, not token estimation or inference admission. the
@@ -94,29 +127,44 @@ values. there are no legacy decoders or invented evidence defaults.
 
 ## native capability
 
-contained codex sessions require a dedicated stock `0.160.0` host. host
+contained codex sessions require a dedicated stock `0.165.0` host. host
 operations call `materialize_codex_containment_catalog(private_directory)`
 and launch the stock process with `-c model_catalog_json="<returned-path>"`.
-`qualify_codex_containment_host(socket_path)` checks the public `config/read`
+`qualify_codex_containment_host(endpoint)` checks the public `config/read`
 declaration. session preparation repeats this check before creating a native
 thread: the canonical catalog basename and `sessionFlags` startup origin must
-match; the initialize user-agent build version must be exactly `0.160.0`.
+match; the initialize user-agent build version must be exactly `0.165.0`.
 per-thread catalog overrides are documented upstream no-ops and are
 never used to claim containment. the trusted host owns the materialized bytes;
 this declaration is not remote attestation against a hostile local operator.
 
 the provider retains the complete official catalog from
-[`rust-v0.160.0`](https://github.com/openai/codex/blob/a956835d020762cb2b570053af06f643a11c0ecc/codex-rs/models-manager/models.json).
-source hash: `fd219bd9f061278275f528939f82f54d2eb97df4b25c23b022adbe48813d920b`.
-restricted hash: `b8b588f4b03c8e08fdb7e2994c03578d9b94bbc01665b7adb6490bd234b3cf54`.
-the compiler preserves every field except `tool_mode=direct` and removal of
-the established native clock/async-user selectors. unknown selectors or tool
-modes fail before materialization. the original apache license and notice
+[`rust-v0.165.0`](https://github.com/openai/codex/blob/rust-v0.165.0/codex-rs/models-manager/models.json).
+source hash: `1384625c0b6b3e67d3c60da29becea2b017f2c283fc1e2d05b8edafb4698eb10`.
+restricted hash: `3bb7176bbd2aa37652d94eeca7a2917867350b5ed0a4ecaa684c809d2d55fb72`.
+the compiler preserves every field except `tool_mode=direct`, removal of
+the established native clock/async-user selectors, and
+`apply_patch_tool_type=null`. containment revision v2 names these three
+restrictions. unknown selectors, patch types or tool modes fail before
+materialization. the original apache license and notice
 accompany the asset. this policy changes the whole endpoint: native code mode,
-clock and async-user interactions are unavailable; model inventory updates
+clock, native patching and async-user interactions are unavailable; model inventory updates
 require an explicit provider/binary/catalog upgrade. exact model identifiers,
 efforts, instructions, context metadata and account routing remain intact.
 ordinary coding sessions use a separate endpoint.
+
+the native workspace extension retains this current catalogue and typed endpoint
+contract. a workspace session may combine declared callbacks with native shell
+and file operations; native observations do not become callback receipts.
+initial and ongoing settings must exactly match the frozen request, and inherited
+mcp servers are explicitly suppressed before declared servers are overlaid.
+isolated builtin-disabled sessions retain their existing restrictions.
+the original workspace consumer qualified stock `0.160.0` at provider source
+`ea9f82025632926a7c7e47d6333fb9346f6ee86c`; that immutable source remains available
+for its existing pin. integration with the current `0.165.0` library contract
+does not upgrade that consumer. controlled protocol checks establish source
+behavior; actual native qualification is recorded separately and is not inferred
+from those checks.
 
 the stock static catalog manager does not replace this catalog during network
 refresh. catalog revision participates in the provider definition identity.
@@ -125,6 +173,10 @@ describes this startup seam. model listing is source metadata, not a promise
 that every listed model is entitled or successfully qualified for the account.
 
 new contained threads opt into the installed raw response event stream.
+their builtin-disabled configuration sets `incremental_tools=false`: declared
+callbacks stay fixed for the thread, and native tool-declaration updates do not
+enter the closed raw-event grammar. responses lite still owns its fixed request
+tool encoding; disabling updates does not change that provider wire format.
 declared direct function calls remain host callbacks. a call to an undeclared
 function that codex itself answers with exactly `unsupported call: <name>` ran
 nothing: it is a model error, emits no event, and the turn continues

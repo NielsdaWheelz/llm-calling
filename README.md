@@ -47,6 +47,13 @@ environment variables**. Every terminal outcome, success or failure, carries a
 and write included), the full attempt trace, billability, the exact native
 reasoning value sent, and the registry revision.
 
+`endpoint_overrides` maps provider names to canonical https origins for generation
+and openai embedding calls. `provider_runtime.endpoints.normalize_endpoint_overrides`
+validates and freezes that map without loading transports or sdks; `None` preserves
+provider defaults. overrides retain each adapter's api path, including openai's
+`/v1`. custom ca trust belongs to the injected `http_client`, configured with
+`httpx.AsyncClient(verify=ssl_context)`.
+
 Multi-turn: use `ContinueGeneration` with the outcome's opaque
 `ContinuationArtifact` and the corresponding tool results. Use
 `provider_runtime.continuation.encode_continuation` / `decode_continuation`
@@ -95,6 +102,7 @@ types.py       the contract: frozen value vocabulary (intents, outcomes,
                stream events, usage, failures, CallMeta)
 errors.py      RuntimeDefect hierarchy + provider-text redaction; defects
                raise, they are never a returned value
+endpoints.py   import-light HTTPS-origin validation shared with host configuration
 registry.py    private capability rows/resolution; public api_model_catalog()
 continuation.py bounded canonical provider-continuation codec
 retry.py       single retry owner: DEFAULT_RETRY + the attempt iterator
@@ -122,20 +130,26 @@ SDK types never cross the contract boundary, and SDK imports are confined to
 `engines/` (plus `embeddings.py`) by a negative gate. Engines make exactly one
 attempt and classify errors against the shared taxonomy; the runtime owns
 retries, sequence numbering, spans, and attempt-trace accumulation.
+The runtime loads only the selected provider's SDK at dispatch. Embedding calls
+load the OpenAI port without loading generation engines. Each provider's first
+call pays its SDK import cost; importing or constructing the runtime does not.
 
 ## Provider catalog and pinning
 
 `provider_runtime.registry.api_model_catalog()` is the sole public catalog
 oracle. It returns an immutable, ordered `ApiModelCatalog` containing exact
 dispatch, capacity, modality, tool, streaming, structured-output, reasoning,
-default, lifecycle, continuation-codec, revision, and row-fingerprint facts.
+default, lifecycle, publication membership (`offered`), continuation-codec,
+revision, and row-fingerprint facts.
 The hand-curated rows and their resolution functions are private runtime
 owners; consumers select and compare only public catalog facts. Rows are
 verified against provider docs, never a place to remember guesses. Any row
 change bumps the catalog's `registry_revision`, which is also stamped into
 every `CallMeta` and flows into the consumer's ledger.
 
-The catalog contains nine selected models across five providers. Model and
+api contract v5 includes required `offered` in each row fingerprint. only
+published rows resolve for execution; credentials do not decide membership.
+Model and
 reasoning keys are exact catalog facts; unsupported keys fail before dispatch.
 `continuation.pending_tool_calls` exposes the owned pending-call seam without
 consumers interpreting native continuation payloads.
@@ -163,12 +177,12 @@ on `CallMeta`. The snapshot records its sources; the library never fetches.
 ## Agent lane
 
 Exactly two routes ship: `(codex, sdk)` and `(claude, sdk)`. The core package
-declares `websockets`; the host separately installs the latest stable Codex and
-supervises its shared service. Native version metadata is diagnostic, not an
-admission gate; protocol validation, subscription auth, and containment remain
-fail-closed. Installing a newer version does not certify its live behavior.
+declares `websockets`; the host separately installs Codex and supervises its
+shared service. contained sessions require the exact qualified 0.165.0 binary
+and startup catalog. protocol validation, subscription auth, and containment
+remain fail-closed. installing a newer version does not certify its behavior.
 The Codex route retains the `sdk` name and owns the documented
-WebSocket-over-Unix-socket App Server client; Claude remains on its official
+Unix or authenticated WebSocket App Server client; Claude remains on its official
 SDK. This package
 owns the authorization model — a retained security kernel with restrictive permission
 defaults, narrowing-only policy changes, unsafe-action confirmation for
@@ -217,6 +231,15 @@ transcript quota. see
 [docs/provider-native-turns.md](docs/provider-native-turns.md) and
 [docs/native-agent-evidence.md](docs/native-agent-evidence.md).
 
+`agent_runtime.codex_host` adds the explicit host-control boundary for consumers
+whose supervisor can retire a whole native incarnation. resolve a
+`CodexHostUnix` or `CodexHostNetwork` configuration once, bind the returned
+`CodexHostTarget` with the fresh native thread, and use only its returned endpoint.
+`resolve_codex_host(config, target)` and `retire_codex_host(config, target)` never
+substitute a replacement incarnation or replay a prompt. the supervisor owns
+retirement proof; the consumer owns job/effect fencing and recovery policy. see
+[the host contract](docs/provider-native-turns.md#host-incarnation-control).
+
 ## Existing terminal agents
 
 `provider-runtime-control` provides one bounded JSON request/reply for
@@ -233,6 +256,16 @@ writes are explicit; absent expected Codex turn identity never selects a newer
 turn for cancellation. installation must use the committed dependency lock
 with the `claude-sdk` extra. Claude's public reader loads the saved file before
 slicing; bounded output does not imply bounded transcript memory.
+
+## account quota subprocess
+
+`python -m provider_runtime.agent_runtime.quota_cli` reads one bounded closed
+stdin document, `{profileKey,endpoint}`, from an already-running codex account
+socket. it reuses observe-only quota transport and emits `{ok,result}` or
+`{ok:false,error:{code}}`. it never starts a provider, loads a thread, reads
+history, writes input or answers approvals. no optional claude SDK is required.
+this narrow consumer boundary leaves the independent public conversation and
+archive APIs above intact.
 
 ## Development
 
@@ -258,8 +291,10 @@ outcomes, no network, no SDK clients, no credential flows.
 The live matrix is the acceptance gate the deterministic suite cannot be: per
 registry row it probes chat, streaming, a tool round trip, `json_out`, and a
 continuation replay against the real providers, and writes one evidence file
-per run into `tests/live/evidence/`. It never runs in CI and is mandatory
-before merging any registry or engine change and before any Nexus pin bump.
+per run into `tests/live/evidence/`. It never runs in CI. Since the owner waiver, 2026-10-13,
+no paid live run gates any merge or Nexus pin bump: deterministic checks and
+controlled proofs (fake models, the stock binary) qualify a change, and its PR
+says which paid runs were not made.
 
 ```bash
 LLM_RUNTIME_LIVE=1 OPENAI_API_KEY=... ANTHROPIC_API_KEY=... GEMINI_API_KEY=... \
@@ -274,7 +309,9 @@ agent lane has its own matrix (`tests/live/test_agent_matrix.py`) with the
 same opt-in flag and evidence conventions. Its dedicated paid Terra containment
 probe is `tests/live/test_codex_containment.py` and requires an explicit
 test-owned Codex endpoint. Shared worker/TUI control has its own separately
-approved live qualification; deterministic fixtures do not substitute for it.
+approved live qualification. The owner waiver, 2026-10-13 covers every paid run in this
+section: the provider matrix, the agent matrix, the containment probe and the
+shared worker/TUI qualification.
 
 The spec for the current architecture is
 [docs/pivot-spec.md](docs/pivot-spec.md); the engineering rules the code is

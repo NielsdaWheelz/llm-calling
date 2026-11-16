@@ -14,6 +14,7 @@ import json
 from base64 import b64encode
 from collections.abc import Mapping
 from dataclasses import replace
+from typing import cast
 
 import httpx
 import pytest
@@ -29,6 +30,8 @@ from provider_runtime.errors import (
 )
 from provider_runtime.registry import (
     REGISTRY_REVISION,
+    _reasoning,
+    _ReasoningRow,
 )
 from provider_runtime.registry import (
     _ModelRow as ModelRow,
@@ -87,17 +90,18 @@ from provider_runtime.types import (
 # A row's reasoning value is a self-describing wire fragment merged verbatim
 # into the request; these are the real per-provider shapes, never synthetic
 # stand-ins (an engine that cannot build a callable request must fail here).
-DEEPSEEK_REASONING: Mapping[ReasoningKey, object] = {
-    # Two parameters, and only the enabling levels carry the effort knob — the
-    # real registry shape, and the reason the collision set cannot be read off
-    # the SELECTED level alone.
-    "none": {"thinking": {"type": "disabled"}},
-    "high": {"thinking": {"type": "enabled"}, "reasoning_effort": "high"},
-}
-XAI_REASONING: Mapping[ReasoningKey, object] = {
-    "low": {"reasoning_effort": "low"},
-    "high": {"reasoning_effort": "high"},
-}
+DEEPSEEK_REASONING: Mapping[ReasoningKey, _ReasoningRow] = dict(
+    (
+        _reasoning(None, "none", 0, {"thinking": {"type": "disabled"}}),
+        _reasoning(None, "high", 1, {"thinking": {"type": "enabled"}, "reasoning_effort": "high"}),
+    )
+)
+XAI_REASONING: Mapping[ReasoningKey, _ReasoningRow] = dict(
+    (
+        _reasoning(None, "low", 0, {"reasoning_effort": "low"}),
+        _reasoning(None, "high", 1, {"reasoning_effort": "high"}),
+    )
+)
 DEEPSEEK_ROW = ModelRow(
     ref="deepseek:deepseek-flash",
     provider="deepseek",
@@ -342,7 +346,10 @@ async def test_deepseek_reasoning_none_sends_the_disabling_fragment(
 
 
 async def test_non_mapping_reasoning_value_is_a_registry_defect(engine: OpenAIChatEngine) -> None:
-    row = replace(DEEPSEEK_ROW, reasoning=Present({"high": "high"}))
+    row = replace(
+        DEEPSEEK_ROW,
+        reasoning=Present(dict((_reasoning(None, "high", 0, cast(Mapping[str, object], "high")),))),
+    )
     with pytest.raises(RuntimeDefect) as excinfo:
         await engine.generate(row, intent_for(row), credential_for(row))
     assert excinfo.value.code == "registry_invalid", f"got {excinfo.value.code}"
@@ -354,9 +361,9 @@ async def test_reasoning_fragment_naming_an_engine_set_field_is_a_registry_defec
     """The body is built ON TOP of the fragment, so a row naming a field the
     engine writes itself loses its knob to the engine's value while
     CallMeta.native_reasoning still reports the fragment as sent."""
-    poisoned: Mapping[ReasoningKey, object] = {
-        "high": {"reasoning_effort": "high", "max_completion_tokens": 8}
-    }
+    poisoned: Mapping[ReasoningKey, _ReasoningRow] = dict(
+        (_reasoning(None, "high", 0, {"reasoning_effort": "high", "max_completion_tokens": 8}),)
+    )
     row = replace(DEEPSEEK_ROW, reasoning=Present(poisoned))
     with pytest.raises(RuntimeDefect, match="max_completion_tokens") as excinfo:
         await engine.generate(row, intent_for(row), credential_for(row))

@@ -111,7 +111,7 @@ from provider_runtime.types import (
 )
 from tests.test_otel import RecordingTracerProvider
 
-TARGET = ProviderTarget(provider="openai", model="gpt-6-sol")
+TARGET = ProviderTarget(provider="openai", model="gpt-6.1-sol")
 TEXT_ONLY_TARGET = ProviderTarget(provider="deepseek", model="deepseek-flash")
 
 POSSIBLY_BILLABLE = PossiblyBillable()
@@ -125,7 +125,7 @@ CREDENTIALS = Credentials(openai="sk-openai-test-key-000", deepseek="sk-deepseek
 # fixture cannot invent field values the registry's own invariants would
 # reject. Drop this if a real capability-poor row ever lands.
 LIMITED_ROW = replace(
-    registry._resolve("openai:gpt-6-sol"),
+    registry._resolve("openai:gpt-6.1-sol"),
     ref="openai:limited",
     model_id="gpt-limited",
     tools=False,
@@ -251,7 +251,7 @@ def engine_meta(
     """A single-attempt meta exactly as an engine constructs it."""
     return CallMeta(
         provider="openai",
-        model="gpt-6-sol",
+        model="gpt-6.1-sol",
         provider_request_id=Present(request_id),
         usage=Present(
             TokenUsage(
@@ -351,7 +351,7 @@ async def test_generate_dispatches_resolved_row_with_credential_and_keeps_engine
     assert outcome.response.content == TextContent(text="Hello.", tool_calls=())
     (call,) = engine.generate_calls
     row, intent, credential = call
-    assert row.ref == "openai:gpt-6-sol"
+    assert row.ref == "openai:gpt-6.1-sol"
     assert intent == make_intent()
     assert credential == ProviderCredential(provider="openai", key="sk-openai-test-key-000")
     trace = outcome.meta.attempt_trace
@@ -373,7 +373,7 @@ async def test_explicit_endpoint_origin_is_applied_after_registry_resolution() -
 
     ((row, _intent, _credential),) = engine.generate_calls
     assert row.base_url == Present("https://127.0.0.1:24443/v1")
-    source = registry._resolve("openai:gpt-6-sol")
+    source = registry._resolve("openai:gpt-6.1-sol")
     assert source.base_url == Absent(), "dispatch overrides must not mutate catalog source facts"
 
 
@@ -435,7 +435,7 @@ async def test_generate_exhaustion_folds_full_trace_and_last_request_id() -> Non
     assert outcome.meta.billability == PossiblyBillable()
     assert outcome.meta.usage == Absent()
     assert outcome.meta.provider == "openai"
-    assert outcome.meta.model == "gpt-6-sol"
+    assert outcome.meta.model == "gpt-6.1-sol"
     assert outcome.meta.registry_revision == REGISTRY_REVISION
 
 
@@ -925,7 +925,7 @@ async def test_json_out_passes_non_success_outcomes_through() -> None:
 async def test_chat_builds_intent_from_row_defaults() -> None:
     engine = FakeEngine(generate_script=[succeeded()])
     outcome = await make_runtime(engine).chat(
-        "openai:gpt-6-sol", system="be brief", user="hi", reasoning="standard/high"
+        "openai:gpt-6.1-sol", system="be brief", user="hi", reasoning="standard/high"
     )
     assert isinstance(outcome, Succeeded)
     (call,) = engine.generate_calls
@@ -938,7 +938,7 @@ async def test_chat_builds_intent_from_row_defaults() -> None:
         ),
         # The contract is "no explicit cap → the resolved row's cap", not the
         # figure the row happens to carry today.
-        max_output_tokens=registry._resolve("openai:gpt-6-sol").max_output_tokens,
+        max_output_tokens=registry._resolve("openai:gpt-6.1-sol").max_output_tokens,
         reasoning="standard/high",
         tools=(),
         tool_choice="auto",
@@ -949,7 +949,7 @@ async def test_chat_builds_intent_from_row_defaults() -> None:
 async def test_chat_without_system_omits_the_system_message_and_caps_tokens() -> None:
     engine = FakeEngine(generate_script=[succeeded()])
     await make_runtime(engine).chat(
-        "openai:gpt-6-sol", user="hi", reasoning="standard/medium", max_output_tokens=64
+        "openai:gpt-6.1-sol", user="hi", reasoning="standard/medium", max_output_tokens=64
     )
     (call,) = engine.generate_calls
     sent = call[1]

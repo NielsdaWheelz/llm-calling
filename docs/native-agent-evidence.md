@@ -253,3 +253,12 @@ the maintenance composition passes 983 existing nonlive cases, skips the
 sdk-present absent-extra case and deselects 40 paid cases; formatting, lint and
 type checks pass. native version, startup catalog and dependency lock are
 unchanged.
+
+the current-runtime forward port independently passed the same four-server
+no-model check on the official stock 0.165.0 darwin binary: every thread
+connection reported `disabled`, with zero http requests and no stdio process.
+the public runtime selected the offered `gpt-6.1-sol` catalog row; no inference
+was requested. seven adapted unix-protocol cases and all 1000 existing nonlive
+cases pass, with one sdk-present skip and 61 paid cases deselected. current
+endpoint types, stock 0.165.0 catalog and dependencies remain unchanged; the
+0.160.0 maintenance consumer retains its separate pin.
