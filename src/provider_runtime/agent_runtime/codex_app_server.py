@@ -364,7 +364,7 @@ class CodexAppServerClient:
             and thread.get("threadSource") != kwargs["thread_source"]
         ):
             raise ProtocolDefect("Codex did not accept required internal session marking")
-        return self._select_thread(self._response_thread_id(response, "thread/start"))
+        return self._select_thread(self._response_thread_id(response, "thread/start"), response)
 
     async def thread_resume(self, thread_id: str, **kwargs: object) -> CodexThread:
         self._thread_id = thread_id
@@ -374,7 +374,7 @@ class CodexAppServerClient:
             ),
             "thread/resume response",
         )
-        return self._select_thread(self._response_thread_id(response, "thread/resume"))
+        return self._select_thread(self._response_thread_id(response, "thread/resume"), response)
 
     async def thread_fork(self, thread_id: str, **kwargs: object) -> CodexThread:
         response = self._mapping(
@@ -383,9 +383,9 @@ class CodexAppServerClient:
             ),
             "thread/fork response",
         )
-        return self._select_thread(self._response_thread_id(response, "thread/fork"))
+        return self._select_thread(self._response_thread_id(response, "thread/fork"), response)
 
-    def _select_thread(self, thread_id: str) -> CodexThread:
+    def _select_thread(self, thread_id: str, settings: Mapping[str, object]) -> CodexThread:
         self._thread_id = thread_id
         if self._failure is not None:
             raise self._failure
@@ -397,7 +397,7 @@ class CodexAppServerClient:
                 self._messages.put_nowait((message, size))
             else:
                 self._queued_bytes -= size
-        return CodexThread(self, thread_id)
+        return CodexThread(self, thread_id, settings)
 
     def _belongs_to_thread(self, params: Mapping[str, object]) -> bool:
         thread_id = params.get("threadId")
@@ -779,9 +779,12 @@ class CodexAppServerClient:
 
 
 class CodexThread:
-    def __init__(self, client: CodexAppServerClient, thread_id: str) -> None:
+    def __init__(
+        self, client: CodexAppServerClient, thread_id: str, settings: Mapping[str, object]
+    ) -> None:
         self._client = client
         self.id = thread_id
+        self.settings = settings
 
     async def turn(self, inputs: list[object], **kwargs: object) -> CodexTurn:
         params = {

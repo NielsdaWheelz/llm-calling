@@ -650,33 +650,33 @@ class CodexSdkAdapter:
             )
         if contained:
             self._validate_strict_native_containment(request)
-        if request.tools and not contained:
-            raise UnsupportedCapability(
-                "declared native callbacks require disabled Codex built-ins"
-            )
         client = await self._open_client(
-            environment=environment, experimental_api=contained, callbacks=bool(request.tools)
+            environment=environment,
+            experimental_api=contained or bool(request.tools),
+            callbacks=bool(request.tools),
         )
         try:
             await self._verify_auth(client)
             config = self._codex_config(request)
-            if contained:
-                startup = self._mapping(
-                    await self._call(
-                        client.request("config/read", {"includeLayers": False, "cwd": request.cwd}),
-                        operation="native host startup configuration",
-                        failure="session",
-                    ),
-                    "Codex host startup configuration",
-                )
+            startup = self._mapping(
+                await self._call(
+                    client.request("config/read", {"includeLayers": False, "cwd": request.cwd}),
+                    operation="native host startup configuration",
+                    failure="session",
+                ),
+                "Codex host startup configuration",
+            )
+            if contained or request.tools:
                 _validate_codex_containment_config(startup, client.metadata)
-                effective = self._mapping(startup["config"], "Codex effective configuration")
-                inherited = self._mapping(
-                    effective.get("mcp_servers"), "Codex inherited MCP servers"
-                )
-                # Native config merges tables recursively; an empty table retains
-                # inherited HTTP servers even with no execution environments.
-                config["mcp_servers"] = {name: {"enabled": False} for name in inherited}
+            effective = self._mapping(startup.get("config"), "Codex effective configuration")
+            inherited = self._mapping(effective.get("mcp_servers"), "Codex inherited MCP servers")
+            # Native config merges tables recursively; an empty table retains
+            # inherited servers. Declared servers alone replace their disabled entries.
+            declared = self._mapping(config["mcp_servers"], "Codex declared MCP servers")
+            config["mcp_servers"] = {
+                **{name: {"enabled": False} for name in inherited},
+                **declared,
+            }
             kwargs: dict[str, object] = {
                 "approval_mode": self._approval_mode(request.policy),
                 "config": config,
@@ -735,6 +735,14 @@ class CodexSdkAdapter:
             else:
                 raise InvalidAgentRequest("unknown Codex session operation")
 
+            self._validate_thread_settings(
+                request,
+                {
+                    **thread.settings,
+                    "effort": thread.settings.get("reasoningEffort"),
+                    "sandboxPolicy": thread.settings.get("sandbox"),
+                },
+            )
             native_session_id = getattr(thread, "id", None)
             if not isinstance(native_session_id, str) or not native_session_id:
                 raise ProtocolDefect("Codex SDK returned no thread id")
@@ -1000,7 +1008,10 @@ class CodexSdkAdapter:
                 if observed_id is not None and observed_id != native_session_id:
                     raise ProtocolDefect("Codex replay changed thread identity")
                 if method == "thread/settings/updated":
-                    self._validate_thread_settings(request, params)
+                    self._validate_thread_settings(
+                        request,
+                        self._mapping(params.get("threadSettings"), "native thread settings"),
+                    )
                 continue
             if method != "thread/tokenUsage/updated":
                 raise ProtocolDefect(f"Codex emitted unexpected pre-turn notification {method}")
@@ -1222,14 +1233,16 @@ class CodexSdkAdapter:
         else:
             operation = "tool_use"
             tool_name = request.method
-        item_id = params.get("itemId")
-        if isinstance(item_id, str) and item_id:
-            expected = state.active_tool_calls.get(item_id)
-            if expected is None and request.method not in (
-                "item/permissions/requestApproval",
-                "item/tool/requestUserInput",
-            ):
-                raise ProtocolDefect("Codex approval did not match a started authority item")
+        if request.method in (
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+            "item/permissions/requestApproval",
+            "item/tool/requestUserInput",
+        ):
+            item_id = self._non_empty_string(params, "itemId", request.method)
+            if operation in ("command", "file_change"):
+                name = "commandExecution" if operation == "command" else "fileChange"
+                self._require_active_tool(state, item_id, name, request.method)
         return AgentPermissionRequest(
             request=ApprovalRequest(
                 operation=operation,
@@ -1331,6 +1344,10 @@ class CodexSdkAdapter:
             "item/autoApprovalReview/started",
             "item/autoApprovalReview/completed",
         ):
+            if state.request.policy.approval == "deny" and not self._strict_native_containment(
+                state
+            ):
+                raise ProtocolDefect("Codex requested undeclared automatic approval authority")
             review_id = self._non_empty_string(params, "reviewId", method)
             state.authority_seen = True
             if method.endswith("/started"):
@@ -1479,8 +1496,10 @@ class CodexSdkAdapter:
         if method in _FORBIDDEN_SESSION_NOTIFICATIONS:
             raise ProtocolDefect(f"Codex app-server changed session lifecycle via {method}")
         if method == "thread/settings/updated":
-            self._validate_thread_settings(state.request, params)
-        if method == "model/rerouted" and self._strict_native_containment(state):
+            self._validate_thread_settings(
+                state.request, self._mapping(params.get("threadSettings"), "native thread settings")
+            )
+        if method == "model/rerouted":
             raise ProtocolDefect("Codex rerouted the selected native model")
         if method in _INERT_NATIVE_METHODS:
             return AgentNative(native_type=method, payload=redact_native_payload(params))
@@ -1581,6 +1600,10 @@ class CodexSdkAdapter:
                 phase="started",
                 payload=redact_native_payload(item),
             )
+        if item_type == "webSearch" and not self._strict_native_containment(state):
+            native = state.request.native
+            if not isinstance(native, CodexNativeOptions) or native.web_search is not True:
+                raise ProtocolDefect("Codex used disabled native web search")
         if item_type in _AUTHORITY_ITEM_TYPES:
             self._start_tool(state, item_id, item_type)
             state.authority_seen = True
@@ -2007,23 +2030,42 @@ class CodexSdkAdapter:
                 )
 
     def _validate_thread_settings(
-        self, request: _ResolvedCodexSessionRequest, params: Mapping[str, object]
+        self, request: _ResolvedCodexSessionRequest, settings: Mapping[str, object]
     ) -> None:
-        settings = self._mapping(params.get("threadSettings"), "native thread settings")
-        if settings.get("model") != request.dispatch_model or settings.get("cwd") != request.cwd:
+        if (
+            settings.get("model") != request.dispatch_model
+            or settings.get("modelProvider") != "openai"
+            or settings.get("cwd") != request.cwd
+        ):
             raise ProtocolDefect("Codex native settings changed the selected model or cwd")
         if settings.get("effort") != request.native_reasoning:
             raise ProtocolDefect("Codex native settings changed the selected reasoning effort")
-        native = request.native
-        if isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled":
-            sandbox = self._mapping(settings.get("sandboxPolicy"), "native sandbox policy")
-            if (
-                settings.get("modelProvider") != "openai"
-                or settings.get("approvalPolicy") != "never"
-                or sandbox.get("type") != "readOnly"
-                or sandbox.get("networkAccess", False) is not False
-            ):
-                raise ProtocolDefect("Codex native settings widened the contained policy")
+        approval = "never" if request.policy.approval == "deny" else "on-request"
+        if settings.get("approvalPolicy") != approval or (
+            request.policy.approval == "provider_review"
+            and settings.get("approvalsReviewer") != "auto_review"
+        ):
+            raise ProtocolDefect("Codex native settings changed the approval policy")
+        sandbox = self._mapping(settings.get("sandboxPolicy"), "native sandbox policy")
+        expected: dict[str, object]
+        if request.policy.filesystem == "read_only":
+            expected = {"type": "readOnly", "networkAccess": False}
+        elif request.policy.filesystem == "full_access":
+            expected = {"type": "dangerFullAccess"}
+        else:
+            controls = self._sandbox_controls
+            expected = {
+                "type": "workspaceWrite",
+                # Stock's public projection leaves the workspace cwd implicit.
+                "writableRoots": [path for path in request.additional_dirs if path != request.cwd],
+                "networkAccess": request.policy.network == "unrestricted",
+                "excludeTmpdirEnvVar": controls.exclude_tmpdir_env_var if controls else False,
+                "excludeSlashTmp": controls.exclude_slash_tmp if controls else False,
+            }
+        if sandbox != expected or any(
+            type(sandbox.get(key)) is not type(value) for key, value in expected.items()
+        ):
+            raise ProtocolDefect("Codex native settings changed the sandbox policy")
 
     def _state(self, session: AgentSession) -> _CodexSessionState:
         if session in self._dead_sessions:
@@ -2232,6 +2274,8 @@ class CodexSdkAdapter:
             workspace: dict[str, object] = {
                 "writable_roots": [request.cwd, *request.additional_dirs],
                 "network_access": request.policy.network == "unrestricted",
+                "exclude_slash_tmp": False,
+                "exclude_tmpdir_env_var": False,
             }
             if self._sandbox_controls is not None:
                 workspace.update(

@@ -171,7 +171,34 @@ class ProtocolPeer:
                 elif method == "thread/list":
                     result = {"data": [self.thread()], "nextCursor": None}
                 elif method == "thread/start":
-                    result = {"thread": self.thread()}
+                    params = message["params"]
+                    config = params.get("config", {})
+                    workspace = config.get("sandbox_workspace_write", {})
+                    sandbox = (
+                        {"type": "readOnly", "networkAccess": False}
+                        if params["sandbox"] == "read-only"
+                        else {
+                            "type": "workspaceWrite",
+                            "writableRoots": [
+                                path
+                                for path in workspace.get("writable_roots", [])
+                                if path != params["cwd"]
+                            ],
+                            "networkAccess": workspace.get("network_access", False),
+                            "excludeTmpdirEnvVar": workspace.get("exclude_tmpdir_env_var", False),
+                            "excludeSlashTmp": workspace.get("exclude_slash_tmp", False),
+                        }
+                    )
+                    result = {
+                        "thread": self.thread(),
+                        "model": params.get("model"),
+                        "modelProvider": "openai",
+                        "cwd": params["cwd"],
+                        "approvalPolicy": params.get("approvalPolicy", "never"),
+                        "approvalsReviewer": params.get("approvalsReviewer", "user"),
+                        "reasoningEffort": config.get("model_reasoning_effort"),
+                        "sandbox": sandbox,
+                    }
                 elif method == "thread/read":
                     result = {"thread": self.thread()}
                 elif method == "thread/turns/list":

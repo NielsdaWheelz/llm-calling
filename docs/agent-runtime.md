@@ -335,7 +335,8 @@ configuration recursively merges tables: an empty `mcp_servers` table does not
 clear user/project servers, and an empty execution-environment selection does
 not disable http mcp. the pinned public protocol has no session-wide reset, so
 these explicit disables are required. a missing or non-object server map fails
-before thread creation. ordinary native clients retain their existing behavior;
+before thread creation. this suppression also applies with built-ins enabled;
+explicitly declared servers replace their disabled inherited entries.
 configuration publication remains stopped host maintenance.
 Claude continues to accept exact tool names, reject glob patterns and its two
 network-reaching built-ins, and verify the reported effective set.
@@ -403,6 +404,25 @@ Native extension objects are versioned, backend-specific escape hatches:
 - `ClaudeNativeOptions(include_partial_messages=...)` is session-scoped.
 
 Unknown or wrong-backend native options fail before SDK startup.
+
+declared callbacks may coexist with native built-ins in one prepared turn.
+callback sessions enable the experimental protocol and require the qualified
+stock startup catalogue, as contained sessions do. native tool observations stay
+`AgentToolUse`; only declared `AgentToolCall` callbacks cross the host reply path.
+explicitly disabled native web use and automatic approval review under unconditional
+denial fail closed. ordinary denied permission requests remain validated observations.
+
+before returning a session, the adapter verifies actual thread-start cwd, selected
+model/provider/reasoning, approval and sandbox authority against the frozen request.
+workspace roots, network and scratch exclusions must match, including their types.
+stock's workspace-write projection leaves cwd implicit; `writableRoots` must
+equal the declared additional roots other than cwd, rather than an arbitrary subset.
+the input `sandbox_workspace_write.writable_roots` still declares cwd explicitly
+alongside the additional roots; input and response projections are distinct.
+ongoing and pre-turn settings updates use the same comparison; missing settings
+fail. native switches and callback declarations have no read-back fields in the
+pinned response; their emitted configuration and actual behavior are qualified
+separately. mutable workspace files are not part of session identity.
 
 ## Event and terminal grammar
 

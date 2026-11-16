@@ -39,9 +39,9 @@ compute or billing cessation is not part of this contract.
 ## contract
 
 1. select exact model and reasoning from `model_catalog`; open a
-   `CodexCatalogSessionRequest` with its revision and fingerprint. native
-   built-ins and web remain disabled when portable callbacks are declared.
-   contained codex requests explicitly disable agents and select no native
+   `CodexCatalogSessionRequest` with its revision and fingerprint. declared
+   callbacks may coexist with native built-ins under the explicit frozen
+   permission policy. contained codex requests explicitly disable agents and select no native
    execution environments. provider containment semantics participate in the
    catalog definition revision; a config repair rotates consumer definitions.
 2. `prepare_turn(session, request, *, attempt_id, input_id, controls)` performs
@@ -152,6 +152,19 @@ clock, native patching and async-user interactions are unavailable; model invent
 require an explicit provider/binary/catalog upgrade. exact model identifiers,
 efforts, instructions, context metadata and account routing remain intact.
 ordinary coding sessions use a separate endpoint.
+
+the native workspace extension retains this current catalogue and typed endpoint
+contract. a workspace session may combine declared callbacks with native shell
+and file operations; native observations do not become callback receipts.
+initial and ongoing settings must exactly match the frozen request, and inherited
+mcp servers are explicitly suppressed before declared servers are overlaid.
+isolated builtin-disabled sessions retain their existing restrictions.
+the original workspace consumer qualified stock `0.160.0` at provider source
+`ea9f82025632926a7c7e47d6333fb9346f6ee86c`; that immutable source remains available
+for its existing pin. integration with the current `0.165.0` library contract
+does not upgrade that consumer. controlled protocol checks establish source
+behavior; actual native qualification is recorded separately and is not inferred
+from those checks.
 
 the stock static catalog manager does not replace this catalog during network
 refresh. catalog revision participates in the provider definition identity.

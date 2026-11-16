@@ -103,7 +103,17 @@ class UsagePeer:
                             }
                         )
                     )
-                result = {"thread": {"id": THREAD}}
+                params = message["params"]
+                result = {
+                    "thread": {"id": THREAD},
+                    "model": params["model"],
+                    "modelProvider": "openai",
+                    "cwd": params["cwd"],
+                    "approvalPolicy": "never",
+                    "approvalsReviewer": "user",
+                    "reasoningEffort": params["config"]["model_reasoning_effort"],
+                    "sandbox": {"type": "readOnly", "networkAccess": False},
+                }
             elif method == "turn/start":
                 self.turns += 1
                 result = {"turn": {"id": str(self.turns)}}
