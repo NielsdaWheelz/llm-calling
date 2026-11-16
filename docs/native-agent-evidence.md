@@ -262,3 +262,39 @@ was requested. seven adapted unix-protocol cases and all 1000 existing nonlive
 cases pass, with one sdk-present skip and 61 paid cases deselected. current
 endpoint types, stock 0.165.0 catalog and dependencies remain unchanged; the
 0.160.0 maintenance consumer retains its separate pin.
+
+## native workspace and callbacks on current stock
+
+2026-11-16 utc: current-library source `11f6ffe7a42cef81ded798c0b4d56f8112d75dec`
+with kernel `6770041d8b321669a54b31efbd184847848b2e42` passed a bounded actual
+stock `0.165.0` linux x86_64 proof on the offered `gpt-6.1-sol` / `high` row.
+the official release archive sha256 was
+`be635d3486a5bd060d0fff582ae6d30160280c31344dd85719707fa920e187f0`.
+
+one real native command wrote the exact synthetic file and committed it locally;
+one declared read callback executed afterward through the kernel and llm-tools.
+matching native start/completion, progress, callback lineage and sealed final
+were retained during review. external inspection verified file sha256
+`d009158b64d84bf8cb36ea087230d4a2d896045721bd53efd118a88dfe6b2c63`,
+local commit `7ec4ac18524dfb5d13fe11edc99f12f7165e9a89` and clean git state.
+borrowed content and modes survived discard. a real isolated one-shot then
+completed with disabled native/network authority and removed its disposable cwd.
+both emitted configurations explicitly disabled an inherited synthetic mcp server
+and native web; only main published the one callback. all three privileged socket
+aliases refused native connections with `EACCES`; no rpc bytes were sent.
+
+this used separate task account state, checkout, unit, endpoint and namespace
+under distinct application/native identities, empty capabilities and
+no-new-privileges. existing authorization was an os read-only file alias, with
+no credential extraction/copy. the original home was inaccessible. stock's
+supported refresh-url override targeted a verified closed loopback https port:
+refresh was intentionally unavailable, and no guarded refresh error occurred.
+this does not qualify normal credential refresh, authenticated websocket
+transport, other models, connector effects or production activation.
+
+an earlier fixed `gpt-5.6-terra` request was refused as unoffered before session
+acquisition or model execution; the new explicit current-model selection is not
+a runtime fallback. expected denied home/skills discovery was not repaired by
+widening access. temporary probes/resources were removed after independent review.
+jarvis retains its separately qualified stock-0.160.0 `ea9f820` source pin; merge
+ancestry preserves that immutable artifact without a legacy path in this head.
