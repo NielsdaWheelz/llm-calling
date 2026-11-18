@@ -468,13 +468,13 @@ accounting source because one runtime turn can make multiple model requests.
 After native compaction, `last` can instead carry a context estimate: all five
 input/output/cache/reasoning components are integer zero and `totalTokens` is
 a positive integer estimate. This exact native shape is not billing usage and
-may exceed cumulative consumption. Ordinary `last` snapshots retain their
-arithmetic and cumulative-bound validation; cumulative `total` is always
-validated unchanged. Actual reported compaction consumption remains chargeable.
-The adapter subtracts every cumulative update from one fixed pre-turn baseline,
-so the last delta aggregates all model requests made by the invocation. The baseline is:
+may exceed cumulative consumption. Ordinary `last` counters must fit the
+corresponding cumulative counters. Reported total tokens are independent of
+the input and output counts. Each
+ordinary update contributes the difference from the previous cumulative report
+to the current invocation. The initial boundary is:
 
-- synthetic zero for a fresh native thread;
+- zero for a fresh native thread;
 - the last validated cumulative end snapshot for consecutive turns; or
 - the cumulative snapshot Codex replays around resume/fork for reopened and
   reconstructed processes/sessions. A replay already queued at resume is
@@ -482,15 +482,22 @@ so the last delta aggregates all model requests made by the invocation. The base
   stale-prior-turn usage identity may establish the unknown baseline after the
   next turn starts. Either form emits no `AgentUsage`.
 
+On context exhaustion, stock can replace all cumulative counters. Both
+breakdowns then have five zero components, the cumulative total equals the
+positive model context window, and the last total is at most that window.
+This frame establishes the new raw counter boundary while preserving previously
+attributed consumption. The next paid snapshot contributes its ordinary delta.
+
 Input, output, total, cached-input, cache-write-input, and reasoning-output
-counters are differenced independently. Optional counter presence must remain
-stable across observed cumulative snapshots; absence is never treated as zero.
-Codex totals and component bounds must be internally consistent.
+counters are differenced independently. Cache components must fit input and
+reasoning must fit output. Optional counter presence must remain stable between
+ordinary cumulative updates. If a component was unknown for any paid portion,
+it remains unknown for the invocation.
 
 The accounting boundary fails safe:
 
-- malformed, negative, internally inconsistent, decreasing, reset, or
-  presence-changing snapshots raise `ProtocolDefect`; counts are never clamped;
+- malformed, negative, or inconsistent components and ordinary decreasing
+  or presence-changing counters raise `ProtocolDefect`; counts are never clamped;
 - unchanged cumulative snapshots are suppressed, including replay and duplicate
   rate-limit updates;
 - a missing usage turn id, or a stale id outside that single first-rebase race,
@@ -500,8 +507,9 @@ The accounting boundary fails safe:
   post-completion update is not attributable and is never assigned to a later
   terminal;
 - if no advancing usage notification is available, terminal usage is `Absent`
-  and the cumulative boundary becomes untrusted. The next observed cumulative
-  snapshot is baseline-only. Usage remains `Absent` until that invocation also
+  and the cumulative boundary becomes untrusted unless a full-window reset
+  established a fresh boundary during that invocation. With an untrusted
+  boundary, the next observed cumulative snapshot is baseline-only. Usage remains `Absent` until that invocation also
   supplies a later monotonic update, or a close/reopen/resume supplies the
   restored baseline before new usage. This deliberately prefers under-reporting
   to guessing or charging history twice;

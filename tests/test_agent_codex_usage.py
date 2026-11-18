@@ -255,8 +255,8 @@ async def test_compaction_estimates_do_not_charge_continuing_or_restored_turns(
 @pytest.mark.parametrize(
     ("member", "key", "value"),
     [
-        ("total", "totalTokens", 901),
-        ("total", "inputTokens", 0),
+        ("total", "totalTokens", -1),
+        ("total", "inputTokens", -1),
         ("last", "inputTokens", 1),
         ("last", "outputTokens", 1),
         ("last", "cachedInputTokens", 1),
