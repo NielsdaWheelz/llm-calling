@@ -124,18 +124,18 @@ class _ObservedCodexAdapter(CodexSdkAdapter):
         self.completed_messages: dict[tuple[str, str], list[tuple[str | None, str]]] = {}
         self.message_selection_by_thread: dict[str, list[dict[str, object]]] = {}
 
-    def _token_usage(self, params: Mapping[str, object]) -> TokenUsage:
-        cumulative = super()._token_usage(params)
+    def _token_usage(self, params: Mapping[str, object]) -> tuple[TokenUsage, bool]:
+        cumulative, context_full = super()._token_usage(params)
         thread_id = params.get("threadId")
         turn_id = params.get("turnId")
         assert isinstance(thread_id, str) and isinstance(turn_id, str)
         self.cumulative_by_thread.setdefault(thread_id, []).append((turn_id, cumulative))
-        return cumulative
+        return cumulative, context_full
 
     def _restored_usage_baseline(
-        self, client: Any, native_session_id: str, request: Any
+        self, client: Any, native_session_id: str, request: Any, previous: TokenUsage | None = None
     ) -> TokenUsage | None:
-        baseline = super()._restored_usage_baseline(client, native_session_id, request)
+        baseline = super()._restored_usage_baseline(client, native_session_id, request, previous)
         if baseline is not None:
             self.restored_by_thread.setdefault(native_session_id, []).append(baseline)
         return baseline
