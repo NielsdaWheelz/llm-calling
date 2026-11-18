@@ -2699,6 +2699,11 @@ class _CodexAgentTurn:
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            if isinstance(self._submission, AgentSubmissionRejected) and isinstance(
+                error, CodexConnectionUnavailable
+            ):
+                # Closing a definitively refused start is ordinary end of stream.
+                return
             if self._terminal is None:
                 if self._error is None:
                     self._error = error
