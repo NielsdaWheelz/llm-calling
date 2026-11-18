@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import weakref
 from collections.abc import AsyncGenerator, Callable, Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
@@ -35,11 +36,15 @@ from .codex_app_server import (
     CodexAppServerClient,
     CodexAppServerConfig,
     CodexAppServerResponseError,
+    CodexConnectionUnavailable,
     CodexRequestId,
     CodexServerRequest,
+    NativeRequestFit,
+    codex_wire_request_fit,
 )
 from .codex_containment import _validate_codex_containment_config
 from .errors import (
+    ConflictingSubmissionEvidence,
     CredentialRejected,
     CredentialUnavailable,
     ExecutableUnavailable,
@@ -87,6 +92,7 @@ from .turn import (
     AgentMessage,
     AgentNotSubmitted,
     AgentSubmission,
+    AgentSubmissionRejected,
     AgentToolCall,
     AgentToolReply,
     AgentTurn,
@@ -125,25 +131,48 @@ from .types import (
 _REQUIRED_MCP_STARTUP_FAILURE = "required MCP servers failed to initialize"
 
 
-def codex_native_request_fits(
-    text: str, *, output: AgentOutputSpec, reasoning: str, input_id: str
-) -> bool:
-    """Check a contained text request before opening a stock 0.160.0 thread.
+def codex_native_request_fit(
+    text: str,
+    *,
+    output: AgentOutputSpec,
+    reasoning: str,
+    input_id: str,
+    operation: Literal["start", "steer"] = "start",
+) -> NativeRequestFit:
+    """Plan with the fixed-width native identities and largest legal RPC id."""
+    identity = "00000000-0000-0000-0000-000000000000"
+    parts = (TextContent(text),)
+    if operation == "start":
+        submitted = CodexSdkAdapter._turn_request(
+            thread_id=identity,
+            input=parts,
+            approval_mode="deny_all",
+            reasoning=reasoning,
+            input_id=input_id,
+            output=output,
+            contained=True,
+        )
+        return codex_wire_request_fit(cast(dict[str, object], thaw_json_value(submitted)))
+    if operation == "steer":
+        params = CodexSdkAdapter._steer_params(identity, identity, input_id, parts)
+        return codex_wire_request_fit({"method": "turn/steer", "params": params})
+    raise InvalidAgentRequest("unknown Codex fit operation")
 
-    Native threads use canonical UUID strings; the host supplies its input id. This is
-    a transport byte check using the largest legal RPC-id envelope, not a token
-    estimate or inference admission.
-    """
-    submitted = CodexSdkAdapter._turn_request(
-        thread_id="00000000-0000-0000-0000-000000000000",
-        input=(TextContent(text),),
-        approval_mode="deny_all",
-        reasoning=reasoning,
-        input_id=input_id,
-        output=output,
-        contained=True,
-    )
-    return CodexAppServerClient._request_fits(cast(dict[str, object], thaw_json_value(submitted)))
+
+def _stock_size_rejection(error: Exception, method: str) -> tuple[int, int] | None:
+    if (
+        not isinstance(error, CodexAppServerResponseError)
+        or error.method != method
+        or error.code != -32602
+    ):
+        return None
+    data = error.data
+    if not isinstance(data, dict) or data.get("input_error_code") != "input_too_large":
+        return None
+    actual, maximum = data.get("actual_chars"), data.get("max_chars")
+    if type(actual) is not int or type(maximum) is not int or not actual > maximum > 0:
+        return None
+    return actual, maximum
 
 
 # The configurable execution, integration, and local-context features in the
@@ -790,10 +819,7 @@ class CodexSdkAdapter:
             output=state.request.output,
             contained=self._strict_native_containment(state),
         )
-        if not CodexAppServerClient._request_fits(
-            cast(dict[str, object], thaw_json_value(submitted))
-        ):
-            raise InvalidAgentRequest("prepared Codex request exceeds its transport byte bound")
+        codex_wire_request_fit(cast(dict[str, object], thaw_json_value(submitted))).require_fit()
         attempt = AgentAttempt(
             attempt_id, hashlib.sha256(canonical_json_bytes(submitted)).hexdigest()
         )
@@ -865,6 +891,10 @@ class CodexSdkAdapter:
         )
         try:
             submission = await handle.submit()
+            if isinstance(submission, AgentSubmissionRejected):
+                raise InvalidAgentRequest(
+                    f"Codex refused input of {submission.actual_chars}/{submission.max_chars} characters"
+                )
             if isinstance(submission, AgentNotSubmitted):
                 raise SessionUnavailable(submission.reason)
             async for event in handle.events():
@@ -2205,6 +2235,17 @@ class CodexSdkAdapter:
         )
 
     @staticmethod
+    def _steer_params(
+        thread_id: str, turn_id: str | None, input_id: str, parts: tuple[ContentPart, ...]
+    ) -> dict[str, object]:
+        return {
+            "threadId": thread_id,
+            "expectedTurnId": turn_id,
+            "clientUserMessageId": input_id,
+            "input": [CodexSdkAdapter._codex_input(part) for part in parts],
+        }
+
+    @staticmethod
     def _codex_input(part: object) -> object:
         if isinstance(part, TextContent):
             return {"type": "text", "text": part.text}
@@ -2501,6 +2542,21 @@ class _CodexAgentTurn:
         self._writer_entered = True
         self._submission = AgentUncertain(self.attempt, None, "native writer entered")
 
+    def _start_error(self, error: CodexAppServerResponseError) -> None:
+        limits = _stock_size_rejection(error, "turn/start")
+        if limits is None or not self._writer_entered:
+            return
+        # Latch refusal on the transport reader before another frame can publish
+        # a callback. The sending task can resume after those frames are queued.
+        self.revoke()
+        if self._state.turn_id is not None:
+            self._error = ConflictingSubmissionEvidence()
+        else:
+            self._terminal = None
+            self._submission = AgentSubmissionRejected(
+                self.attempt, "input_too_large", -32602, *limits
+            )
+
     async def _send(self) -> None:
         params = self._submitted_request["params"]
         if not isinstance(params, Mapping):
@@ -2510,6 +2566,7 @@ class _CodexAgentTurn:
                 "turn/start",
                 thaw_json_value(freeze_json_object(params)),
                 on_write=self._enter_writer,
+                on_error=self._start_error,
                 timeout_seconds=self._controls.rpc_seconds,
             )
             payload = self._adapter._mapping(response, "turn/start response")
@@ -2527,6 +2584,11 @@ class _CodexAgentTurn:
                     self._accepted.set_result(self._submission)
             raise
         except Exception as error:
+            if isinstance(self._submission, AgentSubmissionRejected) or isinstance(
+                self._error, ConflictingSubmissionEvidence
+            ):
+                await self._state.client.close()
+                return
             if self._terminal is not None:
                 self._error = error
                 await self._state.client.close()
@@ -2542,7 +2604,7 @@ class _CodexAgentTurn:
                     self._accepted.set_result(self._submission)
                 self._error = error
                 await self._state.client.close()
-            elif isinstance(error, ProtocolDefect):
+            elif isinstance(error, ProtocolDefect | CodexConnectionUnavailable):
                 self._error = error
                 await self._state.client.close()
 
@@ -2555,7 +2617,7 @@ class _CodexAgentTurn:
         self._submission = AgentAccepted(
             self.attempt, AgentTurnRef(self._state.ref, native_turn_id)
         )
-        if not self._accepted.done():
+        if not self._accepted.done() and not isinstance(self._error, ConflictingSubmissionEvidence):
             self._accepted.set_result(self._submission)
 
     async def _read(self) -> None:
@@ -2589,6 +2651,9 @@ class _CodexAgentTurn:
                                 "native turn evidence omitted exact thread/turn identity"
                             )
                         self._state.turn_id = native
+                        if isinstance(self._submission, AgentSubmissionRejected):
+                            self._error = ConflictingSubmissionEvidence()
+                            self.revoke()
                     values = self._adapter._notification_events(self._state, message)
                     native_terminal = next(
                         (value for value in values if isinstance(value, AgentTerminal)), None
@@ -2617,6 +2682,8 @@ class _CodexAgentTurn:
                 self._error = TurnNotStarted("turn_timeout")
                 return
             submission = self._submission
+            if isinstance(submission, AgentSubmissionRejected):
+                return
             if not isinstance(submission, AgentAccepted | AgentUncertain):
                 submission = AgentUncertain(self.attempt, self._turn_ref(), "native turn deadline")
                 self._submission = submission
@@ -2635,7 +2702,7 @@ class _CodexAgentTurn:
             if self._terminal is None:
                 if self._error is None:
                     self._error = error
-                if not isinstance(self._submission, AgentAccepted):
+                if not isinstance(self._submission, AgentAccepted | AgentSubmissionRejected):
                     reason = sanitize_provider_text(str(self._error)) or type(self._error).__name__
                     self._submission = (
                         AgentUncertain(self.attempt, self._turn_ref(), reason)
@@ -2643,6 +2710,8 @@ class _CodexAgentTurn:
                         else None
                     )
         finally:
+            if self._writer_entered and not self._accepted.done() and self._sender is not None:
+                await asyncio.gather(self._sender, return_exceptions=True)
             if not self._writer_entered:
                 self.revoke()
                 sender = self._sender
@@ -2653,6 +2722,8 @@ class _CodexAgentTurn:
                     self._submission = AgentNotSubmitted(
                         self.attempt, "all deferred writers quiesced before entry"
                     )
+            if not self._accepted.done() and isinstance(self._error, ConflictingSubmissionEvidence):
+                self._accepted.set_exception(self._error)
             if not self._accepted.done():
                 if self._submission is None:
                     self._submission = AgentNotSubmitted(self.attempt, "writer did not enter")
@@ -2669,12 +2740,23 @@ class _CodexAgentTurn:
         self._queued_bytes += size
         self._events.put_nowait((event, size))
 
+    async def check_submission(self) -> None:
+        # A seal can precede its correlated start reply. Preserve the seal even
+        # when the reply reveals a protocol conflict or its transport is lost.
+        if self._terminal is not None and self._sender is not None:
+            await asyncio.shield(asyncio.gather(self._sender, return_exceptions=True))
+        if isinstance(self._error, ConflictingSubmissionEvidence):
+            if self._reader is not None:
+                await asyncio.shield(asyncio.gather(self._reader, return_exceptions=True))
+            raise self._error
+
     async def events(self) -> AsyncGenerator[AgentEvent, None]:
         if self._consumer_open:
             raise InvalidAgentRequest("a controlled turn has one event consumer")
         self._consumer_open = True
         while True:
             if self._events.empty() and self._finished.is_set():
+                await self.check_submission()
                 if self._terminal is not None:
                     yield self._terminal
                 elif self._error is not None:
@@ -2687,6 +2769,8 @@ class _CodexAgentTurn:
                     {next_event, finished}, return_when=asyncio.FIRST_COMPLETED
                 )
                 if next_event in done:
+                    if isinstance(self._error, ConflictingSubmissionEvidence):
+                        await self.check_submission()
                     value, size = next_event.result()
                     self._queued_bytes -= size
                     yield value
@@ -2795,12 +2879,9 @@ class _CodexAgentTurn:
             raise InvalidAgentRequest("steering requires a fresh stable input delivery id")
         if self._validate_input is not None:
             self._validate_input(validated.input)
-        params = {
-            "threadId": self._state.ref.native_session_id,
-            "expectedTurnId": self._state.turn_id,
-            "clientUserMessageId": input_id,
-            "input": [self._adapter._codex_input(part) for part in validated.input],
-        }
+        params = self._adapter._steer_params(
+            self._state.ref.native_session_id, self._state.turn_id, input_id, validated.input
+        )
         return await self._control("steer", input_id, params)
 
     async def interrupt(self) -> AgentControlReceipt:
@@ -2885,6 +2966,14 @@ class _CodexAgentTurn:
             raise
         except Exception as error:
             reason = sanitize_provider_text(str(error)) or type(error).__name__
+            limits = _stock_size_rejection(error, "turn/steer")
+            if limits is not None and operation == "steer":
+                fit = codex_wire_request_fit({"method": "turn/steer", "params": params})
+                reason = (
+                    f"input_too_large: fitted {fit.actual_chars}/{fit.max_chars} characters, "
+                    f"stock {limits[0]}/{limits[1]}"
+                )
+                logging.getLogger(__name__).error("turn/steer %s", reason)
             disposition = "unknown" if entered else "not_sent"
             if isinstance(error, CodexAppServerResponseError) and error.code in (
                 -32600,

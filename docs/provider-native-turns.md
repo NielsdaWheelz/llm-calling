@@ -21,8 +21,13 @@ there is one engine for contained and callback-bearing codex turns.
    non-entry and quiescence. writer entry latches `AgentUncertain` before a
    possible send. `AgentAccepted` requires an exact correlated native turn
    identity, including a started event or callback received before the start
-   rpc acknowledgement. generic rpc errors, timeout, and absent ids do not
-   prove non-submission.
+   rpc acknowledgement. a correlated `turn/start` rpc error −32602 with stock's
+   `input_too_large` tag and integer `actual_chars > max_chars > 0` yields
+   `AgentSubmissionRejected`. its durable codec preserves those counts, code,
+   rpc code and the original attempt. contradictory positive evidence revokes
+   authority and raises `ConflictingSubmissionEvidence`. acceptance before the start
+   acknowledgment permits immediate callbacks. if that rpc times out, the connection
+   closes under the existing operation deadline.
 4. `events()` has one consumer. its independent native reader continues while
    storage or a callback handler waits. messages and recorded input drain in
    order before the terminal. pending callbacks and pending transport buffers
@@ -59,14 +64,14 @@ and any explicit request timeout; that config does not limit native preparation.
 contracts use the same provider engine; the selection is explicit, never inferred
 from output schemas or an empty tool plan.
 
-`codex_native_request_fits(text, *, output, reasoning, input_id)` checks the exact contained
-text-turn serialization before opening a stock `0.160.0` thread. it uses the same
-serializer and byte bound as `prepare_turn`, including json escaping and output
-schema. native threads use canonical uuid strings; the host supplies its input id. this
-is a pure transport fit check, not token estimation or inference admission. the
-transport's own json encoder measures the complete envelope with the largest legal
-positive rpc id, so a fitting request fits every counter value before a connection
-is opened. stock's
+`codex_native_request_fit(text, *, output, reasoning, input_id, operation="start"|"steer")`
+lowers the actual text, output schema and native identities for planning.
+`codex_wire_request_fit(submitted)` measures a lowered start or steer directly.
+both return `NativeRequestFit(actual_chars, wire_bytes)` with inclusive limits
+`max_chars` (1,048,576) and `max_bytes` (4 mib). stock counts unicode scalars in
+input text or start's textual tool output. serialized metadata, json escapes
+and nontext parts consume wire bytes. planning reserves the largest legal rpc
+id. the writer checks the actual envelope before entering transport. stock's
 [`RequestId::Integer(i64)`](https://github.com/openai/codex/blob/a956835d020762cb2b570053af06f643a11c0ecc/codex-rs/app-server-protocol/src/rpc.rs)
 owns that bound; the client enforces it on its actual counter.
 
@@ -76,8 +81,10 @@ owns that bound; the client enforces it on its actual counter.
 prepared attempt to a native turn/result and an explicit seal revision.
 `LocalStopEvidence` preserves accepted or unresolved submission; it is not
 native terminal recovery authority. reader-latched `turn.terminal` survives
-failure after an already validated native seal. no reconnection or second
-provider submission is performed to manufacture recovery proof.
+failure after an already validated native seal. call `await turn.check_submission()`
+before independently settling that latch. it checks the bounded correlated start
+reply and raises on contradictory evidence. retain the conflicting seal as evidence.
+`events()` applies the same check before yielding a terminal.
 
 the host stores the original terminal before calling `decode_agent_output`
 or applying an application schema. `raw_structured_output=None` means absent;
@@ -154,3 +161,14 @@ is rewritten. the restrictions follow the
 and the actual installed jarvis failure. this is not an exhaustive local copy
 of the remote validator; undocumented restrictions remain original native
 failures, not proven non-submission or automatic retry permission.
+
+
+## 2026-11-18 stock input qualification
+
+the predecessor classified a structured refusal as uncertain and prepared an over-limit
+request. stock `0.160.0` with a disposable home and loopback-only model target accepted
+1,048,576 mixed unicode scalars in two input items and rejected 1,048,577. the same
+stock error counts were verified for steer, string tool output and array tool output.
+no provider model call was needed. temporary socket probes exercised the independent
+4 mib edge, proved non-entry, malformed responses, connection loss, both arrival
+orders of a contradictory native seal and the bounded missing-start-ack case.

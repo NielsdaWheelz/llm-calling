@@ -8,6 +8,7 @@ surface.
 from provider_runtime.types import JsonScalar, thaw_json_value
 
 from ._structured_output import OutputSchemaMismatch, decode_agent_output
+from .codex_app_server import CodexConnectionUnavailable, NativeRequestFit, codex_wire_request_fit
 from .codex_containment import (
     CODEX_CONTAINMENT_CATALOG_FILENAME,
     CODEX_CONTAINMENT_CATALOG_REVISION,
@@ -43,11 +44,12 @@ from .codex_control import (
     CodexTurnTarget,
     CodexUnknown,
 )
-from .codex_sdk import codex_native_request_fits
+from .codex_sdk import codex_native_request_fit
 from .errors import (
     AgentRuntimeDefect,
     AgentRuntimeError,
     ConcurrentTurn,
+    ConflictingSubmissionEvidence,
     CredentialRejected,
     CredentialUnavailable,
     ExecutableUnavailable,
@@ -138,6 +140,7 @@ from .turn import (
     AgentNotSubmitted,
     AgentResultRef,
     AgentSubmission,
+    AgentSubmissionRejected,
     AgentToolCall,
     AgentToolReply,
     AgentTurn,
@@ -222,6 +225,7 @@ __all__ = [
     "AgentSessionRef",
     "AgentSessionRequest",
     "AgentSubmission",
+    "AgentSubmissionRejected",
     "AgentTerminal",
     "AgentTerminalFailure",
     "AgentTerminalStatus",
@@ -252,6 +256,7 @@ __all__ = [
     "CodexBounded",
     "CodexCatalogSessionRequest",
     "CodexComplete",
+    "CodexConnectionUnavailable",
     "CodexControl",
     "CodexControlError",
     "CodexCreateRequest",
@@ -277,6 +282,7 @@ __all__ = [
     "CodexTurnTarget",
     "CodexUnknown",
     "ConcurrentTurn",
+    "ConflictingSubmissionEvidence",
     "ContentPart",
     "CredentialKind",
     "CredentialRef",
@@ -302,6 +308,7 @@ __all__ = [
     "McpUnavailable",
     "MissingTerminalEvent",
     "NativeCatalogRevision",
+    "NativeRequestFit",
     "NativeTerminalEvidence",
     "NetworkMode",
     "NewSession",
@@ -338,7 +345,8 @@ __all__ = [
     "UpgradeTargetUnresolved",
     "attempt_from_json",
     "attempt_to_json",
-    "codex_native_request_fits",
+    "codex_native_request_fit",
+    "codex_wire_request_fit",
     "decode_agent_output",
     "freeze_json_object",
     "freeze_json_value",
