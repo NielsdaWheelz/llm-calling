@@ -58,7 +58,7 @@ class _RejectedSubmission(_Document):
     kind: Literal["submission_rejected"]
     attempt: _Attempt
     code: Literal["input_too_large"]
-    rpc_code: Literal[-32602]
+    rpc_code: int
     actual_chars: int
     max_chars: int
 
@@ -171,6 +171,8 @@ def submission_from_json(value: Mapping[str, object]) -> AgentSubmission:
     raw = canonical_json_bytes(freeze_json_object(value))
     if value.get("kind") == "submission_rejected":
         rejected = _RejectedSubmission.model_validate_json(raw)
+        if rejected.rpc_code != -32602:
+            raise ValueError("unexpected rpc code for a stock input rejection")
         return AgentSubmissionRejected(
             AgentAttempt(rejected.attempt.attempt_id, rejected.attempt.request_digest),
             rejected.code,
