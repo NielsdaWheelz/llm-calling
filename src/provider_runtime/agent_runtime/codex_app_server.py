@@ -7,7 +7,7 @@ import json
 from collections.abc import AsyncGenerator, Callable, Mapping
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 if TYPE_CHECKING:
     from websockets.asyncio.client import ClientConnection
@@ -24,7 +24,7 @@ from ._limits import (
     bounded_payload_size,
 )
 from .codex_endpoint import CodexEndpoint, CodexUnixEndpoint, CodexWebSocketEndpoint
-from .errors import AgentRuntimeError, ProtocolDefect, SdkUnavailable
+from .errors import AgentRuntimeError, InvalidAgentRequest, ProtocolDefect, SdkUnavailable
 
 type CodexRequestId = str | int
 type CodexServerRequestKind = Literal["permission", "tool"]
@@ -70,6 +70,48 @@ _FORBIDDEN_SERVER_REQUESTS: dict[str, str] = {
 _FORBIDDEN_AUTHORITY_REQUESTS: dict[str, tuple[CodexServerRequestKind, str]] = {
     "currentTime/read": ("tool", "host time callbacks are unsupported"),
 }
+
+
+@dataclass(frozen=True, slots=True)
+class NativeRequestFit:
+    actual_chars: int
+    wire_bytes: int
+    max_chars: ClassVar[int] = 1_048_576
+    max_bytes: ClassVar[int] = _MAX_MESSAGE_BYTES
+
+    @property
+    def fits(self) -> bool:
+        return self.actual_chars <= self.max_chars and self.wire_bytes <= self.max_bytes
+
+    def require_fit(self) -> None:
+        if self.actual_chars > self.max_chars:
+            raise InvalidAgentRequest(
+                f"Codex input uses {self.actual_chars}/{self.max_chars} characters"
+            )
+        if self.wire_bytes > self.max_bytes:
+            raise InvalidAgentRequest(
+                f"Codex request uses {self.wire_bytes}/{self.max_bytes} wire bytes"
+            )
+
+
+def codex_wire_request_fit(submitted: Mapping[str, object]) -> NativeRequestFit:
+    """Measure canonical planning bytes with the largest legal RPC id."""
+    encoded = CodexAppServerClient._encode({"id": _MAX_REQUEST_ID, **submitted})
+    return _request_fit(submitted, len(encoded))
+
+
+def _request_fit(submitted: Mapping[str, object], wire_bytes: int) -> NativeRequestFit:
+    params = CodexAppServerClient._mapping(submitted["params"], "turn params")
+    items = cast(list[dict[str, Any]], params.get("input", []))
+    chars = sum(len(item["text"]) for item in items if item["type"] == "text")
+    output = params.get("toolOutput")
+    if isinstance(output, Mapping):
+        body = output.get("output")
+        if isinstance(body, str):
+            chars += len(body)
+        elif isinstance(body, list):
+            chars += sum(len(item["text"]) for item in body if item["type"] == "input_text")
+    return NativeRequestFit(chars, wire_bytes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +175,7 @@ class CodexAppServerResponseError(Exception):
 
     def __init__(self, method: str, code: int, detail: str, data: object = None) -> None:
         super().__init__(f"Codex app-server {method} request failed ({code}): {detail}")
+        self.method = method
         self.code = code
         self.detail = detail
         self.data = data
@@ -163,7 +206,12 @@ class CodexAppServerClient:
         self._thread_id: str | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._write_lock = asyncio.Lock()
-        self._pending: dict[int, tuple[str, asyncio.Future[object]]] = {}
+        self._pending: dict[
+            int,
+            tuple[
+                str, asyncio.Future[object], Callable[[CodexAppServerResponseError], None] | None
+            ],
+        ] = {}
         self._messages: asyncio.Queue[tuple[CodexServerMessage | _TransportFailure, int]] = (
             asyncio.Queue()
         )
@@ -251,6 +299,7 @@ class CodexAppServerClient:
         *,
         on_write: Callable[[], None] | None = None,
         timeout_seconds: float = _OPERATION_TIMEOUT_SECONDS,
+        on_error: Callable[[CodexAppServerResponseError], None] | None = None,
     ) -> object:
         self._require_method(method)
         self._require_live()
@@ -262,7 +311,7 @@ class CodexAppServerClient:
         if request_id > _MAX_REQUEST_ID:
             raise ProtocolDefect("Codex app-server request id exceeded its native bound")
         self._next_request_id += 1
-        self._pending[request_id] = (method, future)
+        self._pending[request_id] = (method, future, on_error)
         try:
             async with asyncio.timeout(timeout_seconds):
                 await self._write(
@@ -338,7 +387,7 @@ class CodexAppServerClient:
         if reader is not None:
             await asyncio.gather(reader, return_exceptions=True)
         closed = CodexConnectionUnavailable()
-        for _method, future in self._pending.values():
+        for _method, future, _on_error in self._pending.values():
             if not future.done():
                 future.set_exception(closed)
                 future.add_done_callback(self._consume_future)
@@ -575,7 +624,7 @@ class CodexAppServerClient:
         pending = self._pending.get(request_id)
         if pending is None:
             raise ProtocolDefect("Codex app-server response identity was not pending")
-        method, future = pending
+        method, future, on_error = pending
         if future.done():
             raise ProtocolDefect("Codex app-server response identity completed more than once")
         if "error" in message:
@@ -587,9 +636,10 @@ class CodexAppServerClient:
             if type(code) is not int or not isinstance(text, str) or not text:
                 raise ProtocolDefect("Codex app-server error response was malformed")
             detail = sanitize_provider_text(text, limit=512)
-            future.set_exception(
-                CodexAppServerResponseError(method, code, detail, error.get("data"))
-            )
+            failure = CodexAppServerResponseError(method, code, detail, error.get("data"))
+            if on_error is not None:
+                on_error(failure)
+            future.set_exception(failure)
             self._pending.pop(request_id)
             return
         if method in ("thread/start", "thread/resume", "thread/fork"):
@@ -630,12 +680,6 @@ class CodexAppServerClient:
         except (TypeError, ValueError, RecursionError):
             raise ProtocolDefect("Codex app-server outbound message was not JSON") from None
 
-    @classmethod
-    def _request_fits(cls, submitted: Mapping[str, object]) -> bool:
-        # A fresh client does not yet have its RPC count. The largest native id
-        # gives an exact legal-envelope upper bound, including transport encoding.
-        return len(cls._encode({"id": _MAX_REQUEST_ID, **submitted})) <= _MAX_MESSAGE_BYTES
-
     async def _write(
         self, message: Mapping[str, object], *, on_write: Callable[[], None] | None = None
     ) -> None:
@@ -645,7 +689,9 @@ class CodexAppServerClient:
         if connection is None:
             raise ProtocolDefect("Codex app-server connection is not live")
         encoded = self._encode(message)
-        if len(encoded) > _MAX_MESSAGE_BYTES:
+        if message.get("method") in ("turn/start", "turn/steer"):
+            _request_fit(message, len(encoded)).require_fit()
+        elif len(encoded) > _MAX_MESSAGE_BYTES:
             raise ProtocolDefect("Codex app-server outbound message exceeded its byte bound")
         async with self._write_lock:
             self._require_live()
@@ -671,7 +717,7 @@ class CodexAppServerClient:
         if self._failure is not None:
             return
         self._failure = error
-        for _method, future in self._pending.values():
+        for _method, future, _on_error in self._pending.values():
             if not future.done():
                 future.set_exception(error)
                 future.add_done_callback(self._consume_future)

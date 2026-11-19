@@ -108,6 +108,13 @@ class ProtocolDefect(AgentRuntimeDefect):
         super().__init__(message, code=code)
 
 
+class ConflictingSubmissionEvidence(ProtocolDefect):
+    """The same submission carries both native acceptance and definitive refusal."""
+
+    def __init__(self) -> None:
+        super().__init__("stock both accepted and refused the same turn/start")
+
+
 class MissingTerminalEvent(ProtocolDefect):
     def __init__(self, message: str = "agent stream ended without a terminal event") -> None:
         super().__init__(message, code="missing_terminal_event")

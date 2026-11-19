@@ -94,7 +94,30 @@ class AgentUncertain:
         _non_empty(self.reason, "AgentUncertain.reason")
 
 
-type AgentSubmission = AgentNotSubmitted | AgentAccepted | AgentUncertain
+@dataclass(frozen=True, slots=True)
+class AgentSubmissionRejected:
+    """Correlated stock validation refused entry to a model turn."""
+
+    attempt: AgentAttempt
+    code: Literal["input_too_large"]
+    rpc_code: Literal[-32602]
+    actual_chars: int
+    max_chars: int
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.attempt, AgentAttempt)
+            or self.code != "input_too_large"
+            or type(self.rpc_code) is not int
+            or self.rpc_code != -32602
+            or type(self.actual_chars) is not int
+            or type(self.max_chars) is not int
+            or not self.actual_chars > self.max_chars > 0
+        ):
+            raise InvalidAgentRequest("invalid structured submission rejection")
+
+
+type AgentSubmission = AgentNotSubmitted | AgentAccepted | AgentUncertain | AgentSubmissionRejected
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +229,10 @@ class AgentTurn(Protocol):
 
     @property
     def submitted_request(self) -> JsonObject: ...
+
+    async def check_submission(self) -> None:
+        """Raise on conflicting evidence; resolve a latched seal’s bounded start reply."""
+        ...
 
     def events(self) -> AsyncIterator[AgentEvent]: ...
 
