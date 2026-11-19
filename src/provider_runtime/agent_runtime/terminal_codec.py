@@ -16,6 +16,7 @@ from .turn import (
     AgentNotSubmitted,
     AgentResultRef,
     AgentSubmission,
+    AgentSubmissionRejected,
     AgentTurnRef,
     AgentUncertain,
     LocalStopEvidence,
@@ -51,6 +52,15 @@ class _Submission(_Document):
     attempt: _Attempt
     turn: _NativeRef | None
     reason: str | None
+
+
+class _RejectedSubmission(_Document):
+    kind: Literal["submission_rejected"]
+    attempt: _Attempt
+    code: Literal["input_too_large"]
+    rpc_code: int
+    actual_chars: int
+    max_chars: int
 
 
 class _NativeEvidence(_Document):
@@ -118,6 +128,15 @@ def _native_ref(value: _NativeRef) -> AgentTurnRef | AgentResultRef:
 
 
 def submission_to_json(value: AgentSubmission) -> dict[str, object]:
+    if isinstance(value, AgentSubmissionRejected):
+        return {
+            "kind": "submission_rejected",
+            "attempt": attempt_to_json(value.attempt),
+            "code": value.code,
+            "rpc_code": value.rpc_code,
+            "actual_chars": value.actual_chars,
+            "max_chars": value.max_chars,
+        }
     if isinstance(value, AgentAccepted):
         kind, reason, turn = "accepted", None, _native_ref_json(value.turn)
     elif isinstance(value, AgentUncertain):
@@ -149,8 +168,19 @@ def _submission(document: _Submission) -> AgentSubmission:
 
 
 def submission_from_json(value: Mapping[str, object]) -> AgentSubmission:
-    document = _Submission.model_validate_json(canonical_json_bytes(freeze_json_object(value)))
-    return _submission(document)
+    raw = canonical_json_bytes(freeze_json_object(value))
+    if value.get("kind") == "submission_rejected":
+        rejected = _RejectedSubmission.model_validate_json(raw)
+        if rejected.rpc_code != -32602:
+            raise ValueError("unexpected rpc code for a stock input rejection")
+        return AgentSubmissionRejected(
+            AgentAttempt(rejected.attempt.attempt_id, rejected.attempt.request_digest),
+            rejected.code,
+            rejected.rpc_code,
+            rejected.actual_chars,
+            rejected.max_chars,
+        )
+    return _submission(_Submission.model_validate_json(raw))
 
 
 def terminal_to_json(terminal: AgentTerminal) -> dict[str, object]:
