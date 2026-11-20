@@ -83,9 +83,12 @@ compute or billing cessation is not part of this contract.
    on its correlated `error` with `willRetry=true` and `responseStreamDisconnected`,
    open assistant display items and previous final-text candidates become ineligible.
    a successful turn requires a fresh completed answer. a retry cannot close native
-   tools, input receipts or other pending items. controlled turns retain only
-   abandoned display identities under the 100,000-item and 4 mib bounds and
-   reject their reuse. exact live callback identity is checked;
+   tools, input receipts or other pending items. controlled turns track eligible
+   answer ids even after replacing their text. a typed retry retires those ids and
+   rejects their reuse. current and retired identities share 100,000 slots and
+   4 mib of utf-8 ids. a healthy turn can exceed that history. a later retry
+   then fails because the earlier identities cannot all be proved. exact live
+   callback identity is checked;
    durable host journals own completed callback/input/message identities and
    reject changed replay. written replies and completed callbacks retire pending
    request state; input ids retire only after their native recording. unresolved

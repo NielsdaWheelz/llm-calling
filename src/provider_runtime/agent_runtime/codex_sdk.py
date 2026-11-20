@@ -519,6 +519,8 @@ class _CodexSessionState:
     streamed_text_bytes: int = 0
     completed_agent_messages: list[_CompletedAgentMessage] = field(default_factory=list)
     closed_item_ids: set[str] = field(default_factory=set)
+    response_answer_ids: set[str] | None = field(default_factory=set)
+    retained_answer_id_bytes: int = 0
     started_item_types: dict[str, str] = field(default_factory=dict)
     diagnostics: list[str] = field(default_factory=list)
     active_mcp_calls: dict[str, tuple[str, str]] = field(default_factory=dict)
@@ -532,6 +534,21 @@ class _CodexSessionState:
     attempt: AgentAttempt | None = None
     controlled: bool = False
     handle: _CodexAgentTurn | None = None
+
+    def remember_controlled_answer(self, item_id: str) -> None:
+        ids = self.response_answer_ids
+        if ids is None or item_id in ids or item_id in self.closed_item_ids:
+            return
+        size = len(item_id.encode("utf-8"))
+        if (
+            len(ids) + len(self.closed_item_ids) >= _MAX_MESSAGE_ITEMS
+            or self.retained_answer_id_bytes + size > _MAX_MESSAGE_BYTES
+        ):
+            # A healthy turn still runs. A later retry cannot verify every old id.
+            self.response_answer_ids = None
+            return
+        ids.add(item_id)
+        self.retained_answer_id_bytes += size
 
 
 class CodexSdkAdapter:
@@ -851,6 +868,8 @@ class CodexSdkAdapter:
         state.streamed_text_bytes = 0
         state.completed_agent_messages.clear()
         state.closed_item_ids.clear()
+        state.response_answer_ids = set()
+        state.retained_answer_id_bytes = 0
         state.started_item_types.clear()
         state.usage_accounting.begin_turn()
         state.diagnostics.clear()
@@ -1469,7 +1488,9 @@ class CodexSdkAdapter:
                 and isinstance(info, Mapping)
                 and info.keys() == {"responseStreamDisconnected"}
             ):
-                self._abandon_disconnected_messages(state, info["responseStreamDisconnected"])
+                self._abandon_disconnected_messages(
+                    state, params, error, info["responseStreamDisconnected"]
+                )
             return AgentNative(native_type=method, payload=redact_native_payload(params))
         if method in ("configWarning", "warning", "guardianWarning"):
             message = params.get("summary", params.get("message"))
@@ -1549,7 +1570,23 @@ class CodexSdkAdapter:
         raise ProtocolDefect(f"Codex app-server emitted unknown notification {method}")
 
     @staticmethod
-    def _abandon_disconnected_messages(state: _CodexSessionState, detail: object) -> None:
+    def _abandon_disconnected_messages(
+        state: _CodexSessionState,
+        params: Mapping[str, object],
+        error: Mapping[str, object],
+        detail: object,
+    ) -> None:
+        if (
+            params.keys() != {"threadId", "turnId", "willRetry", "error"}
+            or params["threadId"] != state.ref.native_session_id
+            or params["turnId"] != state.turn_id
+            or not isinstance(params["turnId"], str)
+            or not isinstance(error.get("message"), str)
+            or error.keys() - {"message", "additionalDetails", "codexErrorInfo", "misalignment"}
+            or not isinstance(error.get("additionalDetails"), str | None)
+            or error.get("misalignment") is not None
+        ):
+            raise ProtocolDefect("Codex stream retry has an invalid scoped error notification")
         if not isinstance(detail, Mapping) or detail.keys() - {"httpStatusCode"}:
             raise ProtocolDefect("Codex stream disconnect has invalid detail")
         status = detail.get("httpStatusCode")
@@ -1558,22 +1595,21 @@ class CodexSdkAdapter:
 
         # Stock abandons the interrupted response's display items without sending
         # item/completed. A retried stream must supply its own completed answer.
-        open_messages = {
+        open_messages = [
             key for key, kind in state.started_item_types.items() if kind == "agentMessage"
-        }
-        if not open_messages and not state.completed_agent_messages:
-            return
-        closed = state.closed_item_ids.union(
-            open_messages, (message.item_id for message in state.completed_agent_messages)
-        )
-        if state.controlled and (
-            len(closed) > _MAX_MESSAGE_ITEMS
-            or sum(len(key.encode("utf-8")) for key in closed) > _MAX_MESSAGE_BYTES
-        ):
-            raise ProtocolDefect(
-                "Codex abandoned assistant message identities exceeded their bound"
-            )
-        state.closed_item_ids = closed
+        ]
+        if state.controlled:
+            for key in open_messages:
+                state.remember_controlled_answer(key)
+            ids = state.response_answer_ids
+            if ids is None:
+                raise ProtocolDefect(
+                    "Codex abandoned assistant message identities exceeded their bound"
+                )
+            state.closed_item_ids.update(ids)
+            ids.clear()
+        else:
+            state.closed_item_ids.update(open_messages)
         for key in open_messages:
             del state.started_item_types[key]
         state.completed_agent_messages.clear()
@@ -2404,6 +2440,7 @@ class CodexSdkAdapter:
         if state.controlled:
             if phase == "commentary":
                 return
+            state.remember_controlled_answer(item_id)
             state.completed_agent_messages[:] = [
                 message for message in state.completed_agent_messages if message.phase != phase
             ]
