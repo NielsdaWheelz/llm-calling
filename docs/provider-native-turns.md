@@ -130,7 +130,7 @@ prepared attempt to a native turn/result and an explicit seal revision.
 native terminal recovery authority. reader-latched `turn.terminal` survives
 failure after an already validated native seal. call `await turn.check_submission()`
 before independently settling that latch. it checks the bounded correlated start
-reply and raises on contradictory evidence or raw queue loss. retain the original
+reply and raises on contradictory evidence, raw queue loss or exceeded output limits. retain the original
 seal as evidence. call `check_submission(for_effect=True)` at callback admission
 and immediately before executor entry to enforce the turn’s live writer authority.
 `events()` applies the same check before yielding a terminal.

@@ -2744,16 +2744,15 @@ class _CodexAgentTurn:
                 if self._state.turn_id is None and self._error is None:
                     self._submission = self._refusal
                 return
-            if self._terminal is None or isinstance(error, CodexOutputLimit):
-                if self._error is None:
-                    self._error = error
-                if not isinstance(self._submission, AgentAccepted | AgentSubmissionRejected):
-                    reason = sanitize_provider_text(str(self._error)) or type(self._error).__name__
-                    self._submission = (
-                        AgentUncertain(self.attempt, self._turn_ref(), reason)
-                        if self._writer_entered
-                        else None
-                    )
+            if self._error is None:
+                self._error = error
+            if not isinstance(self._submission, AgentAccepted | AgentSubmissionRejected):
+                reason = sanitize_provider_text(str(self._error)) or type(self._error).__name__
+                self._submission = (
+                    AgentUncertain(self.attempt, self._turn_ref(), reason)
+                    if self._writer_entered
+                    else None
+                )
         finally:
             self._read_timeout = None
             if self._writer_entered and not self._accepted.done() and self._sender is not None:
@@ -2878,7 +2877,9 @@ class _CodexAgentTurn:
             await asyncio.shield(asyncio.gather(self._sender, return_exceptions=True))
         if self._refusal is not None and self._reader is not None:
             await asyncio.shield(asyncio.gather(self._reader, return_exceptions=True))
-        if isinstance(self._error, ConflictingSubmissionEvidence | CodexRawQueueLimit):
+        if isinstance(
+            self._error, ConflictingSubmissionEvidence | CodexRawQueueLimit | CodexOutputLimit
+        ):
             raise self._error
         if for_effect:
             self._require_authority()
@@ -2900,8 +2901,6 @@ class _CodexAgentTurn:
             if not self._revoked or not isinstance(value, AgentToolCall):
                 yield value
         await self.check_submission()
-        if isinstance(self._error, CodexOutputLimit):
-            raise self._error
         if self._terminal is not None:
             yield self._terminal
         elif self._error is not None:
