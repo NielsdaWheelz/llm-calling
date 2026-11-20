@@ -1708,7 +1708,6 @@ class CodexSdkAdapter:
                 if state.turn_id is None or state.handle is None:
                     raise ProtocolDefect("recorded input omitted its controlled native turn")
                 input_id = self._non_empty_string(item, "clientId", method)
-                state.handle.record_input(input_id)
                 return AgentInputRecorded(AgentTurnRef(state.ref, state.turn_id), input_id, item_id)
             return None
         if started_type is None:
@@ -2830,42 +2829,41 @@ class _CodexAgentTurn:
                 self._state.client.buffer_waiter = None
         if self._revoked and isinstance(event, AgentToolCall):
             return
-        if self._queued_bytes + size <= _MAX_MESSAGE_BYTES:
-            self._queued_bytes += size
-            self._events.put_nowait((event, size, False))
-        elif isinstance(event, AgentInputRecorded):
-            # A fenced decoder must reach native evidence without consumer
-            # credit. Only full incorporation receipts may use this reserve.
+        reserved = self._queued_bytes + size > _MAX_MESSAGE_BYTES
+        if reserved:
+            if not isinstance(event, AgentInputRecorded):
+                self._omitted_count += 1
+                self._omitted_bytes += size
+                return
             if self._receipt_count >= _MAX_MESSAGE_ITEMS:
+                held, incoming, limit, unit = self._receipt_count, 1, _MAX_MESSAGE_ITEMS, "records"
+            else:
+                held, incoming, limit, unit = self._receipt_bytes, size, _MAX_MESSAGE_BYTES, "bytes"
+            if held + incoming > limit:
                 raise ProtocolDefect(
                     _buffer_observation(
                         "fenced_input_receipts",
                         "lineage_unresolved",
-                        "records",
-                        self._receipt_count,
-                        1,
-                        _MAX_MESSAGE_ITEMS,
+                        unit,
+                        held,
+                        incoming,
+                        limit,
                         attempt_id=self.attempt.attempt_id,
                     )
                 )
-            if self._receipt_bytes + size > _MAX_MESSAGE_BYTES:
-                raise ProtocolDefect(
-                    _buffer_observation(
-                        "fenced_input_receipts",
-                        "lineage_unresolved",
-                        "bytes",
-                        self._receipt_bytes,
-                        size,
-                        _MAX_MESSAGE_BYTES,
-                        attempt_id=self.attempt.attempt_id,
-                    )
-                )
+        if isinstance(event, AgentInputRecorded):
+            if not self.accepts_input(event.input_id):
+                raise ProtocolDefect("native user item has no prepared input delivery")
+            # Receipt admission and input retirement are one operation. A full
+            # reserve leaves the delivery unresolved, including its original id.
+            self._input_ids.remove(event.input_id)
+            self._pending_input_bytes -= len(event.input_id.encode("utf-8"))
+        if reserved:
             self._receipt_count += 1
             self._receipt_bytes += size
-            self._events.put_nowait((event, size, True))
         else:
-            self._omitted_count += 1
-            self._omitted_bytes += size
+            self._queued_bytes += size
+        self._events.put_nowait((event, size, reserved))
 
     async def check_submission(self) -> None:
         if self._terminal is not None and self._sender is not None:
@@ -2901,12 +2899,6 @@ class _CodexAgentTurn:
 
     def accepts_input(self, input_id: object) -> bool:
         return type(input_id) is str and input_id in self._input_ids
-
-    def record_input(self, input_id: str) -> None:
-        if not self.accepts_input(input_id):
-            raise ProtocolDefect("native user item has no prepared input delivery")
-        self._input_ids.remove(input_id)
-        self._pending_input_bytes -= len(input_id.encode("utf-8"))
 
     def tool_started(self, call_id: str, name: str, arguments: object) -> None:
         if name not in {tool.name for tool in self._state.request.tools}:

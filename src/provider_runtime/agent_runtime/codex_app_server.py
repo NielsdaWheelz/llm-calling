@@ -766,39 +766,28 @@ class CodexAppServerClient:
     def _enqueue(self, message: CodexServerMessage, *, size: int) -> None:
         count = self._messages.qsize()
         if count >= _MAX_EVENT_COUNT:
-            raise CodexRawQueueLimit(
-                "Codex app-server pending message queue exceeded its bound: "
-                + _buffer_observation(
-                    "raw_fifo",
-                    "limit",
-                    "messages",
-                    count,
-                    1,
-                    _MAX_EVENT_COUNT,
-                    attempt_id=self.buffer_attempt_id,
-                    decoder_waiting=self.buffer_waiter is not None
-                    if self.buffer_attempt_id is not None
-                    else None,
-                )
-            )
-        if self._queued_bytes + size > _MAX_TURN_OUTPUT_BYTES:
-            raise CodexRawQueueLimit(
-                "Codex app-server pending message queue exceeded its bound: "
-                + _buffer_observation(
-                    "raw_fifo",
-                    "limit",
-                    "bytes",
-                    self._queued_bytes,
-                    size,
-                    _MAX_TURN_OUTPUT_BYTES,
-                    attempt_id=self.buffer_attempt_id,
-                    decoder_waiting=self.buffer_waiter is not None
-                    if self.buffer_attempt_id is not None
-                    else None,
-                )
-            )
-        self._queued_bytes += size
-        self._messages.put_nowait((message, size))
+            held, incoming, limit, unit = count, 1, _MAX_EVENT_COUNT, "messages"
+        elif self._queued_bytes + size > _MAX_TURN_OUTPUT_BYTES:
+            held, incoming, limit, unit = self._queued_bytes, size, _MAX_TURN_OUTPUT_BYTES, "bytes"
+        else:
+            self._queued_bytes += size
+            self._messages.put_nowait((message, size))
+            return
+        detail = _buffer_observation(
+            "raw_fifo",
+            "limit",
+            unit,
+            held,
+            incoming,
+            limit,
+            attempt_id=self.buffer_attempt_id,
+            decoder_waiting=self.buffer_waiter is not None
+            if self.buffer_attempt_id is not None
+            else None,
+        )
+        raise CodexRawQueueLimit(
+            f"Codex app-server pending message queue exceeded its bound: {detail}"
+        )
 
     def _fail(self, error: ProtocolDefect | CodexConnectionUnavailable) -> None:
         if self._failure is not None:
