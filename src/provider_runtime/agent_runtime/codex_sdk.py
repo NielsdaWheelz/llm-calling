@@ -1301,6 +1301,12 @@ class CodexSdkAdapter:
             kind = self._non_empty_string(item, "type", method)
             if kind in ("message", "reasoning"):
                 return None
+            if kind == "configuration_update":
+                if item != {"type": kind, "reasoning": {"effort": state.request.native_reasoning}}:
+                    raise ProtocolDefect(
+                        "Codex raw configuration changed the submitted reasoning policy"
+                    )
+                return None
             if kind == "function_call_output":
                 held = state.unpublished_calls.pop(
                     self._non_empty_string(item, "call_id", method), None
