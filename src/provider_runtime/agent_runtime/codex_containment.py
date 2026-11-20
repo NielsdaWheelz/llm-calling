@@ -85,10 +85,16 @@ def materialize_codex_containment_catalog(directory: Path) -> Path:
     return path
 
 
-def _session_flag(origins: dict[str, object], key: str) -> bool:
-    origin = origins.get(key)
+def _startup_flag(response: object, key: str) -> object:
+    if not isinstance(response, dict):
+        return None
+    config = response.get("config")
+    origins = response.get("origins")
+    origin = origins.get(key) if isinstance(origins, dict) else None
     name = origin.get("name") if isinstance(origin, dict) else None
-    return isinstance(name, dict) and name.get("type") == "sessionFlags"
+    if isinstance(config, dict) and isinstance(name, dict) and name.get("type") == "sessionFlags":
+        return config.get(key)
+    return None
 
 
 def _validate_codex_containment_config(
@@ -103,24 +109,19 @@ def _validate_codex_containment_config(
             "Codex host startup model catalog requires qualified native version "
             f"{CODEX_CONTAINMENT_VERSION}"
         )
-    config = response.get("config") if isinstance(response, dict) else None
-    origins = response.get("origins") if isinstance(response, dict) else None
-    path = config.get("model_catalog_json") if isinstance(config, dict) else None
+    path = _startup_flag(response, "model_catalog_json")
     catalog = Path(path) if isinstance(path, str) else None
     if (
-        not isinstance(config, dict)
-        or not isinstance(origins, dict)
-        or catalog is None
+        catalog is None
         or not catalog.is_absolute()
         or catalog.name != CODEX_CONTAINMENT_CATALOG_FILENAME
-        or not _session_flag(origins, "model_catalog_json")
     ):
         raise UnsupportedCapability(
             "Codex contained sessions require the pinned host startup model catalog"
         )
-    if required_service_tier is not None and (
-        config.get("service_tier") != required_service_tier
-        or not _session_flag(origins, "service_tier")
+    if (
+        required_service_tier is not None
+        and _startup_flag(response, "service_tier") != required_service_tier
     ):
         raise UnsupportedCapability(
             "Codex host must set the required service tier with a startup flag"

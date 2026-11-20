@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncGenerator, Callable, Mapping
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
@@ -186,11 +187,41 @@ class CodexConnectionUnavailable(AgentRuntimeError):
         super().__init__("Codex connection is unavailable", code="codex_unavailable")
 
 
-class CodexOutputLimit(ProtocolDefect):
-    """Native output exceeded the local byte or structural ingress bound."""
+class CodexRawQueueLimit(ProtocolDefect):
+    """The transport rejected a frame from the pending raw prefix."""
 
-    def __init__(self) -> None:
-        super().__init__("Codex app-server output exceeded its ingress bound")
+
+class CodexOutputLimit(ProtocolDefect):
+    """Native output exceeded a measured ingress boundary."""
+
+
+def _buffer_observation(
+    stage: str,
+    outcome: str,
+    unit: str,
+    held: int | None,
+    incoming: int | None,
+    limit: int,
+    *,
+    attempt_id: str | None = None,
+    wait_ms: float = 0.0,
+    decoder_waiting: bool | None = None,
+) -> str:
+    attempt = (
+        ascii(sanitize_provider_text(attempt_id, limit=96)) if attempt_id is not None else "unknown"
+    )
+    report = (
+        f"Codex buffer attempt={attempt} stage={stage} outcome={outcome} unit={unit} "
+        f"held={held if held is not None else 'unknown'} "
+        f"incoming={incoming if incoming is not None else 'unknown'} "
+        f"limit={limit} wait_ms={wait_ms:.3f}"
+    )
+    if decoder_waiting is not None:
+        report += f" decoder_waiting={decoder_waiting}"
+    logging.getLogger(__name__).log(
+        logging.INFO if outcome == "drained" else logging.WARNING, report
+    )
+    return report
 
 
 _MAX_REQUEST_ID = 2**63 - 1
@@ -202,6 +233,8 @@ class CodexAppServerClient:
     def __init__(self, config: CodexAppServerConfig) -> None:
         self.config = config
         self.metadata: dict[str, object] = {}
+        self.buffer_attempt_id: str | None = None
+        self.buffer_waiter: asyncio.Event | None = None
         self._connection: ClientConnection | None = None
         self._thread_id: str | None = None
         self._reader_task: asyncio.Task[None] | None = None
@@ -379,19 +412,15 @@ class CodexAppServerClient:
     async def _close_connection(self) -> None:
         self._closed = True
         self._closing = True
-        self._fail(CodexConnectionUnavailable())
-        connection = self._connection
-        if connection is not None:
-            await connection.close()
-        reader = self._reader_task
-        if reader is not None:
-            await asyncio.gather(reader, return_exceptions=True)
-        closed = CodexConnectionUnavailable()
-        for _method, future, _on_error in self._pending.values():
-            if not future.done():
-                future.set_exception(closed)
-                future.add_done_callback(self._consume_future)
-        self._pending.clear()
+        # Finish accepting already-received frames before publishing the end
+        # marker. A refusal reply can precede contradictory terminal evidence.
+        try:
+            if self._connection is not None:
+                await self._connection.close()
+            if self._reader_task is not None:
+                await asyncio.gather(self._reader_task, return_exceptions=True)
+        finally:
+            self._fail(CodexConnectionUnavailable())
 
     async def account(self) -> object:
         return await self.request("account/read", {"refreshToken": False})
@@ -456,7 +485,7 @@ class CodexAppServerClient:
         return self._thread_id is None or thread_id in (None, self._thread_id)
 
     async def _reader_loop(self) -> None:
-        from websockets.exceptions import ConnectionClosed
+        from websockets.exceptions import ConnectionClosed, PayloadTooBig
 
         connection = self._connection
         if connection is None:
@@ -477,13 +506,29 @@ class CodexAppServerClient:
             await connection.close()
         except ConnectionClosed as error:
             if not self._closing:
-                self._fail(
-                    CodexOutputLimit()
-                    if error.sent is not None
+                if (
+                    error.sent is not None
                     and error.sent.code == 1009
                     and error.rcvd_then_sent is not True
-                    else CodexConnectionUnavailable()
-                )
+                ):
+                    size = connection.protocol.parser_exc
+                    self._fail(
+                        CodexOutputLimit(
+                            _buffer_observation(
+                                "wire_frame",
+                                "limit",
+                                "bytes",
+                                (size.current_size or 0)
+                                if isinstance(size, PayloadTooBig)
+                                else None,
+                                size.size if isinstance(size, PayloadTooBig) else None,
+                                _MAX_MESSAGE_BYTES,
+                                attempt_id=self.buffer_attempt_id,
+                            )
+                        )
+                    )
+                else:
+                    self._fail(CodexConnectionUnavailable())
         except (OSError, UnicodeError, ValueError, RecursionError):
             self._fail(ProtocolDefect("Codex app-server emitted malformed protocol data"))
 
@@ -502,8 +547,18 @@ class CodexAppServerClient:
                 _MAX_MESSAGE_BYTES,
                 max_items=_MAX_MESSAGE_ITEMS,
             )
-        except OutputLimitExceeded:
-            raise CodexOutputLimit() from None
+        except OutputLimitExceeded as error:
+            raise CodexOutputLimit(
+                _buffer_observation(
+                    "wire_shape",
+                    "limit",
+                    error.unit,
+                    0,
+                    error.incoming,
+                    error.limit,
+                    attempt_id=self.buffer_attempt_id,
+                )
+            ) from None
         if not isinstance(message, dict):
             raise ProtocolDefect("Codex app-server message was not an object")
         if "method" in message:
@@ -704,12 +759,44 @@ class CodexAppServerClient:
                 self._fail(error)
                 raise error from None
 
+    @property
+    def raw_queue_failure(self) -> CodexRawQueueLimit | None:
+        return self._failure if isinstance(self._failure, CodexRawQueueLimit) else None
+
     def _enqueue(self, message: CodexServerMessage, *, size: int) -> None:
-        if (
-            self._messages.qsize() >= _MAX_EVENT_COUNT
-            or self._queued_bytes + size > _MAX_TURN_OUTPUT_BYTES
-        ):
-            raise ProtocolDefect("Codex app-server pending message queue exceeded its bound")
+        count = self._messages.qsize()
+        if count >= _MAX_EVENT_COUNT:
+            raise CodexRawQueueLimit(
+                "Codex app-server pending message queue exceeded its bound: "
+                + _buffer_observation(
+                    "raw_fifo",
+                    "limit",
+                    "messages",
+                    count,
+                    1,
+                    _MAX_EVENT_COUNT,
+                    attempt_id=self.buffer_attempt_id,
+                    decoder_waiting=self.buffer_waiter is not None
+                    if self.buffer_attempt_id is not None
+                    else None,
+                )
+            )
+        if self._queued_bytes + size > _MAX_TURN_OUTPUT_BYTES:
+            raise CodexRawQueueLimit(
+                "Codex app-server pending message queue exceeded its bound: "
+                + _buffer_observation(
+                    "raw_fifo",
+                    "limit",
+                    "bytes",
+                    self._queued_bytes,
+                    size,
+                    _MAX_TURN_OUTPUT_BYTES,
+                    attempt_id=self.buffer_attempt_id,
+                    decoder_waiting=self.buffer_waiter is not None
+                    if self.buffer_attempt_id is not None
+                    else None,
+                )
+            )
         self._queued_bytes += size
         self._messages.put_nowait((message, size))
 
@@ -717,6 +804,8 @@ class CodexAppServerClient:
         if self._failure is not None:
             return
         self._failure = error
+        if isinstance(error, CodexRawQueueLimit) and self.buffer_waiter is not None:
+            self.buffer_waiter.set()
         for _method, future, _on_error in self._pending.values():
             if not future.done():
                 future.set_exception(error)

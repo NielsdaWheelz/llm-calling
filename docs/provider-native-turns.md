@@ -63,8 +63,22 @@ compute or billing cessation is not part of this contract.
    storage or a callback handler waits. messages and recorded input drain in
    order before the terminal. pending callbacks and pending transport buffers
    are bounded; controlled turns have no cumulative event or transcript quota.
-   pending event payloads share a 4 mib byte bound, including field names for
-   empty values; stream chunk count does not impose a second quota.
+   the converted fifo holds 4 mib of measured payload, including field names for
+   empty values. its sole decoder can stage one validated frame's remaining
+   publishable output up to another 4 mib. the validated terminal and python
+   overhead are separate. each positive dequeue renews the current waiter's rpc
+   idle interval. a stalled consumer fences dispatch. without a recovered seal,
+   entered work returns a failed local `turn_timeout` with reason
+   `consumer_stalled`. a rejected raw frame still faults the turn.
+   after a fence the decoder validates the admitted stream under the earliest
+   turn, stop, close or nonrenewing rpc deadline. it withholds callback writes,
+   counts display output omitted under pressure, and delivers incorporation
+   receipts in order. only those receipts may exceed ordinary credit, under
+   the existing 100,000-record and 4 mib limits including native item ids.
+   startup refusal is definite only after the bounded original prefix was
+   examined. conflicting native evidence remains available without authorizing
+   settlement. buffer diagnostics contain bounded identifying and numeric data.
+   stream chunk count does not impose a second quota.
    completed item ids are not retained. exact live callback identity is checked;
    durable host journals own completed callback/input/message identities and
    reject changed replay. written replies and completed callbacks retire pending
@@ -140,7 +154,8 @@ and launch the stock process with `-c model_catalog_json="<returned-path>"`.
 `qualify_codex_containment_host(endpoint)` checks the public `config/read`
 declaration. callers that pass `required_service_tier` also require that exact
 effective tier from the host's `sessionFlags` layer in the same response.
-session preparation repeats the catalog check before creating a native
+when the host pins a tier this way, the sdk verifies it against the initial thread
+settings and every native settings update. session preparation repeats the catalog check before creating a native
 thread: the canonical catalog basename and `sessionFlags` startup origin must
 match; the initialize user-agent build version must be exactly `0.171.0`.
 per-thread catalog overrides are documented upstream no-ops and are
