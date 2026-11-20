@@ -11,7 +11,9 @@ from typing import cast
 from ._archive_codec import (
     MAX_ARCHIVE_EVENTS,
     canonical,
+    confirm_missing,
     event,
+    event_pairs,
     memory_attributes,
     object_value,
     select,
@@ -22,6 +24,7 @@ from ._archive_codec import (
 from .archive import (
     INTERNAL_THREAD_SOURCE,
     MEMORY_TOOL_NAMES,
+    ArchiveBoundaryUncertain,
     ArchiveCapabilities,
     ArchiveConversation,
     ArchiveError,
@@ -85,6 +88,13 @@ async def capabilities(home: ArchiveHome) -> ArchiveCapabilities:
     except (CodexConnectionUnavailable, ProtocolDefect):
         raise ArchiveError("unavailable") from None
     return ArchiveCapabilities(version, True, True, True, True, True)
+
+
+async def read_thread(connection: CodexAppServerClient, native_id: str) -> dict[str, object]:
+    response = await request(
+        connection, "thread/read", {"threadId": native_id, "includeTurns": False}
+    )
+    return object_value(response.get("thread"))
 
 
 def conversation(value: object, *, archived: bool) -> tuple[ArchiveConversation, bool]:
@@ -172,10 +182,7 @@ async def listing(connection: CodexAppServerClient) -> tuple[list[ArchiveConvers
                         if seen[identifier] != archived:
                             raise ArchiveError("source_conflict")
                         continue
-                    response = await request(
-                        connection, "thread/read", {"threadId": identifier, "includeTurns": False}
-                    )
-                    native = object_value(response.get("thread"))
+                    native = await read_thread(connection, identifier)
                     if native.get("id") != identifier:
                         raise ArchiveError("unsupported")
                     item, active = conversation(native, archived=archived)
@@ -237,34 +244,38 @@ async def inventory(home: ArchiveHome, *, with_heads: bool) -> ArchiveInventory:
 async def stable_head(
     connection: CodexAppServerClient, home: ArchiveHome, native_id: str
 ) -> str | None:
-    first, complete = await history(connection, home, native_id)
-    if not complete:
-        raise ArchiveError("unavailable")
-    second, complete = await history(connection, home, native_id)
-    before = (first[-1].native_event_id, first[-1].native_digest) if first else (None, None)
-    after = (second[-1].native_event_id, second[-1].native_digest) if second else (None, None)
-    if not complete or before != after:
+    async def terminal() -> tuple[str | None, str | None]:
+        native = await read_thread(connection, native_id)
+        events, complete = await history(connection, home, native_id, native)
+        if not complete:
+            raise ArchiveError("unavailable")
+        return (events[-1].native_event_id, events[-1].native_digest) if events else (None, None)
+
+    before = await terminal()
+    after = await terminal()
+    if before != after:
         raise ArchiveError("unavailable")
     return after[0]
+
+
+async def unchanged_thread(
+    connection: CodexAppServerClient, before: ArchiveConversation
+) -> dict[str, object] | None:
+    native = await read_thread(connection, before.native_id)
+    current, active = conversation(native, archived=False)
+    return native if current == before and not active else None
 
 
 async def head(home: ArchiveHome, native_id: str) -> ArchiveHead:
     try:
         async with client(home) as connection:
-            response = await request(
-                connection, "thread/read", {"threadId": native_id, "includeTurns": False}
-            )
-            before, active = conversation(response.get("thread"), archived=False)
+            before, active = conversation(await read_thread(connection, native_id), archived=False)
             if before.native_id != native_id or before.internal:
                 raise ArchiveError("unsupported")
             if active:
                 raise ArchiveError("unavailable")
             identifier = await stable_head(connection, home, native_id)
-            response = await request(
-                connection, "thread/read", {"threadId": native_id, "includeTurns": False}
-            )
-            after, active = conversation(response.get("thread"), archived=False)
-            if before != after or active:
+            if await unchanged_thread(connection, before) is None:
                 raise ArchiveError("unavailable")
             return ArchiveHead(identifier, datetime.now(UTC))
     except (CodexConnectionUnavailable, ProtocolDefect):
@@ -277,21 +288,37 @@ async def read(
     observed_at = datetime.now(UTC)
     try:
         async with client(home) as connection:
-            events, caught_up = await history(connection, home, native_id)
+            native = await read_thread(connection, native_id)
+            events, caught_up = await history(connection, home, native_id, native)
+            page = select(
+                events,
+                after=after,
+                checkpoint=checkpoint,
+                caught_up=caught_up,
+                observed_at=observed_at,
+            )
+            if page is not None:
+                return page
+
+            before, active = conversation(native, archived=False)
+            if active:
+                raise ArchiveBoundaryUncertain()
+            first = event_pairs(events)
+            del events
+            native = await unchanged_thread(connection, before)
+            if native is None:
+                raise ArchiveBoundaryUncertain()
+            events, caught_up = await history(connection, home, native_id, native)
+            if await unchanged_thread(connection, before) is None:
+                raise ArchiveBoundaryUncertain()
+            confirm_missing(first, events, caught_up=caught_up, checkpoint=checkpoint)
     except (CodexConnectionUnavailable, ProtocolDefect):
         raise ArchiveError("unavailable") from None
-    return select(
-        events, after=after, checkpoint=checkpoint, caught_up=caught_up, observed_at=observed_at
-    )
 
 
 async def history(
-    connection: CodexAppServerClient, home: ArchiveHome, native_id: str
+    connection: CodexAppServerClient, home: ArchiveHome, native_id: str, native: dict[str, object]
 ) -> tuple[list[ArchiveEvent], bool]:
-    response = await request(
-        connection, "thread/read", {"threadId": native_id, "includeTurns": False}
-    )
-    native = object_value(response.get("thread"))
     info, _ = conversation(native, archived=False)
     if info.native_id != native_id or info.internal:
         raise ArchiveError("unsupported")
