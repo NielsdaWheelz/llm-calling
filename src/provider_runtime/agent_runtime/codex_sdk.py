@@ -2750,7 +2750,10 @@ class _CodexAgentTurn:
         except OutputLimitExceeded:
             raise ProtocolDefect("native event exceeded its per-message bound") from None
         if self._queued_bytes + size > _MAX_MESSAGE_BYTES:
-            raise ProtocolDefect("native pending event buffer exceeded its finite bound")
+            raise ProtocolDefect(
+                f"Codex converted event queue full: held_bytes={self._queued_bytes} "
+                f"incoming_bytes={size} limit_bytes={_MAX_MESSAGE_BYTES}"
+            )
         self._queued_bytes += size
         self._events.put_nowait((event, size))
 

@@ -138,7 +138,9 @@ contained codex sessions require a dedicated stock `0.171.0` host. host
 operations call `materialize_codex_containment_catalog(private_directory)`
 and launch the stock process with `-c model_catalog_json="<returned-path>"`.
 `qualify_codex_containment_host(endpoint)` checks the public `config/read`
-declaration. session preparation repeats this check before creating a native
+declaration. callers that pass `required_service_tier` also require that exact
+effective tier from the host's `sessionFlags` layer in the same response.
+session preparation repeats the catalog check before creating a native
 thread: the canonical catalog basename and `sessionFlags` startup origin must
 match; the initialize user-agent build version must be exactly `0.171.0`.
 per-thread catalog overrides are documented upstream no-ops and are

@@ -85,7 +85,15 @@ def materialize_codex_containment_catalog(directory: Path) -> Path:
     return path
 
 
-def _validate_codex_containment_config(response: object, metadata: dict[str, object]) -> Path:
+def _session_flag(origins: dict[str, object], key: str) -> bool:
+    origin = origins.get(key)
+    name = origin.get("name") if isinstance(origin, dict) else None
+    return isinstance(name, dict) and name.get("type") == "sessionFlags"
+
+
+def _validate_codex_containment_config(
+    response: object, metadata: dict[str, object], required_service_tier: str | None = None
+) -> Path:
     user_agent = metadata.get("userAgent")
     if (
         not isinstance(user_agent, str)
@@ -95,28 +103,34 @@ def _validate_codex_containment_config(response: object, metadata: dict[str, obj
             "Codex host startup model catalog requires qualified native version "
             f"{CODEX_CONTAINMENT_VERSION}"
         )
-    if isinstance(response, dict):
-        config = response.get("config")
-        origins = response.get("origins")
-        if isinstance(config, dict) and isinstance(origins, dict):
-            path = config.get("model_catalog_json")
-            origin = origins.get("model_catalog_json")
-            if isinstance(path, str) and isinstance(origin, dict):
-                name = origin.get("name")
-                catalog = Path(path)
-                if (
-                    catalog.is_absolute()
-                    and catalog.name == CODEX_CONTAINMENT_CATALOG_FILENAME
-                    and isinstance(name, dict)
-                    and name.get("type") == "sessionFlags"
-                ):
-                    return catalog
-    raise UnsupportedCapability(
-        "Codex contained sessions require the pinned host startup model catalog"
-    )
+    config = response.get("config") if isinstance(response, dict) else None
+    origins = response.get("origins") if isinstance(response, dict) else None
+    path = config.get("model_catalog_json") if isinstance(config, dict) else None
+    catalog = Path(path) if isinstance(path, str) else None
+    if (
+        not isinstance(config, dict)
+        or not isinstance(origins, dict)
+        or catalog is None
+        or not catalog.is_absolute()
+        or catalog.name != CODEX_CONTAINMENT_CATALOG_FILENAME
+        or not _session_flag(origins, "model_catalog_json")
+    ):
+        raise UnsupportedCapability(
+            "Codex contained sessions require the pinned host startup model catalog"
+        )
+    if required_service_tier is not None and (
+        config.get("service_tier") != required_service_tier
+        or not _session_flag(origins, "service_tier")
+    ):
+        raise UnsupportedCapability(
+            "Codex host must set the required service tier with a startup flag"
+        )
+    return catalog
 
 
-async def qualify_codex_containment_host(endpoint: CodexEndpoint) -> Path:
+async def qualify_codex_containment_host(
+    endpoint: CodexEndpoint, *, required_service_tier: str | None = None
+) -> Path:
     """Verify the public startup declaration; the trusted host owns file bytes."""
     async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
         async with CodexAppServerClient(
@@ -125,7 +139,9 @@ async def qualify_codex_containment_host(endpoint: CodexEndpoint) -> Path:
             )
         ) as client:
             return _validate_codex_containment_config(
-                await client.request("config/read", {"includeLayers": False}), client.metadata
+                await client.request("config/read", {"includeLayers": False}),
+                client.metadata,
+                required_service_tier,
             )
 
 
