@@ -19,13 +19,15 @@ from provider_runtime.types import (
 from .codex_containment import CODEX_CONTAINMENT_CATALOG_REVISION
 from .errors import ProtocolDefect
 
-AGENT_BACKEND_CONTRACT_REVISION = "provider-runtime.agent-model-catalog.v3"
+AGENT_BACKEND_CONTRACT_REVISION = "provider-runtime.agent-model-catalog.v4"
 _MAX_PAGES = 64
 # Reviewed publication membership for every visible dispatch id in the pinned
 # complete vendor catalog. Authenticated discovery may expose any subset.
 _CODEX_OFFERED_MODELS = {
-    "gpt-6-astra": True,
-    "gpt-6.1-sol": True,
+    "gpt-6.2-astra": True,
+    "gpt-6.2-sol": True,
+    "gpt-6-astra": False,
+    "gpt-6.1-sol": False,
     "gpt-6.1-terra": True,
     "gpt-6-sol": False,
     "gpt-6-luna": True,
@@ -93,7 +95,7 @@ class AgentModelFacts:
     offered: bool
     source_context_window: Presence[int]
     source_max_output_tokens: Presence[int]
-    input_modalities: tuple[Literal["text", "image"], ...]
+    input_modalities: tuple[Literal["text", "image", "audio"], ...]
     reasoning: tuple[AgentReasoningFacts, ...]
     source_default_reasoning: Presence[AgentReasoningKey]
     upgrade: Presence[AgentUpgradeFacts]
@@ -127,7 +129,7 @@ class _ObservedModel:
     offered: bool
     source_context_window: Presence[int]
     source_max_output_tokens: Presence[int]
-    input_modalities: tuple[Literal["text", "image"], ...]
+    input_modalities: tuple[Literal["text", "image", "audio"], ...]
     reasoning: tuple[AgentReasoningFacts, ...]
     source_default_reasoning: Presence[str]
     native_upgrade_targets: tuple[str, ...]
@@ -188,7 +190,7 @@ async def read_codex_model_catalog(
     if observed_at.tzinfo is None or observed_at.utcoffset() is None:
         raise ProtocolDefect("AgentModelCatalog.observed_at must be timezone-aware")
     definition_revision = _hash(
-        b"provider-runtime.agent-model-catalog.v3",
+        b"provider-runtime.agent-model-catalog.v4",
         {
             "row_fingerprints": tuple(row.row_fingerprint for row in facts),
             "native_containment_revision": CODEX_CONTAINMENT_CATALOG_REVISION,
@@ -215,10 +217,10 @@ def _normalize_row(row: Mapping[str, object]) -> _ObservedModel:
     modalities_value = row.get("inputModalities", row.get("input_modalities"))
     if not isinstance(modalities_value, list) or not modalities_value:
         raise ProtocolDefect(f"Codex model {key!r} has incomplete input modalities")
-    modalities: list[Literal["text", "image"]] = []
+    modalities: list[Literal["text", "image", "audio"]] = []
     for item in modalities_value:
         value = _enum_string(item)
-        if value not in ("text", "image"):
+        if value not in ("text", "image", "audio"):
             raise ProtocolDefect(f"Codex model {key!r} has an unknown input modality")
         if value in modalities:
             raise ProtocolDefect(f"Codex model {key!r} has duplicate input modalities")
@@ -347,7 +349,7 @@ def _row_fingerprint(
     upgrade: Presence[AgentUpgradeFacts],
 ) -> str:
     return _hash(
-        b"provider-runtime.agent-model-row.v3",
+        b"provider-runtime.agent-model-row.v4",
         {
             "key": row.key,
             "dispatch_model": row.dispatch_model,

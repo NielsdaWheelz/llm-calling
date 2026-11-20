@@ -990,7 +990,19 @@ async def test_generate_non_object_tool_input_returns_failed_value() -> None:
 
 
 @respx.mock
-async def test_generate_pre_output_refusal_is_confirmed_non_billable() -> None:
+@pytest.mark.parametrize(
+    ("category", "billability"),
+    [
+        ("general_harms", ConfirmedNonBillable()),
+        ("bio", PossiblyBillable()),
+        ("frontier_llm", PossiblyBillable()),
+        ("reasoning_extraction", PossiblyBillable()),
+        ("unknown_category", PossiblyBillable()),
+    ],
+)
+async def test_generate_pre_output_refusal_billability(
+    category: str, billability: Billability
+) -> None:
     respx.post(MESSAGES_URL).mock(
         return_value=mock_response(
             envelope(
@@ -999,7 +1011,7 @@ async def test_generate_pre_output_refusal_is_confirmed_non_billable() -> None:
                 usage=usage_body(output_tokens=0),
                 stop_details={
                     "type": "refusal",
-                    "category": "general_harms",
+                    "category": category,
                     "explanation": "I can't help with that.",
                 },
             )
@@ -1009,7 +1021,7 @@ async def test_generate_pre_output_refusal_is_confirmed_non_billable() -> None:
     assert isinstance(outcome, Refused), f"outcome: {outcome!r}"
     assert outcome.safe_detail == "I can't help with that.", f"safe_detail: {outcome.safe_detail!r}"
     zero_output = replace(EXPECTED_USAGE, output_tokens=0, total_tokens=108)
-    assert_meta(outcome, usage=zero_output, billability=ConfirmedNonBillable())
+    assert_meta(outcome, usage=zero_output, billability=billability)
 
 
 @respx.mock
@@ -1306,18 +1318,14 @@ async def test_generate_billing_error_is_quota_defect() -> None:
 
 
 @respx.mock
-async def test_stream_decodes_thinking_text_tool_usage_and_terminal() -> None:
+@pytest.mark.parametrize("thinking", ["pondering", ""])
+async def test_stream_decodes_thinking_text_tool_usage_and_terminal(thinking: str) -> None:
     frames: list[dict[str, object]] = [
         message_start_frame(),
         {
             "type": "content_block_start",
             "index": 0,
             "content_block": {"type": "thinking", "thinking": "", "signature": ""},
-        },
-        {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "thinking_delta", "thinking": "pondering"},
         },
         {
             "type": "content_block_delta",
@@ -1353,6 +1361,15 @@ async def test_stream_decodes_thinking_text_tool_usage_and_terminal() -> None:
         message_delta_frame(stop_reason="tool_use"),
         {"type": "message_stop"},
     ]
+    if thinking:
+        frames.insert(
+            2,
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": thinking},
+            },
+        )
     route = respx.post(MESSAGES_URL).mock(return_value=mock_stream(frames))
     events = await collect_stream(AnthropicMessagesEngine(), make_intent(tools=(SEARCH_TOOL,)))
 
@@ -1382,7 +1399,7 @@ async def test_stream_decodes_thinking_text_tool_usage_and_terminal() -> None:
     blocks = artifact.opaque_payload["blocks"]
     assert isinstance(blocks, tuple)
     assert list(blocks) == [
-        THINKING_BLOCK,
+        dict(THINKING_BLOCK, thinking=thinking),
         {"type": "text", "text": "Hi there"},
         {"type": "tool_use", "id": "toolu_1", "name": "search_library", "input": {"query": "cats"}},
     ], f"payload blocks must be the assembled thinking block: {artifact.opaque_payload!r}"
@@ -1402,7 +1419,13 @@ async def test_stream_decodes_thinking_text_tool_usage_and_terminal() -> None:
 
 
 @respx.mock
-async def test_stream_refusal_folds_into_incomplete_refused_terminal() -> None:
+@pytest.mark.parametrize(
+    ("category", "billability"),
+    [(None, ConfirmedNonBillable()), ("bio", PossiblyBillable())],
+)
+async def test_stream_refusal_folds_into_incomplete_refused_terminal(
+    category: str | None, billability: Billability
+) -> None:
     frames: list[dict[str, object]] = [
         message_start_frame(usage={"input_tokens": 20, "output_tokens": 0}),
         {
@@ -1419,7 +1442,7 @@ async def test_stream_refusal_folds_into_incomplete_refused_terminal() -> None:
         message_delta_frame(
             stop_reason="refusal",
             usage={"output_tokens": 0},
-            stop_details={"type": "refusal", "category": None, "explanation": "Can't help."},
+            stop_details={"type": "refusal", "category": category, "explanation": "Can't help."},
         ),
         {"type": "message_stop"},
     ]
@@ -1448,7 +1471,7 @@ async def test_stream_refusal_folds_into_incomplete_refused_terminal() -> None:
         outcome,
         request_id="req_s1",
         usage=refusal_usage,
-        billability=ConfirmedNonBillable(),
+        billability=billability,
     )
     assert len(events) == 3, f"no ContinuationDelta on refusal: {events!r}"
 
@@ -1781,7 +1804,7 @@ async def test_stream_strict_json_terminal_promotes_structured_content() -> None
 
 @respx.mock
 async def test_continuation_round_trip_replays_decoded_blocks_verbatim() -> None:
-    first_content = [THINKING_BLOCK, TOOL_USE_BLOCK]
+    first_content = [dict(THINKING_BLOCK, thinking=""), TOOL_USE_BLOCK]
     route = respx.post(MESSAGES_URL).mock(
         return_value=mock_response(
             envelope(content=first_content, stop_reason="tool_use", usage=usage_body())
@@ -1814,15 +1837,7 @@ async def test_continuation_round_trip_replays_decoded_blocks_verbatim() -> None
         },
         {
             "role": "assistant",
-            "content": [
-                THINKING_BLOCK,
-                {
-                    "type": "tool_use",
-                    "id": "toolu_1",
-                    "name": "search_library",
-                    "input": {"query": "cats"},
-                },
-            ],
+            "content": first_content,
         },
         {
             "role": "user",

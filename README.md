@@ -31,7 +31,7 @@ from provider_runtime import Credentials, ProviderRuntime, estimate_cost
 rt = ProviderRuntime(credentials=Credentials(openai="...", anthropic="..."))
 
 # the 95% call site:
-out = await rt.chat("anthropic:claude-fable-5-1", system=SYS, user=question, reasoning="high")
+out = await rt.chat("anthropic:claude-fable-5-2", system=SYS, user=question, reasoning="adaptive/high")
 
 out = await rt.generate(intent)                 # CallOutcome
 async for event in rt.stream(intent):           # RuntimeStreamEvent(seq, event)
@@ -178,7 +178,7 @@ on `CallMeta`. The snapshot records its sources; the library never fetches.
 
 Exactly two routes ship: `(codex, sdk)` and `(claude, sdk)`. The core package
 declares `websockets`; the host separately installs Codex and supervises its
-shared service. contained sessions require the exact qualified 0.165.0 binary
+shared service. contained sessions require the exact qualified 0.171.0 binary
 and startup catalog. protocol validation, subscription auth, and containment
 remain fail-closed. installing a newer version does not certify its behavior.
 The Codex route retains the `sdk` name and owns the documented

@@ -611,7 +611,7 @@ class PossiblyBillable:
 
 @dataclass(frozen=True, slots=True)
 class ConfirmedNonBillable:
-    """Provider-confirmed unbilled (e.g. Anthropic pre-output refusal)."""
+    """Provider-confirmed unbilled (e.g. a zero-output refusal in an unbilled category)."""
 
 
 type Billability = NotDispatched | PossiblyBillable | ConfirmedNonBillable

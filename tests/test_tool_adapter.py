@@ -40,7 +40,6 @@ from provider_runtime.tool_adapter import (
 )
 from provider_runtime.types import (
     GenerateIntent,
-    Present,
     ProviderTarget,
     TextOutput,
     ToolCall,
@@ -97,14 +96,13 @@ def _semantic_projection(value: Any) -> Any:
     return value
 
 
-def _intent(row_ref: str, tools: tuple):
+def _intent(row_ref: str, reasoning: str, tools: tuple):
     row = resolve(row_ref)
-    assert isinstance(row.source_default_reasoning, Present)
     return row, GenerateIntent(
         target=ProviderTarget(provider=row.provider, model=row.model_id),
         messages=(),
         max_output_tokens=64,
-        reasoning=row.source_default_reasoning.value.value,
+        reasoning=reasoning,
         tools=tools,
         tool_choice="auto",
         output=TextOutput(),
@@ -333,19 +331,21 @@ def test_all_engine_encoders_preserve_the_frozen_portable_schema_semantics() -> 
     tool = published.tools[2]
     expected = WEB_SEARCH_SPEC.input_schema.semantic
 
-    openai_row, openai_intent = _intent("openai:gpt-6.1-sol", (tool,))
+    openai_row, openai_intent = _intent("openai:gpt-6.2-sol", "standard/medium", (tool,))
     openai_tools = encode_openai_responses(openai_row, openai_intent).params["tools"]
     assert isinstance(openai_tools, list)
     openai = openai_tools[0]
     assert isinstance(openai, Mapping)
 
-    anthropic_row, anthropic_intent = _intent("anthropic:claude-sonnet-5-5", (tool,))
+    anthropic_row, anthropic_intent = _intent(
+        "anthropic:claude-sonnet-5-5", "adaptive/high", (tool,)
+    )
     anthropic_tools = encode_anthropic(anthropic_row, anthropic_intent).params["tools"]
     assert isinstance(anthropic_tools, list)
     anthropic = anthropic_tools[0]
     assert isinstance(anthropic, Mapping)
 
-    chat_row, chat_intent = _intent("deepseek:deepseek-flash", (tool,))
+    chat_row, chat_intent = _intent("deepseek:deepseek-flash", "high", (tool,))
     chat_tools = encode_openai_chat("deepseek", chat_row, chat_intent).body["tools"]
     assert isinstance(chat_tools, list)
     chat_definition = chat_tools[0]
@@ -353,7 +353,7 @@ def test_all_engine_encoders_preserve_the_frozen_portable_schema_semantics() -> 
     chat_function = chat_definition["function"]
     assert isinstance(chat_function, Mapping)
 
-    gemini_row, gemini_intent = _intent("gemini:gemini-3.8-flash", (tool,))
+    gemini_row, gemini_intent = _intent("gemini:gemini-4-hydrogen", "xhigh", (tool,))
     gemini_config = encode_gemini(gemini_row, gemini_intent).config
     assert gemini_config.tools is not None
     declarations = getattr(gemini_config.tools[0], "function_declarations", None)

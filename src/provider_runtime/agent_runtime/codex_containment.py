@@ -14,13 +14,13 @@ from .codex_app_server import CodexAppServerClient, CodexAppServerConfig
 from .codex_endpoint import CodexEndpoint
 from .errors import UnsupportedCapability
 
-CODEX_CONTAINMENT_VERSION = "0.165.0"
-CODEX_CONTAINMENT_SOURCE_SHA256 = "1384625c0b6b3e67d3c60da29becea2b017f2c283fc1e2d05b8edafb4698eb10"
+CODEX_CONTAINMENT_VERSION = "0.171.0"
+CODEX_CONTAINMENT_SOURCE_SHA256 = "d50b6749506d97e5f334dbabcb666eb1689f423cf3e88cfabdcf3c536b873068"
 CODEX_CONTAINMENT_CATALOG_SHA256 = (
-    "3bb7176bbd2aa37652d94eeca7a2917867350b5ed0a4ecaa684c809d2d55fb72"
+    "552646113928209983c67c598ce80c534652b4916d1b0595d2d175ee7ee6627b"
 )
 CODEX_CONTAINMENT_CATALOG_REVISION = (
-    f"codex-contained-catalog.v2:{CODEX_CONTAINMENT_CATALOG_SHA256}"
+    f"codex-contained-catalog.v3:{CODEX_CONTAINMENT_CATALOG_SHA256}"
 )
 CODEX_CONTAINMENT_CATALOG_FILENAME = (
     f"codex-contained-models-{CODEX_CONTAINMENT_VERSION}-{CODEX_CONTAINMENT_CATALOG_SHA256}.json"
@@ -45,6 +45,8 @@ def _restrict_catalog(catalog: object) -> bytes:
             or value
             not in (
                 "clock",
+                "literature_search_query",
+                "multi_agent_v2_in_code_mode",
                 "send_user_message_async",
                 "request_user_input_async",
                 "send_message_to_user_async",
@@ -54,6 +56,17 @@ def _restrict_catalog(catalog: object) -> bytes:
             raise UnsupportedCapability("Codex source model has unqualified native tool selectors")
         if model.get("apply_patch_tool_type") not in (None, "freeform"):
             raise UnsupportedCapability("Codex source model has an unqualified native patch tool")
+        # Ultra combines a lower inference effort with automatic delegation.
+        # Builtin-disabled sessions cannot execute that preset.
+        levels = model.get("supported_reasoning_levels")
+        if not isinstance(levels, list) or any(
+            not isinstance(row, dict) or type(row.get("effort")) is not str for row in levels
+        ):
+            raise UnsupportedCapability("Codex source model has unqualified reasoning presets")
+        levels = [row for row in levels if row["effort"] != "ultra"]
+        if model.get("default_reasoning_level") not in {row["effort"] for row in levels}:
+            raise UnsupportedCapability("Codex contained model lacks its default reasoning effort")
+        model["supported_reasoning_levels"] = levels
         model["apply_patch_tool_type"] = None
         model["tool_mode"] = "direct"
         model["experimental_supported_tools"] = []
@@ -64,7 +77,7 @@ def materialize_codex_containment_catalog(directory: Path) -> Path:
     """Write the host startup catalog; never touch auth or an existing process."""
     if not directory.is_absolute():
         raise ValueError("Codex host catalog directory must be absolute")
-    source = files(__package__).joinpath("_codex_models_0_165_0.json").read_bytes()
+    source = files(__package__).joinpath("_codex_models_0_171_0.json").read_bytes()
     payload = _restrict_catalog(json.loads(source))
     path = directory / CODEX_CONTAINMENT_CATALOG_FILENAME
     path.write_bytes(payload)
