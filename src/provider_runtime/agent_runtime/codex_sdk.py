@@ -7,7 +7,7 @@ import hashlib
 import logging
 import weakref
 from collections.abc import AsyncGenerator, Callable, Mapping
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from typing import Any, Literal, cast
 from uuid import uuid4
 
@@ -36,12 +36,15 @@ from .codex_app_server import (
     CodexAppServerConfig,
     CodexAppServerResponseError,
     CodexConnectionUnavailable,
+    CodexOutputLimit,
+    CodexRawQueueLimit,
     CodexRequestId,
     CodexServerRequest,
     NativeRequestFit,
+    _buffer_observation,
     codex_wire_request_fit,
 )
-from .codex_containment import _validate_codex_containment_config
+from .codex_containment import _startup_flag, _validate_codex_containment_config
 from .codex_endpoint import CodexEndpoint, fingerprint_codex_endpoint
 from .errors import (
     ConflictingSubmissionEvidence,
@@ -516,6 +519,9 @@ class _CodexSessionState:
     streamed_text_bytes: int = 0
     completed_agent_messages: list[_CompletedAgentMessage] = field(default_factory=list)
     completed_item_ids: set[str] = field(default_factory=set)
+    response_message_ids: set[str] = field(default_factory=set)
+    retired_message_ids: set[str] = field(default_factory=set)
+    retained_message_id_bytes: int | None = 0
     started_item_types: dict[str, str] = field(default_factory=dict)
     diagnostics: list[str] = field(default_factory=list)
     active_mcp_calls: dict[str, tuple[str, str]] = field(default_factory=dict)
@@ -529,6 +535,24 @@ class _CodexSessionState:
     attempt: AgentAttempt | None = None
     controlled: bool = False
     handle: _CodexAgentTurn | None = None
+
+    def observe_response_message(self, item_id: str) -> None:
+        if item_id in self.retired_message_ids:
+            raise ProtocolDefect("Codex reused an abandoned assistant message identity")
+        held = self.retained_message_id_bytes
+        if held is None or item_id in self.response_message_ids:
+            return
+        size = len(item_id.encode("utf-8"))
+        if self.controlled and (
+            len(self.response_message_ids) + len(self.retired_message_ids) >= _MAX_MESSAGE_ITEMS
+            or held + size > _MAX_MESSAGE_BYTES
+        ):
+            # A healthy turn still runs. A later retry cannot verify every old id.
+            self.response_message_ids.clear()
+            self.retained_message_id_bytes = None
+            return
+        self.response_message_ids.add(item_id)
+        self.retained_message_id_bytes = held + size
 
 
 class CodexSdkAdapter:
@@ -679,6 +703,11 @@ class CodexSdkAdapter:
             )
             if contained or request.tools:
                 _validate_codex_containment_config(startup, client.metadata)
+            service_tier = _startup_flag(startup, "service_tier")
+            if service_tier is not None:
+                if not isinstance(service_tier, str) or not service_tier:
+                    raise ProtocolDefect("Codex host declared an invalid startup service tier")
+                request = replace(request, startup_service_tier=service_tier)
             effective = self._mapping(startup.get("config"), "Codex effective configuration")
             inherited = self._mapping(effective.get("mcp_servers"), "Codex inherited MCP servers")
             # Native config merges tables recursively; an empty table retains
@@ -843,6 +872,9 @@ class CodexSdkAdapter:
         state.streamed_text_bytes = 0
         state.completed_agent_messages.clear()
         state.completed_item_ids.clear()
+        state.response_message_ids.clear()
+        state.retired_message_ids.clear()
+        state.retained_message_id_bytes = 0
         state.started_item_types.clear()
         state.usage_accounting.begin_turn()
         state.diagnostics.clear()
@@ -1291,7 +1323,18 @@ class CodexSdkAdapter:
         if method == "rawResponseItem/completed":
             item = self._mapping(params.get("item"), "raw Responses item")
             kind = self._non_empty_string(item, "type", method)
-            if kind in ("message", "reasoning"):
+            if kind == "message":
+                item_id = item.get("id")
+                if item.get("role") == "assistant" and isinstance(item_id, str) and item_id:
+                    state.observe_response_message(item_id)
+                return None
+            if kind == "reasoning":
+                return None
+            if kind == "configuration_update":
+                if item != {"type": kind, "reasoning": {"effort": state.request.native_reasoning}}:
+                    raise ProtocolDefect(
+                        "Codex raw configuration changed the submitted reasoning policy"
+                    )
                 return None
             if kind == "function_call_output":
                 held = state.unpublished_calls.pop(
@@ -1335,7 +1378,7 @@ class CodexSdkAdapter:
         if method == "turn/started":
             return AgentNative(native_type=method, payload=redact_native_payload(params))
         if method == "item/agentMessage/delta":
-            self._non_empty_string(params, "itemId", method)
+            state.observe_response_message(self._non_empty_string(params, "itemId", method))
             delta = self._string(params, "delta", method)
             self._count_streamed_text(state, delta)
             return AgentText(delta)
@@ -1449,8 +1492,15 @@ class CodexSdkAdapter:
             self._append_diagnostic(state, normalized)
             if self._is_quota_error(error):
                 state.quota_exhausted = True
-            # Retries the backend performs itself are visible here too (willRetry);
-            # the bounded native frame is their only representation.
+            info = error.get("codexErrorInfo")
+            if (
+                params.get("willRetry") is True
+                and isinstance(info, Mapping)
+                and info.keys() == {"responseStreamDisconnected"}
+            ):
+                self._abandon_disconnected_messages(
+                    state, params, error, info["responseStreamDisconnected"]
+                )
             return AgentNative(native_type=method, payload=redact_native_payload(params))
         if method in ("configWarning", "warning", "guardianWarning"):
             message = params.get("summary", params.get("message"))
@@ -1529,6 +1579,45 @@ class CodexSdkAdapter:
             return AgentNative(native_type=method, payload=redact_native_payload(params))
         raise ProtocolDefect(f"Codex app-server emitted unknown notification {method}")
 
+    @staticmethod
+    def _abandon_disconnected_messages(
+        state: _CodexSessionState,
+        params: Mapping[str, object],
+        error: Mapping[str, object],
+        detail: object,
+    ) -> None:
+        if (
+            params.keys() != {"threadId", "turnId", "willRetry", "error"}
+            or params["threadId"] != state.ref.native_session_id
+            or params["turnId"] != state.turn_id
+            or not isinstance(params["turnId"], str)
+            or not isinstance(error.get("message"), str)
+            or error.keys() - {"message", "additionalDetails", "codexErrorInfo", "misalignment"}
+            or not isinstance(error.get("additionalDetails"), str | None)
+            or error.get("misalignment") is not None
+        ):
+            raise ProtocolDefect("Codex stream retry has an invalid scoped error notification")
+        if not isinstance(detail, Mapping) or detail.keys() - {"httpStatusCode"}:
+            raise ProtocolDefect("Codex stream disconnect has invalid detail")
+        status = detail.get("httpStatusCode")
+        if status is not None and (type(status) is not int or not 0 <= status <= 65535):
+            raise ProtocolDefect("Codex stream disconnect has invalid HTTP status")
+
+        # Stock abandons the interrupted response's display items without sending
+        # item/completed. A retried stream must supply its own completed answer.
+        if state.retained_message_id_bytes is None:
+            raise ProtocolDefect(
+                "Codex abandoned assistant message identities exceeded their bound"
+            )
+        for key in state.response_message_ids:
+            if state.started_item_types.get(key) not in (None, "agentMessage"):
+                raise ProtocolDefect("Codex stream retry shared a display id with an active item")
+        for key in state.response_message_ids:
+            state.started_item_types.pop(key, None)
+            state.retired_message_ids.add(key)
+        state.response_message_ids.clear()
+        state.completed_agent_messages.clear()
+
     def _item_started(
         self,
         state: _CodexSessionState,
@@ -1542,13 +1631,17 @@ class CodexSdkAdapter:
         if item_type == "custom_tool_call_output":
             raise ProtocolDefect("custom tool output started as an independent item")
         item_id = self._non_empty_string(item, "id", method)
-        if item_id in state.started_item_types or (
-            not state.controlled and item_id in state.completed_item_ids
+        if (
+            item_id in state.started_item_types
+            or item_id in state.completed_item_ids
+            or item_id in state.retired_message_ids
         ):
             raise ProtocolDefect("Codex item identity started more than once")
         if len(state.started_item_types) >= _MAX_MESSAGE_ITEMS:
             raise ProtocolDefect("Codex active item count exceeded its finite bound")
         state.started_item_types[item_id] = item_type
+        if item_type == "agentMessage":
+            state.observe_response_message(item_id)
         if item_type in _INERT_ITEM_TYPES:
             return None
         if item_type == "commandExecution":
@@ -1668,9 +1761,9 @@ class CodexSdkAdapter:
                 succeeded=True,
             )
         item_id = self._non_empty_string(item, "id", method)
+        if item_id in state.completed_item_ids or item_id in state.retired_message_ids:
+            raise ProtocolDefect("Codex closed item identity completed again")
         if not state.controlled:
-            if item_id in state.completed_item_ids:
-                raise ProtocolDefect("Codex item identity completed more than once")
             state.completed_item_ids.add(item_id)
         started_type = state.started_item_types.pop(item_id, None)
         if (
@@ -1700,7 +1793,6 @@ class CodexSdkAdapter:
                 if state.turn_id is None or state.handle is None:
                     raise ProtocolDefect("recorded input omitted its controlled native turn")
                 input_id = self._non_empty_string(item, "clientId", method)
-                state.handle.record_input(input_id)
                 return AgentInputRecorded(AgentTurnRef(state.ref, state.turn_id), input_id, item_id)
             return None
         if started_type is None:
@@ -2054,6 +2146,11 @@ class CodexSdkAdapter:
             raise ProtocolDefect("Codex native settings changed the selected model or cwd")
         if settings.get("effort") != request.native_reasoning:
             raise ProtocolDefect("Codex native settings changed the selected reasoning effort")
+        if (
+            request.startup_service_tier is not None
+            and settings.get("serviceTier") != request.startup_service_tier
+        ):
+            raise ProtocolDefect("Codex native settings changed the host startup service tier")
         approval = "never" if request.policy.approval == "deny" else "on-request"
         if settings.get("approvalPolicy") != approval or (
             request.policy.approval == "provider_review"
@@ -2350,6 +2447,7 @@ class CodexSdkAdapter:
             raise ProtocolDefect("Codex completed agent message carried an unknown phase")
         if phase in (None, "final_answer") and len(text.encode("utf-8")) > _MAX_FINAL_TEXT_BYTES:
             raise OutputLimitExceeded(_MAX_FINAL_TEXT_BYTES)
+        state.observe_response_message(item_id)
         if state.controlled:
             if phase == "commentary":
                 return
@@ -2485,12 +2583,15 @@ class _CodexAgentTurn:
         self._session = session
         self._state = state
         self._attempt = state.attempt
+        state.client.buffer_attempt_id = self._attempt.attempt_id
+        state.client.on_raw_queue_loss = self._raw_queue_loss
         self._submitted_request = submitted
         self._request = request
         self._controls = controls
         self._release = release
         self._validate_input = validate_input
         self._submission: AgentSubmission | None = None
+        self._refusal: AgentSubmissionRejected | None = None
         self._terminal: AgentTerminal | None = None
         self._error: BaseException | None = None
         self._started = False
@@ -2504,7 +2605,15 @@ class _CodexAgentTurn:
         self._calls: dict[str, _ActiveCall] = {}
         self._reply_tokens: dict[str, _PendingReply] = {}
         self._pending_call_bytes = 0
-        self._events: asyncio.Queue[tuple[AgentEvent, int]] = asyncio.Queue()
+        self._events: asyncio.Queue[tuple[AgentEvent, int, bool] | None] = asyncio.Queue()
+        self._space: asyncio.Event | None = None
+        self._last_drain = 0.0
+        self._reported_wait = False
+        self._stalled = False
+        self._read_timeout: asyncio.Timeout | None = None
+        self._fence_until: float | None = None
+        self._receipt_count = self._receipt_bytes = 0
+        self._omitted_count = self._omitted_bytes = 0
         self._queued_bytes = 0
         self._accepted: asyncio.Future[AgentSubmission] = asyncio.get_running_loop().create_future()
         self._finished = asyncio.Event()
@@ -2551,20 +2660,21 @@ class _CodexAgentTurn:
         self._writer_entered = True
         self._submission = AgentUncertain(self.attempt, None, "native writer entered")
 
-    def _start_error(self, error: CodexAppServerResponseError) -> None:
-        limits = _stock_size_rejection(error, "turn/start")
-        if limits is None or not self._writer_entered:
-            return
-        # Latch refusal on the transport reader before another frame can publish
-        # a callback. The sending task can resume after those frames are queued.
+    def _raw_queue_loss(self, error: CodexRawQueueLimit) -> None:
+        if not isinstance(self._error, ConflictingSubmissionEvidence):
+            self._error = error
         self.revoke()
+
+    def _start_error(self, error: CodexAppServerResponseError) -> None:
+        if not self._writer_entered:
+            return
+        self.revoke()
+        limits = _stock_size_rejection(error, "turn/start")
+        if limits is None:
+            return
+        self._refusal = AgentSubmissionRejected(self.attempt, "input_too_large", -32602, *limits)
         if self._state.turn_id is not None:
             self._error = ConflictingSubmissionEvidence()
-        else:
-            self._terminal = None
-            self._submission = AgentSubmissionRejected(
-                self.attempt, "input_too_large", -32602, *limits
-            )
 
     async def _send(self) -> None:
         params = self._submitted_request["params"]
@@ -2593,29 +2703,18 @@ class _CodexAgentTurn:
                     self._accepted.set_result(self._submission)
             raise
         except Exception as error:
-            if isinstance(self._submission, AgentSubmissionRejected) or isinstance(
-                self._error, ConflictingSubmissionEvidence
-            ):
-                await self._state.client.close()
-                return
-            if self._terminal is not None:
-                self._error = error
-                await self._state.client.close()
-                return
-            if not isinstance(self._submission, AgentAccepted):
-                reason = sanitize_provider_text(str(error)) or type(error).__name__
-                self._submission = (
-                    AgentUncertain(self.attempt, self._turn_ref(), reason)
-                    if self._writer_entered
-                    else AgentNotSubmitted(self.attempt, reason)
-                )
-                if not self._accepted.done():
-                    self._accepted.set_result(self._submission)
-                self._error = error
-                await self._state.client.close()
-            elif isinstance(error, ProtocolDefect | CodexConnectionUnavailable):
-                self._error = error
-                await self._state.client.close()
+            self.revoke()
+            if self._refusal is None:
+                if self._error is None:
+                    self._error = error
+                if not isinstance(self._submission, AgentAccepted):
+                    reason = sanitize_provider_text(str(error)) or type(error).__name__
+                    self._submission = (
+                        AgentUncertain(self.attempt, self._turn_ref(), reason)
+                        if self._writer_entered
+                        else AgentNotSubmitted(self.attempt, reason)
+                    )
+            await self._state.client.close()
 
     def _accept(self, native_turn_id: str) -> None:
         if self._state.turn_id is not None and self._state.turn_id != native_turn_id:
@@ -2631,8 +2730,15 @@ class _CodexAgentTurn:
 
     async def _read(self) -> None:
         try:
-            async with asyncio.timeout(self._request.timeout_seconds):
+            async with asyncio.timeout(self._request.timeout_seconds) as timeout:
+                self._read_timeout = timeout
+                if self._fence_until is not None:
+                    self._shorten_deadline(self._fence_until)
+                loop = asyncio.get_running_loop()
                 while True:
+                    deadline = timeout.when()
+                    if deadline is not None and loop.time() >= deadline:
+                        raise TimeoutError
                     message = await self._state.client.next_message()
                     params = message.params
                     thread_id = params.get("threadId")
@@ -2660,7 +2766,7 @@ class _CodexAgentTurn:
                                 "native turn evidence omitted exact thread/turn identity"
                             )
                         self._state.turn_id = native
-                        if isinstance(self._submission, AgentSubmissionRejected):
+                        if self._refusal is not None:
                             self._error = ConflictingSubmissionEvidence()
                             self.revoke()
                     values = self._adapter._notification_events(self._state, message)
@@ -2685,14 +2791,19 @@ class _CodexAgentTurn:
                             raise ProtocolDefect("native acceptance omitted turn identity")
                         self._accept(self._state.turn_id)
                     for value in values:
-                        self._publish(value)
+                        await self._publish(value)
         except TimeoutError:
             if not self._writer_entered:
                 self._error = TurnNotStarted("turn_timeout")
                 return
             submission = self._submission
-            if isinstance(submission, AgentSubmissionRejected):
+            if (
+                self._refusal is not None
+                or self._terminal is not None
+                or isinstance(self._error, CodexRawQueueLimit)
+            ):
                 return
+            reason = "consumer_stalled" if self._stalled else "turn_timeout"
             if not isinstance(submission, AgentAccepted | AgentUncertain):
                 submission = AgentUncertain(self.attempt, self._turn_ref(), "native turn deadline")
                 self._submission = submission
@@ -2701,29 +2812,29 @@ class _CodexAgentTurn:
                 failure=AgentFailure("turn_timeout"),
                 final_text=self._adapter._selected_final_text(self._state, required=False),
                 session_ref=self._state.ref,
-                evidence=LocalStopEvidence(submission, "turn_timeout"),
+                evidence=LocalStopEvidence(submission, reason),
                 usage=self._state.usage_accounting.finish_turn(),
                 diagnostics=tuple(self._state.diagnostics),
             )
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            if isinstance(self._submission, AgentSubmissionRejected) and isinstance(
-                error, CodexConnectionUnavailable
-            ):
-                # Closing a definitively refused start is ordinary end of stream.
+            if self._refusal is not None and isinstance(error, CodexConnectionUnavailable):
+                # Only a completely examined prefix can certify non-acceptance.
+                if self._state.turn_id is None and self._error is None:
+                    self._submission = self._refusal
                 return
-            if self._terminal is None:
-                if self._error is None:
-                    self._error = error
-                if not isinstance(self._submission, AgentAccepted | AgentSubmissionRejected):
-                    reason = sanitize_provider_text(str(self._error)) or type(self._error).__name__
-                    self._submission = (
-                        AgentUncertain(self.attempt, self._turn_ref(), reason)
-                        if self._writer_entered
-                        else None
-                    )
+            if self._error is None:
+                self._error = error
+            if not isinstance(self._submission, AgentAccepted | AgentSubmissionRejected):
+                reason = sanitize_provider_text(str(self._error)) or type(self._error).__name__
+                self._submission = (
+                    AgentUncertain(self.attempt, self._turn_ref(), reason)
+                    if self._writer_entered
+                    else None
+                )
         finally:
+            self._read_timeout = None
             if self._writer_entered and not self._accepted.done() and self._sender is not None:
                 await asyncio.gather(self._sender, return_exceptions=True)
             if not self._writer_entered:
@@ -2744,64 +2855,139 @@ class _CodexAgentTurn:
                 self._accepted.set_result(self._submission)
             self._finish()
 
-    def _publish(self, event: AgentEvent) -> None:
+    async def _publish(self, event: AgentEvent) -> None:
+        if isinstance(event, AgentInputRecorded) and not self.accepts_input(event.input_id):
+            raise ProtocolDefect("native user item has no prepared input delivery")
         try:
             size = bounded_payload_size(event, _MAX_MESSAGE_BYTES, max_items=_MAX_MESSAGE_ITEMS)
-        except OutputLimitExceeded:
-            raise ProtocolDefect("native event exceeded its per-message bound") from None
-        if self._queued_bytes + size > _MAX_MESSAGE_BYTES:
-            raise ProtocolDefect("native pending event buffer exceeded its finite bound")
-        self._queued_bytes += size
-        self._events.put_nowait((event, size))
+        except OutputLimitExceeded as error:
+            raise CodexOutputLimit(
+                _buffer_observation(
+                    "converted_event",
+                    "limit",
+                    error.unit,
+                    0,
+                    error.incoming,
+                    error.limit,
+                    attempt_id=self.attempt.attempt_id,
+                )
+            ) from None
+        if not self._revoked and self._queued_bytes + size > _MAX_MESSAGE_BYTES:
+            loop = asyncio.get_running_loop()
+            started = self._last_drain = loop.time()
+            held = self._queued_bytes
+            self._space = asyncio.Event()
+            self._state.client.buffer_decoder_waiting = True
+            try:
+                while not self._revoked and self._queued_bytes + size > _MAX_MESSAGE_BYTES:
+                    self._space.clear()
+                    deadline = self._last_drain + self._controls.rpc_seconds
+                    try:
+                        async with asyncio.timeout_at(deadline):
+                            await self._space.wait()
+                    except TimeoutError:
+                        if self._revoked:
+                            break
+                        if self._last_drain + self._controls.rpc_seconds <= loop.time():
+                            _buffer_observation(
+                                "converted_fifo",
+                                "stalled",
+                                "bytes",
+                                held,
+                                size,
+                                _MAX_MESSAGE_BYTES,
+                                attempt_id=self.attempt.attempt_id,
+                                wait_ms=(loop.time() - started) * 1000,
+                            )
+                            self._stalled = True
+                            self.revoke()
+                if not self._revoked and not self._reported_wait:
+                    _buffer_observation(
+                        "converted_fifo",
+                        "drained",
+                        "bytes",
+                        held,
+                        size,
+                        _MAX_MESSAGE_BYTES,
+                        attempt_id=self.attempt.attempt_id,
+                        wait_ms=(loop.time() - started) * 1000,
+                    )
+                    self._reported_wait = True
+            finally:
+                self._space = None
+                self._state.client.buffer_decoder_waiting = False
+        if self._revoked and isinstance(event, AgentToolCall):
+            return
+        reserved = self._queued_bytes + size > _MAX_MESSAGE_BYTES
+        if reserved:
+            if not isinstance(event, AgentInputRecorded):
+                self._omitted_count += 1
+                self._omitted_bytes += size
+                return
+            if self._receipt_count >= _MAX_MESSAGE_ITEMS:
+                held, incoming, limit, unit = self._receipt_count, 1, _MAX_MESSAGE_ITEMS, "records"
+            else:
+                held, incoming, limit, unit = self._receipt_bytes, size, _MAX_MESSAGE_BYTES, "bytes"
+            if held + incoming > limit:
+                raise ProtocolDefect(
+                    _buffer_observation(
+                        "fenced_input_receipts",
+                        "lineage_unresolved",
+                        unit,
+                        held,
+                        incoming,
+                        limit,
+                        attempt_id=self.attempt.attempt_id,
+                    )
+                )
+        if isinstance(event, AgentInputRecorded):
+            # Receipt admission and input retirement are one operation. A full
+            # reserve leaves the delivery unresolved, including its original id.
+            self._input_ids.remove(event.input_id)
+            self._pending_input_bytes -= len(event.input_id.encode("utf-8"))
+        if reserved:
+            self._receipt_count += 1
+            self._receipt_bytes += size
+        else:
+            self._queued_bytes += size
+        self._events.put_nowait((event, size, reserved))
 
-    async def check_submission(self) -> None:
-        # A seal can precede its correlated start reply. Preserve the seal even
-        # when the reply reveals a protocol conflict or its transport is lost.
+    async def check_submission(self, *, for_effect: bool = False) -> None:
         if self._terminal is not None and self._sender is not None:
             await asyncio.shield(asyncio.gather(self._sender, return_exceptions=True))
-        if isinstance(self._error, ConflictingSubmissionEvidence):
-            if self._reader is not None:
-                await asyncio.shield(asyncio.gather(self._reader, return_exceptions=True))
+        if self._refusal is not None and self._reader is not None:
+            await asyncio.shield(asyncio.gather(self._reader, return_exceptions=True))
+        if isinstance(
+            self._error, ConflictingSubmissionEvidence | CodexRawQueueLimit | CodexOutputLimit
+        ):
             raise self._error
+        if for_effect:
+            self._require_authority()
 
     async def events(self) -> AsyncGenerator[AgentEvent, None]:
         if self._consumer_open:
             raise InvalidAgentRequest("a controlled turn has one event consumer")
         self._consumer_open = True
-        while True:
-            if self._events.empty() and self._finished.is_set():
-                await self.check_submission()
-                if self._terminal is not None:
-                    yield self._terminal
-                elif self._error is not None:
-                    raise self._error
-                return
-            next_event = asyncio.create_task(self._events.get())
-            finished = asyncio.create_task(self._finished.wait())
-            try:
-                done, _ = await asyncio.wait(
-                    {next_event, finished}, return_when=asyncio.FIRST_COMPLETED
-                )
-                if next_event in done:
-                    if isinstance(self._error, ConflictingSubmissionEvidence):
-                        await self.check_submission()
-                    value, size = next_event.result()
-                    self._queued_bytes -= size
-                    yield value
-            finally:
-                for task in (next_event, finished):
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(next_event, finished, return_exceptions=True)
+        while (item := await self._events.get()) is not None:
+            value, size, reserved = item
+            if reserved:
+                self._receipt_count -= 1
+                self._receipt_bytes -= size
+            else:
+                self._queued_bytes -= size
+                if size and self._space is not None:
+                    self._last_drain = asyncio.get_running_loop().time()
+                    self._space.set()
+            if not self._revoked or not isinstance(value, AgentToolCall):
+                yield value
+        await self.check_submission()
+        if self._terminal is not None:
+            yield self._terminal
+        elif self._error is not None:
+            raise self._error
 
     def accepts_input(self, input_id: object) -> bool:
         return type(input_id) is str and input_id in self._input_ids
-
-    def record_input(self, input_id: str) -> None:
-        if not self.accepts_input(input_id):
-            raise ProtocolDefect("native user item has no prepared input delivery")
-        self._input_ids.remove(input_id)
-        self._pending_input_bytes -= len(input_id.encode("utf-8"))
 
     def tool_started(self, call_id: str, name: str, arguments: object) -> None:
         if name not in {tool.name for tool in self._state.request.tools}:
@@ -2899,6 +3085,7 @@ class _CodexAgentTurn:
         return await self._control("steer", input_id, params)
 
     async def interrupt(self) -> AgentControlReceipt:
+        self.revoke()
         return await self._control(
             "interrupt",
             None,
@@ -3015,15 +3202,41 @@ class _CodexAgentTurn:
         if self._revoked or self._closed or self._finished.is_set():
             raise SessionUnavailable("controlled turn authority has been revoked or ended")
 
+    def _shorten_deadline(self, deadline: float) -> None:
+        timer = self._read_timeout
+        if timer is not None and not timer.expired():
+            current = timer.when()
+            if current is None or deadline < current:
+                timer.reschedule(deadline)
+
     def revoke(self) -> None:
+        if self._revoked:
+            return
         self._revoked = True
+        self._fence_until = asyncio.get_running_loop().time() + self._controls.rpc_seconds
+        self._shorten_deadline(self._fence_until)
+        if self._space is not None:
+            self._space.set()
 
     def _finish(self) -> None:
-        self._finished.set()
+        if not self._finished.is_set():
+            self._finished.set()
+            self._events.put_nowait(None)
+            unresolved = len(self._input_ids) if self._state.controlled and self._revoked else 0
+            if self._omitted_count or unresolved:
+                logging.getLogger(__name__).info(
+                    "Codex fenced turn attempt=%r omitted_events=%d omitted_bytes=%d unresolved_inputs=%d",
+                    sanitize_provider_text(self.attempt.attempt_id, limit=96),
+                    self._omitted_count,
+                    self._omitted_bytes,
+                    unresolved,
+                )
 
     def _release_slot(self) -> None:
         if not self._released:
             self._released = True
+            self._state.client.buffer_attempt_id = None
+            self._state.client.on_raw_queue_loss = None
             self._release()
 
     async def close(self) -> AgentCloseResult:
@@ -3034,14 +3247,25 @@ class _CodexAgentTurn:
     async def _close(self) -> AgentCloseResult:
         self.revoke()
         diagnostics: list[str] = []
+        assert self._fence_until is not None
+        deadline = min(self._fence_until, asyncio.get_running_loop().time() + 2)
+        self._shorten_deadline(deadline)
         sender = self._sender
         if sender is not None and not sender.done():
-            sender.cancel()
-            await asyncio.gather(sender, return_exceptions=True)
+            if self._writer_entered:
+                # A correlated refusal can still qualify or contradict a raw seal.
+                try:
+                    async with asyncio.timeout_at(deadline):
+                        await asyncio.shield(sender)
+                except TimeoutError:
+                    pass
+            if not sender.done():
+                sender.cancel()
+                await asyncio.gather(sender, return_exceptions=True)
         reader = self._reader
         if reader is not None and not reader.done():
             try:
-                async with asyncio.timeout(min(2.0, self._controls.rpc_seconds)):
+                async with asyncio.timeout_at(deadline):
                     await asyncio.shield(reader)
             except TimeoutError:
                 reader.cancel()

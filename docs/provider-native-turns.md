@@ -63,9 +63,33 @@ compute or billing cessation is not part of this contract.
    storage or a callback handler waits. messages and recorded input drain in
    order before the terminal. pending callbacks and pending transport buffers
    are bounded; controlled turns have no cumulative event or transcript quota.
-   pending event payloads share a 4 mib byte bound, including field names for
-   empty values; stream chunk count does not impose a second quota.
-   completed item ids are not retained. exact live callback identity is checked;
+   the converted fifo holds 4 mib of measured payload, including field names for
+   empty values. its sole decoder can stage one validated frame's remaining
+   publishable output up to another 4 mib. the validated terminal and python
+   overhead are separate. each positive dequeue renews the current waiter's rpc
+   idle interval. a stalled consumer fences dispatch. without a recovered seal,
+   entered work returns a failed local `turn_timeout` with reason
+   `consumer_stalled`. a rejected raw frame still faults the turn.
+   after a fence the decoder validates the admitted stream under the earliest
+   turn, stop, close or nonrenewing rpc deadline. it withholds callback writes,
+   counts display output omitted under pressure, and delivers incorporation
+   receipts in order. only those receipts may exceed ordinary credit, under
+   the existing 100,000-record and 4 mib limits including native item ids.
+   startup refusal is definite only after the bounded original prefix was
+   examined. conflicting native evidence remains available without authorizing
+   settlement. buffer diagnostics contain bounded identifying and numeric data.
+   stream chunk count does not impose a second quota.
+   stock can disconnect an upstream response and retry within the same turn.
+   on its correlated `error` with `willRetry=true` and `responseStreamDisconnected`,
+   assistant ids observed before the retry become ineligible. normalized starts,
+   deltas, completions in any phase and explicit raw assistant message ids all
+   identify display items. anonymous raw messages supply no identity. the stock
+   stream carries no sampling-attempt id. a fresh normalized completion with an
+   id unseen before the retry can supply final text. a retry leaves native tools,
+   input receipts and other pending items intact. controlled turns allow 100,000
+   current and retired display ids and 4 mib of utf-8 identity bytes. a healthy turn
+   can exceed that history. a later retry then fails because earlier ids cannot
+   all be proved. the provider checks each live callback identity.
    durable host journals own completed callback/input/message identities and
    reject changed replay. written replies and completed callbacks retire pending
    request state; input ids retire only after their native recording. unresolved
@@ -116,7 +140,9 @@ prepared attempt to a native turn/result and an explicit seal revision.
 native terminal recovery authority. reader-latched `turn.terminal` survives
 failure after an already validated native seal. call `await turn.check_submission()`
 before independently settling that latch. it checks the bounded correlated start
-reply and raises on contradictory evidence. retain the conflicting seal as evidence.
+reply and raises on contradictory evidence, raw queue loss or exceeded output limits. retain the original
+seal as evidence. call `check_submission(for_effect=True)` at callback admission
+and immediately before executor entry to enforce the turn’s live writer authority.
 `events()` applies the same check before yielding a terminal.
 
 the host stores the original terminal before calling `decode_agent_output`
@@ -138,7 +164,10 @@ contained codex sessions require a dedicated stock `0.171.0` host. host
 operations call `materialize_codex_containment_catalog(private_directory)`
 and launch the stock process with `-c model_catalog_json="<returned-path>"`.
 `qualify_codex_containment_host(endpoint)` checks the public `config/read`
-declaration. session preparation repeats this check before creating a native
+declaration. callers that pass `required_service_tier` also require that exact
+effective tier from the host's `sessionFlags` layer in the same response.
+when the host pins a tier this way, the sdk verifies it against the initial thread
+settings and every native settings update. session preparation repeats the catalog check before creating a native
 thread: the canonical catalog basename and `sessionFlags` startup origin must
 match; the initialize user-agent build version must be exactly `0.171.0`.
 per-thread catalog overrides are documented upstream no-ops and are

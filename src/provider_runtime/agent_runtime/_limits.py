@@ -21,9 +21,11 @@ _MAX_DIAGNOSTICS = 256
 class OutputLimitExceeded(Exception):
     """A bounded agent stream exceeded its configured limit."""
 
-    def __init__(self, limit: int) -> None:
+    def __init__(self, limit: int, *, unit: str = "units", incoming: int | None = None) -> None:
         super().__init__(f"agent output exceeded its {limit}-unit limit")
         self.limit = limit
+        self.unit = unit
+        self.incoming = incoming
 
 
 def bounded_payload_size(
@@ -48,26 +50,30 @@ def bounded_payload_size(
     def visit(child: object, depth: int) -> None:
         nonlocal items, total
         if depth > max_depth:
-            raise OutputLimitExceeded(limit)
+            raise OutputLimitExceeded(max_depth, unit="depth", incoming=depth)
         items += 1
         if items > max_items:
-            raise OutputLimitExceeded(limit)
+            raise OutputLimitExceeded(max_items, unit="items", incoming=items)
         if child is None or type(child) in (bool, float):
             total += 8
         elif type(child) is int:
             if not -(2**63) <= child <= 2**63 - 1:
-                raise OutputLimitExceeded(limit)
+                raise OutputLimitExceeded(
+                    64,
+                    unit="signed_bits",
+                    incoming=(child if child >= 0 else ~child).bit_length() + 1,
+                )
             total += len(str(child))
         elif isinstance(child, Enum):
             visit(child.value, depth + 1)
         elif isinstance(child, str):
             if len(child) > limit:
-                raise OutputLimitExceeded(limit)
+                raise OutputLimitExceeded(limit, unit="bytes")
             total += len(child.encode("utf-8"))
         elif isinstance(child, Mapping):
             identity = id(child)
             if identity in active:
-                raise OutputLimitExceeded(limit)
+                raise OutputLimitExceeded(0, unit="cycles", incoming=1)
             active.add(identity)
             try:
                 for key, item in child.items():
@@ -80,7 +86,7 @@ def bounded_payload_size(
         elif isinstance(child, (tuple, list)):
             identity = id(child)
             if identity in active:
-                raise OutputLimitExceeded(limit)
+                raise OutputLimitExceeded(0, unit="cycles", incoming=1)
             active.add(identity)
             try:
                 for item in child:
@@ -90,7 +96,7 @@ def bounded_payload_size(
         elif is_dataclass(child) and not isinstance(child, type):
             identity = id(child)
             if identity in active:
-                raise OutputLimitExceeded(limit)
+                raise OutputLimitExceeded(0, unit="cycles", incoming=1)
             active.add(identity)
             try:
                 for item in fields(child):
@@ -103,7 +109,7 @@ def bounded_payload_size(
         else:
             total += len(type(child).__name__)
         if total > limit:
-            raise OutputLimitExceeded(limit)
+            raise OutputLimitExceeded(limit, unit="bytes")
 
     visit(value, 0)
     return total
