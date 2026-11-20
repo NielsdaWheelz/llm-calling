@@ -234,7 +234,8 @@ class CodexAppServerClient:
         self.config = config
         self.metadata: dict[str, object] = {}
         self.buffer_attempt_id: str | None = None
-        self.buffer_waiter: asyncio.Event | None = None
+        self.buffer_decoder_waiting = False
+        self.on_raw_queue_loss: Callable[[CodexRawQueueLimit], None] | None = None
         self._connection: ClientConnection | None = None
         self._thread_id: str | None = None
         self._reader_task: asyncio.Task[None] | None = None
@@ -759,10 +760,6 @@ class CodexAppServerClient:
                 self._fail(error)
                 raise error from None
 
-    @property
-    def raw_queue_failure(self) -> CodexRawQueueLimit | None:
-        return self._failure if isinstance(self._failure, CodexRawQueueLimit) else None
-
     def _enqueue(self, message: CodexServerMessage, *, size: int) -> None:
         count = self._messages.qsize()
         if count >= _MAX_EVENT_COUNT:
@@ -781,7 +778,7 @@ class CodexAppServerClient:
             incoming,
             limit,
             attempt_id=self.buffer_attempt_id,
-            decoder_waiting=self.buffer_waiter is not None
+            decoder_waiting=self.buffer_decoder_waiting
             if self.buffer_attempt_id is not None
             else None,
         )
@@ -793,8 +790,8 @@ class CodexAppServerClient:
         if self._failure is not None:
             return
         self._failure = error
-        if isinstance(error, CodexRawQueueLimit) and self.buffer_waiter is not None:
-            self.buffer_waiter.set()
+        if isinstance(error, CodexRawQueueLimit) and self.on_raw_queue_loss is not None:
+            self.on_raw_queue_loss(error)
         for _method, future, _on_error in self._pending.values():
             if not future.done():
                 future.set_exception(error)

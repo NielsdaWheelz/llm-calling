@@ -2498,6 +2498,7 @@ class _CodexAgentTurn:
         self._state = state
         self._attempt = state.attempt
         state.client.buffer_attempt_id = self._attempt.attempt_id
+        state.client.on_raw_queue_loss = self._raw_queue_loss
         self._submitted_request = submitted
         self._request = request
         self._controls = controls
@@ -2572,6 +2573,11 @@ class _CodexAgentTurn:
         self._require_authority()
         self._writer_entered = True
         self._submission = AgentUncertain(self.attempt, None, "native writer entered")
+
+    def _raw_queue_loss(self, error: CodexRawQueueLimit) -> None:
+        if not isinstance(self._error, ConflictingSubmissionEvidence):
+            self._error = error
+        self.revoke()
 
     def _start_error(self, error: CodexAppServerResponseError) -> None:
         if not self._writer_entered:
@@ -2784,13 +2790,9 @@ class _CodexAgentTurn:
             started = self._last_drain = loop.time()
             held = self._queued_bytes
             self._space = asyncio.Event()
-            self._state.client.buffer_waiter = self._space
+            self._state.client.buffer_decoder_waiting = True
             try:
                 while not self._revoked and self._queued_bytes + size > _MAX_MESSAGE_BYTES:
-                    if (raw_failure := self._state.client.raw_queue_failure) is not None:
-                        self._error = raw_failure
-                        self.revoke()
-                        break
                     self._space.clear()
                     deadline = self._last_drain + self._controls.rpc_seconds
                     try:
@@ -2826,7 +2828,7 @@ class _CodexAgentTurn:
                     self._reported_wait = True
             finally:
                 self._space = None
-                self._state.client.buffer_waiter = None
+                self._state.client.buffer_decoder_waiting = False
         if self._revoked and isinstance(event, AgentToolCall):
             return
         reserved = self._queued_bytes + size > _MAX_MESSAGE_BYTES
@@ -2865,13 +2867,15 @@ class _CodexAgentTurn:
             self._queued_bytes += size
         self._events.put_nowait((event, size, reserved))
 
-    async def check_submission(self) -> None:
+    async def check_submission(self, *, for_effect: bool = False) -> None:
         if self._terminal is not None and self._sender is not None:
             await asyncio.shield(asyncio.gather(self._sender, return_exceptions=True))
         if self._refusal is not None and self._reader is not None:
             await asyncio.shield(asyncio.gather(self._reader, return_exceptions=True))
         if isinstance(self._error, ConflictingSubmissionEvidence | CodexRawQueueLimit):
             raise self._error
+        if for_effect:
+            self._require_authority()
 
     async def events(self) -> AsyncGenerator[AgentEvent, None]:
         if self._consumer_open:
@@ -3147,6 +3151,7 @@ class _CodexAgentTurn:
         if not self._released:
             self._released = True
             self._state.client.buffer_attempt_id = None
+            self._state.client.on_raw_queue_loss = None
             self._release()
 
     async def close(self) -> AgentCloseResult:
