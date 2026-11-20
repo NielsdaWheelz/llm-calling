@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime
-from typing import Literal, overload
+from typing import Literal, Never, overload
 from uuid import UUID
 
 from ._limits import (
@@ -14,7 +14,14 @@ from ._limits import (
     OutputLimitExceeded,
     bounded_payload_size,
 )
-from .archive import ArchiveError, ArchiveEvent, ArchiveKind, ArchiveRead, ArchiveRole
+from .archive import (
+    ArchiveBoundaryUncertain,
+    ArchiveError,
+    ArchiveEvent,
+    ArchiveKind,
+    ArchiveRead,
+    ArchiveRole,
+)
 
 MAX_ARCHIVE_EVENTS = 100_000
 ARCHIVE_PAGE_EVENTS = 100
@@ -91,6 +98,7 @@ def event(
     occurred_at: datetime | None,
     original: object,
     legacy_previous: str | None = None,
+    projection_max_bytes: int = _MAX_MESSAGE_BYTES,
 ) -> ArchiveEvent:
     projection = {
         "native_id": native_id,
@@ -101,7 +109,7 @@ def event(
         "original": original,
         "occurred_at": occurred_at.isoformat() if occurred_at else None,
     }
-    bounded(projection)
+    bounded(projection, max_bytes=projection_max_bytes)
     digest = hashlib.sha256(canonical(projection).encode("utf-8")).hexdigest()
     if legacy_previous is not None:
         native_id = "legacy:" + hashlib.sha256((legacy_previous + digest).encode()).hexdigest()
@@ -117,7 +125,8 @@ def select(
     checkpoint: str | None,
     caught_up: bool,
     observed_at: datetime,
-) -> ArchiveRead:
+) -> ArchiveRead | None:
+    """Return a page, or request confirmation of a marker missing from an exhausted scan."""
     boundary = checkpoint if checkpoint is not None else after
     start = 0
     if boundary is not None:
@@ -125,15 +134,31 @@ def select(
             (i for i, value in enumerate(events) if value.native_event_id == boundary), None
         )
         if index is None:
-            raise ArchiveError(
-                "history_changed" if checkpoint is not None else "activation_boundary_lost"
-            )
+            if not caught_up:
+                raise ArchiveBoundaryUncertain()
+            return None
         start = index if checkpoint is not None else index + 1
     result = tuple(events[start : start + ARCHIVE_PAGE_EVENTS])
     more = start + len(result) < len(events)
     return ArchiveRead(
         result, result[-1].native_event_id if more else None, caught_up and not more, observed_at
     )
+
+
+def event_pairs(events: list[ArchiveEvent]) -> tuple[tuple[str, str], ...]:
+    return tuple((event.native_event_id, event.native_digest) for event in events)
+
+
+def confirm_missing(
+    first: tuple[tuple[str, str], ...],
+    events: list[ArchiveEvent],
+    *,
+    caught_up: bool,
+    checkpoint: str | None,
+) -> Never:
+    if not caught_up or first != event_pairs(events):
+        raise ArchiveBoundaryUncertain()
+    raise ArchiveError("history_changed" if checkpoint is not None else "activation_boundary_lost")
 
 
 def memory_attributes(tool: str, arguments: object, result: object) -> dict[str, object]:

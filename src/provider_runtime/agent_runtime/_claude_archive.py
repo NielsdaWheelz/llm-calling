@@ -13,7 +13,9 @@ from ._archive_codec import (
     MAX_ARCHIVE_EVENTS,
     bounded,
     canonical,
+    confirm_missing,
     event,
+    event_pairs,
     memory_attributes,
     object_value,
     select,
@@ -21,8 +23,10 @@ from ._archive_codec import (
     text,
     timestamp,
 )
+from ._limits import _MAX_MESSAGE_BYTES
 from .archive import (
     MEMORY_TOOL_NAMES,
+    ArchiveBoundaryUncertain,
     ArchiveConversation,
     ArchiveError,
     ArchiveErrorCode,
@@ -34,7 +38,8 @@ from .archive import (
     ArchiveRead,
 )
 
-MAX_ARCHIVE_RECORD_BYTES = 8 * 1024 * 1024
+MAX_ARCHIVE_RECORD_BYTES = 16 * 1024 * 1024
+MAX_TOOL_RESULT_PROJECTION_BYTES = 8 * 1024 * 1024
 
 # These records describe native UI/provider bookkeeping. They are not conversation
 # evidence or replacement history. Unknown persisted records with UUIDs become gaps.
@@ -149,6 +154,14 @@ def marked(home: ArchiveHome, identifier: str, transcript: Transcript) -> bool:
     return (home.state_root / ".provider-runtime" / "archive-internal" / root_id).is_file()
 
 
+def file_version(path: Path) -> tuple[int, int]:
+    try:
+        metadata = path.stat()
+    except OSError:
+        raise ArchiveError("unavailable") from None
+    return metadata.st_size, metadata.st_mtime_ns
+
+
 def inventory(home: ArchiveHome, *, with_heads: bool) -> ArchiveInventory:
     before = files(home)
     items: list[ArchiveConversation] = []
@@ -209,15 +222,11 @@ def stable_head(
 ) -> tuple[str | None, str | None, datetime | None]:
     if marked(home, native_id, transcript):
         raise ArchiveError("unsupported")
-    try:
-        before = transcript.path.stat()
-        events, caught_up, cwd, created = history(home, native_id, transcript)
-        after = transcript.path.stat()
-    except OSError:
-        raise ArchiveError("unavailable") from None
+    before = file_version(transcript.path)
+    events, caught_up, cwd, created = history(home, native_id, transcript)
     if (
         not caught_up
-        or (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns)
+        or file_version(transcript.path) != before
         or marked(home, native_id, transcript)
     ):
         raise ArchiveError("unavailable")
@@ -241,10 +250,31 @@ def read(
         raise ArchiveMissing()
     if marked(home, native_id, transcript):
         raise ArchiveError("unsupported")
+    before = file_version(transcript.path)
     events, caught_up, _, _ = history(home, native_id, transcript)
-    return select(
+    page = select(
         events, after=after, checkpoint=checkpoint, caught_up=caught_up, observed_at=observed_at
     )
+    if page is not None:
+        return page
+    first = event_pairs(events)
+    del events
+
+    def require_same_transcript() -> None:
+        current = files(home).get(native_id)
+        if current is None:
+            raise ArchiveMissing()
+        if (
+            current != transcript
+            or marked(home, native_id, current)
+            or file_version(current.path) != before
+        ):
+            raise ArchiveBoundaryUncertain()
+
+    require_same_transcript()
+    events, caught_up, _, _ = history(home, native_id, transcript)
+    require_same_transcript()
+    confirm_missing(first, events, caught_up=caught_up, checkpoint=checkpoint)
 
 
 def history(
@@ -404,6 +434,11 @@ def row_events(
                 attributes=attributes,
                 occurred_at=occurred_at,
                 original=original,
+                projection_max_bytes=(
+                    MAX_TOOL_RESULT_PROJECTION_BYTES
+                    if event_kind == "tool_result"
+                    else _MAX_MESSAGE_BYTES
+                ),
             )
         )
 

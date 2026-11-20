@@ -73,9 +73,16 @@ link is invented from it or inferred from the caller's workflow scope.
 reads emit at most 100 complete normalized events. `next` is the final returned
 event identity when another batch remains; reread that identity inclusively with
 `from_event_id`. the checkpoint takes precedence over the exclusive activation
-head. lost boundaries are explicit errors, never a new baseline. `caught_up`
-requires exhaustion of the stable complete prefix observed when reading began.
-native times do not decide eligibility.
+head. a marker found in a completed prefix admits progress before an unfinished
+suffix. an absent marker in an unfinished traversal is retryable. after an
+exhausted miss, confirm once before parking. both traversals must be exhausted
+and agree on all ordered native id/digest pairs. codex requires unchanged
+conversation metadata and a non-active thread across both traversals. claude
+requires the same eligible transcript with stable length and nanosecond mtime
+and a complete final line. a confirmed miss returns `activation_boundary_lost`
+for an activation cut or `history_changed` for a checkpoint. uncertainty never
+moves the marker. `caught_up` describes delivery of the entire observed prefix
+after the marker. a page limit can make it false after an exhausted traversal.
 
 `archive_head` reads one conversation's stable head with the same rules as head
 inventory. its null head proves empty; unreadable, internal, active or moving
@@ -116,10 +123,12 @@ new backlogs remain. legacy paging costs extra native reads and server-side
 history reconstruction. broader throughput work remains separate.
 
 codex websocket ingress and pre-suppression event projections retain their
-4 mib bounds. claude raw JSONL records permit 8 mib, including excluded native
-bookkeeping, with the same 100,000-item and depth-32 structural limits. this
-allows a larger raw/decoded allocation without enlarging a retained event or any
-active cognition limit. these bounds are distinct from the library's 8 mib
+4 mib bounds. claude permits 16 mib per physical jsonl record including the
+newline, and 16 mib of structural walk for a decoded record, including native
+bookkeeping. both claude layouts and bookkeeping use the same raw bound. only
+the pre-suppression identity projection of an ordinary claude tool result uses
+the 8 mib structural budget. user attachments and memory-tool references retain
+4 mib. existing 100,000-item and depth-32 bounds apply. these bounds are distinct from the library's 8 mib
 encoded normalized-event ceiling. oversize is `event_too_large`, before any
 returned prefix or checkpoint change; no record is silently truncated or skipped.
 the bounds can still reject a native body whose reference-only projection would
@@ -193,6 +202,9 @@ client contract, not protection against hostile filesystem mutation.
 `ArchiveError` carries only a closed, content-free code. `ArchiveMissing` is the
 `unavailable` subtype reserved for direct proof of absence; generic network or
 native-method failures do not authorize an absence claim.
+`ArchiveBoundaryUncertain` is the `unavailable` subtype for an inconclusive
+missing-marker observation. callers can log it privately and retry at the same
+position.
 
 temporary qualification on 2026-10-09:
 
