@@ -252,7 +252,7 @@ async def test_fake_engine_stream_rejects_a_generate_step() -> None:
 
 async def test_fake_engine_drives_provider_runtime_generate() -> None:
     """FakeEngine is what test_runtime.py-style consumers inject at the seam."""
-    row = registry._resolve("openai:gpt-6.1-sol")
+    row = registry._resolve("openai:gpt-6.2-sol")
     outcome = succeeded()
     engine = FakeEngine([outcome])
     runtime = ProviderRuntime(
@@ -310,13 +310,13 @@ async def test_scripted_chat_returns_outcome_and_captures_args_verbatim() -> Non
     runtime = ScriptedRuntime(chat_outcomes=[outcome])
 
     assert (
-        await runtime.chat("openai:gpt-6.1-sol", user="hi", reasoning="standard/medium") is outcome
+        await runtime.chat("openai:gpt-6.2-sol", user="hi", reasoning="standard/medium") is outcome
     )
     assert runtime.calls == [
         CapturedRuntimeCall(
             operation="chat",
             call=ChatCall(
-                ref="openai:gpt-6.1-sol",
+                ref="openai:gpt-6.2-sol",
                 system="",
                 user="hi",
                 reasoning="standard/medium",

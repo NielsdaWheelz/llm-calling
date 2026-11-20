@@ -31,11 +31,11 @@ from provider_runtime.types import (
     freeze_json_object,
 )
 
-REGISTRY_REVISION: Final = "2026-10-28.2"
+REGISTRY_REVISION: Final = "2026-11-20.1"
 _BACKEND_CONTRACT_REVISION: Final = "provider-runtime.api-model-catalog.v5"
 _KEY = re.compile(r"[a-z0-9]+(?:[_/][a-z0-9]+)*\Z")
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
-GPT6_MODEL_IDS: Final = ("gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna")
+GPT6_MODEL_IDS: Final = ("gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-terra", "gpt-6-luna")
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,27 +73,27 @@ class _ModelRow:
 
 
 def _source(url: str) -> SourceCitation:
-    return SourceCitation(url=url, verified_on=date(2026, 10, 28))
+    return SourceCitation(url=url, verified_on=date(2026, 11, 20))
 
 
 _OPENAI_SOURCE = _source("https://developers.openai.com/api/docs/guides/reasoning")
 _CLAUDE_SOURCE = _source("https://platform.claude.com/docs/en/build-with-claude/effort")
-_GEMINI_SOURCE = _source("https://ai.google.dev/gemini-api/docs/thinking")
+_GEMINI_SOURCE = _source("https://aistudio.google.com/docs/thinking")
 _DEEPSEEK_SOURCE = _source("https://api-docs.deepseek.com/guides/thinking_mode/")
 _VISION: Final[frozenset[Literal["text", "image"]]] = frozenset({"text", "image"})
 _MODEL_LABELS: Final[Mapping[str, str]] = {
-    "gpt-6-astra": "GPT-6 Astra",
-    "gpt-6.1-sol": "GPT-6.1 Sol",
+    "gpt-6.2-astra": "GPT-6.2 Astra",
+    "gpt-6.2-sol": "GPT-6.2 Sol",
     "gpt-6.1-terra": "GPT-6.1 Terra",
     "gpt-6-luna": "GPT-6 Luna",
-    "claude-fable-5-1": "Claude Fable 5.1",
+    "claude-fable-5-2": "Claude Fable 5.2",
     "claude-opus-5-5": "Claude Opus 5.5",
     "claude-sonnet-5-5": "Claude Sonnet 5.5",
     "claude-haiku-5-5": "Claude Haiku 5.5",
-    "gemini-4-argon": "Gemini 4 Argon",
-    "gemini-3.8-flash": "Gemini 3.8 Flash",
+    "gemini-4-carbon": "Gemini 4 Carbon",
+    "gemini-4-neon": "Gemini 4 Neon",
+    "gemini-4-hydrogen": "Gemini 4 Hydrogen",
     "gemini-3.5-flash-lite": "Gemini 3.5 Flash-Lite",
-    "gemini-3.1-pro-preview": "Gemini 3.1 Pro · preview",
     "deepseek-flash": "DeepSeek V4.1 Flash",
     "deepseek-v4-pro": "DeepSeek V4 Pro",
 }
@@ -117,7 +117,8 @@ def _reasoning(
 
 
 def _openai_row(model: str) -> _ModelRow:
-    efforts = _EFFORTS if model in ("gpt-6-astra", "gpt-6.1-sol") else ("none", *_EFFORTS)
+    supports_none = model in ("gpt-6.1-terra", "gpt-6-luna")
+    efforts = ("none", *_EFFORTS) if supports_none else _EFFORTS
     reasoning = dict(
         _reasoning(mode, effort, order, {"reasoning": {"mode": mode, "effort": effort}})
         for mode in ("standard", "pro")
@@ -138,7 +139,9 @@ def _openai_row(model: str) -> _ModelRow:
         structured="native",
         reasoning=Present(reasoning),
         source_default_reasoning=(
-            Absent() if model == "gpt-6-astra" else _default("standard/medium", _OPENAI_SOURCE)
+            _default("standard/medium", _OPENAI_SOURCE)
+            if model in ("gpt-6.1-terra", "gpt-6-luna")
+            else Absent()
         ),
         upgrade=Absent(),
         retirement=Absent(),
@@ -185,18 +188,13 @@ def _claude_row(model: str) -> _ModelRow:
     )
 
 
-def _gemini_row(model: str) -> _ModelRow:
-    efforts = (
-        ("minimal", "low", "medium", "high")
-        if model == "gemini-3.5-flash-lite"
-        else ("low", "medium", "high")
-    )
-    default = {
-        "gemini-4-argon": "medium",
-        "gemini-3.8-flash": "medium",
-        "gemini-3.5-flash-lite": "minimal",
-        "gemini-3.1-pro-preview": "high",
-    }[model]
+def _gemini_row(
+    model: str,
+    efforts: tuple[str, ...],
+    default: str,
+    *,
+    output_limit: int,
+) -> _ModelRow:
     return _ModelRow(
         ref=f"gemini:{model}",
         provider="gemini",
@@ -204,10 +202,10 @@ def _gemini_row(model: str) -> _ModelRow:
         engine="gemini_generate",
         base_url=Absent(),
         context_window=1_048_576,
-        # Argon shares its window across input, thinking and output. Keep one
-        # bounded request below both its streaming and non-streaming hop caps.
-        max_output_tokens=32_768 if model == "gemini-4-argon" else 65_536,
-        source_max_output_tokens=Present(1_048_576 if model == "gemini-4-argon" else 65_536),
+        # models.get gives the portable single-request limit across GenerateContent paths.
+        # Long decode takes multiple requests.
+        max_output_tokens=output_limit,
+        source_max_output_tokens=Present(output_limit),
         modalities=_VISION,
         tools=True,
         streaming=True,
@@ -267,20 +265,32 @@ _ROWS: Final[tuple[_ModelRow, ...]] = (
     *(
         _claude_row(model)
         for model in (
-            "claude-fable-5-1",
+            "claude-fable-5-2",
             "claude-opus-5-5",
             "claude-sonnet-5-5",
             "claude-haiku-5-5",
         )
     ),
+    _gemini_row(
+        "gemini-4-carbon",
+        ("low", "medium", "high"),
+        "medium",
+        output_limit=32_768,
+    ),
     *(
-        _gemini_row(model)
-        for model in (
-            "gemini-4-argon",
-            "gemini-3.8-flash",
-            "gemini-3.5-flash-lite",
-            "gemini-3.1-pro-preview",
+        _gemini_row(
+            model,
+            ("low", "medium", "high", "xhigh"),
+            "high",
+            output_limit=65_536,
         )
+        for model in ("gemini-4-neon", "gemini-4-hydrogen")
+    ),
+    _gemini_row(
+        "gemini-3.5-flash-lite",
+        ("minimal", "low", "medium", "high"),
+        "minimal",
+        output_limit=65_536,
     ),
     *(_deepseek_row(model) for model in ("deepseek-flash", "deepseek-v4-pro")),
 )

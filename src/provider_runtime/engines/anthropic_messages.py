@@ -29,10 +29,10 @@ Wire obligations (spec §5/§6, anthropic_messages row):
   ``TokenUsage.input_tokens`` is cache-INCLUSIVE, so ingress adds
   cache_read_input_tokens + cache_creation_input_tokens back in
   (cache_write = cache_creation_input_tokens).
-- Refusals: pre-output refusal (reported usage with zero output tokens) is
-  provider-confirmed unbilled → ConfirmedNonBillable; non-streamed refusal →
-  Refused; streamed HTTP-200 stop_reason refusal → Incomplete(status="refused")
-  with the partial output invalidated (no ContinuationDelta).
+- Refusals: confirmed nonbillable only at zero output tokens in a known
+  unbilled category. Non-streamed refusal → Refused; streamed HTTP-200
+  stop_reason refusal → Incomplete(status="refused") with the partial output
+  invalidated (no ContinuationDelta).
 - One attempt: retryable trouble raises TransientAttempt (429 → rate limit with
   retry-after, 5xx/529/overloaded → unavailable, timeout/transport →
   timeout/unavailable, in-band overloaded/api_error stream events and mid-stream
@@ -461,15 +461,17 @@ def _meta(
     )
 
 
-def _refusal_billability(usage: Presence[TokenUsage]) -> Billability:
-    """Anthropic contract: a pre-output refusal is unbilled. The observable
-    signal is reported usage with zero output tokens; anything else (billed
-    partial output, or no reported usage) stays PossiblyBillable."""
-    match usage:
-        case Present(value=value) if value.output_tokens == 0:
-            return ConfirmedNonBillable()
-        case _:
-            return PossiblyBillable()
+def _refusal_billability(usage: Presence[TokenUsage], details: object) -> Billability:
+    # https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback#how-refusals-are-billed
+    if (
+        isinstance(usage, Present)
+        and usage.value.output_tokens == 0
+        and isinstance(details, RefusalStopDetails)
+        and "category" in details.model_fields_set
+        and details.category in (None, "cyber", "general_harms")
+    ):
+        return ConfirmedNonBillable()
+    return PossiblyBillable()
 
 
 def _refusal_detail(details: object) -> str:
@@ -698,7 +700,7 @@ def _decode_response(
                 model=model,
                 request_id=request_id,
                 usage=usage,
-                billability=_refusal_billability(usage),
+                billability=_refusal_billability(usage, message.stop_details),
                 native_reasoning=native_reasoning,
                 started_ms=started_ms,
                 status_code=Present(200),
@@ -935,7 +937,7 @@ def _terminal_events(
                         model=state.model,
                         request_id=request_id,
                         usage=usage,
-                        billability=_refusal_billability(usage),
+                        billability=_refusal_billability(usage, state.stop_details),
                         native_reasoning=native_reasoning,
                         started_ms=started_ms,
                         status_code=Present(status_code),

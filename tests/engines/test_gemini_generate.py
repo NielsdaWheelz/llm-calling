@@ -9,11 +9,9 @@ shapes: thinking_config carrying thinking_level on Gemini 3+, thinking_budget
 on 2.5-era — the row decides), provider_options passthrough vs collision, and
 the full fault-injection table.
 
-Wire facts verified against the installed SDK (google-genai 1.75): the mldev
-converter emits camelCase envelope keys but serializes ThinkingConfig and
-FunctionDeclaration values with snake_case field names (proto3 JSON parsing
-accepts both); bytes fields ride as base64 strings and round-trip through
-part dict payloads unchanged.
+The SDK emits camelCase envelope keys but serializes some nested values with
+snake_case field names (proto3 JSON parsing accepts both). Bytes fields ride
+as base64 strings and round-trip through part dict payloads unchanged.
 """
 
 import json
@@ -118,6 +116,15 @@ LEVEL_ROW = ModelRow(
     retirement=Absent(),
     continuation_codec="gemini.v2",
     correlation="none",
+)
+
+HYDROGEN_ROW = replace(
+    LEVEL_ROW,
+    ref="gemini:gemini-4-hydrogen",
+    model_id="gemini-4-hydrogen",
+    reasoning=Present(
+        dict((_reasoning(None, "xhigh", 0, {"thinking_config": {"thinking_level": "xhigh"}}),))
+    ),
 )
 
 BUDGET_ROW = ModelRow(
@@ -598,7 +605,7 @@ async def test_image_blocks_encode_as_inline_data_parts(engine: GeminiGenerateEn
     parts = contents[0]["parts"]
     assert parts[0] == {"text": "look:"}, f"contents: {contents}"
     inline = parts[1]["inlineData"]
-    assert inline["mimeType"] == "image/png", f"contents: {contents}"
+    assert inline["mime_type"] == "image/png", f"contents: {contents}"
     # The SDK base64-encodes bytes (urlsafe alphabet); these bytes decode back.
     assert inline["data"] in (
         b64encode(png).decode("ascii"),
@@ -624,6 +631,33 @@ async def test_structured_native_sends_mime_and_json_schema(engine: GeminiGenera
     assert outcome.response.content == StructuredContent(
         payload={"answer": "42"}, text='{"answer": "42"}'
     ), f"StrictJsonOutput must decode to StructuredContent, got {outcome.response.content}"
+
+
+@respx.mock
+async def test_hydrogen_xhigh_with_functions_and_structured_output(
+    engine: GeminiGenerateEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOOGLE_GENAI_API_VERSION", "v1")
+    route = mock_generate(HYDROGEN_ROW, response_body(parts=[{"text": '{"answer": "42"}'}]))
+    outcome = await engine.generate(
+        HYDROGEN_ROW,
+        intent_for(
+            HYDROGEN_ROW,
+            reasoning="xhigh",
+            tools=(SEARCH_TOOL,),
+            output=StrictJsonOutput("answer", ANSWER_SCHEMA),
+        ),
+        CREDENTIAL,
+    )
+
+    body = last_request_json(route)
+    config = body["generationConfig"]
+    assert isinstance(config, dict)
+    assert config["thinkingConfig"] == {"thinking_level": "XHIGH"}
+    assert config["responseMimeType"] == "application/json"
+    assert config["responseJsonSchema"] == ANSWER_SCHEMA
+    assert body["toolConfig"] == {"functionCallingConfig": {"mode": "VALIDATED"}}
+    assert isinstance(outcome, Succeeded)
 
 
 @respx.mock
@@ -1278,6 +1312,35 @@ async def test_stream_non_stop_finish_yields_incomplete_terminal(
     assert (usage.input_tokens, usage.output_tokens, usage.total_tokens) == (5, 9, 14), (
         f"usage: {usage}"
     )
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@respx.mock
+async def test_long_decode_continuation_stops_after_one_request(
+    engine: GeminiGenerateEngine, streaming: bool
+) -> None:
+    initial = response_body(parts=[{"text": "partial"}], finish_reason="CONTINUATION")
+    candidates = initial["candidates"]
+    assert isinstance(candidates, list)
+    candidates[0]["continuationToken"] = "dG9rZW4="
+    final = response_body()
+    intent = replace(intent_for(HYDROGEN_ROW, reasoning="xhigh"), max_output_tokens=70_000)
+    if streaming:
+        route = respx.post(stream_url(HYDROGEN_ROW)).mock(
+            side_effect=[httpx.Response(200, content=sse_bytes(body)) for body in (initial, final)]
+        )
+        terminal = (await collect(engine.stream(HYDROGEN_ROW, intent, CREDENTIAL)))[-1]
+        assert isinstance(terminal, TerminalEvent)
+        outcome = terminal.outcome
+    else:
+        route = respx.post(generate_url(HYDROGEN_ROW)).mock(
+            side_effect=[httpx.Response(200, json=body) for body in (initial, final)]
+        )
+        outcome = await engine.generate(HYDROGEN_ROW, intent, CREDENTIAL)
+
+    assert route.call_count == 1
+    assert isinstance(outcome, Incomplete)
+    assert outcome.reason == "max_output_tokens"
 
 
 @respx.mock

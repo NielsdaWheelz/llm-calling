@@ -44,17 +44,15 @@ Engine decisions (wire-observable):
 - Usage: promptTokenCount is already cache-INCLUSIVE on this wire (per the
   SDK's own field contract), so no ingress normalization; thoughtsTokenCount
   → reasoning, cachedContentTokenCount → cache_read, no cache writes billed.
-- AFC (the SDK's automatic-function-calling agent loop) is disabled on every
-  call — never on the wire, it would break the one-attempt contract.
-- The SDK's own retry machinery defaults to a single attempt (retry_options
-  None → stop_after_attempt(1)); the engine leaves it unset — the runtime is
-  the one retry owner.
+- The SDK's automatic function calling and long decode loops are disabled.
+  A `CONTINUATION` finish reports the single-request output limit.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Final, assert_never
 
@@ -157,6 +155,8 @@ _OWNED_KEYS: Final[frozenset[str]] = frozenset(
         "httpOptions",
         "automatic_function_calling",
         "automaticFunctionCalling",
+        "automatic_continuation",
+        "automaticContinuation",
     }
 )
 
@@ -173,6 +173,8 @@ _ENGINE_SET_CONFIG_KEYS: Final[frozenset[str]] = frozenset(
         "maxOutputTokens",
         "automatic_function_calling",
         "automaticFunctionCalling",
+        "automatic_continuation",
+        "automaticContinuation",
         "system_instruction",
         "systemInstruction",
         "tools",
@@ -222,9 +224,10 @@ def _encode(row: ModelRow, intent: GenerateIntent) -> _Encoded:
     system_parts, contents = _encode_contents(row, intent)
     config: dict[str, object] = {
         "max_output_tokens": intent.max_output_tokens,
-        # SDK-side agent loop, never on the wire; disabled so the one-attempt
-        # contract holds.
+        # A runtime attempt sends one request even when the model asks to
+        # continue a tool call or long generation.
         "automatic_function_calling": {"disable": True},
+        "automatic_continuation": False,
     }
     config.update(reasoning.fragment)
     if system_parts:
@@ -245,7 +248,7 @@ def _encode(row: ModelRow, intent: GenerateIntent) -> _Encoded:
         ]
         match intent.tool_choice:
             case "auto":
-                mode = "AUTO"
+                mode = "VALIDATED" if isinstance(intent.output, StrictJsonOutput) else "AUTO"
             case "none":
                 mode = "NONE"
             case _:
@@ -572,7 +575,7 @@ def _blocked_incomplete(meta: CallMeta, detail: str) -> Incomplete:
 
 
 def _non_stop_outcome(finish: str, meta: CallMeta) -> Incomplete | Failed:
-    if finish == "MAX_TOKENS":
+    if finish in ("MAX_TOKENS", "CONTINUATION"):
         return Incomplete(
             meta=meta,
             reason="max_output_tokens",
@@ -718,7 +721,10 @@ class GeminiGenerateEngine:
         self._timeout_s = timeout_s
         self._http_client = http_client
 
-    def _client(self, row: ModelRow, credential: ProviderCredential) -> genai.Client:
+    @asynccontextmanager
+    async def _client(
+        self, row: ModelRow, credential: ProviderCredential
+    ) -> AsyncIterator[genai.Client]:
         match row.base_url:
             case Present(value=base_url):
                 pass
@@ -726,23 +732,32 @@ class GeminiGenerateEngine:
                 base_url = _CANONICAL_BASE_URL  # pinned, never SDK/env-resolved
             case _:
                 assert_never(row.base_url)
-        return genai.Client(
-            vertexai=False,  # explicit: never let SDK env sniffing flip the backend
-            api_key=credential.key,
-            http_options=genai_types.HttpOptions(
-                base_url=base_url,
-                timeout=int(self._timeout_s * 1000),  # HttpOptions.timeout is milliseconds
-                httpx_async_client=self._http_client,
-            ),
+        # Use the same transport and exception classes with or without an
+        # injected client. The SDK's default transport is httpx2.
+        transport = (
+            httpx.AsyncClient() if self._http_client is None else nullcontext(self._http_client)
         )
+        async with transport as http_client:
+            with genai.Client(
+                vertexai=False,
+                api_key=credential.key,
+                http_options=genai_types.HttpOptions(
+                    api_version="v1beta",
+                    base_url=base_url,
+                    timeout=int(self._timeout_s * 1000),  # HttpOptions.timeout is milliseconds
+                    retry_options=genai_types.HttpRetryOptions(attempts=1),
+                    httpx_async_client=http_client,
+                ),
+            ) as client:
+                async with client.aio:
+                    yield client
 
     async def generate(
         self, row: ModelRow, intent: GenerateIntent, credential: ProviderCredential
     ) -> CallOutcome:
         encoded = _encode(row, intent)
-        client = self._client(row, credential)
-        started_ms = monotonic_ms()
-        try:
+        async with self._client(row, credential) as client:
+            started_ms = monotonic_ms()
             try:
                 response = await client.aio.models.generate_content(
                     model=row.model_id, contents=list(encoded.contents), config=encoded.config
@@ -771,38 +786,14 @@ class GeminiGenerateEngine:
                     f"GenerateContentResponse ({_validation_summary(exc)})",
                 ) from None
             return _decode_response(row, intent, response, encoded.native_reasoning, started_ms)
-        finally:
-            # The SDK skips closing an injected httpx client.
-            await client.aio.aclose()
 
     async def stream(
         self, row: ModelRow, intent: GenerateIntent, credential: ProviderCredential
     ) -> AsyncIterator[CodecStreamEvent]:
         encoded = _encode(row, intent)
-        client = self._client(row, credential)
-        started_ms = monotonic_ms()
-        try:
-            try:
-                chunks = await client.aio.models.generate_content_stream(
-                    model=row.model_id, contents=list(encoded.contents), config=encoded.config
-                )
-            except genai_errors.APIError as exc:
-                overflow = _classify_api_error(exc)
-                yield TerminalEvent(
-                    outcome=Failed(
-                        meta=_error_meta(row, exc, encoded.native_reasoning, started_ms),
-                        failure=overflow,
-                    )
-                )
-                return
-            except httpx.TimeoutException as exc:
-                raise _timeout_attempt(exc) from exc
-            except httpx.TransportError as exc:
-                raise _transport_attempt(exc) from exc
-
-            # Provider accepted the request (headers + 2xx) — the envelope opens.
-            yield StreamStart()
-
+        async with self._client(row, credential) as client:
+            started_ms = monotonic_ms()
+            accepted = False
             semantic = False
             model = row.model_id
             fold = _UsageFold()
@@ -832,7 +823,14 @@ class GeminiGenerateEngine:
                 )
 
             try:
+                # The SDK opens the HTTP request when iteration starts.
+                chunks = await client.aio.models.generate_content_stream(
+                    model=row.model_id, contents=list(encoded.contents), config=encoded.config
+                )
                 async for chunk in chunks:
+                    if not accepted:
+                        accepted = True
+                        yield StreamStart()
                     if chunk.model_version:
                         model = chunk.model_version
                     if chunk.usage_metadata is not None:
@@ -892,12 +890,24 @@ class GeminiGenerateEngine:
                         yield TerminalEvent(outcome=_non_stop_outcome(finish, stream_meta()))
                     return
             except genai_errors.APIError as exc:
-                # In-band error frame (HTTP stayed 200), surfaced by the SDK
-                # mid-iteration.
+                if isinstance(exc.response, httpx.Response):
+                    overflow = _classify_api_error(exc)
+                    yield TerminalEvent(
+                        outcome=Failed(
+                            meta=_error_meta(row, exc, encoded.native_reasoning, started_ms),
+                            failure=overflow,
+                        )
+                    )
+                    return
+                # The SDK wraps the HTTP response for in-band error frames.
+                if not accepted:
+                    yield StreamStart()
                 raise interrupted(_inband_cause(exc)) from exc
             except (genai_errors.UnknownApiResponseError, json.JSONDecodeError):
                 # The SDK's frame-parse error embeds the raw frame verbatim —
                 # never chained.
+                if not accepted:
+                    yield StreamStart()
                 raise ProtocolDefect(
                     code="malformed_stream_frame",
                     message="gemini stream frame is not valid JSON",
@@ -905,20 +915,26 @@ class GeminiGenerateEngine:
             except pydantic.ValidationError as exc:
                 # The cause embeds frame payloads — never chained; locations +
                 # error types stand in.
+                if not accepted:
+                    yield StreamStart()
                 raise ProtocolDefect(
                     code="malformed_stream_frame",
                     message="gemini stream frame does not validate as a "
                     f"GenerateContentResponse ({_validation_summary(exc)})",
                 ) from None
             except httpx.TimeoutException as exc:
+                if not accepted:
+                    raise _timeout_attempt(exc) from exc
                 raise interrupted(ProviderTimeout()) from exc
             except httpx.TransportError as exc:
+                if not accepted:
+                    raise _transport_attempt(exc) from exc
                 raise interrupted(TransportUnavailable()) from exc
 
             # The stream ended without a terminal frame — a cut, not a close.
+            if not accepted:
+                yield StreamStart()
             raise interrupted(ProviderStreamInterrupted(partial_output=False))
-        finally:
-            await client.aio.aclose()
 
 
 # ---------------------------------------------------------------------------

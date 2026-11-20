@@ -127,12 +127,6 @@ def estimate_cost(meta: CallMeta) -> Presence[CostEstimate]:
         and usage.input_tokens > 100_000
     ):
         return Absent()
-    if (
-        meta.provider == "gemini"
-        and meta.model == "gemini-3.1-pro-preview"
-        and usage.input_tokens > 200_000
-    ):
-        return Absent()
     match matched:
         case Absent():
             return Absent()

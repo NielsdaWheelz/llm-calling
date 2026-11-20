@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
 import provider_runtime.registry as registry
+from provider_runtime.agent_runtime.codex_containment import (
+    CODEX_CONTAINMENT_CATALOG_SHA256,
+    materialize_codex_containment_catalog,
+)
 from provider_runtime.agent_runtime.errors import ProtocolDefect
 from provider_runtime.agent_runtime.model_catalog import (
     AGENT_BACKEND_CONTRACT_REVISION,
@@ -62,19 +69,41 @@ def _row(
     }
 
 
+def test_codex_containment_preserves_single_agent_efforts(tmp_path: Path) -> None:
+    catalog = materialize_codex_containment_catalog(tmp_path).read_bytes()
+    assert hashlib.sha256(catalog).hexdigest() == CODEX_CONTAINMENT_CATALOG_SHA256
+    offered = {"gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-terra", "gpt-6-luna"}
+    rows = {row["slug"]: row for row in json.loads(catalog)["models"]}
+    for key in offered:
+        row = rows[key]
+        assert [level["effort"] for level in row["supported_reasoning_levels"]] == [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        ]
+        assert row["default_reasoning_level"] == ("medium" if key == "gpt-6-luna" else "low")
+        assert row["experimental_supported_tools"] == []
+        assert row["tool_mode"] == "direct"
+        assert row["apply_patch_tool_type"] is None
+
+
 async def test_codex_catalog_reads_every_page_and_normalizes_only_public_facts() -> None:
     client = _GenericClient(
         [
             {
                 "data": [
-                    _row("old", "gpt-6-sol", upgrade="gpt-6.1-sol"),
+                    _row("old", "gpt-6.1-sol", upgrade="gpt-6.2-sol"),
                     _row("hidden", "hidden-wire", hidden=True),
                 ],
                 "nextCursor": "page-2",
                 "revision": "native-provenance-only",
             },
             {
-                "data": [_row("new", "gpt-6.1-sol")],
+                "data": [
+                    _row("new", "gpt-6.2-sol") | {"inputModalities": ["text", "image", "audio"]}
+                ],
                 "nextCursor": None,
                 "revision": "native-provenance-only",
             },
@@ -100,7 +129,10 @@ async def test_codex_catalog_reads_every_page_and_normalizes_only_public_facts()
     assert catalog.native_revision == Present("native-provenance-only")
     assert tuple(row.key for row in catalog.models) == ("old", "new")
     old = catalog.models[0]
-    assert old.dispatch_model == "gpt-6-sol"
+    assert old.dispatch_model == "gpt-6.1-sol"
+    assert not old.offered
+    assert catalog.models[1].offered
+    assert catalog.models[1].input_modalities == ("text", "image", "audio")
     assert old.source_context_window == Absent()
     assert old.source_max_output_tokens == Absent()
     assert old.source_default_reasoning == Present("high")
@@ -129,6 +161,10 @@ async def test_codex_definition_hash_excludes_observation_provenance() -> None:
 @pytest.mark.parametrize(
     "pages, message",
     [
+        (
+            [{"data": [_row("one", "gpt-6.2-sol") | {"inputModalities": ["text", "video"]}]}],
+            "unknown input modality",
+        ),
         (
             [
                 {"data": [_row("one", "gpt-6.1-sol")], "nextCursor": "again"},
@@ -215,18 +251,18 @@ def test_api_catalog_is_exact_immutable_and_the_registry_has_no_public_rows() ->
     assert first.registry_revision == registry.REGISTRY_REVISION
     assert len(first.definition_revision) == 64
     assert tuple(row.model_ref for row in first.models) == (
-        "openai:gpt-6-astra",
-        "openai:gpt-6.1-sol",
+        "openai:gpt-6.2-astra",
+        "openai:gpt-6.2-sol",
         "openai:gpt-6.1-terra",
         "openai:gpt-6-luna",
-        "anthropic:claude-fable-5-1",
+        "anthropic:claude-fable-5-2",
         "anthropic:claude-opus-5-5",
         "anthropic:claude-sonnet-5-5",
         "anthropic:claude-haiku-5-5",
-        "gemini:gemini-4-argon",
-        "gemini:gemini-3.8-flash",
+        "gemini:gemini-4-carbon",
+        "gemini:gemini-4-neon",
+        "gemini:gemini-4-hydrogen",
         "gemini:gemini-3.5-flash-lite",
-        "gemini:gemini-3.1-pro-preview",
         "deepseek:deepseek-flash",
         "deepseek:deepseek-v4-pro",
     )
@@ -235,8 +271,8 @@ def test_api_catalog_is_exact_immutable_and_the_registry_has_no_public_rows() ->
     assert all(len(row.row_fingerprint) == 64 for row in first.models)
     assert all(row.label and all(item.label for item in row.reasoning) for row in first.models)
     defaults = {row.model_ref: row.source_default_reasoning for row in first.models}
-    assert defaults["openai:gpt-6-astra"] == Absent()
-    assert defaults["openai:gpt-6.1-sol"] == Present("standard/medium")
+    assert defaults["openai:gpt-6.2-astra"] == Absent()
+    assert defaults["openai:gpt-6.2-sol"] == Absent()
     assert defaults["anthropic:claude-opus-5-5"] == Present("adaptive/medium")
     for row in first.models:
         assert row.reasoning
