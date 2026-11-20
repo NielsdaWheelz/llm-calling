@@ -62,6 +62,13 @@ class ArchiveMissing(ArchiveError):
         super().__init__("unavailable")
 
 
+class ArchiveBoundaryUncertain(ArchiveError):
+    """A missing event boundary could not be confirmed on stable, complete history."""
+
+    def __init__(self) -> None:
+        super().__init__("unavailable")
+
+
 @dataclass(frozen=True, slots=True)
 class ArchiveHome:
     provider: ArchiveProvider
