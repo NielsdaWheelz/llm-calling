@@ -79,7 +79,13 @@ compute or billing cessation is not part of this contract.
    examined. conflicting native evidence remains available without authorizing
    settlement. buffer diagnostics contain bounded identifying and numeric data.
    stream chunk count does not impose a second quota.
-   completed item ids are not retained. exact live callback identity is checked;
+   stock can disconnect an upstream response and retry within the same turn.
+   on its correlated `error` with `willRetry=true` and `responseStreamDisconnected`,
+   open assistant display items and previous final-text candidates become ineligible.
+   a successful turn requires a fresh completed answer. a retry cannot close native
+   tools, input receipts or other pending items. controlled turns retain only
+   abandoned display identities under the 100,000-item and 4 mib bounds and
+   reject their reuse. exact live callback identity is checked;
    durable host journals own completed callback/input/message identities and
    reject changed replay. written replies and completed callbacks retire pending
    request state; input ids retire only after their native recording. unresolved

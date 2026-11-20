@@ -518,7 +518,7 @@ class _CodexSessionState:
     output_bytes: int = 0
     streamed_text_bytes: int = 0
     completed_agent_messages: list[_CompletedAgentMessage] = field(default_factory=list)
-    completed_item_ids: set[str] = field(default_factory=set)
+    closed_item_ids: set[str] = field(default_factory=set)
     started_item_types: dict[str, str] = field(default_factory=dict)
     diagnostics: list[str] = field(default_factory=list)
     active_mcp_calls: dict[str, tuple[str, str]] = field(default_factory=dict)
@@ -850,7 +850,7 @@ class CodexSdkAdapter:
         state.output_bytes = 0
         state.streamed_text_bytes = 0
         state.completed_agent_messages.clear()
-        state.completed_item_ids.clear()
+        state.closed_item_ids.clear()
         state.started_item_types.clear()
         state.usage_accounting.begin_turn()
         state.diagnostics.clear()
@@ -1463,8 +1463,13 @@ class CodexSdkAdapter:
             self._append_diagnostic(state, normalized)
             if self._is_quota_error(error):
                 state.quota_exhausted = True
-            # Retries the backend performs itself are visible here too (willRetry);
-            # the bounded native frame is their only representation.
+            info = error.get("codexErrorInfo")
+            if (
+                params.get("willRetry") is True
+                and isinstance(info, Mapping)
+                and info.keys() == {"responseStreamDisconnected"}
+            ):
+                self._abandon_disconnected_messages(state, info["responseStreamDisconnected"])
             return AgentNative(native_type=method, payload=redact_native_payload(params))
         if method in ("configWarning", "warning", "guardianWarning"):
             message = params.get("summary", params.get("message"))
@@ -1543,6 +1548,36 @@ class CodexSdkAdapter:
             return AgentNative(native_type=method, payload=redact_native_payload(params))
         raise ProtocolDefect(f"Codex app-server emitted unknown notification {method}")
 
+    @staticmethod
+    def _abandon_disconnected_messages(state: _CodexSessionState, detail: object) -> None:
+        if not isinstance(detail, Mapping) or detail.keys() - {"httpStatusCode"}:
+            raise ProtocolDefect("Codex stream disconnect has invalid detail")
+        status = detail.get("httpStatusCode")
+        if status is not None and (type(status) is not int or not 0 <= status <= 65535):
+            raise ProtocolDefect("Codex stream disconnect has invalid HTTP status")
+
+        # Stock abandons the interrupted response's display items without sending
+        # item/completed. A retried stream must supply its own completed answer.
+        open_messages = {
+            key for key, kind in state.started_item_types.items() if kind == "agentMessage"
+        }
+        if not open_messages and not state.completed_agent_messages:
+            return
+        closed = state.closed_item_ids.union(
+            open_messages, (message.item_id for message in state.completed_agent_messages)
+        )
+        if state.controlled and (
+            len(closed) > _MAX_MESSAGE_ITEMS
+            or sum(len(key.encode("utf-8")) for key in closed) > _MAX_MESSAGE_BYTES
+        ):
+            raise ProtocolDefect(
+                "Codex abandoned assistant message identities exceeded their bound"
+            )
+        state.closed_item_ids = closed
+        for key in open_messages:
+            del state.started_item_types[key]
+        state.completed_agent_messages.clear()
+
     def _item_started(
         self,
         state: _CodexSessionState,
@@ -1556,9 +1591,7 @@ class CodexSdkAdapter:
         if item_type == "custom_tool_call_output":
             raise ProtocolDefect("custom tool output started as an independent item")
         item_id = self._non_empty_string(item, "id", method)
-        if item_id in state.started_item_types or (
-            not state.controlled and item_id in state.completed_item_ids
-        ):
+        if item_id in state.started_item_types or item_id in state.closed_item_ids:
             raise ProtocolDefect("Codex item identity started more than once")
         if len(state.started_item_types) >= _MAX_MESSAGE_ITEMS:
             raise ProtocolDefect("Codex active item count exceeded its finite bound")
@@ -1667,9 +1700,9 @@ class CodexSdkAdapter:
             call_id = self._non_empty_string(item, "call_id", method)
             completion_id = f"custom-output:{call_id}"
             if not state.controlled:
-                if completion_id in state.completed_item_ids:
+                if completion_id in state.closed_item_ids:
                     raise ProtocolDefect("Codex custom tool output completed more than once")
-                state.completed_item_ids.add(completion_id)
+                state.closed_item_ids.add(completion_id)
             name = state.active_tool_calls.pop(call_id, None)
             if name is None:
                 raise ProtocolDefect("custom tool output completed before its call started")
@@ -1682,10 +1715,10 @@ class CodexSdkAdapter:
                 succeeded=True,
             )
         item_id = self._non_empty_string(item, "id", method)
+        if item_id in state.closed_item_ids:
+            raise ProtocolDefect("Codex closed item identity completed again")
         if not state.controlled:
-            if item_id in state.completed_item_ids:
-                raise ProtocolDefect("Codex item identity completed more than once")
-            state.completed_item_ids.add(item_id)
+            state.closed_item_ids.add(item_id)
         started_type = state.started_item_types.pop(item_id, None)
         if (
             item_type not in _INERT_ITEM_TYPES
