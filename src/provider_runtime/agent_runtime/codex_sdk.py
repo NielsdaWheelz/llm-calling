@@ -2771,6 +2771,8 @@ class _CodexAgentTurn:
             self._finish()
 
     async def _publish(self, event: AgentEvent) -> None:
+        if isinstance(event, AgentInputRecorded) and not self.accepts_input(event.input_id):
+            raise ProtocolDefect("native user item has no prepared input delivery")
         try:
             size = bounded_payload_size(event, _MAX_MESSAGE_BYTES, max_items=_MAX_MESSAGE_ITEMS)
         except OutputLimitExceeded as error:
@@ -2854,8 +2856,6 @@ class _CodexAgentTurn:
                     )
                 )
         if isinstance(event, AgentInputRecorded):
-            if not self.accepts_input(event.input_id):
-                raise ProtocolDefect("native user item has no prepared input delivery")
             # Receipt admission and input retirement are one operation. A full
             # reserve leaves the delivery unresolved, including its original id.
             self._input_ids.remove(event.input_id)
