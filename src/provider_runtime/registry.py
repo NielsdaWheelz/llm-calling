@@ -193,8 +193,7 @@ def _gemini_row(
     efforts: tuple[str, ...],
     default: str,
     *,
-    request_limit: int,
-    source_output_limit: int,
+    output_limit: int,
 ) -> _ModelRow:
     return _ModelRow(
         ref=f"gemini:{model}",
@@ -203,8 +202,10 @@ def _gemini_row(
         engine="gemini_generate",
         base_url=Absent(),
         context_window=1_048_576,
-        max_output_tokens=request_limit,
-        source_max_output_tokens=Present(source_output_limit),
+        # models.get gives the portable single-request limit across GenerateContent paths.
+        # Long decode takes multiple requests.
+        max_output_tokens=output_limit,
+        source_max_output_tokens=Present(output_limit),
         modalities=_VISION,
         tools=True,
         streaming=True,
@@ -274,16 +275,14 @@ _ROWS: Final[tuple[_ModelRow, ...]] = (
         "gemini-4-carbon",
         ("low", "medium", "high"),
         "medium",
-        request_limit=32_768,
-        source_output_limit=1_048_576,
+        output_limit=32_768,
     ),
     *(
         _gemini_row(
             model,
             ("low", "medium", "high", "xhigh"),
             "high",
-            request_limit=65_536,
-            source_output_limit=1_048_576,
+            output_limit=65_536,
         )
         for model in ("gemini-4-neon", "gemini-4-hydrogen")
     ),
@@ -291,8 +290,7 @@ _ROWS: Final[tuple[_ModelRow, ...]] = (
         "gemini-3.5-flash-lite",
         ("minimal", "low", "medium", "high"),
         "minimal",
-        request_limit=65_536,
-        source_output_limit=65_536,
+        output_limit=65_536,
     ),
     *(_deepseek_row(model) for model in ("deepseek-flash", "deepseek-v4-pro")),
 )

@@ -81,10 +81,10 @@ def test_source_capacity_is_not_inferred_from_a_request_budget() -> None:
                 "claude-haiku-5-5",
             )
         },
-        "gemini:gemini-4-carbon": (1_048_576, Present(1_048_576)),
-        "gemini:gemini-4-hydrogen": (1_048_576, Present(1_048_576)),
+        "gemini:gemini-4-carbon": (1_048_576, Present(32_768)),
+        "gemini:gemini-4-hydrogen": (1_048_576, Present(65_536)),
         "gemini:gemini-3.5-flash-lite": (1_048_576, Present(65_536)),
-        "gemini:gemini-4-neon": (1_048_576, Present(1_048_576)),
+        "gemini:gemini-4-neon": (1_048_576, Present(65_536)),
         "deepseek:deepseek-flash": (1_048_576, Present(393_216)),
         "deepseek:deepseek-v4-pro": (1_048_576, Present(393_216)),
     }
