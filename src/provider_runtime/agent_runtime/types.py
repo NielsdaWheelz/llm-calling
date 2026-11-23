@@ -618,6 +618,7 @@ class _ResolvedCodexSessionRequest(CodexCatalogSessionRequest):
 
     dispatch_model: str
     native_reasoning: str
+    startup_service_tier: str | None = None
 
     def __post_init__(self) -> None:
         CodexCatalogSessionRequest.__post_init__(self)

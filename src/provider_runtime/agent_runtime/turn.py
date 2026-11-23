@@ -230,8 +230,8 @@ class AgentTurn(Protocol):
     @property
     def submitted_request(self) -> JsonObject: ...
 
-    async def check_submission(self) -> None:
-        """Raise on conflicting evidence; resolve a latched seal’s bounded start reply."""
+    async def check_submission(self, *, for_effect: bool = False) -> None:
+        """Adjudicate submission evidence. Effect entry also requires live write authority."""
         ...
 
     def events(self) -> AsyncIterator[AgentEvent]: ...
