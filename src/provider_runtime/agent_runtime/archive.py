@@ -13,7 +13,7 @@ from typing import Literal
 from .codex_endpoint import CodexEndpoint, CodexUnixEndpoint, CodexWebSocketEndpoint
 from .errors import AgentRuntimeError, InvalidAgentRequest
 
-ARCHIVE_CONTRACT_REVISION = "native-archive.v3"
+ARCHIVE_CONTRACT_REVISION = "native-archive.v4"
 INTERNAL_THREAD_SOURCE = "jarvis.cognition"
 MEMORY_TOOL_NAMES = frozenset(
     (
@@ -116,6 +116,7 @@ class ArchiveConversation:
     working_directory: str | None = None
     head_event_id: str | None = None
     head_error: ArchiveErrorCode | None = None
+    worker: bool = False
 
     def __post_init__(self) -> None:
         if self.head_error is not None and self.head_event_id is not None:
@@ -152,6 +153,22 @@ class ArchiveEvent:
 @dataclass(frozen=True, slots=True)
 class ArchiveRead:
     events: tuple[ArchiveEvent, ...]
+    next: str | None
+    caught_up: bool
+    observed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveOccurrence:
+    native_event_id: str
+    native_digest: str
+    capture_digest: str
+    records: tuple[ArchiveEvent, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveCapture:
+    occurrences: tuple[ArchiveOccurrence, ...]
     next: str | None
     caught_up: bool
     observed_at: datetime
@@ -203,23 +220,46 @@ async def archive_capabilities(home: ArchiveHome) -> ArchiveCapabilities:
 
 
 async def archive_list(
-    home: ArchiveHome, page: str | None = None, *, with_heads: bool = False
+    home: ArchiveHome, page: str | None = None, *, with_heads: bool = False, capture: bool = False
 ) -> ArchiveInventory:
     """Assemble one bounded inventory; provider pagination stays inside the codec."""
-    if page is not None or type(with_heads) is not bool:
+    if page is not None or type(with_heads) is not bool or type(capture) is not bool:
         raise InvalidAgentRequest("archive inventories use one complete request")
     if home.provider == "codex":
         from ._codex_archive import inventory
 
-        return await inventory(home, with_heads=with_heads)
+        return await inventory(home, with_heads=with_heads, capture=capture)
     from ._claude_archive import inventory
 
-    return await asyncio.to_thread(inventory, home, with_heads=with_heads)
+    return await asyncio.to_thread(inventory, home, with_heads=with_heads, capture=capture)
 
 
 async def archive_read(
     home: ArchiveHome, native_id: str, after: str | None = None, from_event_id: str | None = None
 ) -> ArchiveRead:
+    """Read native originals for evidence inspection."""
+    result = await _read(home, native_id, after, from_event_id, capture=False)
+    assert isinstance(result, ArchiveRead)
+    return result
+
+
+async def archive_capture(
+    home: ArchiveHome, native_id: str, after: str | None = None, from_event_id: str | None = None
+) -> ArchiveCapture:
+    """Read accounted occurrences, including omitted native events at the boundary."""
+    result = await _read(home, native_id, after, from_event_id, capture=True)
+    assert isinstance(result, ArchiveCapture)
+    return result
+
+
+async def _read(
+    home: ArchiveHome,
+    native_id: str,
+    after: str | None,
+    from_event_id: str | None,
+    *,
+    capture: bool,
+) -> ArchiveRead | ArchiveCapture:
     if not native_id or len(native_id.encode("utf-8")) > 256:
         raise InvalidAgentRequest("native conversation identity must be bounded and nonempty")
     if any(
@@ -230,20 +270,22 @@ async def archive_read(
     if home.provider == "codex":
         from ._codex_archive import read
 
-        return await read(home, native_id, after=after, checkpoint=from_event_id)
+        return await read(home, native_id, after=after, checkpoint=from_event_id, capture=capture)
     from ._claude_archive import read
 
-    return await asyncio.to_thread(read, home, native_id, after=after, checkpoint=from_event_id)
+    return await asyncio.to_thread(
+        read, home, native_id, after=after, checkpoint=from_event_id, capture=capture
+    )
 
 
-async def archive_head(home: ArchiveHome, native_id: str) -> ArchiveHead:
+async def archive_head(home: ArchiveHome, native_id: str, *, capture: bool = False) -> ArchiveHead:
     """Read one stable baseline; null is proved empty, errors never imply empty."""
     if not native_id or len(native_id.encode("utf-8")) > 256:
         raise InvalidAgentRequest("native conversation identity must be bounded and nonempty")
     if home.provider == "codex":
         from ._codex_archive import head
 
-        return await head(home, native_id)
+        return await head(home, native_id, capture=capture)
     from ._claude_archive import head
 
-    return await asyncio.to_thread(head, home, native_id)
+    return await asyncio.to_thread(head, home, native_id, capture=capture)

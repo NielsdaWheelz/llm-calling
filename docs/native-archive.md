@@ -14,6 +14,23 @@ batch = await archive_read(home, native_id, after=activation_head,
                            from_event_id=checkpoint)
 ```
 
+shared memory requests the v4 capture projection.
+
+```python
+inventory = await archive_list(home, with_heads=True, capture=True)
+head = await archive_head(home, native_id, capture=True)
+batch = await archive_capture(home, native_id, after=activation_head,
+                              from_event_id=checkpoint)
+```
+
+capture inventories mark proven workers with `worker=True` and skip their
+heads. capture head and read reject an excluded worker. codex proves worker
+identity with its subagent source and parent metadata, including spawns with
+fork lineage. claude checks native agent and sidechain markers, including an
+explicit fork-context reference. a directory can supply an inventory identity;
+it cannot prove the worker marker. original evidence remains available via the
+raw read surface at its original addresses.
+
 inventory assembly handles native pages internally. `next_page` is null; a
 non-null input page is invalid. both archived and ordinary codex threads are
 enumerated across all declared native source kinds. claude enumerates the native
@@ -91,12 +108,44 @@ consumers use this narrow read to repair a pending baseline without rereading
 every other conversation. the consumer owns the new activation cut and excluded
 gap; this module never resets a boundary or backfills it.
 
-the current contract is `native-archive.v3`. it adds per-conversation head errors
-and the single-head read; native event projections, identities, digests and
-existing checkpoints stay exact. capture consumers must adopt this contract
-together with its pending-baseline semantics. there is no old-contract fallback
-or compatibility reader. earlier corrected-variant checkpoints cannot be
-silently relabeled or reset.
+the current contract is `native-archive.v4`. the existing source identities,
+digests, pending baselines and inclusive checkpoints carry through the cut.
+`archive_capture` returns `occurrences`, `next`, `caught_up` and `observed_at`.
+each occurrence carries `native_event_id`, `native_digest`, `capture_digest`
+and ordered `records`. an empty record list accounts for an excluded occurrence
+and preserves the native cursor. each capture decision uses the current
+occurrence and its prefix. the new digest binds the consumed evidence and
+selection before redaction. capture consumes no tool bodies, including memory
+tool wrappers, downstream of the provider projection.
+
+capture keeps speech, eligible attachments, reference-only context, revisions and
+source gaps. derived utterances are `text` events with a closed `delivery`
+attribute and a conversation-scoped `delivery:` identity. the attribute identifies
+the carrier, kind, order and available source call, question, delivery and sender
+ids. the record digest binds the evidenced speaker and literal pre-redaction
+wording. a repeated native delivery with the same wording retains the same
+record identity across carrier copies. a changed utterance at that identity
+conflicts in admission. a separate delivery can carry the same words.
+
+claude pairs a typed question result with the earlier ask. the delivered record
+supplies the question, actual answers and human notes. previews and cancelled or
+unstructured tool results do not become speech. native origin, prompt source
+or turn origin can establish a non-human message independently. a task notice
+needs native delivery and a corresponding earlier worker launch to carry a
+report. a successful inline agent receipt can also deliver a report. queued
+items and formatted markup pasted into ordinary user speech carry no worker
+provenance.
+
+codex terminal wait results can carry a report for each named, completed child.
+typed async question messages retain the assistant's delivered wording. a
+subsequent ordinary user answer comes through at its native address. stock
+0.171 public history supplies neither
+the matched blocking answer nor modern mailbox message carriers. the same
+release delivers typed agent-mail items on the live root stream. the provider
+helper extracts those live deliveries from explicit author, recipient and
+delivery fields. external capture can miss genuine mailbox reports. both
+surfaces require source evidence before interpreting a wrapper
+as a report.
 
 events carry `native_event_id`, `native_digest`, `turn_id`, `native_parent_id`,
 `role`, `kind`, `text`, closed `attributes` and `occurred_at`. the digest binds the

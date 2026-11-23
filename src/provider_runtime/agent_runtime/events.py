@@ -111,6 +111,19 @@ class AgentText:
 
 
 @dataclass(frozen=True, slots=True)
+class StockToolObservation:
+    """Typed stock evidence, separate from diagnostic events and host callbacks."""
+
+    unsupported: bool = False
+    occurred_at_ms: int | None = None
+    shell_output: Literal["reported", "absent", "truncated"] | None = None
+    upstream_omitted_characters: int | None = None
+    exit_code: int | None = None
+    delivery_id: str | None = None
+    reports: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class AgentToolUse:
     """One observation of a model-initiated tool action.
 
@@ -126,6 +139,7 @@ class AgentToolUse:
     phase: ToolUsePhase
     payload: JsonValue = None
     succeeded: bool | None = None
+    stock: StockToolObservation | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.tool_call_id, "AgentToolUse.tool_call_id")
@@ -133,6 +147,10 @@ class AgentToolUse:
         if self.phase not in ("started", "updated", "completed"):
             raise ProtocolDefect(f"AgentToolUse.phase {self.phase!r} is unknown")
         _validate_frozen_json(self.payload, "AgentToolUse.payload")
+        if self.stock is not None and (
+            type(self.stock) is not StockToolObservation or self.phase == "updated"
+        ):
+            raise ProtocolDefect("stock tool evidence must belong to an observed phase")
         if self.phase == "completed":
             if type(self.succeeded) is not bool:
                 raise ProtocolDefect("completed AgentToolUse requires a bool succeeded")
@@ -327,6 +345,7 @@ __all__ = [
     "AgentText",
     "AgentToolUse",
     "AgentUsage",
+    "StockToolObservation",
     "ToolUsePhase",
     "validate_event_stream",
 ]

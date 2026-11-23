@@ -27,6 +27,31 @@ from ._limits import (
 from .codex_endpoint import CodexEndpoint, CodexUnixEndpoint, CodexWebSocketEndpoint
 from .errors import AgentRuntimeError, InvalidAgentRequest, ProtocolDefect, SdkUnavailable
 
+STOCK_FRAME_BYTES = 16 * 1024 * 1024
+
+
+def stock_notification_limit(method: object, params: object) -> int:
+    """Widen only stock patch frames, their echoes, and typed deliveries."""
+    if not isinstance(params, Mapping):
+        return _MAX_MESSAGE_BYTES
+    item = params.get("item")
+    if isinstance(item, Mapping) and (
+        method in ("item/started", "item/completed")
+        and item.get("type") in ("fileChange", "commandExecution")
+        or method == "item/completed"
+        and item.get("type") == "collabAgentToolCall"
+        and item.get("tool") == "wait"
+        or method == "rawResponseItem/completed"
+        and (
+            item.get("type") == "agent_message"
+            or item.get("type") in ("custom_tool_call", "function_call")
+            and item.get("name") == "apply_patch"
+        )
+    ):
+        return STOCK_FRAME_BYTES
+    return _MAX_MESSAGE_BYTES
+
+
 type CodexRequestId = str | int
 type CodexServerRequestKind = Literal["permission", "tool"]
 
@@ -124,6 +149,11 @@ class CodexAppServerConfig:
     client_version: str = "0.1.0"
     experimental_api: bool = False
     callbacks: bool = False
+    stock_observations: bool = False
+
+    @property
+    def frame_bytes(self) -> int:
+        return STOCK_FRAME_BYTES if self.stock_observations else _MAX_MESSAGE_BYTES
 
     def __post_init__(self) -> None:
         if not isinstance(self.endpoint, CodexUnixEndpoint | CodexWebSocketEndpoint):
@@ -132,6 +162,10 @@ class CodexAppServerConfig:
             raise ValueError("Codex app-server request policy is invalid")
         if type(self.experimental_api) is not bool:
             raise ValueError("Codex experimental API selection must be boolean")
+        if type(self.stock_observations) is not bool or (
+            self.stock_observations and self.request_policy == "observe_only"
+        ):
+            raise ValueError("stock observations require an owned connection")
         if type(self.callbacks) is not bool or (
             self.callbacks and self.request_policy == "observe_only"
         ):
@@ -277,8 +311,8 @@ class CodexAppServerClient:
             options: dict[str, Any] = {
                 "open_timeout": _OPERATION_TIMEOUT_SECONDS,
                 "close_timeout": 2,
-                "max_size": _MAX_MESSAGE_BYTES,
-                "max_queue": 16,
+                "max_size": self.config.frame_bytes,
+                "max_queue": 4 if self.config.stock_observations else 16,
                 "compression": None,
                 "proxy": None,
             }
@@ -302,11 +336,17 @@ class CodexAppServerClient:
             await self._connection.close()
             raise CodexConnectionUnavailable()
         self._reader_task = asyncio.create_task(self._reader_loop())
+        capabilities: dict[str, object] = {"experimentalApi": self.config.experimental_api}
+        if self.config.stock_observations:
+            capabilities["optOutNotificationMethods"] = [
+                "turn/diff/updated",
+                "item/fileChange/patchUpdated",
+            ]
         try:
             initialized = await self.request(
                 "initialize",
                 {
-                    "capabilities": {"experimentalApi": self.config.experimental_api},
+                    "capabilities": capabilities,
                     "clientInfo": {
                         "name": self.config.client_name,
                         "title": self.config.client_title,
@@ -523,7 +563,7 @@ class CodexAppServerClient:
                                 if isinstance(size, PayloadTooBig)
                                 else None,
                                 size.size if isinstance(size, PayloadTooBig) else None,
-                                _MAX_MESSAGE_BYTES,
+                                self.config.frame_bytes,
                                 attempt_id=self.buffer_attempt_id,
                             )
                         )
@@ -542,12 +582,13 @@ class CodexAppServerClient:
             )
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
             raise ProtocolDefect("Codex app-server emitted malformed JSON") from None
+        limit = _MAX_MESSAGE_BYTES
+        if self.config.stock_observations and isinstance(message, dict) and "id" not in message:
+            limit = stock_notification_limit(message.get("method"), message.get("params"))
         try:
-            bounded_payload_size(
-                message,
-                _MAX_MESSAGE_BYTES,
-                max_items=_MAX_MESSAGE_ITEMS,
-            )
+            if len(line) > limit:
+                raise OutputLimitExceeded(limit, unit="bytes", incoming=len(line))
+            bounded_payload_size(message, limit, max_items=_MAX_MESSAGE_ITEMS)
         except OutputLimitExceeded as error:
             raise CodexOutputLimit(
                 _buffer_observation(
