@@ -11,6 +11,7 @@ from typing import BinaryIO, cast
 
 from ._archive_codec import (
     MAX_ARCHIVE_EVENTS,
+    ArchiveEntry,
     bounded,
     canonical,
     confirm_missing,
@@ -18,15 +19,18 @@ from ._archive_codec import (
     event_pairs,
     memory_attributes,
     object_value,
+    occurrence,
     select,
     string,
     text,
     timestamp,
 )
+from ._claude_deliveries import ClaudeDeliveries
 from ._limits import _MAX_MESSAGE_BYTES
 from .archive import (
     MEMORY_TOOL_NAMES,
     ArchiveBoundaryUncertain,
+    ArchiveCapture,
     ArchiveConversation,
     ArchiveError,
     ArchiveErrorCode,
@@ -35,6 +39,7 @@ from .archive import (
     ArchiveHome,
     ArchiveInventory,
     ArchiveMissing,
+    ArchiveOccurrence,
     ArchiveRead,
 )
 
@@ -162,10 +167,52 @@ def file_version(path: Path) -> tuple[int, int]:
     return metadata.st_size, metadata.st_mtime_ns
 
 
-def inventory(home: ArchiveHome, *, with_heads: bool) -> ArchiveInventory:
+def worker(transcript: Transcript) -> bool:
+    if transcript.workflow:
+        return True  # files() already proved the native first-message marker.
+    if transcript.agent_id is None:
+        return False
+    try:
+        with transcript.path.open("rb") as stream:
+            header = record(stream)
+            while header is not None and string(header.get("type"), limit=256) in _BOOKKEEPING:
+                header = record(stream)
+    except (OSError, ArchiveError):
+        # A directory does not prove worker lineage. Unreadable transcripts
+        # still have a normal inventory identity and the usual head error.
+        return False
+    if header is None:
+        return False
+    if header.get("type") == "fork-context-ref":
+        reference = fork_reference(header)
+        matches = (
+            reference["agentId"] == transcript.agent_id
+            and reference["parentSessionId"] == transcript.parent
+        )
+    elif header.get("type") in ("user", "assistant") and header.get("isSidechain") is True:
+        matches = (
+            string(header.get("agentId"), limit=256) == transcript.agent_id
+            and string(header.get("sessionId"), limit=256) == transcript.parent
+        )
+    else:
+        return False
+    if not matches:
+        raise ArchiveError("source_conflict")
+    return True
+
+
+def worker_inventory(transcript: Transcript) -> tuple[bool, ArchiveErrorCode | None]:
+    try:
+        return worker(transcript), None
+    except ArchiveError as error:
+        return False, cast(ArchiveErrorCode, error.code)
+
+
+def inventory(home: ArchiveHome, *, with_heads: bool, capture: bool) -> ArchiveInventory:
     before = files(home)
     items: list[ArchiveConversation] = []
     stats: dict[str, tuple[int, int]] = {}
+    worker_proofs: dict[str, tuple[bool, ArchiveErrorCode | None]] = {}
     complete = True
     try:
         for identifier, transcript in sorted(before.items()):
@@ -176,6 +223,8 @@ def inventory(home: ArchiveHome, *, with_heads: bool) -> ArchiveInventory:
             parent = transcript.parent
             created = datetime.fromtimestamp(metadata.st_ctime, UTC)
             updated = datetime.fromtimestamp(metadata.st_mtime, UTC)
+            proof = worker_inventory(transcript) if capture and not internal else (False, None)
+            worker_proofs[identifier] = proof
             item = ArchiveConversation(
                 identifier,
                 created,
@@ -184,8 +233,10 @@ def inventory(home: ArchiveHome, *, with_heads: bool) -> ArchiveInventory:
                 internal,
                 relation="child" if parent else None,
                 parent_native_id=parent,
+                worker=proof[0],
+                head_error=proof[1],
             )
-            if with_heads and not internal:
+            if with_heads and not (internal or item.worker or item.head_error is not None):
                 try:
                     head_id, cwd, native_created = stable_head(home, identifier, transcript)
                     item = replace(
@@ -206,9 +257,15 @@ def inventory(home: ArchiveHome, *, with_heads: bool) -> ArchiveInventory:
                     continue
                 if marked(home, item.native_id, transcript) != item.internal:
                     complete = False
+                if (
+                    capture
+                    and not item.internal
+                    and worker_inventory(transcript) != worker_proofs[item.native_id]
+                ):
+                    complete = False
                 metadata = transcript.path.stat()
                 if (
-                    not item.internal
+                    not (item.internal or item.worker)
                     and (metadata.st_size, metadata.st_mtime_ns) != stats[item.native_id]
                 ):
                     items[index] = replace(item, head_event_id=None, head_error="unavailable")
@@ -233,27 +290,34 @@ def stable_head(
     return events[-1].native_event_id if events else None, cwd, created
 
 
-def head(home: ArchiveHome, native_id: str) -> ArchiveHead:
+def head(home: ArchiveHome, native_id: str, *, capture: bool) -> ArchiveHead:
     transcript = files(home).get(native_id)
     if transcript is None:
         raise ArchiveMissing()
+    if capture and worker(transcript):
+        raise ArchiveError("unsupported")
     identifier, _, _ = stable_head(home, native_id, transcript)
     return ArchiveHead(identifier, datetime.now(UTC))
 
 
 def read(
-    home: ArchiveHome, native_id: str, *, after: str | None, checkpoint: str | None
-) -> ArchiveRead:
+    home: ArchiveHome, native_id: str, *, after: str | None, checkpoint: str | None, capture: bool
+) -> ArchiveRead | ArchiveCapture:
     observed_at = datetime.now(UTC)
     transcript = files(home).get(native_id)
     if transcript is None:
         raise ArchiveMissing()
-    if marked(home, native_id, transcript):
+    if marked(home, native_id, transcript) or capture and worker(transcript):
         raise ArchiveError("unsupported")
     before = file_version(transcript.path)
-    events, caught_up, _, _ = history(home, native_id, transcript)
+    events, caught_up, _, _ = history(home, native_id, transcript, capture=capture)
     page = select(
-        events, after=after, checkpoint=checkpoint, caught_up=caught_up, observed_at=observed_at
+        events,
+        after=after,
+        checkpoint=checkpoint,
+        caught_up=caught_up,
+        observed_at=observed_at,
+        capture=capture,
     )
     if page is not None:
         return page
@@ -267,21 +331,27 @@ def read(
         if (
             current != transcript
             or marked(home, native_id, current)
+            or capture
+            and worker(current)
             or file_version(current.path) != before
         ):
             raise ArchiveBoundaryUncertain()
 
     require_same_transcript()
-    events, caught_up, _, _ = history(home, native_id, transcript)
+    events, caught_up, _, _ = history(home, native_id, transcript, capture=capture)
     require_same_transcript()
     confirm_missing(first, events, caught_up=caught_up, checkpoint=checkpoint)
 
 
 def history(
-    home: ArchiveHome, identifier: str, transcript: Transcript
-) -> tuple[list[ArchiveEvent], bool, str | None, datetime | None]:
-    result: list[ArchiveEvent] = []
-    seen: dict[str, str] = {}
+    home: ArchiveHome,
+    identifier: str,
+    transcript: Transcript,
+    *,
+    capture: bool = False,
+) -> tuple[list[ArchiveEntry], bool, str | None, datetime | None]:
+    result: list[ArchiveEntry] = []
+    seen: dict[str, tuple[str, str | None]] = {}
     tool_names: dict[str, str] = {}
     child_ids: dict[str, str] = {}
     previous: str | None = None
@@ -290,6 +360,7 @@ def history(
     caught_up = True
     path = transcript.path
     expected_session = transcript.parent or identifier
+    deliveries = ClaudeDeliveries(identifier) if capture else None
     try:
         with path.open("rb") as stream:
             prefix = path.stat().st_size
@@ -363,29 +434,32 @@ def history(
                     child_ids=child_ids,
                 )
                 if previous is not None and parent is not None and parent != previous and values:
-                    result.append(
-                        event(
-                            "branch:" + raw_id,
-                            turn_id=None,
-                            parent_id=parent,
-                            role="unknown",
-                            kind="revision",
-                            body="",
-                            attributes={"reason": "branch"},
-                            occurred_at=occurred_at,
-                            original={"reason": "branch", "parent": parent, "previous": previous},
-                        )
+                    revision = event(
+                        "branch:" + raw_id,
+                        turn_id=None,
+                        parent_id=parent,
+                        role="unknown",
+                        kind="revision",
+                        body="",
+                        attributes={"reason": "branch"},
+                        occurred_at=occurred_at,
+                        original={"reason": "branch", "parent": parent, "previous": previous},
                     )
+                    result.append(occurrence(revision) if capture else revision)
                 if native.get("uuid") is not None:
                     previous = raw_id
-                for value in values:
+                projected = deliveries.project(native, values, tool_names) if deliveries else values
+                for value in projected:
+                    proof = (
+                        value.native_digest,
+                        value.capture_digest if isinstance(value, ArchiveOccurrence) else None,
+                    )
                     old = seen.get(value.native_event_id)
-                    if old is not None:
-                        if old != value.native_digest:
-                            raise ArchiveError("source_conflict")
-                        continue
-                    seen[value.native_event_id] = value.native_digest
-                    result.append(value)
+                    if old is None:
+                        seen[value.native_event_id] = proof
+                        result.append(value)
+                    elif old != proof:
+                        raise ArchiveError("source_conflict")
                 if len(result) > MAX_ARCHIVE_EVENTS:
                     raise ArchiveError("event_too_large")
     except OSError:

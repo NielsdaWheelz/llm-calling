@@ -78,6 +78,7 @@ from .events import (
     AgentText,
     AgentToolUse,
     AgentUsage,
+    StockToolObservation,
 )
 from .model_catalog import (
     AGENT_BACKEND_CONTRACT_REVISION,
@@ -337,6 +338,7 @@ __all__ = [
     "SessionSnapshot",
     "SessionSummary",
     "SessionUnavailable",
+    "StockToolObservation",
     "TextAgentOutput",
     "TextContent",
     "TurnNotStarted",

@@ -14,6 +14,7 @@ from uuid import uuid4
 from provider_runtime.errors import sanitize_provider_text
 from provider_runtime.types import Absent, Presence, Present, TokenUsage, canonical_json_bytes
 
+from ._codex_stock import observed_delivery, stock_phase
 from ._limits import (
     _MAX_DIAGNOSTICS,
     _MAX_EVENT_COUNT,
@@ -32,6 +33,7 @@ from .auth import (
     redact_native_payload,
 )
 from .codex_app_server import (
+    STOCK_FRAME_BYTES,
     CodexAppServerClient,
     CodexAppServerConfig,
     CodexAppServerResponseError,
@@ -43,6 +45,7 @@ from .codex_app_server import (
     NativeRequestFit,
     _buffer_observation,
     codex_wire_request_fit,
+    stock_notification_limit,
 )
 from .codex_containment import _startup_flag, _validate_codex_containment_config
 from .codex_endpoint import CodexEndpoint, fingerprint_codex_endpoint
@@ -688,8 +691,9 @@ class CodexSdkAdapter:
             self._validate_strict_native_containment(request)
         client = await self._open_client(
             environment=environment,
-            experimental_api=contained or bool(request.tools),
+            experimental_api=internal or contained or bool(request.tools),
             callbacks=bool(request.tools),
+            stock_observations=internal and not contained,
         )
         try:
             await self._verify_auth(client)
@@ -732,6 +736,7 @@ class CodexSdkAdapter:
                 kwargs["ephemeral"] = True
             if isinstance(request.open, NewSession) and contained:
                 kwargs["environments"] = []
+            if isinstance(request.open, NewSession) and (contained or internal):
                 kwargs["experimentalRawEvents"] = True
             if request.tools:
                 kwargs["dynamicTools"] = [
@@ -992,12 +997,14 @@ class CodexSdkAdapter:
         environment: Mapping[str, str],
         experimental_api: bool = False,
         callbacks: bool = False,
+        stock_observations: bool = False,
     ) -> CodexAppServerClient:
         client = CodexAppServerClient(
             CodexAppServerConfig(
                 endpoint=self._endpoint(environment),
                 experimental_api=experimental_api,
                 callbacks=callbacks,
+                stock_observations=stock_observations,
             )
         )
         try:
@@ -1174,12 +1181,14 @@ class CodexSdkAdapter:
             direct_params if direct_params is not None else getattr(payload, "params", payload)
         )
         bounded_params = getattr(raw_params, "root", raw_params)
+        observe_stock = state.controlled and state.client.config.stock_observations
+        limit = (
+            stock_notification_limit(method, bounded_params)
+            if observe_stock
+            else _MAX_MESSAGE_BYTES
+        )
         try:
-            size = bounded_payload_size(
-                bounded_params,
-                _MAX_MESSAGE_BYTES,
-                max_items=_MAX_MESSAGE_ITEMS,
-            )
+            size = bounded_payload_size(bounded_params, limit, max_items=_MAX_MESSAGE_ITEMS)
         except OutputLimitExceeded:
             self._append_diagnostic(
                 state,
@@ -1208,6 +1217,17 @@ class CodexSdkAdapter:
                 self._turn_terminal(state, params),
             )
         event = self._notification_event(state, method, params)
+        if (
+            observe_stock
+            and isinstance(event, AgentToolUse)
+            and method in ("item/started", "item/completed")
+        ):
+            event = stock_phase(
+                event,
+                self._mapping(params.get("item"), method),
+                state.ref.native_session_id,
+                params.get("startedAtMs" if method == "item/started" else "completedAtMs"),
+            )
         return () if event is None else (event,)
 
     def _server_request_event(
@@ -1324,6 +1344,14 @@ class CodexSdkAdapter:
         if method == "rawResponseItem/completed":
             item = self._mapping(params.get("item"), "raw Responses item")
             kind = self._non_empty_string(item, "type", method)
+            if state.client.config.stock_observations:
+                return (
+                    observed_delivery(item)
+                    if state.controlled and kind == "agent_message"
+                    else None
+                )
+            if kind == "agent_message":
+                return None
             if kind == "message":
                 item_id = item.get("id")
                 if item.get("role") == "assistant" and isinstance(item_id, str) and item_id:
@@ -2858,8 +2886,13 @@ class _CodexAgentTurn:
     async def _publish(self, event: AgentEvent) -> None:
         if isinstance(event, AgentInputRecorded) and not self.accepts_input(event.input_id):
             raise ProtocolDefect("native user item has no prepared input delivery")
+        event_limit = (
+            STOCK_FRAME_BYTES
+            if isinstance(event, AgentToolUse) and event.stock is not None
+            else _MAX_MESSAGE_BYTES
+        )
         try:
-            size = bounded_payload_size(event, _MAX_MESSAGE_BYTES, max_items=_MAX_MESSAGE_ITEMS)
+            size = bounded_payload_size(event, event_limit, max_items=_MAX_MESSAGE_ITEMS)
         except OutputLimitExceeded as error:
             raise CodexOutputLimit(
                 _buffer_observation(
@@ -2872,14 +2905,16 @@ class _CodexAgentTurn:
                     attempt_id=self.attempt.attempt_id,
                 )
             ) from None
-        if not self._revoked and self._queued_bytes + size > _MAX_MESSAGE_BYTES:
+        # A larger typed observation may occupy the normal FIFO by itself.
+        limit = max(_MAX_MESSAGE_BYTES, size)
+        if not self._revoked and self._queued_bytes + size > limit:
             loop = asyncio.get_running_loop()
             started = self._last_drain = loop.time()
             held = self._queued_bytes
             self._space = asyncio.Event()
             self._state.client.buffer_decoder_waiting = True
             try:
-                while not self._revoked and self._queued_bytes + size > _MAX_MESSAGE_BYTES:
+                while not self._revoked and self._queued_bytes + size > limit:
                     self._space.clear()
                     deadline = self._last_drain + self._controls.rpc_seconds
                     try:
@@ -2895,7 +2930,7 @@ class _CodexAgentTurn:
                                 "bytes",
                                 held,
                                 size,
-                                _MAX_MESSAGE_BYTES,
+                                limit,
                                 attempt_id=self.attempt.attempt_id,
                                 wait_ms=(loop.time() - started) * 1000,
                             )
@@ -2908,7 +2943,7 @@ class _CodexAgentTurn:
                         "bytes",
                         held,
                         size,
-                        _MAX_MESSAGE_BYTES,
+                        limit,
                         attempt_id=self.attempt.attempt_id,
                         wait_ms=(loop.time() - started) * 1000,
                     )
@@ -2918,7 +2953,7 @@ class _CodexAgentTurn:
                 self._state.client.buffer_decoder_waiting = False
         if self._revoked and isinstance(event, AgentToolCall):
             return
-        reserved = self._queued_bytes + size > _MAX_MESSAGE_BYTES
+        reserved = self._queued_bytes + size > (_MAX_MESSAGE_BYTES if self._revoked else limit)
         if reserved:
             if not isinstance(event, AgentInputRecorded):
                 self._omitted_count += 1

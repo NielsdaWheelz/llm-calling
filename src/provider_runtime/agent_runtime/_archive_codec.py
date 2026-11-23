@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime
-from typing import Literal, Never, overload
+from typing import Literal, Never, cast, overload
 from uuid import UUID
 
 from ._limits import (
@@ -16,15 +16,19 @@ from ._limits import (
 )
 from .archive import (
     ArchiveBoundaryUncertain,
+    ArchiveCapture,
     ArchiveError,
     ArchiveEvent,
     ArchiveKind,
+    ArchiveOccurrence,
     ArchiveRead,
     ArchiveRole,
 )
 
 MAX_ARCHIVE_EVENTS = 100_000
 ARCHIVE_PAGE_EVENTS = 100
+
+type ArchiveEntry = ArchiveEvent | ArchiveOccurrence
 
 
 def object_value(value: object) -> dict[str, object]:
@@ -79,6 +83,10 @@ def canonical(value: object) -> str:
         raise ArchiveError("unsupported") from None
 
 
+def canonical_digest(value: object) -> str:
+    return hashlib.sha256(canonical(value).encode("utf-8")).hexdigest()
+
+
 def bounded(value: object, *, max_bytes: int = _MAX_MESSAGE_BYTES) -> None:
     try:
         bounded_payload_size(value, max_bytes, max_items=_MAX_MESSAGE_ITEMS)
@@ -110,7 +118,7 @@ def event(
         "occurred_at": occurred_at.isoformat() if occurred_at else None,
     }
     bounded(projection, max_bytes=projection_max_bytes)
-    digest = hashlib.sha256(canonical(projection).encode("utf-8")).hexdigest()
+    digest = canonical_digest(projection)
     if legacy_previous is not None:
         native_id = "legacy:" + hashlib.sha256((legacy_previous + digest).encode()).hexdigest()
     return ArchiveEvent(
@@ -119,13 +127,14 @@ def event(
 
 
 def select(
-    events: list[ArchiveEvent],
+    events: list[ArchiveEntry],
     *,
     after: str | None,
     checkpoint: str | None,
     caught_up: bool,
     observed_at: datetime,
-) -> ArchiveRead | None:
+    capture: bool,
+) -> ArchiveRead | ArchiveCapture | None:
     """Return a page, or request confirmation of a marker missing from an exhausted scan."""
     boundary = checkpoint if checkpoint is not None else after
     start = 0
@@ -140,18 +149,33 @@ def select(
         start = index if checkpoint is not None else index + 1
     result = tuple(events[start : start + ARCHIVE_PAGE_EVENTS])
     more = start + len(result) < len(events)
+    following = result[-1].native_event_id if more else None
+    if capture:
+        return ArchiveCapture(
+            cast(tuple[ArchiveOccurrence, ...], result),
+            following,
+            caught_up and not more,
+            observed_at,
+        )
     return ArchiveRead(
-        result, result[-1].native_event_id if more else None, caught_up and not more, observed_at
+        cast(tuple[ArchiveEvent, ...], result), following, caught_up and not more, observed_at
     )
 
 
-def event_pairs(events: list[ArchiveEvent]) -> tuple[tuple[str, str], ...]:
-    return tuple((event.native_event_id, event.native_digest) for event in events)
+def event_pairs(events: list[ArchiveEntry]) -> tuple[tuple[str, str, str | None], ...]:
+    return tuple(
+        (
+            event.native_event_id,
+            event.native_digest,
+            event.capture_digest if isinstance(event, ArchiveOccurrence) else None,
+        )
+        for event in events
+    )
 
 
 def confirm_missing(
-    first: tuple[tuple[str, str], ...],
-    events: list[ArchiveEvent],
+    first: tuple[tuple[str, str, str | None], ...],
+    events: list[ArchiveEntry],
     *,
     caught_up: bool,
     checkpoint: str | None,
@@ -159,6 +183,78 @@ def confirm_missing(
     if not caught_up or first != event_pairs(events):
         raise ArchiveBoundaryUncertain()
     raise ArchiveError("history_changed" if checkpoint is not None else "activation_boundary_lost")
+
+
+def occurrence(
+    native: ArchiveEvent,
+    records: tuple[ArchiveEvent, ...] | None = None,
+    evidence: object = None,
+) -> ArchiveOccurrence:
+    if records is None:
+        records = (
+            ()
+            if native.kind in ("memory_reference", "tool_call", "tool_result")
+            or native.role == "tool"
+            else (native,)
+        )
+    selected = [
+        [record.native_event_id, record.kind, record.role, record.attributes, record.text]
+        for record in records
+    ]
+    digest = canonical_digest(["capture.v4", native.native_digest, [evidence, selected]])
+    return ArchiveOccurrence(native.native_event_id, native.native_digest, digest, records)
+
+
+def utterance(
+    native: ArchiveEvent,
+    *,
+    conversation: str,
+    role: Literal["owner", "assistant", "peer"],
+    kind: Literal["question", "answer", "answer_note", "report"],
+    body: str,
+    source_key: str | int,
+    ordinal: int,
+    delivery_id: str | None = None,
+    call_id: str | None = None,
+    question_id: str | None = None,
+    sender_id: str | None = None,
+) -> ArchiveEvent:
+    source = [
+        conversation,
+        delivery_id or native.native_event_id,
+        role,
+        sender_id,
+        kind,
+        source_key,
+    ]
+    identity = "delivery:" + canonical_digest(source)
+    digest = canonical_digest([source, body])
+    attributes = {
+        "kind": kind,
+        "carrier_event_id": native.native_event_id,
+        "ordinal": ordinal,
+        **{
+            name: value
+            for name, value in (
+                ("delivery_id", delivery_id),
+                ("call_id", call_id),
+                ("question_id", question_id),
+                ("sender_id", sender_id),
+            )
+            if value is not None
+        },
+    }
+    return ArchiveEvent(
+        identity,
+        digest,
+        native.turn_id,
+        native.native_parent_id,
+        role,
+        "text",
+        body,
+        {"delivery": attributes},
+        native.occurred_at,
+    )
 
 
 def memory_attributes(tool: str, arguments: object, result: object) -> dict[str, object]:

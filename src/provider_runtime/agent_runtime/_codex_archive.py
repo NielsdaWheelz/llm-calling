@@ -10,22 +10,27 @@ from typing import cast
 
 from ._archive_codec import (
     MAX_ARCHIVE_EVENTS,
+    ArchiveEntry,
     canonical,
     confirm_missing,
     event,
     event_pairs,
     memory_attributes,
     object_value,
+    occurrence,
     select,
     string,
     text,
     timestamp,
+    utterance,
 )
+from ._codex_deliveries import collaboration_reports
 from .archive import (
     INTERNAL_THREAD_SOURCE,
     MEMORY_TOOL_NAMES,
     ArchiveBoundaryUncertain,
     ArchiveCapabilities,
+    ArchiveCapture,
     ArchiveConversation,
     ArchiveError,
     ArchiveErrorCode,
@@ -105,6 +110,7 @@ def conversation(value: object, *, archived: bool) -> tuple[ArchiveConversation,
     fork = string(native.get("forkedFromId"), optional=True, limit=256)
     thread_source = string(native.get("threadSource"), optional=True, limit=256)
     internal = thread_source == INTERNAL_THREAD_SOURCE
+    review = False
     if type(source) is str:
         if source not in ("cli", "vscode", "exec", "appServer", "unknown"):
             raise ArchiveError("unsupported")
@@ -115,6 +121,7 @@ def conversation(value: object, *, archived: bool) -> tuple[ArchiveConversation,
                 if agent not in ("review", "compact", "memory_consolidation"):
                     raise ArchiveError("unsupported")
                 internal = internal or agent in ("compact", "memory_consolidation")
+                review = agent == "review"
             elif isinstance(agent, dict) and "thread_spawn" in agent:
                 spawn = object_value(agent["thread_spawn"])
                 origin = string(spawn.get("parent_thread_id"), limit=256)
@@ -146,6 +153,7 @@ def conversation(value: object, *, archived: bool) -> tuple[ArchiveConversation,
         relation="fork" if fork is not None else "child" if parent is not None else None,
         parent_native_id=fork or parent,
         working_directory=string(native.get("cwd"), optional=True),
+        worker=parent is not None or review,
     ), active
 
 
@@ -202,7 +210,7 @@ async def listing(connection: CodexAppServerClient) -> tuple[list[ArchiveConvers
     return result, active_ids
 
 
-async def inventory(home: ArchiveHome, *, with_heads: bool) -> ArchiveInventory:
+async def inventory(home: ArchiveHome, *, with_heads: bool, capture: bool) -> ArchiveInventory:
     observed_at = datetime.now(UTC)
     try:
         async with client(home) as connection:
@@ -211,7 +219,7 @@ async def inventory(home: ArchiveHome, *, with_heads: bool) -> ArchiveInventory:
                 return ArchiveInventory(tuple(before), None, True, observed_at)
             items: list[ArchiveConversation] = []
             for item in before:
-                if item.internal:
+                if item.internal or capture and item.worker:
                     items.append(item)
                     continue
                 try:
@@ -230,7 +238,7 @@ async def inventory(home: ArchiveHome, *, with_heads: bool) -> ArchiveInventory:
                     continue
                 if replace(current, updated_at=original.updated_at) != original:
                     complete = False
-                if not original.internal and (
+                if not (original.internal or capture and original.worker) and (
                     current.updated_at != original.updated_at or original.native_id in active_ids
                 ):
                     items[index] = replace(
@@ -266,11 +274,11 @@ async def unchanged_thread(
     return native if current == before and not active else None
 
 
-async def head(home: ArchiveHome, native_id: str) -> ArchiveHead:
+async def head(home: ArchiveHome, native_id: str, *, capture: bool) -> ArchiveHead:
     try:
         async with client(home) as connection:
             before, active = conversation(await read_thread(connection, native_id), archived=False)
-            if before.native_id != native_id or before.internal:
+            if before.native_id != native_id or before.internal or capture and before.worker:
                 raise ArchiveError("unsupported")
             if active:
                 raise ArchiveError("unavailable")
@@ -283,19 +291,20 @@ async def head(home: ArchiveHome, native_id: str) -> ArchiveHead:
 
 
 async def read(
-    home: ArchiveHome, native_id: str, *, after: str | None, checkpoint: str | None
-) -> ArchiveRead:
+    home: ArchiveHome, native_id: str, *, after: str | None, checkpoint: str | None, capture: bool
+) -> ArchiveRead | ArchiveCapture:
     observed_at = datetime.now(UTC)
     try:
         async with client(home) as connection:
             native = await read_thread(connection, native_id)
-            events, caught_up = await history(connection, home, native_id, native)
+            events, caught_up = await history(connection, home, native_id, native, capture=capture)
             page = select(
                 events,
                 after=after,
                 checkpoint=checkpoint,
                 caught_up=caught_up,
                 observed_at=observed_at,
+                capture=capture,
             )
             if page is not None:
                 return page
@@ -308,7 +317,7 @@ async def read(
             native = await unchanged_thread(connection, before)
             if native is None:
                 raise ArchiveBoundaryUncertain()
-            events, caught_up = await history(connection, home, native_id, native)
+            events, caught_up = await history(connection, home, native_id, native, capture=capture)
             if await unchanged_thread(connection, before) is None:
                 raise ArchiveBoundaryUncertain()
             confirm_missing(first, events, caught_up=caught_up, checkpoint=checkpoint)
@@ -317,10 +326,15 @@ async def read(
 
 
 async def history(
-    connection: CodexAppServerClient, home: ArchiveHome, native_id: str, native: dict[str, object]
-) -> tuple[list[ArchiveEvent], bool]:
+    connection: CodexAppServerClient,
+    home: ArchiveHome,
+    native_id: str,
+    native: dict[str, object],
+    *,
+    capture: bool = False,
+) -> tuple[list[ArchiveEntry], bool]:
     info, _ = conversation(native, archived=False)
-    if info.native_id != native_id or info.internal:
+    if info.native_id != native_id or info.internal or capture and info.worker:
         raise ArchiveError("unsupported")
     source = native.get("source")
     agent = source.get("subAgent") if isinstance(source, dict) else None
@@ -328,7 +342,7 @@ async def history(
     mode = native.get("historyMode", "legacy")
     if mode not in ("legacy", "paginated"):
         raise ArchiveError("unsupported")
-    result: list[ArchiveEvent] = []
+    result: list[ArchiveEntry] = []
     previous = ""
     seen: set[str] = set()
     item_count = 0
@@ -368,7 +382,43 @@ async def history(
             if value.native_event_id in seen:
                 raise ArchiveError("source_conflict")
             seen.add(value.native_event_id)
-            result.append(value)
+            if capture:
+                records = None
+                evidence = None
+                if value.kind == "tool_result" and item.get("type") == "collabAgentToolCall":
+                    sender_thread = string(item.get("senderThreadId"), limit=256)
+                    # Fork copies may have been delivered to their immediate
+                    # source. Their derived ids remain local to this fork.
+                    recipient_proven = sender_thread == native_id or (
+                        info.relation == "fork" and sender_thread == info.parent_native_id
+                    )
+                    reports = collaboration_reports(item, sender_thread) if recipient_proven else ()
+                    call_id = string(item.get("id"), limit=256)
+                    records = tuple(
+                        utterance(
+                            value,
+                            conversation=native_id,
+                            role="peer",
+                            kind="report",
+                            body=body,
+                            source_key=sender,
+                            ordinal=index,
+                            call_id=call_id,
+                            sender_id=sender,
+                        )
+                        for index, (sender, body) in enumerate(reports)
+                    )
+                elif item.get("type") == "agentMessage" and item.get("delivery") == "async":
+                    questions = item.get("questions")
+                    if questions is not None:
+                        if not isinstance(questions, list):
+                            raise ArchiveError("unsupported")
+                        evidence = ["async", questions]
+                elif item.get("type") in ("subAgentActivity", "sleep", "imageGeneration"):
+                    records = ()
+                result.append(occurrence(value, records, evidence))
+            else:
+                result.append(value)
         return True
 
     turns = []
