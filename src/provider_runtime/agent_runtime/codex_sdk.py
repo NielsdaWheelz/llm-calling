@@ -132,6 +132,7 @@ from .types import (
 )
 
 _REQUIRED_MCP_STARTUP_FAILURE = "required MCP servers failed to initialize"
+_QUOTA_ERROR_INFO = ("usageLimitExceeded", "sessionBudgetExceeded")
 
 
 def codex_native_request_fit(
@@ -1490,9 +1491,9 @@ class CodexSdkAdapter:
                 else "Codex error"
             )
             self._append_diagnostic(state, normalized)
-            if self._is_quota_error(error):
-                state.quota_exhausted = True
             info = error.get("codexErrorInfo")
+            if info in _QUOTA_ERROR_INFO:
+                state.quota_exhausted = True
             if (
                 params.get("willRetry") is True
                 and isinstance(info, Mapping)
@@ -1904,6 +1905,8 @@ class CodexSdkAdapter:
         diagnostics = tuple(state.diagnostics)
         if state.attempt is None or state.turn_id is None:
             raise ProtocolDefect("Codex native terminal omitted its submitted attempt")
+        if turn.get("id") != state.turn_id:
+            raise ProtocolDefect("Codex native terminal changed or omitted its turn identity")
         evidence = NativeTerminalEvidence(
             state.attempt,
             AgentTurnRef(state.ref, state.turn_id),
@@ -1930,11 +1933,15 @@ class CodexSdkAdapter:
                 diagnostics=diagnostics,
             )
         if status == "failed":
-            failure: AgentTerminalFailure = (
-                AgentQuotaExhausted()
-                if state.quota_exhausted or self._is_quota_error(turn.get("error"))
-                else AgentFailure("backend_failed")
-            )
+            error = turn.get("error")
+            info = error.get("codexErrorInfo") if isinstance(error, Mapping) else None
+            failure: AgentTerminalFailure
+            if state.quota_exhausted or info in _QUOTA_ERROR_INFO:
+                failure = AgentQuotaExhausted()
+            elif info == "contextWindowExceeded":
+                failure = AgentFailure("context_window_exceeded")
+            else:
+                failure = AgentFailure("backend_failed")
             return AgentTerminal(
                 status="failed",
                 failure=failure,
@@ -2495,13 +2502,6 @@ class CodexSdkAdapter:
         if not isinstance(value, str) or value not in _PATCH_APPLY_STATUS:
             raise ProtocolDefect(f"{method} file change carried an impossible status")
         return _PATCH_APPLY_STATUS[value]
-
-    @staticmethod
-    def _is_quota_error(value: object) -> bool:
-        if not isinstance(value, Mapping):
-            return False
-        info = value.get("codexErrorInfo")
-        return info in ("usageLimitExceeded", "sessionBudgetExceeded")
 
     @staticmethod
     def _is_quota_error_text(value: str) -> bool:

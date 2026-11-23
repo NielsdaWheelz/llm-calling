@@ -39,6 +39,7 @@ from .types import (
 
 type AgentFailureCause = Literal[
     "backend_failed",
+    "context_window_exceeded",
     "turn_timeout",
     "output_limit_exceeded",
     "approval_unanswered",
@@ -46,6 +47,7 @@ type AgentFailureCause = Literal[
 ]
 AGENT_FAILURE_CAUSES: tuple[AgentFailureCause, ...] = (
     "backend_failed",
+    "context_window_exceeded",
     "turn_timeout",
     "output_limit_exceeded",
     "approval_unanswered",
