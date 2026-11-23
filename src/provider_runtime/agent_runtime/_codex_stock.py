@@ -136,7 +136,7 @@ def _file_changes(value: object, *, include_diffs: bool) -> list[dict[str, objec
         operation = kind.get("type")
         if operation not in ("add", "delete", "update"):
             return None
-        change_kind = {"type": operation}
+        change_kind: dict[str, str | None] = {"type": operation}
         if operation == "update":
             move_path = kind.get("move_path")
             if not isinstance(move_path, str | None):
