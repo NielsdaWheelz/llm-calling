@@ -8,7 +8,7 @@ import logging
 import weakref
 from collections.abc import AsyncGenerator, Callable, Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
-from typing import Any, Literal, cast
+from typing import Any, Literal, Never, cast
 from uuid import uuid4
 
 from provider_runtime.errors import sanitize_provider_text
@@ -50,6 +50,9 @@ from .codex_app_server import (
 from .codex_containment import _startup_flag, _validate_codex_containment_config
 from .codex_endpoint import CodexEndpoint, fingerprint_codex_endpoint
 from .errors import (
+    CodexSummaryMatch,
+    CodexUnfinishedItemReason,
+    CodexUnfinishedItems,
     ConflictingSubmissionEvidence,
     CredentialRejected,
     CredentialUnavailable,
@@ -387,6 +390,14 @@ class _CompletedAgentMessage:
     item_id: str
     text: str
     phase: AgentMessagePhase
+    start_order: int | None
+
+
+@dataclass(slots=True)
+class _StartedItem:
+    kind: str
+    start_order: int | None = None
+    last_activity: int = 0
 
 
 def _presence_delta(
@@ -523,10 +534,12 @@ class _CodexSessionState:
     streamed_text_bytes: int = 0
     completed_agent_messages: list[_CompletedAgentMessage] = field(default_factory=list)
     completed_item_ids: set[str] = field(default_factory=set)
-    response_message_ids: set[str] = field(default_factory=set)
+    response_messages_completed: dict[str, bool] = field(default_factory=dict)
     retired_message_ids: set[str] = field(default_factory=set)
     retained_message_id_bytes: int | None = 0
-    started_item_types: dict[str, str] = field(default_factory=dict)
+    reused_message_identity: bool = False
+    display_order: int = 0
+    started_items: dict[str, _StartedItem] = field(default_factory=dict)
     diagnostics: list[str] = field(default_factory=list)
     active_mcp_calls: dict[str, tuple[str, str]] = field(default_factory=dict)
     active_tool_calls: dict[str, str] = field(default_factory=dict)
@@ -540,23 +553,35 @@ class _CodexSessionState:
     controlled: bool = False
     handle: _CodexAgentTurn | None = None
 
-    def observe_response_message(self, item_id: str) -> None:
+    def observe_response_message(self, item_id: str) -> bool:
         if item_id in self.retired_message_ids:
             raise ProtocolDefect("Codex reused an abandoned assistant message identity")
+        started = self.started_items.get(item_id)
+        if self.controlled and started is not None and started.kind == "agentMessage":
+            self.display_order += 1
+            started.last_activity = self.display_order
         held = self.retained_message_id_bytes
-        if held is None or item_id in self.response_message_ids:
-            return
+        if held is None or item_id in self.response_messages_completed:
+            return False
         size = len(item_id.encode("utf-8"))
         if self.controlled and (
-            len(self.response_message_ids) + len(self.retired_message_ids) >= _MAX_MESSAGE_ITEMS
+            len(self.response_messages_completed) + len(self.retired_message_ids)
+            >= _MAX_MESSAGE_ITEMS
             or held + size > _MAX_MESSAGE_BYTES
         ):
             # A healthy turn still runs. A later retry cannot verify every old id.
-            self.response_message_ids.clear()
+            self.response_messages_completed.clear()
             self.retained_message_id_bytes = None
-            return
-        self.response_message_ids.add(item_id)
+            return False
+        self.response_messages_completed[item_id] = False
         self.retained_message_id_bytes = held + size
+        return True
+
+    def retire_response_messages(self, item_ids: tuple[str, ...]) -> None:
+        for item_id in item_ids:
+            self.started_items.pop(item_id, None)
+            del self.response_messages_completed[item_id]
+            self.retired_message_ids.add(item_id)
 
 
 class CodexSdkAdapter:
@@ -878,10 +903,12 @@ class CodexSdkAdapter:
         state.streamed_text_bytes = 0
         state.completed_agent_messages.clear()
         state.completed_item_ids.clear()
-        state.response_message_ids.clear()
+        state.response_messages_completed.clear()
         state.retired_message_ids.clear()
         state.retained_message_id_bytes = 0
-        state.started_item_types.clear()
+        state.reused_message_identity = False
+        state.display_order = 0
+        state.started_items.clear()
         state.usage_accounting.begin_turn()
         state.diagnostics.clear()
         state.active_mcp_calls.clear()
@@ -1344,6 +1371,11 @@ class CodexSdkAdapter:
         if method == "rawResponseItem/completed":
             item = self._mapping(params.get("item"), "raw Responses item")
             kind = self._non_empty_string(item, "type", method)
+            if kind == "message":
+                item_id = item.get("id")
+                if item.get("role") == "assistant" and isinstance(item_id, str) and item_id:
+                    state.observe_response_message(item_id)
+                return None
             if state.client.config.stock_observations:
                 return (
                     observed_delivery(item)
@@ -1351,11 +1383,6 @@ class CodexSdkAdapter:
                     else None
                 )
             if kind == "agent_message":
-                return None
-            if kind == "message":
-                item_id = item.get("id")
-                if item.get("role") == "assistant" and isinstance(item_id, str) and item_id:
-                    state.observe_response_message(item_id)
                 return None
             if kind == "reasoning":
                 return None
@@ -1638,13 +1665,11 @@ class CodexSdkAdapter:
             raise ProtocolDefect(
                 "Codex abandoned assistant message identities exceeded their bound"
             )
-        for key in state.response_message_ids:
-            if state.started_item_types.get(key) not in (None, "agentMessage"):
+        for key in state.response_messages_completed:
+            started = state.started_items.get(key)
+            if started is not None and started.kind != "agentMessage":
                 raise ProtocolDefect("Codex stream retry shared a display id with an active item")
-        for key in state.response_message_ids:
-            state.started_item_types.pop(key, None)
-            state.retired_message_ids.add(key)
-        state.response_message_ids.clear()
+        state.retire_response_messages(tuple(state.response_messages_completed))
         state.completed_agent_messages.clear()
 
     def _item_started(
@@ -1661,16 +1686,21 @@ class CodexSdkAdapter:
             raise ProtocolDefect("custom tool output started as an independent item")
         item_id = self._non_empty_string(item, "id", method)
         if (
-            item_id in state.started_item_types
+            item_id in state.started_items
             or item_id in state.completed_item_ids
             or item_id in state.retired_message_ids
         ):
             raise ProtocolDefect("Codex item identity started more than once")
-        if len(state.started_item_types) >= _MAX_MESSAGE_ITEMS:
+        if len(state.started_items) >= _MAX_MESSAGE_ITEMS:
             raise ProtocolDefect("Codex active item count exceeded its finite bound")
-        state.started_item_types[item_id] = item_type
+        started = _StartedItem(item_type)
+        state.started_items[item_id] = started
         if item_type == "agentMessage":
-            state.observe_response_message(item_id)
+            fresh = state.observe_response_message(item_id)
+            if state.controlled:
+                state.reused_message_identity |= not fresh
+                if fresh:
+                    started.start_order = started.last_activity
         if item_type in _INERT_ITEM_TYPES:
             return None
         if item_type == "commandExecution":
@@ -1794,18 +1824,20 @@ class CodexSdkAdapter:
             raise ProtocolDefect("Codex closed item identity completed again")
         if not state.controlled:
             state.completed_item_ids.add(item_id)
-        started_type = state.started_item_types.pop(item_id, None)
+        started = state.started_items.pop(item_id, None)
         if (
             item_type not in _INERT_ITEM_TYPES
             and item_type not in _AUTHORITY_ITEM_TYPES
             and item_type not in ("custom_tool_call",)
         ):
             raise ProtocolDefect(f"{method} carried unknown item type {item_type}")
-        if started_type is not None and started_type != item_type:
+        if started is not None and started.kind != item_type:
             raise ProtocolDefect("Codex item changed type during its lifecycle")
         if item_type in _INERT_ITEM_TYPES:
             if item_type == "agentMessage":
-                self._record_completed_agent_message(state, item_id, item, method)
+                self._record_completed_agent_message(
+                    state, item_id, item, method, None if started is None else started.start_order
+                )
                 if state.controlled:
                     if state.turn_id is None:
                         raise ProtocolDefect("completed message omitted its native turn")
@@ -1824,7 +1856,7 @@ class CodexSdkAdapter:
                 input_id = self._non_empty_string(item, "clientId", method)
                 return AgentInputRecorded(AgentTurnRef(state.ref, state.turn_id), input_id, item_id)
             return None
-        if started_type is None:
+        if started is None:
             raise ProtocolDefect("Codex authority item completed before its start")
         if item_type == "commandExecution":
             self._complete_tool(state, item_id, "commandExecution", method)
@@ -1915,9 +1947,12 @@ class CodexSdkAdapter:
         turn = self._mapping(params.get("turn"), "turn/completed turn")
         status = turn.get("status")
         aborted_items = state.controlled and status in ("interrupted", "failed")
+        superseded_drafts = state.controlled and status == "completed" and bool(state.started_items)
+        if superseded_drafts:
+            self._require_superseded_drafts(state, turn)
         if state.active_mcp_calls:
             raise ProtocolDefect("turn completed with active MCP tool calls")
-        if state.started_item_types and not aborted_items:
+        if state.started_items and not (aborted_items or superseded_drafts):
             raise ProtocolDefect("turn completed with unfinished Codex item lifecycles")
         if state.active_tool_calls and not aborted_items:
             raise ProtocolDefect("turn completed with active Codex authority items")
@@ -1941,7 +1976,7 @@ class CodexSdkAdapter:
             "codex-turn-completed.v1",
         )
         if status == "completed":
-            return AgentTerminal(
+            terminal = AgentTerminal(
                 status="succeeded",
                 failure=None,
                 final_text=final_text,
@@ -1950,6 +1985,9 @@ class CodexSdkAdapter:
                 usage=usage,
                 diagnostics=diagnostics,
             )
+            if superseded_drafts:
+                state.retire_response_messages(tuple(state.started_items))
+            return terminal
         if status == "interrupted":
             return AgentTerminal(
                 status="cancelled",
@@ -1980,6 +2018,84 @@ class CodexSdkAdapter:
                 diagnostics=diagnostics,
             )
         raise ProtocolDefect("turn/completed carried an impossible status")
+
+    def _require_superseded_drafts(
+        self,
+        state: _CodexSessionState,
+        turn: Mapping[str, object],
+    ) -> None:
+        handle = state.handle
+        open_display = sum(item.kind == "agentMessage" for item in state.started_items.values())
+        open_other = len(state.started_items) - open_display
+        call_ids = state.active_tool_calls.keys() | state.active_mcp_calls.keys()
+        call_ids.update(state.unpublished_calls)
+        pending_inputs = 0
+        if handle is not None:
+            call_ids.update(handle._calls)
+            call_ids.update(reply.call.call_id for reply in handle._reply_tokens.values())
+            pending_inputs = len(handle._input_ids)
+        server_requests = len(state.server_request_ids)
+
+        def reject(
+            reason: CodexUnfinishedItemReason, summary: CodexSummaryMatch = "unchecked"
+        ) -> Never:
+            raise CodexUnfinishedItems(
+                reason=reason,
+                open_display_items=open_display,
+                open_other_items=open_other,
+                pending_calls=len(call_ids),
+                pending_inputs=pending_inputs,
+                pending_server_requests=server_requests,
+                summary=summary,
+            )
+
+        if (
+            open_other
+            or call_ids
+            or server_requests
+            or (state.authority_seen and self._strict_native_containment(state))
+        ):
+            reject("open_authority")
+        if pending_inputs:
+            reject("pending_input")
+        if (
+            handle is None
+            or handle._attempt != state.attempt
+            or not handle._writer_entered
+            or handle._refusal is not None
+            or handle._error is not None
+            or state.turn_id is None
+            or turn.get("id") != state.turn_id
+            or turn.get("error") is not None
+            or state.retained_message_id_bytes is None
+            or state.reused_message_identity
+        ):
+            reject("incomplete_identity")
+
+        final = self._selected_final_message(state)
+        if final is None or final.phase != "final_answer" or final.start_order is None:
+            reject("unproved_order")
+        if any(item.last_activity >= final.start_order for item in state.started_items.values()):
+            reject("unproved_order")
+
+        items_view = turn.get("itemsView")
+        items = turn.get("items")
+        if items_view is None or items is None:
+            reject("summary_mismatch", "absent")
+        if items_view != "summary" or not isinstance(items, list):
+            reject("summary_mismatch", "mismatch")
+        answers: list[Mapping[str, object]] = []
+        for item in items:
+            if not isinstance(item, Mapping) or not isinstance(item.get("type"), str):
+                reject("summary_mismatch", "mismatch")
+            if item.get("type") == "agentMessage" and item.get("phase") == "final_answer":
+                answers.append(item)
+        if (
+            len(answers) != 1
+            or answers[0].get("id") != final.item_id
+            or answers[0].get("text") != final.text
+        ):
+            reject("summary_mismatch", "mismatch")
 
     def _token_usage(self, params: Mapping[str, object]) -> tuple[TokenUsage, bool]:
         """Decode a live turn update, independently witnessed in the live matrix."""
@@ -2475,6 +2591,7 @@ class CodexSdkAdapter:
         item_id: str,
         item: Mapping[str, object],
         method: str,
+        start_order: int | None,
     ) -> None:
         text = self._string(item, "text", method)
         phase = item.get("phase")
@@ -2484,6 +2601,9 @@ class CodexSdkAdapter:
             raise OutputLimitExceeded(_MAX_FINAL_TEXT_BYTES)
         state.observe_response_message(item_id)
         if state.controlled:
+            if state.retained_message_id_bytes is not None:
+                state.reused_message_identity |= state.response_messages_completed[item_id]
+                state.response_messages_completed[item_id] = True
             if phase == "commentary":
                 return
             state.completed_agent_messages[:] = [
@@ -2494,20 +2614,25 @@ class CodexSdkAdapter:
                 item_id=item_id,
                 text=text,
                 phase=cast(AgentMessagePhase, phase),
+                start_order=start_order,
             )
         )
 
     @staticmethod
-    def _selected_final_text(state: _CodexSessionState, *, required: bool) -> str:
+    def _selected_final_message(state: _CodexSessionState) -> _CompletedAgentMessage | None:
         """Select the last final answer, else the last unknown-phase message."""
         last_unknown: _CompletedAgentMessage | None = None
         for message in reversed(state.completed_agent_messages):
             if message.phase == "final_answer":
-                return message.text
+                return message
             if message.phase is None and last_unknown is None:
                 last_unknown = message
-        if last_unknown is not None:
-            return last_unknown.text
+        return last_unknown
+
+    def _selected_final_text(self, state: _CodexSessionState, *, required: bool) -> str:
+        message = self._selected_final_message(state)
+        if message is not None:
+            return message.text
         if required:
             raise ProtocolDefect("Codex turn completed without an eligible completed agent message")
         return ""
@@ -3309,7 +3434,7 @@ class _CodexAgentTurn:
         needs_discard = (
             not self._state.client.usable
             or bool(
-                self._state.started_item_types
+                self._state.started_items
                 or self._state.active_tool_calls
                 or self._state.server_request_ids
             )

@@ -49,6 +49,7 @@ from .codex_sdk import codex_native_request_fit
 from .errors import (
     AgentRuntimeDefect,
     AgentRuntimeError,
+    CodexUnfinishedItems,
     ConcurrentTurn,
     ConflictingSubmissionEvidence,
     CredentialRejected,
@@ -283,6 +284,7 @@ __all__ = [
     "CodexTurnSnapshot",
     "CodexTurnStatus",
     "CodexTurnTarget",
+    "CodexUnfinishedItems",
     "CodexUnixEndpoint",
     "CodexUnknown",
     "CodexWebSocketEndpoint",
