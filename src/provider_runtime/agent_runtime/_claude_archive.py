@@ -98,6 +98,37 @@ def record(stream: BinaryIO) -> dict[str, object] | None:
     return native
 
 
+def bookkeeping(
+    native: dict[str, object], kind: str, *, session: str, agent_id: str | None
+) -> bool:
+    if kind in _BOOKKEEPING:
+        return True
+    if kind not in ("data-flow-records", "data-flow-incomplete", "derived-from"):
+        return False
+    version = native.get("v")
+    if type(version) is not int or version != 1 or native.get("sessionId") != session:
+        return False
+    fields = {"type", "v", "sessionId"}
+    if kind == "derived-from":
+        return (
+            agent_id is None
+            and native.keys() == fields | {"sessions"}
+            and native["sessions"]
+            == [{"type": "claude_code_session", "id": session, "via": "compact"}]
+        )
+    if agent_id is not None:
+        if native.get("agentId") != agent_id:
+            return False
+        fields.add("agentId")
+    array_key = "codes" if kind == "data-flow-incomplete" else "records"
+    fields.add(array_key)
+    if array_key == "records" and "snapshot" in native:
+        if type(native["snapshot"]) is not bool:
+            return False
+        fields.add("snapshot")
+    return native.keys() == fields and isinstance(native[array_key], list)
+
+
 def files(home: ArchiveHome) -> dict[str, Transcript]:
     projects = home.state_root / "projects"
     if not home.state_root.is_dir():
@@ -299,7 +330,9 @@ def history(
                     caught_up = False
                     break
                 kind = string(native.get("type"), limit=256)
-                if kind in _BOOKKEEPING:
+                if bookkeeping(
+                    native, kind, session=expected_session, agent_id=transcript.agent_id
+                ):
                     continue
                 if transcript.workflow and kind in ("user", "assistant"):
                     if native.get("isSidechain") is not True:
