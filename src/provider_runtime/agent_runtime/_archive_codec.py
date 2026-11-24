@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime
-from typing import Literal, Never, cast, overload
+from typing import Literal, cast, overload
 from uuid import UUID
 
 from ._limits import (
@@ -178,11 +178,10 @@ def confirm_missing(
     events: list[ArchiveEntry],
     *,
     caught_up: bool,
-    checkpoint: str | None,
-) -> Never:
+) -> None:
+    """Require a second exhausted scan matching the scan that missed the marker."""
     if not caught_up or first != event_pairs(events):
         raise ArchiveBoundaryUncertain()
-    raise ArchiveError("history_changed" if checkpoint is not None else "activation_boundary_lost")
 
 
 def occurrence(

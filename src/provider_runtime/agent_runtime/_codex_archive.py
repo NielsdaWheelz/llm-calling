@@ -267,11 +267,20 @@ async def stable_head(
 
 
 async def unchanged_thread(
-    connection: CodexAppServerClient, before: ArchiveConversation
+    connection: CodexAppServerClient,
+    before: ArchiveConversation,
+    *,
+    selected_path: str | None = None,
 ) -> dict[str, object] | None:
     native = await read_thread(connection, before.native_id)
     current, active = conversation(native, archived=False)
-    return native if current == before and not active else None
+    if current != before or active:
+        return None
+    if selected_path is not None and (
+        native.get("historyMode") != "paginated" or native.get("path") != selected_path
+    ):
+        return None
+    return native
 
 
 async def head(home: ArchiveHome, native_id: str, *, capture: bool) -> ArchiveHead:
@@ -291,7 +300,13 @@ async def head(home: ArchiveHome, native_id: str, *, capture: bool) -> ArchiveHe
 
 
 async def read(
-    home: ArchiveHome, native_id: str, *, after: str | None, checkpoint: str | None, capture: bool
+    home: ArchiveHome,
+    native_id: str,
+    *,
+    after: str | None,
+    checkpoint: str | None,
+    capture: bool,
+    resume_selected: bool,
 ) -> ArchiveRead | ArchiveCapture:
     observed_at = datetime.now(UTC)
     try:
@@ -312,15 +327,42 @@ async def read(
             before, active = conversation(native, archived=False)
             if active:
                 raise ArchiveBoundaryUncertain()
+            selected_path = None
+            if (
+                resume_selected
+                and checkpoint is not None
+                and native.get("historyMode") == "paginated"
+            ):
+                path = native.get("path")
+                if type(path) is not str or not path:
+                    raise ArchiveBoundaryUncertain()
+                selected_path = path
             first = event_pairs(events)
             del events
-            native = await unchanged_thread(connection, before)
+            native = await unchanged_thread(connection, before, selected_path=selected_path)
             if native is None:
                 raise ArchiveBoundaryUncertain()
             events, caught_up = await history(connection, home, native_id, native, capture=capture)
-            if await unchanged_thread(connection, before) is None:
+            if await unchanged_thread(connection, before, selected_path=selected_path) is None:
                 raise ArchiveBoundaryUncertain()
-            confirm_missing(first, events, caught_up=caught_up, checkpoint=checkpoint)
+            confirm_missing(first, events, caught_up=caught_up)
+            if selected_path is None:
+                raise ArchiveError(
+                    "history_changed" if checkpoint is not None else "activation_boundary_lost"
+                )
+
+            page = select(
+                events,
+                after=after,
+                checkpoint=None,
+                caught_up=caught_up,
+                observed_at=observed_at,
+                capture=True,
+            )
+            if page is None:
+                raise ArchiveError("activation_boundary_lost")
+            assert isinstance(page, ArchiveCapture)
+            return replace(page, replayed_from_cut=True)
     except (CodexConnectionUnavailable, ProtocolDefect):
         raise ArchiveError("unavailable") from None
 
