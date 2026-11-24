@@ -230,6 +230,22 @@ the native `prompt_snapshot` attachment requires `systemPrompt`, while
 `contextRendering` is optional. present context binds the digest; absence and
 explicit null stay distinct. both fields remain reference-only.
 
+claude's provenance tracker persists `data-flow-records` updates (a `records`
+array with optional boolean `snapshot`) and `data-flow-incomplete` loss codes
+(a `codes` array). array values are opaque. a root can also persist
+`derived-from` with exactly one origin naming its own session through
+`{"type":"claude_code_session","id":"<session>","via":"compact"}`.
+exclude these complete records after applying the physical and decoded limits.
+the envelope requires `type`, integer `v=1`, the transcript's `sessionId`, and
+only the listed fields. child and workflow records use their native parent as
+the session and require matching `agentId` on data-flow records. root records
+omit `agentId`. extra fields, including `uuid` or `parentUuid`, use ordinary
+identity and error rules. tracker loss leaves no archive gap. compaction
+boundaries and fork references retain their own events.
+the direct-child capture header scan skips these records before checking the
+native sidechain or fork marker. workflow identity still requires the first
+physical sidechain user record.
+
 `fork-context-ref` is retained as empty-body context, with its exact closed
 `agentId`, `parentSessionId`, `parentLastUuid` and `contextLength` reference in
 `native_source_reference`. its stable identity and digest bind those fields,
