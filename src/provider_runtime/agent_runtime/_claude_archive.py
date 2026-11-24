@@ -103,6 +103,37 @@ def record(stream: BinaryIO) -> dict[str, object] | None:
     return native
 
 
+def bookkeeping(
+    native: dict[str, object], kind: str, *, session: str, agent_id: str | None
+) -> bool:
+    if kind in _BOOKKEEPING:
+        return True
+    if kind not in ("data-flow-records", "data-flow-incomplete", "derived-from"):
+        return False
+    version = native.get("v")
+    if type(version) is not int or version != 1 or native.get("sessionId") != session:
+        return False
+    fields = {"type", "v", "sessionId"}
+    if kind == "derived-from":
+        return (
+            agent_id is None
+            and native.keys() == fields | {"sessions"}
+            and native["sessions"]
+            == [{"type": "claude_code_session", "id": session, "via": "compact"}]
+        )
+    if agent_id is not None:
+        if native.get("agentId") != agent_id:
+            return False
+        fields.add("agentId")
+    array_key = "codes" if kind == "data-flow-incomplete" else "records"
+    fields.add(array_key)
+    if array_key == "records" and "snapshot" in native:
+        if type(native["snapshot"]) is not bool:
+            return False
+        fields.add("snapshot")
+    return native.keys() == fields and isinstance(native[array_key], list)
+
+
 def files(home: ArchiveHome) -> dict[str, Transcript]:
     projects = home.state_root / "projects"
     if not home.state_root.is_dir():
@@ -170,13 +201,15 @@ def file_version(path: Path) -> tuple[int, int]:
 def worker(transcript: Transcript) -> bool:
     if transcript.workflow:
         return True  # files() already proved the native first-message marker.
-    if transcript.agent_id is None:
+    session = transcript.parent
+    if session is None or transcript.agent_id is None:
         return False
     try:
         with transcript.path.open("rb") as stream:
-            header = record(stream)
-            while header is not None and string(header.get("type"), limit=256) in _BOOKKEEPING:
-                header = record(stream)
+            while (header := record(stream)) is not None:
+                kind = string(header.get("type"), limit=256)
+                if not bookkeeping(header, kind, session=session, agent_id=transcript.agent_id):
+                    break
     except (OSError, ArchiveError):
         # A directory does not prove worker lineage. Unreadable transcripts
         # still have a normal inventory identity and the usual head error.
@@ -186,13 +219,12 @@ def worker(transcript: Transcript) -> bool:
     if header.get("type") == "fork-context-ref":
         reference = fork_reference(header)
         matches = (
-            reference["agentId"] == transcript.agent_id
-            and reference["parentSessionId"] == transcript.parent
+            reference["agentId"] == transcript.agent_id and reference["parentSessionId"] == session
         )
     elif header.get("type") in ("user", "assistant") and header.get("isSidechain") is True:
         matches = (
             string(header.get("agentId"), limit=256) == transcript.agent_id
-            and string(header.get("sessionId"), limit=256) == transcript.parent
+            and string(header.get("sessionId"), limit=256) == session
         )
     else:
         return False
@@ -370,7 +402,9 @@ def history(
                     caught_up = False
                     break
                 kind = string(native.get("type"), limit=256)
-                if kind in _BOOKKEEPING:
+                if bookkeeping(
+                    native, kind, session=expected_session, agent_id=transcript.agent_id
+                ):
                     continue
                 if transcript.workflow and kind in ("user", "assistant"):
                     if native.get("isSidechain") is not True:
