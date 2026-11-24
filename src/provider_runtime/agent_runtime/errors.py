@@ -108,6 +108,36 @@ class ProtocolDefect(AgentRuntimeDefect):
         super().__init__(message, code=code)
 
 
+type CodexUnfinishedItemReason = Literal[
+    "open_authority", "pending_input", "unproved_order", "summary_mismatch", "incomplete_identity"
+]
+type CodexSummaryMatch = Literal["match", "mismatch", "absent", "unchecked"]
+
+
+class CodexUnfinishedItems(ProtocolDefect):
+    """Content-free evidence for rejection of a successful but unbalanced terminal."""
+
+    def __init__(
+        self,
+        *,
+        reason: CodexUnfinishedItemReason,
+        open_display_items: int,
+        open_other_items: int,
+        pending_calls: int,
+        pending_inputs: int,
+        pending_server_requests: int,
+        summary: CodexSummaryMatch,
+    ) -> None:
+        super().__init__("turn completed with unfinished Codex item lifecycles")
+        self.reason = reason
+        self.open_display_items = open_display_items
+        self.open_other_items = open_other_items
+        self.pending_calls = pending_calls
+        self.pending_inputs = pending_inputs
+        self.pending_server_requests = pending_server_requests
+        self.summary = summary
+
+
 class ConflictingSubmissionEvidence(ProtocolDefect):
     """The same submission carries both native acceptance and definitive refusal."""
 

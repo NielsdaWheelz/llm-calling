@@ -108,9 +108,16 @@ consumers use this narrow read to repair a pending baseline without rereading
 every other conversation. the consumer owns the new activation cut and excluded
 gap; this module never resets a boundary or backfills it.
 
-the current contract is `native-archive.v4`. the existing source identities,
+the current contract is `native-archive.v5`. the existing source identities,
 digests, pending baselines and inclusive checkpoints carry through the cut.
-`archive_capture` returns `occurrences`, `next`, `caught_up` and `observed_at`.
+`archive_capture` returns `occurrences`, `next`, `caught_up`, `observed_at`
+and `replayed_from_cut`. codex consumers may explicitly pass
+`resume_selected=True`. after proving an absent checkpoint in paginated history,
+the reader also requires the same native selected path and history mode across
+the guarded reads. it then pages that second verified occurrence sequence from
+the original exclusive cut and sets `replayed_from_cut=True`. a missing cut
+returns `activation_boundary_lost`. the flag is false on ordinary reads.
+the caller owns the previous checkpoint, its digests, and replay admission.
 each occurrence carries `native_event_id`, `native_digest`, `capture_digest`
 and ordered `records`. an empty record list accounts for an excluded occurrence
 and preserves the native cursor. each capture decision uses the current

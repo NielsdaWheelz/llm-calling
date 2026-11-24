@@ -372,7 +372,8 @@ def read(
     require_same_transcript()
     events, caught_up, _, _ = history(home, native_id, transcript, capture=capture)
     require_same_transcript()
-    confirm_missing(first, events, caught_up=caught_up, checkpoint=checkpoint)
+    confirm_missing(first, events, caught_up=caught_up)
+    raise ArchiveError("history_changed" if checkpoint is not None else "activation_boundary_lost")
 
 
 def history(

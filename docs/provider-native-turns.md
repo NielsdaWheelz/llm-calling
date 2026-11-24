@@ -90,6 +90,23 @@ compute or billing cessation is not part of this contract.
    current and retired display ids and 4 mib of utf-8 identity bytes. a healthy turn
    can exceed that history. a later retry then fails because earlier ids cannot
    all be proved. the provider checks each live callback identity.
+   stock can also close a successful turn with an older interrupted assistant
+   draft still open. the adapter accepts that terminal only when all open
+   items are assistant messages, and every callback, authority request and
+   writer-entered input is resolved. it must retain complete, unreused display
+   identities. a fresh normalized final-answer start must follow every open
+   draft's last decoded activity. the sole final answer in stock's terminal
+   summary must match that started and completed item's id, phase and exact text.
+   the adapter retires the drafts after the ordinary native checks and emits
+   the original terminal. it emits no completions for the drafts. host
+   publication and effect fences still apply.
+   rejection of this exception carries `CodexUnfinishedItems` under
+   `ProtocolDefect`. the first failed check determines the reason, in order
+   `open_authority`, `pending_input`, `incomplete_identity`,
+   `unproved_order`, `summary_mismatch`. the attached counts describe open
+   items, distinct pending calls, pending inputs and server requests. summary
+   evidence is unchecked when an earlier check fails. the defect has no ids,
+   answer text or arguments.
    durable host journals own completed callback/input/message identities and
    reject changed replay. written replies and completed callbacks retire pending
    request state; input ids retire only after their native recording. unresolved

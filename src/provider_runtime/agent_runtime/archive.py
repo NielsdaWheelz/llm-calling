@@ -13,7 +13,7 @@ from typing import Literal
 from .codex_endpoint import CodexEndpoint, CodexUnixEndpoint, CodexWebSocketEndpoint
 from .errors import AgentRuntimeError, InvalidAgentRequest
 
-ARCHIVE_CONTRACT_REVISION = "native-archive.v4"
+ARCHIVE_CONTRACT_REVISION = "native-archive.v5"
 INTERNAL_THREAD_SOURCE = "jarvis.cognition"
 MEMORY_TOOL_NAMES = frozenset(
     (
@@ -172,6 +172,7 @@ class ArchiveCapture:
     next: str | None
     caught_up: bool
     observed_at: datetime
+    replayed_from_cut: bool = False
 
 
 def mark_internal_session(state_root: Path, native_id: str) -> None:
@@ -244,10 +245,19 @@ async def archive_read(
 
 
 async def archive_capture(
-    home: ArchiveHome, native_id: str, after: str | None = None, from_event_id: str | None = None
+    home: ArchiveHome,
+    native_id: str,
+    after: str | None = None,
+    from_event_id: str | None = None,
+    *,
+    resume_selected: bool = False,
 ) -> ArchiveCapture:
     """Read accounted occurrences, including omitted native events at the boundary."""
-    result = await _read(home, native_id, after, from_event_id, capture=True)
+    if type(resume_selected) is not bool or (resume_selected and home.provider != "codex"):
+        raise InvalidAgentRequest("selected history recovery requires Codex capture")
+    result = await _read(
+        home, native_id, after, from_event_id, capture=True, resume_selected=resume_selected
+    )
     assert isinstance(result, ArchiveCapture)
     return result
 
@@ -259,6 +269,7 @@ async def _read(
     from_event_id: str | None,
     *,
     capture: bool,
+    resume_selected: bool = False,
 ) -> ArchiveRead | ArchiveCapture:
     if not native_id or len(native_id.encode("utf-8")) > 256:
         raise InvalidAgentRequest("native conversation identity must be bounded and nonempty")
@@ -270,7 +281,14 @@ async def _read(
     if home.provider == "codex":
         from ._codex_archive import read
 
-        return await read(home, native_id, after=after, checkpoint=from_event_id, capture=capture)
+        return await read(
+            home,
+            native_id,
+            after=after,
+            checkpoint=from_event_id,
+            capture=capture,
+            resume_selected=resume_selected,
+        )
     from ._claude_archive import read
 
     return await asyncio.to_thread(
