@@ -534,8 +534,11 @@ The accounting boundary fails safe:
   stream ended before Codex's terminal usage boundary.
 
 `AgentTerminal.failure` is `None`, `AgentQuotaExhausted()`, or
-`AgentFailure(cause)` with causes `backend_failed`, `turn_timeout`,
+`AgentFailure(cause)` with causes `backend_failed`, `context_window_exceeded`, `turn_timeout`,
 `output_limit_exceeded`, `approval_unanswered`, `output_schema_violation`.
+codex reports `context_window_exceeded` only when the matching failed
+`turn/completed` carries `turn.error.codexErrorInfo == "contextWindowExceeded"`.
+a quota failure takes precedence. the terminal codec preserves the original seal.
 Model/backend failures are terminal values; broken runtime invariants raise
 (`ProtocolDefect`, `MissingTerminalEvent`). Exactly one `AgentTerminal` ends
 every valid started-turn stream, last; a defect raises without accepting a
