@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal, assert_never, cast
 from uuid import UUID
@@ -40,6 +41,22 @@ type CodexErrorCode = Literal[
 ]
 type CodexNativeStatus = Literal["notLoaded", "idle", "active", "systemError"]
 type CodexTurnStatus = Literal["inProgress", "completed", "interrupted", "failed"]
+type CodexAllowanceState = Literal[
+    "available",
+    "available_with_credits",
+    "credits_available",
+    "included_exhausted",
+    "workspace_limit",
+    "identity_unverified",
+    "unavailable",
+]
+
+_WORKSPACE_LIMITS = (
+    "workspace_owner_credits_depleted",
+    "workspace_member_credits_depleted",
+    "workspace_owner_usage_limit_reached",
+    "workspace_member_usage_limit_reached",
+)
 
 
 def _profile(value: str) -> None:
@@ -236,6 +253,28 @@ class CodexUnknown:
 type CodexInterruptOutcome = CodexInterrupted | CodexFinished | CodexStale | CodexUnknown
 
 
+@dataclass(frozen=True, slots=True)
+class CodexSubject:
+    user_id: str = field(repr=False)
+    account_id: str = field(repr=False)
+    plan_type: str
+
+    def __post_init__(self) -> None:
+        if any(
+            type(value) is not str or not value
+            for value in (self.user_id, self.account_id, self.plan_type)
+        ):
+            raise InvalidAgentRequest("Codex allowance requires an enrolled subject and plan")
+
+
+@dataclass(frozen=True, slots=True)
+class CodexAllowance:
+    profile: str
+    observed_at: datetime
+    state: CodexAllowanceState
+    reset_at: datetime | None = None
+
+
 class CodexControlError(AgentRuntimeError):
     """A content-free expected failure; ambiguous dispatch is never a retry signal."""
 
@@ -310,6 +349,68 @@ class CodexControl:
                     raise CodexControlError("unavailable", "NotSent") from None
             report[key] = normalized
         return report
+
+    async def observe_codex_allowance(
+        self,
+        profile_key: str,
+        expected_subject: CodexSubject,
+        *,
+        allow_existing_credits: bool = False,
+    ) -> CodexAllowance:
+        """Read allowance on one enrolled endpoint, with optional finite existing credits.
+
+        Funded observations distinguish available included usage from included exhaustion.
+        The caller establishes the account's billing policy before enabling credit use.
+        """
+        _profile(profile_key)
+        if not isinstance(expected_subject, CodexSubject):
+            raise InvalidAgentRequest("Codex allowance requires an enrolled subject and plan")
+        if type(allow_existing_credits) is not bool:
+            raise InvalidAgentRequest("Codex credit permission must be a boolean")
+        identity_verified = False
+        deadline = asyncio.get_running_loop().time() + 3
+        try:
+            async with self._client(
+                profile_key, check_chatgpt=False, connect_deadline=deadline
+            ) as client:
+                # Teardown must not change a verified denial into an unavailable read.
+                async with asyncio.timeout_at(deadline):
+                    identity = _object(
+                        await client.request("account/read", {"refreshToken": False})
+                    )
+                    account = identity.get("account")
+                    if (
+                        not isinstance(account, Mapping)
+                        or account.get("type") != "chatgpt"
+                        or identity.get("userId") != expected_subject.user_id
+                        or account.get("planType") != expected_subject.plan_type
+                    ):
+                        return CodexAllowance(profile_key, datetime.now(UTC), "identity_unverified")
+                    identity_verified = True
+                    result = _object(
+                        await client.request(
+                            "account/rateLimits/read", {"excludeResetCreditDetails": True}
+                        )
+                    )
+                    state, reset_at = _codex_allowance(
+                        result, expected_subject, allow_existing_credits=allow_existing_credits
+                    )
+                    return CodexAllowance(profile_key, datetime.now(UTC), state, reset_at)
+        except CodexAppServerResponseError:
+            if identity_verified:
+                # The error is not an authenticated allowance response. In particular,
+                # a 429 is not evidence of this account's included allowance.
+                raise ProtocolDefect("Codex did not report included allowance") from None
+            return CodexAllowance(profile_key, datetime.now(UTC), "identity_unverified")
+        except TimeoutError:
+            state = "unavailable" if identity_verified else "identity_unverified"
+            return CodexAllowance(profile_key, datetime.now(UTC), state)
+        except (CodexConnectionUnavailable, CodexControlError):
+            if identity_verified:
+                raise ProtocolDefect(
+                    "Codex allowance transport changed after identity read"
+                ) from None
+            return CodexAllowance(profile_key, datetime.now(UTC), "identity_unverified")
 
     async def list(self, request: CodexListRequest) -> CodexThreadPage:
         async with self._client(request.profile_key) as client:
@@ -831,7 +932,12 @@ class CodexControl:
 
     @asynccontextmanager
     async def _client(
-        self, profile: str, *, experimental_api: bool = False
+        self,
+        profile: str,
+        *,
+        experimental_api: bool = False,
+        check_chatgpt: bool = True,
+        connect_deadline: float | None = None,
     ) -> AsyncIterator[CodexAppServerClient]:
         if self._closed:
             raise CodexControlError("unavailable", "NotSent")
@@ -846,14 +952,15 @@ class CodexControl:
         self._clients.add(client)
         try:
             try:
-                await client.__aenter__()
+                async with asyncio.timeout_at(connect_deadline):
+                    await client.__aenter__()
             except CodexConnectionUnavailable:
                 raise CodexControlError("unavailable", "NotSent") from None
             except CodexAppServerResponseError:
                 if not self._native_owners:
                     raise
                 raise CodexControlError("unavailable", "NotSent") from None
-            if not self._native_owners:
+            if check_chatgpt and not self._native_owners:
                 account = _object(
                     await self._request(client, "account/read", {"refreshToken": False})
                 )
@@ -1066,6 +1173,84 @@ def _object(value: object) -> dict[str, object]:
     if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
         raise ProtocolDefect("Codex control response was not an object")
     return value
+
+
+def _codex_allowance(
+    value: dict[str, object], subject: CodexSubject, *, allow_existing_credits: bool
+) -> tuple[CodexAllowanceState, datetime | None]:
+    if value.get("accountId") != subject.account_id:
+        return "identity_unverified", None
+    buckets = _object(value.get("rateLimitsByLimitId"))
+    snapshot = _object(buckets.get("codex"))
+    if snapshot.get("limitId") != "codex":
+        raise ProtocolDefect("Codex did not identify its included allowance bucket")
+    if snapshot.get("planType") != subject.plan_type:
+        return "identity_unverified", None
+
+    reached = snapshot.get("rateLimitReachedType")
+    spend_control = snapshot.get("spendControlReached")
+    individual_limit = snapshot.get("individualLimit")
+    if individual_limit is not None and not isinstance(_object(individual_limit).get("limit"), str):
+        raise ProtocolDefect("Codex individual spend control was malformed")
+    if spend_control is True or reached in _WORKSPACE_LIMITS or individual_limit is not None:
+        return "workspace_limit", None
+    if spend_control is not False:
+        raise ProtocolDefect("Codex did not verify workspace spend control")
+    credits = _object(snapshot.get("credits"))
+    balance = credits.get("balance")
+    try:
+        amount = Decimal(balance) if isinstance(balance, str) else None
+    except InvalidOperation:
+        amount = None
+    has_credits = credits.get("hasCredits")
+    empty = has_credits is False and (balance is None or amount is not None and amount.is_zero())
+    funded = (
+        allow_existing_credits
+        and has_credits is True
+        and amount is not None
+        and amount.is_finite()
+        and amount > 0
+    )
+    if credits.get("unlimited") is not False or "balance" not in credits or not (empty or funded):
+        if allow_existing_credits:
+            raise ProtocolDefect("Codex did not verify a finite existing credit balance")
+        raise ProtocolDefect("Codex did not verify absence of usable credits")
+
+    allowed = value.get("ordinaryUsageAllowed")
+    if reached is None:
+        if allowed is True:
+            return ("available_with_credits" if funded else "available"), None
+        if allowed is None and not funded:
+            return "unavailable", None
+    elif reached == "rate_limit_reached" and allowed is False:
+        if funded:
+            return "credits_available", None
+        return "included_exhausted", _allowance_reset(snapshot)
+    raise ProtocolDefect("Codex did not report a classified included allowance")
+
+
+def _allowance_reset(snapshot: dict[str, object]) -> datetime | None:
+    resets: set[int] = set()
+    for key in ("primary", "secondary"):
+        window = snapshot.get(key)
+        if window is None:
+            continue
+        if not isinstance(window, Mapping):
+            return None
+        used = window.get("usedPercent")
+        if type(used) is not int:
+            return None
+        if used >= 100:
+            reset = window.get("resetsAt")
+            if type(reset) is not int:
+                return None
+            resets.add(reset)
+    if len(resets) != 1:
+        return None
+    try:
+        return datetime.fromtimestamp(resets.pop(), UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _finalized(turn: dict[str, object]) -> bool:
