@@ -146,8 +146,9 @@ class _ObservedCodexAdapter(CodexSdkAdapter):
         item_id: str,
         item: Mapping[str, object],
         method: str,
+        start_order: int | None,
     ) -> None:
-        super()._record_completed_agent_message(state, item_id, item, method)
+        super()._record_completed_agent_message(state, item_id, item, method, start_order)
         phase = item.get("phase")
         text = item.get("text")
         assert phase in (None, "commentary", "final_answer") and isinstance(text, str)
