@@ -42,7 +42,13 @@ type CodexErrorCode = Literal[
 type CodexNativeStatus = Literal["notLoaded", "idle", "active", "systemError"]
 type CodexTurnStatus = Literal["inProgress", "completed", "interrupted", "failed"]
 type CodexAllowanceState = Literal[
-    "available", "included_exhausted", "workspace_limit", "identity_unverified", "unavailable"
+    "available",
+    "available_with_credits",
+    "credits_available",
+    "included_exhausted",
+    "workspace_limit",
+    "identity_unverified",
+    "unavailable",
 ]
 
 _WORKSPACE_LIMITS = (
@@ -345,12 +351,22 @@ class CodexControl:
         return report
 
     async def observe_codex_allowance(
-        self, profile_key: str, expected_subject: CodexSubject
+        self,
+        profile_key: str,
+        expected_subject: CodexSubject,
+        *,
+        allow_existing_credits: bool = False,
     ) -> CodexAllowance:
-        """Read included Codex allowance on one enrolled, qualified endpoint."""
+        """Read allowance on one enrolled endpoint, with optional finite existing credits.
+
+        Funded observations distinguish available included usage from included exhaustion.
+        The caller establishes the account's billing policy before enabling credit use.
+        """
         _profile(profile_key)
         if not isinstance(expected_subject, CodexSubject):
             raise InvalidAgentRequest("Codex allowance requires an enrolled subject and plan")
+        if type(allow_existing_credits) is not bool:
+            raise InvalidAgentRequest("Codex credit permission must be a boolean")
         identity_verified = False
         deadline = asyncio.get_running_loop().time() + 3
         try:
@@ -376,7 +392,9 @@ class CodexControl:
                             "account/rateLimits/read", {"excludeResetCreditDetails": True}
                         )
                     )
-                    state, reset_at = _included_allowance(result, expected_subject)
+                    state, reset_at = _codex_allowance(
+                        result, expected_subject, allow_existing_credits=allow_existing_credits
+                    )
                     return CodexAllowance(profile_key, datetime.now(UTC), state, reset_at)
         except CodexAppServerResponseError:
             if identity_verified:
@@ -1157,8 +1175,8 @@ def _object(value: object) -> dict[str, object]:
     return value
 
 
-def _included_allowance(
-    value: dict[str, object], subject: CodexSubject
+def _codex_allowance(
+    value: dict[str, object], subject: CodexSubject, *, allow_existing_credits: bool
 ) -> tuple[CodexAllowanceState, datetime | None]:
     if value.get("accountId") != subject.account_id:
         return "identity_unverified", None
@@ -1181,24 +1199,32 @@ def _included_allowance(
     credits = _object(snapshot.get("credits"))
     balance = credits.get("balance")
     try:
-        empty = balance is None or isinstance(balance, str) and Decimal(balance).is_zero()
+        amount = Decimal(balance) if isinstance(balance, str) else None
     except InvalidOperation:
-        empty = False
-    if (
-        credits.get("hasCredits") is not False
-        or credits.get("unlimited") is not False
-        or "balance" not in credits
-        or not empty
-    ):
+        amount = None
+    has_credits = credits.get("hasCredits")
+    empty = has_credits is False and (balance is None or amount is not None and amount.is_zero())
+    funded = (
+        allow_existing_credits
+        and has_credits is True
+        and amount is not None
+        and amount.is_finite()
+        and amount > 0
+    )
+    if credits.get("unlimited") is not False or "balance" not in credits or not (empty or funded):
+        if allow_existing_credits:
+            raise ProtocolDefect("Codex did not verify a finite existing credit balance")
         raise ProtocolDefect("Codex did not verify absence of usable credits")
 
     allowed = value.get("ordinaryUsageAllowed")
     if reached is None:
         if allowed is True:
-            return "available", None
-        if allowed is None:
+            return ("available_with_credits" if funded else "available"), None
+        if allowed is None and not funded:
             return "unavailable", None
     elif reached == "rate_limit_reached" and allowed is False:
+        if funded:
+            return "credits_available", None
         return "included_exhausted", _allowance_reset(snapshot)
     raise ProtocolDefect("Codex did not report a classified included allowance")
 
