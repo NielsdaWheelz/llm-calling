@@ -352,25 +352,32 @@ class CodexControl:
         if not isinstance(expected_subject, CodexSubject):
             raise InvalidAgentRequest("Codex allowance requires an enrolled subject and plan")
         identity_verified = False
+        deadline = asyncio.get_running_loop().time() + 3
         try:
-            async with asyncio.timeout(3), self._client(profile_key, check_chatgpt=False) as client:
-                identity = _object(await client.request("account/read", {"refreshToken": False}))
-                account = identity.get("account")
-                if (
-                    not isinstance(account, Mapping)
-                    or account.get("type") != "chatgpt"
-                    or identity.get("userId") != expected_subject.user_id
-                    or account.get("planType") != expected_subject.plan_type
-                ):
-                    return CodexAllowance(profile_key, datetime.now(UTC), "identity_unverified")
-                identity_verified = True
-                result = _object(
-                    await client.request(
-                        "account/rateLimits/read", {"excludeResetCreditDetails": True}
+            async with self._client(
+                profile_key, check_chatgpt=False, connect_deadline=deadline
+            ) as client:
+                # Teardown must not change a verified denial into an unavailable read.
+                async with asyncio.timeout_at(deadline):
+                    identity = _object(
+                        await client.request("account/read", {"refreshToken": False})
                     )
-                )
-                state, reset_at = _included_allowance(result, expected_subject)
-                return CodexAllowance(profile_key, datetime.now(UTC), state, reset_at)
+                    account = identity.get("account")
+                    if (
+                        not isinstance(account, Mapping)
+                        or account.get("type") != "chatgpt"
+                        or identity.get("userId") != expected_subject.user_id
+                        or account.get("planType") != expected_subject.plan_type
+                    ):
+                        return CodexAllowance(profile_key, datetime.now(UTC), "identity_unverified")
+                    identity_verified = True
+                    result = _object(
+                        await client.request(
+                            "account/rateLimits/read", {"excludeResetCreditDetails": True}
+                        )
+                    )
+                    state, reset_at = _included_allowance(result, expected_subject)
+                    return CodexAllowance(profile_key, datetime.now(UTC), state, reset_at)
         except CodexAppServerResponseError:
             if identity_verified:
                 # The error is not an authenticated allowance response. In particular,
@@ -907,7 +914,12 @@ class CodexControl:
 
     @asynccontextmanager
     async def _client(
-        self, profile: str, *, experimental_api: bool = False, check_chatgpt: bool = True
+        self,
+        profile: str,
+        *,
+        experimental_api: bool = False,
+        check_chatgpt: bool = True,
+        connect_deadline: float | None = None,
     ) -> AsyncIterator[CodexAppServerClient]:
         if self._closed:
             raise CodexControlError("unavailable", "NotSent")
@@ -922,7 +934,8 @@ class CodexControl:
         self._clients.add(client)
         try:
             try:
-                await client.__aenter__()
+                async with asyncio.timeout_at(connect_deadline):
+                    await client.__aenter__()
             except CodexConnectionUnavailable:
                 raise CodexControlError("unavailable", "NotSent") from None
             except CodexAppServerResponseError:
