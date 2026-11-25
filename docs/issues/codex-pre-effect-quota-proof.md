@@ -1,0 +1,7 @@
+# codex pre-effect quota proof remains unqualified
+
+jarvis adr 0108 permits a fresh retry of an accepted quota turn only with complete, ordered evidence that no output or effect-capable activity occurred. the provider emits no such authorization. an accepted failure can require operator reconciliation even when quota arrived before the model acted.
+
+on pinned stock `0.171.0` with a loopback responses provider, an immediate quota refusal and a quota refusal following a real native command both returned `failed`, `usageLimitExceeded`, `itemsView=notLoaded`, and an empty `items` list in `turn/completed`. the command case created an isolated marker. preceding raw and typed events distinguished these runs. the terminal protocol provides no completeness witness for those observations. native agent spawn also performs work before it emits typed agent-activity items. [stock terminal serialization](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/app-server/src/bespoke_event_handling.rs#L1415-L1441) · [stock spawn path](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs#L124-L175)
+
+resolve with a pinned-stock witness that distinguishes first-response quota from prior activity for every granted capability. require independent absence-of-gap evidence and reject missing events, queued steering, and ambiguous or foreign turns. rerun both isolated cases and show that only the first can authorize the retry.

@@ -19,6 +19,7 @@ from .codex_containment import (
     qualify_codex_containment_host,
 )
 from .codex_control import (
+    CodexAllowance,
     CodexBounded,
     CodexComplete,
     CodexControl,
@@ -34,6 +35,7 @@ from .codex_control import (
     CodexPromptRequest,
     CodexStale,
     CodexSteer,
+    CodexSubject,
     CodexSubmit,
     CodexThreadPage,
     CodexThreadRead,
@@ -256,6 +258,7 @@ __all__ = [
     "CapturedAgentCall",
     "ClaudeNativeOptions",
     "ClaudeNativeSessionRequest",
+    "CodexAllowance",
     "CodexBounded",
     "CodexCatalogSessionRequest",
     "CodexComplete",
@@ -277,6 +280,7 @@ __all__ = [
     "CodexStale",
     "CodexSteer",
     "CodexSubmit",
+    "CodexSubject",
     "CodexThreadPage",
     "CodexThreadRead",
     "CodexThreadSummary",
