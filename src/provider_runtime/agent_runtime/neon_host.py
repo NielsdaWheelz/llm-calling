@@ -13,6 +13,7 @@ import os
 import re
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import asdict, dataclass, field
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -34,16 +35,22 @@ from ._limits import (
     OutputLimitExceeded,
     bounded_payload_size,
 )
-from .neon_config import NEON_MAX_OUTPUT_TOKENS, NEON_MODEL, _origin, materialize_neon_catalog
+from .neon_config import (
+    AGY_MAX_INPUT_BYTES,
+    NEON_MAX_OUTPUT_TOKENS,
+    NEON_MODEL,
+    _origin,
+    materialize_neon_catalog,
+)
 from .neon_control import (
     NeonChildFacts,
     NeonControlError,
     NeonFence,
     NeonFirstSampleRefusal,
     NeonProbe,
+    _is_hex256,
     _read,
     _valid_retry_after,
-    _valid_sdk_bearer,
     _write,
 )
 from .neon_responses import NativeResponses, NativeSample, NeonProtocolError
@@ -71,6 +78,7 @@ class _Armed:
     refusal: NeonFirstSampleRefusal | None = None
     closed: bool = False
     sdk_bearer: str | None = field(default=None, repr=False)
+    sdk_input: tuple[int, str] | None = None
     capacity: NeonProbe | None = None
 
     def sample_thread(self, metadata: object, header_thread: str | None) -> tuple[str, set[str]]:
@@ -177,19 +185,32 @@ class _Adapter:
                 await _write(writer, {"type": "rejected"})
                 return
             sdk_bearer = turn_id = None
+            sdk_input = None
             if operation == "arm_sdk":
                 sdk_bearer = command.pop("bearer", None)
                 turn_id = command.pop("turn_id", None)
+                input_bytes = command.pop("input_bytes", None)
+                input_sha256 = command.pop("input_sha256", None)
                 if (
-                    not _valid_sdk_bearer(sdk_bearer)
+                    self._model_version != NEON_MODEL
+                    or not _is_hex256(sdk_bearer)
+                    or not _is_hex256(input_sha256)
+                    or type(input_bytes) is not int
+                    or not 0 < input_bytes <= AGY_MAX_INPUT_BYTES
                     or f"Bearer {sdk_bearer}" == self._bearer
                     or not isinstance(turn_id, str)
                     or not 0 < len(turn_id) <= 128
                 ):
                     await _write(writer, {"type": "rejected"})
                     return
+                sdk_input = (input_bytes, input_sha256)
             tree = _Armed(
-                NeonFence(**command), writer, self._codec, turn=turn_id, sdk_bearer=sdk_bearer
+                NeonFence(**command),
+                writer,
+                self._codec,
+                turn=turn_id,
+                sdk_bearer=sdk_bearer,
+                sdk_input=sdk_input,
             )
             self._armed = tree
             await _write(writer, {"type": "armed"})
@@ -449,8 +470,6 @@ class _Adapter:
             return _sdk_error(401)
         if tree.closed or tree.refusal is not None:
             return _sdk_error(403)
-        if self._model_version != NEON_MODEL:
-            return _sdk_error(502)
 
         stream = request.path == _GEMINI_STREAM
         query = (("alt", "sse"),) if stream else ()
@@ -458,13 +477,17 @@ class _Adapter:
             return _sdk_error(400)
         try:
             payload = await request.read()
-            _validate_sdk_request(payload)
+            document = _validate_sdk_request(payload)
         except (ValueError, RecursionError, OutputLimitExceeded):
             return _sdk_error(400)
         if self._armed is not tree or tree.closed or tree.refusal is not None:
             return _sdk_error(403)
         if tree.opened_samples and not tree.ack.is_set():
             return _sdk_error(409)
+        if tree.opened_samples == 0:
+            if tree.sdk_input is None or not _sdk_root_matches(document, tree.sdk_input):
+                tree.close()
+                return _sdk_error(400)
 
         turn = tree.turn
         assert turn is not None
@@ -607,7 +630,7 @@ def _strict_json(payload: bytes) -> dict[str, Any]:
     return value
 
 
-def _validate_sdk_request(payload: bytes) -> None:
+def _validate_sdk_request(payload: bytes) -> dict[str, Any]:
     request = _strict_json(payload)
     bounded_payload_size(request, _MAX_WIRE_BYTES, max_items=_MAX_MESSAGE_ITEMS)
     generation = request.get("generationConfig")
@@ -690,6 +713,27 @@ def _validate_sdk_request(payload: bytes) -> None:
     config = request.get("toolConfig", {})
     if not isinstance(config, dict) or config.keys() - {"functionCallingConfig"}:
         raise ValueError("unqualified SDK Gemini tool config")
+    return request
+
+
+def _sdk_root_matches(request: dict[str, Any], expected: tuple[int, str]) -> bool:
+    contents = request["contents"]
+    if len(contents) != 1 or contents[0]["role"] != "user":
+        return False
+    parts = contents[0]["parts"]
+    if len(parts) != 1 or parts[0].keys() != {"text"} or type(parts[0]["text"]) is not str:
+        return False
+    try:
+        text = parts[0]["text"].encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    prefix = b"<USER_REQUEST>\n"
+    end = len(prefix) + expected[0]
+    return (
+        text.startswith(prefix)
+        and text.startswith(b"\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\n", end)
+        and sha256(text[len(prefix) : end]).hexdigest() == expected[1]
+    )
 
 
 def _validate_sdk_response(body: bytes, *, stream: bool, model_version: str) -> None:

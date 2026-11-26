@@ -44,7 +44,13 @@ from .events import (
     AgentToolUse,
     StockToolObservation,
 )
-from .neon_config import _NEON_MAX_AGENT_DEPTH, AGY_SDK_VERSION, NEON_MAX_OUTPUT_TOKENS, NEON_MODEL
+from .neon_config import (
+    _NEON_MAX_AGENT_DEPTH,
+    AGY_MAX_INPUT_BYTES,
+    AGY_SDK_VERSION,
+    NEON_MAX_OUTPUT_TOKENS,
+    NEON_MODEL,
+)
 from .turn import (
     AgentAccepted,
     AgentAttempt,
@@ -96,6 +102,17 @@ _WORKSPACE_TOOLS = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _AntigravityRequestFit(NativeRequestFit):
+    input_bytes: int
+
+    @property
+    def overflow(self) -> tuple[int, int, str] | None:
+        if self.input_bytes > AGY_MAX_INPUT_BYTES:
+            return self.input_bytes, AGY_MAX_INPUT_BYTES, "utf-8 input bytes"
+        return super(_AntigravityRequestFit, self).overflow
+
+
 def antigravity_native_request_fit(
     text: str,
     *,
@@ -111,7 +128,7 @@ def antigravity_native_request_fit(
     # Output schema configures the session and input_id belongs to the host journal.
     # Neither is part of the SDK input event. Local wire fit and model context differ.
     wire = json.dumps({"userInput": {"parts": [{"text": text}]}}, ensure_ascii=True, indent=2)
-    return NativeRequestFit(len(text), len(wire))
+    return _AntigravityRequestFit(len(text), len(wire), len(text.encode("utf-8")))
 
 
 @dataclass(frozen=True, slots=True)

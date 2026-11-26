@@ -12,13 +12,14 @@ from pathlib import Path
 from typing import Literal
 
 from ._limits import _OPERATION_TIMEOUT_SECONDS
+from .neon_config import AGY_MAX_INPUT_BYTES
 
 
 class NeonControlError(RuntimeError):
     pass
 
 
-def _valid_sdk_bearer(value: object) -> bool:
+def _is_hex256(value: object) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value) is not None
 
 
@@ -336,24 +337,38 @@ class NeonControl:
         generation: str,
         turn_id: str,
         bearer: str,
+        input_bytes: int,
+        input_sha256: str,
         on_delivery: Callable[[str], Awaitable[None]],
     ) -> NeonLease:
         """Arm the SDK's separate, attempt-private Gemini ingress."""
         if (
-            not _valid_sdk_bearer(bearer)
+            not _is_hex256(bearer)
+            or not _is_hex256(input_sha256)
+            or type(input_bytes) is not int
+            or not 0 < input_bytes <= AGY_MAX_INPUT_BYTES
             or not isinstance(turn_id, str)
             or not 0 < len(turn_id) <= 128
         ):
             raise NeonControlError("invalid SDK Neon authority")
         fence = NeonFence(attempt_id, owner_epoch, root_thread_id, generation)
         return await self._arm(
-            fence, {"type": "arm_sdk", "turn_id": turn_id, "bearer": bearer}, on_delivery, None
+            fence,
+            {
+                "type": "arm_sdk",
+                "turn_id": turn_id,
+                "bearer": bearer,
+                "input_bytes": input_bytes,
+                "input_sha256": input_sha256,
+            },
+            on_delivery,
+            None,
         )
 
     async def _arm(
         self,
         fence: NeonFence,
-        command: dict[str, str],
+        command: dict[str, str | int],
         on_delivery: Callable[[str], Awaitable[None]],
         on_child: Callable[[NeonChildFacts], Awaitable[None]] | None,
     ) -> NeonLease:
@@ -363,8 +378,14 @@ class NeonControl:
                 await _write(writer, {**command, **asdict(fence)})
                 if await _read(reader) != {"type": "armed"}:
                     raise NeonControlError("Neon adapter did not arm the requested tree")
+                sdk_turn_id = command.get("turn_id")
                 return NeonLease(
-                    reader, writer, fence, on_delivery, on_child, sdk_turn_id=command.get("turn_id")
+                    reader,
+                    writer,
+                    fence,
+                    on_delivery,
+                    on_child,
+                    sdk_turn_id=sdk_turn_id if isinstance(sdk_turn_id, str) else None,
                 )
             except BaseException:
                 writer.close()
