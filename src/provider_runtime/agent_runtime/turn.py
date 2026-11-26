@@ -316,3 +316,32 @@ class AgentInputRecorded:
             raise ProtocolDefect("AgentInputRecorded.turn must be AgentTurnRef")
         _non_empty(self.input_id, "AgentInputRecorded.input_id")
         _non_empty(self.item_id, "AgentInputRecorded.item_id")
+
+
+@dataclass(frozen=True, slots=True)
+class AgentChildObserved:
+    """A qualified model response on a native child trajectory."""
+
+    turn: AgentTurnRef
+    child_id: str
+    parent_id: str
+    model_version: str
+    effort: Literal["high"]
+
+    def __post_init__(self) -> None:
+        from .neon_config import NEON_MODEL
+
+        if (
+            not isinstance(self.turn, AgentTurnRef)
+            or self.turn.session_ref.backend != "antigravity"
+        ):
+            raise ProtocolDefect("child observation requires an Antigravity root turn")
+        for value in (self.child_id, self.parent_id):
+            if type(value) is not str or not value or len(value) > 128:
+                raise ProtocolDefect("child observation requires bounded native identity")
+        if (
+            self.child_id in (self.parent_id, self.turn.session_ref.native_session_id)
+            or self.model_version != NEON_MODEL
+            or self.effort != "high"
+        ):
+            raise ProtocolDefect("child observation changed native lineage or model authority")

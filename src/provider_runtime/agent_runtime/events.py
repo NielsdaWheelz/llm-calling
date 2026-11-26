@@ -1,6 +1,6 @@
-"""The six normalized agent stream events and the terminal grammar.
+"""Normalized agent stream events and the terminal grammar.
 
-The event vocabulary is deliberately closed at six kinds. First-class kinds carry
+The event vocabulary is deliberately closed. First-class kinds carry
 owned, validated data; every native frame that has no first-class kind travels as
 ``AgentNative`` with a bounded, recursively redacted payload. Exactly one
 ``AgentTerminal`` ends every started turn.
@@ -20,6 +20,7 @@ from .errors import (
     ProtocolDefect,
 )
 from .turn import (
+    AgentChildObserved,
     AgentInputRecorded,
     AgentMessage,
     AgentToolCall,
@@ -96,7 +97,7 @@ type AgentTerminalFailure = AgentQuotaExhausted | AgentFailure
 
 
 # ---------------------------------------------------------------------------
-# The six event kinds.
+# The event kinds.
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +286,7 @@ type AgentEvent = (
     | AgentToolCall
     | AgentMessage
     | AgentInputRecorded
+    | AgentChildObserved
 )
 
 # The closed kind set, spelled once for isinstance checks and gate tests.
@@ -298,6 +300,7 @@ AGENT_EVENT_KINDS: tuple[type, ...] = (
     AgentToolCall,
     AgentMessage,
     AgentInputRecorded,
+    AgentChildObserved,
 )
 
 

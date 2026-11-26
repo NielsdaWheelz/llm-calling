@@ -21,6 +21,7 @@ from provider_runtime.agent_runtime.events import (
 )
 from provider_runtime.agent_runtime.turn import (
     AgentAttempt,
+    AgentChildObserved,
     AgentInputRecorded,
     AgentMessage,
     AgentResultRef,
@@ -101,6 +102,7 @@ def test_the_event_union_is_closed() -> None:
         AgentToolCall,
         AgentMessage,
         AgentInputRecorded,
+        AgentChildObserved,
     ), f"the closed event vocabulary changed: {AGENT_EVENT_KINDS}"
 
 

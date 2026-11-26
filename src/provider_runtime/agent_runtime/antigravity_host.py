@@ -39,6 +39,7 @@ from .terminal_codec import (
 from .turn import (
     AgentAccepted,
     AgentAttempt,
+    AgentChildObserved,
     AgentCloseResult,
     AgentControlReceipt,
     AgentInputRecorded,
@@ -484,6 +485,15 @@ def _encode_event(writer: asyncio.StreamWriter, event: AgentEvent, turn: AgentTu
         )
     elif isinstance(event, AgentMessage) and event.turn == turn:
         _send(writer, "message", message_id=event.message_id, phase=event.phase, text=event.text)
+    elif isinstance(event, AgentChildObserved) and event.turn == turn:
+        _send(
+            writer,
+            "child",
+            child_id=event.child_id,
+            parent_id=event.parent_id,
+            model_version=event.model_version,
+            effort=event.effort,
+        )
     elif isinstance(event, AgentToolUse):
         _send(writer, "tool", **asdict(event))
     else:
@@ -506,6 +516,12 @@ def _decode_event(kind: str, value: dict[str, Any], turn: AgentTurnRef) -> Agent
             )
         case "message":
             return AgentMessage(turn, value["message_id"], value["phase"], value["text"])
+        case "child":
+            if value.keys() != {"child_id", "parent_id", "model_version", "effort"}:
+                raise ProtocolDefect("Antigravity child frame changed its approved fields")
+            return AgentChildObserved(
+                turn, value["child_id"], value["parent_id"], value["model_version"], value["effort"]
+            )
         case "tool":
             stock = value["stock"]
             if stock is not None:

@@ -34,6 +34,7 @@ def test_the_event_union_is_exported_whole() -> None:
         events.AgentToolCall,
         events.AgentMessage,
         events.AgentInputRecorded,
+        events.AgentChildObserved,
     )
     for kind in events.AGENT_EVENT_KINDS:
         assert kind.__name__ in agent_runtime.__all__, f"{kind.__name__} must be exported"

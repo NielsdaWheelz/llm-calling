@@ -44,10 +44,11 @@ from .events import (
     AgentToolUse,
     StockToolObservation,
 )
-from .neon_config import AGY_SDK_VERSION, NEON_MAX_OUTPUT_TOKENS, NEON_MODEL
+from .neon_config import _NEON_MAX_AGENT_DEPTH, AGY_SDK_VERSION, NEON_MAX_OUTPUT_TOKENS, NEON_MODEL
 from .turn import (
     AgentAccepted,
     AgentAttempt,
+    AgentChildObserved,
     AgentCloseResult,
     AgentControlReceipt,
     AgentInputRecorded,
@@ -303,6 +304,28 @@ class AntigravitySdkTurn:
         self._close = AgentCloseResult(True, ())
         return self._close
 
+    def _observe_child(
+        self, child_id: str, parent_id: str, children: dict[str, tuple[str, int]]
+    ) -> None:
+        if not self._options.workspace_tools or not isinstance(self._submission, AgentAccepted):
+            raise ProtocolDefect("Antigravity child exceeded its root authority")
+        previous = children.get(child_id)
+        if previous is not None:
+            if previous[0] != parent_id:
+                raise ProtocolDefect("Antigravity child changed its parent")
+            return
+        # SDK 0.1.24 reports depth=0 even for descendants. Bound the typed parent chain.
+        parent = children.get(parent_id)
+        if parent_id == self._root:
+            depth = 1
+        elif parent is not None and parent[1] < _NEON_MAX_AGENT_DEPTH:
+            depth = parent[1] + 1
+        else:
+            raise ProtocolDefect("Antigravity child lineage exceeded its root")
+        # The paid gateway qualifies this exact version and effort before releasing model bytes.
+        self._emit(AgentChildObserved(self._turn, child_id, parent_id, NEON_MODEL, "high"))
+        children[child_id] = (parent_id, depth)
+
     def _emit(self, event: AgentEvent, size: int = 0) -> None:
         self._event_count += 1
         self._event_bytes += size
@@ -362,11 +385,18 @@ class AntigravitySdkTurn:
         tool_names = {tool.name for tool in self._tools}
         workspace = _WORKSPACE_TOOLS if options.workspace_tools else ()
         observations: dict[str, str] = {}
+        children: dict[str, tuple[str, int]] = {}
         schema = (
             thaw_json_value(options.output.schema)
             if isinstance(options.output, JsonSchemaAgentOutput)
             else None
         )
+
+        policies = []
+        if workspace:
+            policies = [policy.allow(name) for name in (*workspace, *sorted(tool_names))]
+            if schema is not None:
+                policies.append(policy.allow("finish"))
 
         @hooks.pre_tool_call_decide
         async def authorize(_context: hooks.HookContext, call: types.ToolCall) -> types.HookResult:
@@ -375,8 +405,6 @@ class AntigravitySdkTurn:
                 return types.HookResult(allow=False, message=denial)
             if call.server_name:
                 return types.HookResult(allow=False, message=denial)
-            if name == "finish" and schema is not None:
-                return types.HookResult(allow=True)
             step_id = call.step_id or ""
             trajectory, _, sequence = step_id.partition(":")
             if (
@@ -386,6 +414,11 @@ class AntigravitySdkTurn:
                 or not sequence.isdecimal()
             ):
                 return types.HookResult(allow=False, message=denial)
+            if name == "finish" and schema is not None:
+                return types.HookResult(
+                    allow=trajectory == self._root,
+                    message="" if trajectory == self._root else denial,
+                )
             if name in workspace:
                 if step_id in observations:
                     return types.HookResult(allow=False, message=denial)
@@ -551,12 +584,12 @@ class AntigravitySdkTurn:
                 capabilities=types.CapabilitiesConfig(
                     enable_subagents=options.workspace_tools,
                     enabled_tools=[types.BuiltinTools(name) for name in workspace],
-                    max_subagent_depth=2 if options.workspace_tools else None,
+                    max_subagent_depth=_NEON_MAX_AGENT_DEPTH if options.workspace_tools else None,
                     run_command_config=types.RunCommandConfig(enable_sandbox=True)
                     if workspace
                     else None,
                 ),
-                policies=[policy.allow("run_command")] if workspace else [],
+                policies=policies,
                 tools=[register(tool) for tool in self._tools],
                 hooks=[authorize, observe],
             )
@@ -580,11 +613,20 @@ class AntigravitySdkTurn:
                         try:
                             await conversation.send(self._text)
                             async for step in conversation.receive_steps():
-                                if (
-                                    step.trajectory_id != self._root
-                                    or step.depth != 0
-                                    or step.parent_trajectory_id
-                                ):
+                                if step.trajectory_id != self._root:
+                                    if step.source == types.StepSource.MODEL and (
+                                        step.type == types.StepType.TOOL_CALL
+                                        and step.status
+                                        in (types.StepStatus.ACTIVE, types.StepStatus.DONE)
+                                        or step.status == types.StepStatus.DONE
+                                        and step.type
+                                        in (types.StepType.TEXT_RESPONSE, types.StepType.FINISH)
+                                    ):
+                                        self._observe_child(
+                                            step.trajectory_id, step.parent_trajectory_id, children
+                                        )
+                                    continue
+                                if step.depth != 0 or step.parent_trajectory_id:
                                     continue
                                 if (
                                     step.source == types.StepSource.MODEL

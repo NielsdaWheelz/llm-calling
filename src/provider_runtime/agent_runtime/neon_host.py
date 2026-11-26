@@ -449,6 +449,8 @@ class _Adapter:
             return _sdk_error(401)
         if tree.closed or tree.refusal is not None:
             return _sdk_error(403)
+        if self._model_version != NEON_MODEL:
+            return _sdk_error(502)
 
         stream = request.path == _GEMINI_STREAM
         query = (("alt", "sse"),) if stream else ()
