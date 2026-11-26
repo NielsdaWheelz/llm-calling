@@ -79,7 +79,7 @@ def test_credential_references_never_accept_values_or_ambiguous_sources() -> Non
         == "OPENAI_API_KEY"
     )
 
-    with pytest.raises(InvalidAgentRequest, match="name must be absent"):
+    with pytest.raises(InvalidAgentRequest, match="do not carry credential names"):
         CredentialRef(kind="local_account", profile_key="personal", name="secret-value")
     with pytest.raises(InvalidAgentRequest, match="name is required"):
         CredentialRef(kind="secret_reference", profile_key="vault")
