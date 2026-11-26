@@ -19,10 +19,15 @@ dependencies = [
 
 [project.scripts]
 provider-runtime-control = "provider_runtime.agent_runtime.native_control_cli:main"
+provider-runtime-worker = "provider_runtime.agent_runtime.worker:main"
 
-# Claude's SDK remains optional. Codex is a core WebSocket client of a
-# host-owned service; it carries no Python SDK or executable.
+# Claude SDK and the managed terminal editor remain optional; Codex uses a
+# native executable supplied by the selected profile.
 [project.optional-dependencies]
+worker = [
+    "claude-agent-sdk==0.2.130",
+    "prompt-toolkit==3.0.53",
+]
 claude-sdk = [
     "claude-agent-sdk>=0.2.130,<1",
 ]

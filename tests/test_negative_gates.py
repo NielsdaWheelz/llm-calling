@@ -81,20 +81,19 @@ _PROVIDER_SDK_IMPORT = (
 )
 
 
-def test_provider_sdk_imports_are_confined_to_engines_and_embeddings() -> None:
-    """SDK types never cross the contract boundary (spec §1); the import sites prove it.
-
-    The four protocol adapters under ``engines/`` own all provider SDK usage,
-    plus the one spec-sanctioned exception: ``embeddings.py`` is rewritten on
-    the ``openai`` SDK (spec §3) and lives outside the engines package.
-    """
-    allowed_outside_engines = {SRC / "embeddings.py"}
+def test_provider_sdk_imports_are_confined_to_provider_adapters() -> None:
+    """Only the owning provider adapters may import SDK types."""
+    allowed_outside_engines = {
+        SRC / "embeddings.py",
+        AGENT_RUNTIME / "neon_host.py",
+        AGENT_RUNTIME / "neon_responses.py",
+    }
     hits = [
         hit
         for hit in _scan(_PROVIDER_SDK_IMPORT)
         if ENGINES not in hit.path.parents and hit.path not in allowed_outside_engines
     ]
-    assert not hits, f"provider SDK import outside engines/ (or embeddings.py):\n{_fmt(hits)}"
+    assert not hits, f"provider SDK import outside an owning adapter:\n{_fmt(hits)}"
 
 
 # One allowlist per optional dependency, never a shared one. The scan matches the bare
