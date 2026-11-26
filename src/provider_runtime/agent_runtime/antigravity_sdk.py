@@ -8,7 +8,7 @@ import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from hashlib import sha256
-from importlib.metadata import PackageNotFoundError, version
+from importlib.metadata import version
 from pathlib import Path
 from secrets import token_hex
 from tempfile import TemporaryDirectory
@@ -187,6 +187,7 @@ class AntigravitySdkTurn:
         self._submission: AgentSubmission | None = None
         self._accepted: asyncio.Future[AgentSubmission] | None = None
         self._terminal: AgentTerminal | None = None
+        self._reported_usage: Presence[TokenUsage] = Absent()
         self._runner: asyncio.Task[None] | None = None
         self._conversation: sdk_conversation.Conversation | None = None
         self._events: asyncio.Queue[AgentEvent | None] = asyncio.Queue()
@@ -315,8 +316,6 @@ class AntigravitySdkTurn:
             if version("google-antigravity") != _SDK_VERSION:
                 return
             await self._run_sdk(accepted)
-        except (ImportError, PackageNotFoundError):
-            pass
         except asyncio.CancelledError:
             if self._callback_defect:
                 self._finish_local(
@@ -349,6 +348,7 @@ class AntigravitySdkTurn:
                 "",
                 self._turn.session_ref,
                 LocalStopEvidence(self._submission, reason),
+                usage=self._reported_usage,
             )
 
     async def _run_sdk(self, accepted: asyncio.Future[AgentSubmission]) -> None:
@@ -520,7 +520,6 @@ class AntigravitySdkTurn:
 
         status: AgentTerminalStatus = "failed"
         cause: AgentFailureCause | None = "backend_failed"
-        usage: Presence[TokenUsage] = Absent()
         public: AgentMessage | None = None
         public_index = -1
         latest_action = -1
@@ -615,6 +614,10 @@ class AntigravitySdkTurn:
                                     and step.is_complete_response
                                     and step.step_index > public_index
                                 ):
+                                    if not isinstance(self._submission, AgentAccepted):
+                                        raise ProtocolDefect(
+                                            "Antigravity output preceded recorded delivery"
+                                        )
                                     size = len(step.content.encode("utf-8"))
                                     if size > _MAX_EVENT_TEXT_BYTES:
                                         raise OutputLimitExceeded(
@@ -644,7 +647,7 @@ class AntigravitySdkTurn:
                         except OutputSchemaMismatch:
                             status, cause = "failed", "output_schema_violation"
                         finally:
-                            usage = _usage(conversation.total_usage)
+                            self._reported_usage = _usage(conversation.total_usage)
             except TimeoutError:
                 self._finish_local("failed", "turn_timeout", "Antigravity turn deadline expired")
                 return
@@ -676,5 +679,5 @@ class AntigravitySdkTurn:
             self._turn.session_ref,
             NativeTerminalEvidence(self._attempt, self._turn, "antigravity-sdk-turn.v1"),
             raw_structured_output=raw_output,
-            usage=usage,
+            usage=self._reported_usage,
         )
