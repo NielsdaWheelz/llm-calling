@@ -14,7 +14,6 @@ from provider_runtime.agent_runtime.policy import PermissionPolicy
 from provider_runtime.agent_runtime.types import (
     AGENT_ROUTES,
     AgentSessionRef,
-    AgentSessionRequest,
     AgentTransport,
     ApprovalRequest,
     Backend,
@@ -59,7 +58,7 @@ def _ref() -> AgentSessionRef:
     )
 
 
-def _request() -> AgentSessionRequest:
+def _request() -> CodexCatalogSessionRequest:
     return CodexCatalogSessionRequest(
         auth=_credential(),
         open=NewSession(),
