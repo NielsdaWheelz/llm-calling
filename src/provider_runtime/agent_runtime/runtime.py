@@ -386,7 +386,10 @@ class AgentRuntime:
             request,
             CodexCatalogSessionRequest | ClaudeNativeSessionRequest | AntigravitySdkSessionRequest,
         ):
-            raise InvalidAgentRequest("open_session requires an exact native session request")
+            raise InvalidAgentRequest(
+                "open_session requires CodexCatalogSessionRequest, ClaudeNativeSessionRequest, "
+                "or AntigravitySdkSessionRequest"
+            )
         return await self._run_owned_operation(lambda: self._open_session_locked(request))
 
     async def antigravity_ready(self) -> bool:
