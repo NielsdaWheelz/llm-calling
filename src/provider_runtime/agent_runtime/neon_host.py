@@ -1,4 +1,4 @@
-"""Private stock Codex Responses adapter to the paid Gemini Developer API."""
+"""Private native inference endpoints for the paid Gemini Developer API."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import contextlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 from collections.abc import AsyncGenerator, Callable
@@ -22,23 +23,35 @@ from aiohttp import web
 from google.genai import errors as gemini_errors
 from google.genai.types import GenerateContentResponse
 
+from provider_runtime.engines._common import retry_after_seconds
 from provider_runtime.engines.gemini_generate import GeminiGenerateEngine, _retry_after
 from provider_runtime.registry import _resolve
 from provider_runtime.types import Present, ProviderCredential
 
-from ._limits import _MAX_MESSAGE_ITEMS, _MAX_TURN_OUTPUT_BYTES, bounded_payload_size
-from .neon_config import NEON_MODEL, _origin, materialize_neon_catalog
+from ._limits import (
+    _MAX_MESSAGE_ITEMS,
+    _MAX_TURN_OUTPUT_BYTES,
+    OutputLimitExceeded,
+    bounded_payload_size,
+)
+from .neon_config import NEON_MAX_OUTPUT_TOKENS, NEON_MODEL, _origin, materialize_neon_catalog
 from .neon_control import (
     NeonChildFacts,
     NeonControlError,
     NeonFence,
     NeonFirstSampleRefusal,
+    NeonProbe,
     _read,
+    _valid_retry_after,
+    _valid_sdk_bearer,
     _write,
 )
 from .neon_responses import NativeResponses, NativeSample, NeonProtocolError
 
 _MAX_WIRE_BYTES = 32 * 1024 * 1024
+_GEMINI_ORIGIN = "https://generativelanguage.googleapis.com"
+_GEMINI_GENERATE = f"/v1beta/models/{NEON_MODEL}:generateContent"
+_GEMINI_STREAM = f"/v1beta/models/{NEON_MODEL}:streamGenerateContent"
 
 
 @dataclass(slots=True)
@@ -52,10 +65,13 @@ class _Armed:
     observed_children: set[str] = field(default_factory=set)
     frame_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     ack: asyncio.Event = field(default_factory=asyncio.Event)
+    announced_delivery: bool = False
     turn: str | None = None
     opened_samples: int = 0
     refusal: NeonFirstSampleRefusal | None = None
     closed: bool = False
+    sdk_bearer: str | None = field(default=None, repr=False)
+    capacity: NeonProbe | None = None
 
     def sample_thread(self, metadata: object, header_thread: str | None) -> tuple[str, set[str]]:
         if self.closed or not isinstance(metadata, dict):
@@ -120,11 +136,15 @@ class _Adapter:
         continuation_key: bytes,
         project_id: str,
         sample: Callable[[NativeSample], AsyncGenerator[GenerateContentResponse, None]],
+        sdk_transport: httpx.AsyncClient,
+        sdk_api_key: str,
     ) -> None:
         self._bearer = f"Bearer {bearer}"
         self._model_version = model_version
         self._codec = NativeResponses(continuation_key, project_id + "/" + model_version)
         self._sample = sample
+        self._sdk_transport = sdk_transport
+        self._sdk_api_key = sdk_api_key
         self._armed: _Armed | None = None
         self._probe_lock = asyncio.Lock()
 
@@ -152,28 +172,54 @@ class _Adapter:
                 async with self._probe_lock:
                     await _write(writer, await self._probe())
                 return
-            if command.pop("type", None) != "arm" or self._armed is not None:
+            operation = command.pop("type", None)
+            if operation not in ("arm", "arm_sdk") or self._armed is not None:
                 await _write(writer, {"type": "rejected"})
                 return
-            tree = _Armed(NeonFence(**command), writer, self._codec)
+            sdk_bearer = turn_id = None
+            if operation == "arm_sdk":
+                sdk_bearer = command.pop("bearer", None)
+                turn_id = command.pop("turn_id", None)
+                if (
+                    not _valid_sdk_bearer(sdk_bearer)
+                    or f"Bearer {sdk_bearer}" == self._bearer
+                    or not isinstance(turn_id, str)
+                    or not 0 < len(turn_id) <= 128
+                ):
+                    await _write(writer, {"type": "rejected"})
+                    return
+            tree = _Armed(
+                NeonFence(**command), writer, self._codec, turn=turn_id, sdk_bearer=sdk_bearer
+            )
             self._armed = tree
             await _write(writer, {"type": "armed"})
             while True:
                 command = await _read(reader)
                 if command == {"type": "disarm"}:
                     tree.close()
-                    if tree.refusal is None:
-                        final = {"type": "disarmed"}
-                    else:
+                    if tree.refusal is not None:
                         final = {
                             "type": "first_sample_refused",
                             **asdict(tree.fence),
                             **asdict(tree.refusal),
                         }
+                    else:
+                        final = {
+                            "type": "disarmed",
+                            **asdict(tree.fence),
+                            "turn_id": tree.turn,
+                            "upstream_entries": tree.opened_samples
+                            if tree.sdk_bearer is not None
+                            else None,
+                            "capacity": asdict(tree.capacity)
+                            if tree.capacity is not None
+                            else None,
+                        }
                     await _write(writer, final)
                     return
                 if (
                     tree.turn is None
+                    or not tree.announced_delivery
                     or tree.ack.is_set()
                     or command
                     != {
@@ -243,7 +289,7 @@ class _Adapter:
         ):
             return _error(401, "invalid_stock_credential")
         tree = self._armed
-        if tree is None or tree.closed or tree.refusal is not None:
+        if tree is None or tree.sdk_bearer is not None or tree.closed or tree.refusal is not None:
             return _error(403, "unarmed_stock_generation")
 
         try:
@@ -293,6 +339,7 @@ class _Adapter:
                 if tree.closed:
                     return response
                 if not tree.ack.is_set():
+                    tree.announced_delivery = True
                     await _write(
                         tree.control,
                         {
@@ -352,6 +399,13 @@ class _Adapter:
                 else None
             )
             if refusal is not None:
+                retry = _retry_after(error) if refusal == "rate_limited" else None
+                retry_after = (
+                    retry.value
+                    if isinstance(retry, Present) and _valid_retry_after(retry.value)
+                    else None
+                )
+                tree.capacity = NeonProbe(refusal, retry_after)
                 if (
                     tree.opened_samples == 1
                     and len(tree.parents) == 1
@@ -360,12 +414,7 @@ class _Adapter:
                     and metadata["request_kind"] == "turn"
                     and tree.turn is not None
                 ):
-                    retry = _retry_after(error) if refusal == "rate_limited" else None
-                    tree.refusal = NeonFirstSampleRefusal(
-                        tree.turn,
-                        refusal,
-                        retry.value if isinstance(retry, Present) else None,
-                    )
+                    tree.refusal = NeonFirstSampleRefusal(tree.turn, refusal, retry_after)
                 await response.write(
                     _failure(
                         "insufficient_quota"
@@ -383,6 +432,116 @@ class _Adapter:
         except (ValueError, httpx.HTTPError, RuntimeError):
             await response.write(_failure("invalid_neon_response"))
             return response
+        finally:
+            tree.incoming.discard(operation)
+
+    async def sdk_samples(self, request: web.Request) -> web.StreamResponse:
+        tree = self._armed
+        # The pinned SDK sends GeminiAPIEndpoint.api_key in this header.
+        # That value authenticates the enclosed attempt, not an individual child.
+        key = request.headers.getall("x-goog-api-key", [])
+        if (
+            tree is None
+            or tree.sdk_bearer is None
+            or len(key) != 1
+            or not hmac.compare_digest(key[0].encode(), tree.sdk_bearer.encode())
+        ):
+            return _sdk_error(401)
+        if tree.closed or tree.refusal is not None:
+            return _sdk_error(403)
+
+        stream = request.path == _GEMINI_STREAM
+        query = (("alt", "sse"),) if stream else ()
+        if tuple(request.query.items()) != query or request.content_type != "application/json":
+            return _sdk_error(400)
+        try:
+            payload = await request.read()
+            _validate_sdk_request(payload)
+        except (ValueError, RecursionError, OutputLimitExceeded):
+            return _sdk_error(400)
+        if self._armed is not tree or tree.closed or tree.refusal is not None:
+            return _sdk_error(403)
+        if tree.opened_samples and not tree.ack.is_set():
+            return _sdk_error(409)
+
+        turn = tree.turn
+        assert turn is not None
+        tree.opened_samples += 1
+        operation = asyncio.current_task()
+        assert operation is not None
+        tree.incoming.add(operation)
+        response = None
+        try:
+            async with self._sdk_transport.stream(
+                "POST",
+                _GEMINI_ORIGIN + (_GEMINI_STREAM if stream else _GEMINI_GENERATE),
+                params=query,
+                content=payload,
+                headers={"Content-Type": "application/json", "x-goog-api-key": self._sdk_api_key},
+                timeout=600,
+                follow_redirects=False,
+            ) as upstream:
+                received = bytearray()
+                async for chunk in upstream.aiter_bytes():
+                    if len(received) + len(chunk) > _MAX_TURN_OUTPUT_BYTES:
+                        raise ValueError("Gemini response exceeds wire bound")
+                    received.extend(chunk)
+                body = bytes(received)
+                if upstream.status_code in (402, 429):
+                    error = _strict_json(body).get("error")
+                    if not isinstance(error, dict) or error.get("code") != upstream.status_code:
+                        raise ValueError("unverified Gemini capacity response")
+                    retry_after = retry_after_seconds(upstream.headers)
+                    reason = "prepaid_depleted" if upstream.status_code == 402 else "rate_limited"
+                    retry = (
+                        retry_after.value
+                        if reason == "rate_limited"
+                        and isinstance(retry_after, Present)
+                        and _valid_retry_after(retry_after.value)
+                        else None
+                    )
+                    tree.capacity = NeonProbe(reason, retry)
+                    if tree.opened_samples == 1 and not tree.ack.is_set():
+                        tree.refusal = NeonFirstSampleRefusal(turn, reason, retry)
+                    else:
+                        tree.incoming.discard(operation)
+                        tree.close()
+                    return _sdk_error(upstream.status_code)
+                upstream.raise_for_status()
+                content_type = "text/event-stream" if stream else "application/json"
+                if (
+                    upstream.headers.get("Content-Type", "").split(";", 1)[0].strip()
+                    != content_type
+                ):
+                    raise ValueError("unqualified Gemini content type")
+                _validate_sdk_response(body, stream=stream, model_version=self._model_version)
+
+            if not tree.ack.is_set():
+                tree.announced_delivery = True
+                await _write(
+                    tree.control,
+                    {"type": "may_have_delivered", **asdict(tree.fence), "turn_id": turn},
+                )
+                await asyncio.wait_for(tree.ack.wait(), timeout=30)
+            if tree.closed:
+                return _sdk_error(403)
+            response = web.StreamResponse(headers={"Content-Type": content_type})
+            response.content_length = len(body)
+            await response.prepare(request)
+            if not tree.closed:
+                await response.write(body)
+                await response.write_eof()
+            return response
+        except asyncio.CancelledError:
+            tree.incoming.discard(operation)
+            tree.close()
+            raise
+        except (httpx.HTTPError, OSError, ValueError, RecursionError, OutputLimitExceeded):
+            tree.incoming.discard(operation)
+            tree.close()
+            if response is not None:
+                raise
+            return _sdk_error(502)
         finally:
             tree.incoming.discard(operation)
 
@@ -419,6 +578,194 @@ def _error(status: int, code: str) -> web.Response:
     )
 
 
+def _strict_json(payload: bytes) -> dict[str, Any]:
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value = dict(pairs)
+        if len(value) != len(pairs):
+            raise ValueError("Gemini JSON repeats a field")
+        return value
+
+    def invalid_constant(_value: str) -> None:
+        raise ValueError("Gemini JSON has a non-finite number")
+
+    def finite_float(value: str) -> float:
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError("Gemini JSON has a non-finite number")
+        return result
+
+    value = json.loads(
+        payload,
+        object_pairs_hook=unique_object,
+        parse_constant=invalid_constant,
+        parse_float=finite_float,
+    )
+    if not isinstance(value, dict):
+        raise ValueError("Gemini JSON is not an object")
+    return value
+
+
+def _validate_sdk_request(payload: bytes) -> None:
+    request = _strict_json(payload)
+    bounded_payload_size(request, _MAX_WIRE_BYTES, max_items=_MAX_MESSAGE_ITEMS)
+    generation = request.get("generationConfig")
+    thinking = generation.get("thinkingConfig") if isinstance(generation, dict) else None
+    session_id = request.get("sessionId")
+    if (
+        request.keys()
+        - {
+            "contents",
+            "generationConfig",
+            "serviceTier",
+            "sessionId",
+            "systemInstruction",
+            "toolConfig",
+            "tools",
+        }
+        or request.get("serviceTier") != "standard"
+        or not isinstance(session_id, str)
+        or not re.fullmatch(r"-?[0-9]{1,20}", session_id)
+        or not isinstance(generation, dict)
+        or generation.keys() != {"maxOutputTokens", "thinkingConfig"}
+        or type(generation["maxOutputTokens"]) is not int
+        or not 0 < generation["maxOutputTokens"] <= NEON_MAX_OUTPUT_TOKENS
+        or not isinstance(thinking, dict)
+        or thinking.keys() != {"thinkingLevel", "includeThoughts"}
+        or thinking["thinkingLevel"] != "high"
+        or thinking["includeThoughts"] is not True
+    ):
+        raise ValueError("unqualified SDK Gemini settings")
+    contents = request.get("contents")
+    if not isinstance(contents, list) or not contents:
+        raise ValueError("SDK Gemini contents are required")
+    for content in contents:
+        if (
+            not isinstance(content, dict)
+            or content.keys() != {"role", "parts"}
+            or content["role"] not in ("user", "model")
+            or not isinstance(content["parts"], list)
+            or not content["parts"]
+        ):
+            raise ValueError("unqualified SDK Gemini content")
+        for part in content["parts"]:
+            if (
+                not isinstance(part, dict)
+                or not part
+                or part.keys()
+                - {
+                    "text",
+                    "thought",
+                    "thoughtSignature",
+                    "inlineData",
+                    "functionCall",
+                    "functionResponse",
+                }
+            ):
+                raise ValueError("unqualified SDK Gemini part")
+            result = part.get("functionResponse")
+            if result is not None and (
+                not isinstance(result, dict) or result.keys() - {"name", "id", "response"}
+            ):
+                raise ValueError("unqualified SDK Gemini function response")
+    instruction = request.get("systemInstruction")
+    if instruction is not None and (
+        not isinstance(instruction, dict)
+        or instruction.keys() - {"role", "parts"}
+        or not isinstance(instruction.get("parts"), list)
+        or any(
+            not isinstance(part, dict) or part.keys() != {"text"} for part in instruction["parts"]
+        )
+    ):
+        raise ValueError("unqualified SDK Gemini system instruction")
+    tools = request.get("tools", [])
+    if not isinstance(tools, list) or any(
+        not isinstance(tool, dict)
+        or tool.keys() != {"functionDeclarations"}
+        or not isinstance(tool["functionDeclarations"], list)
+        for tool in tools
+    ):
+        raise ValueError("hosted Gemini tools are disabled")
+    config = request.get("toolConfig", {})
+    if not isinstance(config, dict) or config.keys() - {"functionCallingConfig"}:
+        raise ValueError("unqualified SDK Gemini tool config")
+
+
+def _validate_sdk_response(body: bytes, *, stream: bool, model_version: str) -> None:
+    frames: list[bytes]
+    if stream:
+        normalized = body.replace(b"\r\n", b"\n")
+        if not normalized.endswith(b"\n\n"):
+            raise ValueError("incomplete Gemini event stream")
+        frames = []
+        for block in normalized.split(b"\n\n"):
+            lines = [line for line in block.splitlines() if not line.startswith(b":")]
+            if not lines:
+                continue
+            if any(not line.startswith(b"data:") for line in lines):
+                raise ValueError("unexpected Gemini event stream field")
+            frames.append(b"\n".join(line[5:].removeprefix(b" ") for line in lines))
+    else:
+        frames = [body]
+    witnessed_model = finished = saw_parts = saw_call = False
+    for frame in frames:
+        value = _strict_json(frame)
+        if "error" in value or ("modelVersion" in value and value["modelVersion"] != model_version):
+            raise ValueError("unqualified Gemini response")
+        witnessed_model |= value.get("modelVersion") == model_version
+        candidates = value.get("candidates", [])
+        if not isinstance(candidates, list) or len(candidates) > 1 or (finished and candidates):
+            raise ValueError("conflicting Gemini candidates")
+        if candidates:
+            candidate = candidates[0]
+            if not isinstance(candidate, dict) or candidate.get("finishReason") not in (
+                None,
+                "STOP",
+            ):
+                raise ValueError("Gemini candidate did not complete")
+            finished = candidate.get("finishReason") == "STOP"
+            content = candidate.get("content")
+            if content is None:
+                continue
+            parts = content.get("parts", []) if isinstance(content, dict) else None
+            if not isinstance(parts, list):
+                raise ValueError("invalid Gemini parts")
+            for part in parts:
+                if not isinstance(part, dict) or not part:
+                    raise ValueError("invalid Gemini part")
+                if not saw_call and "functionCall" in part:
+                    signature = part.get("thoughtSignature")
+                    if not isinstance(signature, str) or not signature:
+                        raise ValueError("Gemini tool call lacks its signature")
+                    saw_call = True
+                saw_parts = True
+    if not witnessed_model or not finished or not saw_parts:
+        raise ValueError("Gemini model or completion was not attested")
+
+
+def _sdk_error(code: int) -> web.Response:
+    status = {
+        400: "INVALID_ARGUMENT",
+        401: "UNAUTHENTICATED",
+        402: "RESOURCE_EXHAUSTED",
+        403: "PERMISSION_DENIED",
+        409: "ABORTED",
+        429: "RESOURCE_EXHAUSTED",
+        502: "UNAVAILABLE",
+    }[code]
+    return web.json_response(
+        {"error": {"code": code, "status": status, "message": "Neon sample unavailable"}},
+        status=code,
+    )
+
+
+def _application(adapter: _Adapter) -> web.Application:
+    application = web.Application(client_max_size=_MAX_WIRE_BYTES)
+    application.router.add_post("/v1/responses", adapter.responses)
+    application.router.add_post(_GEMINI_GENERATE, adapter.sdk_samples)
+    application.router.add_post(_GEMINI_STREAM, adapter.sdk_samples)
+    return application
+
+
 async def _serve(args: argparse.Namespace) -> None:
     origin = urlsplit(_origin(args.origin))
     directory = Path(os.environ["CREDENTIALS_DIRECTORY"])
@@ -429,7 +776,9 @@ async def _serve(args: argparse.Namespace) -> None:
         raise RuntimeError("Neon adapter credentials are missing or malformed")
     if not args.project_id or not args.model_version:
         raise RuntimeError("Neon adapter requires its enrolled project and served model")
-    async with httpx.AsyncClient(trust_env=False) as transport:
+    async with httpx.AsyncClient(
+        trust_env=False, transport=httpx.AsyncHTTPTransport(retries=0, trust_env=False)
+    ) as transport:
         engine = GeminiGenerateEngine(http_client=transport)
         credential = ProviderCredential(provider="gemini", key=api_key)
         row = _resolve(f"gemini:{NEON_MODEL}")
@@ -448,10 +797,10 @@ async def _serve(args: argparse.Namespace) -> None:
             continuation_key=continuation_key,
             project_id=args.project_id,
             sample=sample,
+            sdk_transport=transport,
+            sdk_api_key=api_key,
         )
-        application = web.Application(client_max_size=_MAX_WIRE_BYTES)
-        application.router.add_post("/v1/responses", adapter.responses)
-        runner = web.AppRunner(application, access_log=None, handler_cancellation=True)
+        runner = web.AppRunner(_application(adapter), access_log=None, handler_cancellation=True)
         await runner.setup()
         try:
             site = web.TCPSite(runner, origin.hostname, origin.port)
