@@ -227,6 +227,16 @@ class NativeResponses:
         positions: list[dict] = []
         calls: dict[str, _Call] = {}
         replayed: dict[int, int] = {}
+        interleaved: list[tuple[dict, gemini.Content]] = []
+
+        def append_data(position: dict, content: gemini.Content) -> None:
+            positions.append(position)
+            if calls:
+                interleaved.append((position, content))
+            else:
+                position["content_index"] = len(contents)
+                contents.append(content)
+
         index = 0
         while index < len(messages):
             item = messages[index]
@@ -274,9 +284,9 @@ class NativeResponses:
                     # A stock history cut may retain the opaque marker and omit
                     # the corresponding public response. Do not invent its effects.
                     continue
+                if calls:
+                    raise NeonProtocolError("native history has an incomplete signed tool group")
                 replayed.update((ordinal, len(contents)) for ordinal in materialized)
-                if calls.keys() & reference.calls.keys():
-                    raise NeonProtocolError("duplicate call identity in native history")
                 positions.append(
                     {
                         "index": position,
@@ -343,35 +353,34 @@ class NativeResponses:
                         "part_index": part_index,
                     }
                 )
+                if not calls:
+                    # Gemini requires a signed call group and its results to be adjacent.
+                    # The trusted stock positions still identify the actual order.
+                    for marker, content in interleaved:
+                        marker["content_index"] = len(contents)
+                        contents.append(content)
+                    interleaved.clear()
                 continue
             if kind == "agent_message":
-                positions.append(
-                    {"index": position, "role": "agent_message", "content_index": len(contents)}
-                )
-                contents.append(
+                append_data(
+                    {"index": position, "role": "agent_message"},
                     gemini.Content(
                         role="user",
                         parts=[gemini.Part(text=json.dumps(item, separators=(",", ":")))],
-                    )
+                    ),
                 )
                 continue
             if kind != "message":
                 raise NeonProtocolError("native history contains an unsupported item")
             role = item.get("role")
             parts = [_part(_object(part)) for part in _array(item.get("content"))]
-            positions.append(
-                {
-                    "index": position,
-                    "role": role,
-                    **({"content_index": len(contents)} if role in ("user", "assistant") else {}),
-                }
-            )
+            marker = {"index": position, "role": role}
             if role in ("system", "developer") and all(p.text is not None for p in parts):
-                instructions.append(
-                    {"index": position, "role": role, "instructions": [p.text for p in parts]}
-                )
+                positions.append(marker)
+                instructions.append({**marker, "instructions": [p.text for p in parts]})
             elif role == "user":
-                contents.append(
+                append_data(
+                    marker,
                     gemini.Content(
                         role="user",
                         parts=[
@@ -382,10 +391,10 @@ class NativeResponses:
                             )
                             for part in parts
                         ],
-                    )
+                    ),
                 )
-            elif role == "assistant":
-                contents.append(gemini.Content(role="model", parts=parts))
+            elif role == "assistant" and not calls:
+                append_data(marker, gemini.Content(role="model", parts=parts))
             else:
                 raise NeonProtocolError("native history contains an unsupported message role")
         if calls:
