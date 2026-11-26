@@ -8,6 +8,8 @@ surface.
 from provider_runtime.types import JsonScalar, thaw_json_value
 
 from ._structured_output import OutputSchemaMismatch, decode_agent_output
+from .antigravity_host import AGY_WORKSPACE_POLICY, AntigravityLease
+from .antigravity_sdk import antigravity_native_request_fit
 from .codex_app_server import CodexConnectionUnavailable, NativeRequestFit, codex_wire_request_fit
 from .codex_containment import (
     CODEX_CONTAINMENT_CATALOG_FILENAME,
@@ -161,6 +163,7 @@ from .types import (
     AgentSessionRef,
     AgentSessionRequest,
     AgentTransport,
+    AntigravitySdkSessionRequest,
     ApprovalDecision,
     ApprovalHandler,
     ApprovalRequest,
@@ -261,6 +264,10 @@ __all__ = [
     "CodexAllowance",
     "CodexBounded",
     "CodexCatalogSessionRequest",
+    "AntigravitySdkSessionRequest",
+    "AntigravityLease",
+    "AGY_WORKSPACE_POLICY",
+    "antigravity_native_request_fit",
     "CodexComplete",
     "CodexConnectionUnavailable",
     "CodexControl",

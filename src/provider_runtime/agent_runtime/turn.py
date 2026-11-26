@@ -39,8 +39,11 @@ class AgentTurnRef:
     native_turn_id: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.session_ref, AgentSessionRef) or self.session_ref.backend != "codex":
-            raise InvalidAgentRequest("AgentTurnRef requires a Codex session ref")
+        if not isinstance(self.session_ref, AgentSessionRef) or self.session_ref.backend not in {
+            "codex",
+            "antigravity",
+        }:
+            raise InvalidAgentRequest("AgentTurnRef requires a turn-based native session ref")
         _non_empty(self.native_turn_id, "AgentTurnRef.native_turn_id")
 
 
@@ -118,20 +121,27 @@ class AgentSubmissionRejected:
 
 
 type AgentSubmission = AgentNotSubmitted | AgentAccepted | AgentUncertain | AgentSubmissionRejected
+type NativeSealRevision = Literal[
+    "codex-turn-completed.v1", "antigravity-sdk-turn.v1", "claude-result.v1"
+]
 
 
 @dataclass(frozen=True, slots=True)
 class NativeTerminalEvidence:
     attempt: AgentAttempt
     native_ref: AgentTurnRef | AgentResultRef
-    seal_revision: Literal["codex-turn-completed.v1", "claude-result.v1"]
+    seal_revision: NativeSealRevision
     origin: Literal["native"] = field(default="native", init=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.attempt, AgentAttempt):
             raise ProtocolDefect("native terminal evidence omitted its submitted attempt")
         if isinstance(self.native_ref, AgentTurnRef):
-            expected = "codex-turn-completed.v1"
+            expected = (
+                "codex-turn-completed.v1"
+                if self.native_ref.session_ref.backend == "codex"
+                else "antigravity-sdk-turn.v1"
+            )
         elif isinstance(self.native_ref, AgentResultRef):
             expected = "claude-result.v1"
         else:
