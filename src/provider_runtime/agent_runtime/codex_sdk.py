@@ -79,6 +79,14 @@ from .events import (
     AgentUsage,
 )
 from .model_catalog import AgentModelCatalog, read_codex_model_catalog
+from .neon_config import (
+    NEON_MODEL,
+    NEON_PROFILE,
+    NEON_PROVIDER,
+    neon_shell_environment,
+    require_neon_auth,
+    validate_neon_startup,
+)
 from .policy import PermissionPolicy
 from .sessions import (
     AgentSession,
@@ -597,26 +605,43 @@ class CodexSdkAdapter:
         *,
         endpoints: Mapping[str, CodexEndpoint],
         sandbox_controls: CodexSandboxControls | None = None,
+        neon_origin: str | None = None,
     ) -> None:
         if sandbox_controls is not None and not isinstance(sandbox_controls, CodexSandboxControls):
             raise InvalidAgentRequest(
                 "sandbox_controls must be CodexSandboxControls when configured"
             )
         self._endpoints = dict(endpoints)
+        self._neon_origin = neon_origin
         self._sandbox_controls = sandbox_controls
         self._sessions: dict[AgentSession, _CodexSessionState] = {}
         self._dead_sessions: weakref.WeakSet[AgentSession] = weakref.WeakSet()
         self._clients: set[Any] = set()
 
     def validate_auth(self, credential: CredentialRef) -> None:
-        self._require_local_auth(credential.kind)
+        if credential.profile_key == NEON_PROFILE and self._neon_origin is not None:
+            if credential.kind != "host_managed":
+                raise UnsupportedCapability("Neon requires an explicit host-managed credential")
+        else:
+            self._require_local_auth(credential.kind)
 
     async def model_catalog(self, *, environment: Mapping[str, str]) -> AgentModelCatalog:
-        client = await self._open_client(environment=environment)
+        origin = self._neon_binding(environment)
+        client = await self._open_client(
+            environment=environment, experimental_api=origin is not None
+        )
         try:
-            await self._verify_auth(client)
+            await self._verify_auth(client, environment)
+            if origin is not None:
+                validate_neon_startup(
+                    await client.request("config/read", {"includeLayers": False}),
+                    client.metadata,
+                    origin,
+                )
             return await self._call(
-                read_codex_model_catalog(client), operation="model catalog", failure="executable"
+                read_codex_model_catalog(client, neon=origin is not None),
+                operation="model catalog",
+                failure="executable",
             )
         finally:
             await self._close_client(client)
@@ -629,10 +654,10 @@ class CodexSdkAdapter:
     ) -> SessionPage:
         if query.backend != self.backend or query.transport != self.transport:
             raise InvalidAgentRequest("CodexSdkAdapter received a different route")
-        self._require_local_auth(query.auth.kind)
+        self.validate_auth(query.auth)
         client = await self._open_client(environment=environment)
         try:
-            await self._verify_auth(client)
+            await self._verify_auth(client, environment)
             response = await self._call(
                 client.thread_list(archived=None, cursor=query.cursor, limit=query.limit),
                 operation="thread listing",
@@ -668,12 +693,12 @@ class CodexSdkAdapter:
         if ref.backend != self.backend or ref.transport != self.transport:
             raise SessionMismatch("Codex SDK cannot read a different route")
         validate_read_session_auth(ref, options)
-        self._require_local_auth(options.auth.kind)
+        self.validate_auth(options.auth)
         if ref.state_root_fingerprint != fingerprint_codex_endpoint(self._endpoint(environment)):
             raise SessionMismatch("session state root does not match the supplied environment")
         client = await self._open_client(environment=environment)
         try:
-            await self._verify_auth(client)
+            await self._verify_auth(client, environment)
             response = await self._call(
                 client.request(
                     "thread/read", {"threadId": ref.native_session_id, "includeTurns": False}
@@ -700,11 +725,18 @@ class CodexSdkAdapter:
     ) -> AgentSession:
         if not isinstance(request, _ResolvedCodexSessionRequest):
             raise InvalidAgentRequest("CodexSdkAdapter requires a catalog-resolved request")
-        self._require_local_auth(request.auth.kind)
+        self.validate_auth(request.auth)
         self._validate_policy_mapping(request.policy)
         validate_mcp_network_policy(request.mcp_servers, request.policy)
         self._validate_mcp_filters(request)
         endpoint = self._endpoint(environment)
+        neon_origin = self._neon_binding(environment)
+        if neon_origin is not None and (
+            request.dispatch_model != NEON_MODEL or request.mcp_servers
+        ):
+            raise UnsupportedCapability(
+                "Neon requires its declared model and callback capabilities"
+            )
         native = request.native
         contained = isinstance(native, CodexNativeOptions) and native.builtin_tools == "disabled"
         internal = isinstance(native, CodexNativeOptions) and native.archive_internal
@@ -716,12 +748,15 @@ class CodexSdkAdapter:
             self._validate_strict_native_containment(request)
         client = await self._open_client(
             environment=environment,
-            experimental_api=internal or contained or bool(request.tools),
+            experimental_api=neon_origin is not None
+            or internal
+            or contained
+            or bool(request.tools),
             callbacks=bool(request.tools),
             stock_observations=internal and not contained,
         )
         try:
-            await self._verify_auth(client)
+            await self._verify_auth(client, environment)
             config = self._codex_config(request)
             startup = self._mapping(
                 await self._call(
@@ -731,7 +766,9 @@ class CodexSdkAdapter:
                 ),
                 "Codex host startup configuration",
             )
-            if contained or request.tools:
+            if neon_origin is not None:
+                validate_neon_startup(startup, client.metadata, neon_origin)
+            elif contained or request.tools:
                 _validate_codex_containment_config(startup, client.metadata)
             service_tier = _startup_flag(startup, "service_tier")
             if service_tier is not None:
@@ -1146,7 +1183,13 @@ class CodexSdkAdapter:
             raise ProtocolDefect("Codex session state changed before teardown")
         await self.close_session(session)
 
-    async def _verify_auth(self, client: Any) -> None:
+    def _neon_binding(self, environment: Mapping[str, str]) -> str | None:
+        return self._neon_origin if environment.get("CODEX_PROFILE") == NEON_PROFILE else None
+
+    async def _verify_auth(self, client: Any, environment: Mapping[str, str]) -> None:
+        if self._neon_binding(environment) is not None:
+            await require_neon_auth(client)
+            return
         response = await self._call(
             client.account(), operation="account discovery", failure="credential"
         )
@@ -2291,7 +2334,8 @@ class CodexSdkAdapter:
     ) -> None:
         if (
             settings.get("model") != request.dispatch_model
-            or settings.get("modelProvider") != "openai"
+            or settings.get("modelProvider")
+            != (NEON_PROVIDER if request.auth.kind == "host_managed" else "openai")
             or settings.get("cwd") != request.cwd
         ):
             raise ProtocolDefect("Codex native settings changed the selected model or cwd")
@@ -2520,6 +2564,10 @@ class CodexSdkAdapter:
             "web_search": "disabled",
             "shell_environment_policy": {"inherit": "core", "exclude": []},
         }
+        if request.auth.kind == "host_managed":
+            if request.policy.filesystem == "full_access":
+                raise UnsupportedCapability("Neon requires an enforced native sandbox")
+            config["shell_environment_policy"] = neon_shell_environment()
         native = request.native
         if isinstance(native, CodexNativeOptions) and native.web_search is not None:
             config["web_search"] = "live" if native.web_search else "disabled"

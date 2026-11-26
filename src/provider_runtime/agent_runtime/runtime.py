@@ -62,6 +62,7 @@ from .events import (
     validate_event_stream,
 )
 from .model_catalog import AgentModelCatalog
+from .neon_config import NEON_PROFILE, _origin
 from .policy import PermissionPolicy, narrow_policy
 from .sessions import (
     AgentSession,
@@ -122,12 +123,19 @@ _STATE_ROOT_MODE = 0o700
 class AgentRuntimeConfig:
     state_root_base: Path
     codex_endpoints: Mapping[str, CodexEndpoint] = field(default_factory=dict)
+    codex_neon_origin: str | None = None
     claude_executable: str = "claude"
     max_turn_seconds: float = 3_600.0
     codex_sandbox: CodexSandboxControls | None = None
     secret_resolver: SecretResolver | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self.codex_neon_origin is not None:
+            _origin(self.codex_neon_origin)
+            if not isinstance(self.codex_endpoints.get(NEON_PROFILE), CodexUnixEndpoint):
+                raise InvalidAgentRequest("Neon requires a dedicated Unix host binding")
+        elif NEON_PROFILE in self.codex_endpoints:
+            raise InvalidAgentRequest("Neon endpoint requires its explicit adapter origin")
         for profile, endpoint in self.codex_endpoints.items():
             CredentialRef(kind="local_account", profile_key=profile)
             if not isinstance(endpoint, CodexUnixEndpoint | CodexWebSocketEndpoint):
@@ -1566,7 +1574,11 @@ def _default_adapters(config: AgentRuntimeConfig) -> tuple[AgentAdapter, ...]:
     from .codex_sdk import CodexSdkAdapter
 
     return (
-        CodexSdkAdapter(endpoints=config.codex_endpoints, sandbox_controls=config.codex_sandbox),
+        CodexSdkAdapter(
+            endpoints=config.codex_endpoints,
+            sandbox_controls=config.codex_sandbox,
+            neon_origin=config.codex_neon_origin,
+        ),
         ClaudeSdkAdapter(executable=_resolve_executable(config.claude_executable)),
     )
 
