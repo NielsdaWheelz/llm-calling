@@ -32,7 +32,9 @@ from .policy import PermissionPolicy, PermissionPolicyPatch
 
 type Backend = Literal["codex", "claude"]
 type AgentTransport = Literal["sdk"]
-type CredentialKind = Literal["local_account", "api_key_environment", "secret_reference"]
+type CredentialKind = Literal[
+    "local_account", "host_managed", "api_key_environment", "secret_reference"
+]
 type ApprovalDecision = Literal["allow", "deny", "abort"]
 
 _BACKENDS: tuple[Backend, ...] = ("codex", "claude")
@@ -106,13 +108,20 @@ class CredentialRef:
     name: str | None = None
 
     def __post_init__(self) -> None:
-        if self.kind not in ("local_account", "api_key_environment", "secret_reference"):
+        if self.kind not in (
+            "local_account",
+            "host_managed",
+            "api_key_environment",
+            "secret_reference",
+        ):
             raise InvalidAgentRequest(f"unknown credential kind {self.kind!r}")
         if type(self.profile_key) is not str or _PROFILE_KEY.fullmatch(self.profile_key) is None:
             raise InvalidAgentRequest("profile_key must be a safe named state scope")
-        if self.kind == "local_account":
+        if self.kind in ("local_account", "host_managed"):
             if self.name is not None:
-                raise InvalidAgentRequest("CredentialRef.name must be absent for local_account")
+                raise InvalidAgentRequest(
+                    "account and host references do not carry credential names"
+                )
             return
         if self.name is None:
             raise InvalidAgentRequest(f"CredentialRef.name is required for {self.kind}")

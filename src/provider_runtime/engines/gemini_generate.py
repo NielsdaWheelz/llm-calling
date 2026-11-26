@@ -51,7 +51,7 @@ Engine decisions (wire-observable):
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Final, assert_never
@@ -454,6 +454,7 @@ class _UsageFold:
     total: int | None = None
     thoughts: int | None = None
     cached: int | None = None
+    tool_prompt: int | None = None
     seen: bool = False
 
     def fold(self, metadata: genai_types.GenerateContentResponseUsageMetadata) -> None:
@@ -463,6 +464,7 @@ class _UsageFold:
         self.total = metadata.total_token_count or self.total
         self.thoughts = metadata.thoughts_token_count or self.thoughts
         self.cached = metadata.cached_content_token_count or self.cached
+        self.tool_prompt = metadata.tool_use_prompt_token_count or self.tool_prompt
 
     def usage(self) -> Presence[TokenUsage]:
         if not self.seen:
@@ -751,6 +753,24 @@ class GeminiGenerateEngine:
             ) as client:
                 async with client.aio:
                     yield client
+
+    async def _stream_native_sample(
+        self,
+        row: ModelRow,
+        credential: ProviderCredential,
+        *,
+        contents: list[genai_types.Content],
+        config: genai_types.GenerateContentConfig,
+    ) -> AsyncGenerator[genai_types.GenerateContentResponse, None]:
+        """One GenerateContent stream for the trusted native Responses codec."""
+        async with self._client(row, credential) as client:
+            chunks = await client.aio.models.generate_content_stream(
+                model=row.model_id,
+                contents=contents,
+                config=config,
+            )
+            async for chunk in chunks:
+                yield chunk
 
     async def generate(
         self, row: ModelRow, intent: GenerateIntent, credential: ProviderCredential

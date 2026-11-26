@@ -18,6 +18,13 @@ from provider_runtime.types import (
 
 from .codex_containment import CODEX_CONTAINMENT_CATALOG_REVISION
 from .errors import ProtocolDefect
+from .neon_config import (
+    NEON_CATALOG_REVISION,
+    NEON_CONTEXT_WINDOW,
+    NEON_EFFORTS,
+    NEON_MAX_OUTPUT_TOKENS,
+    NEON_MODEL,
+)
 
 AGENT_BACKEND_CONTRACT_REVISION = "provider-runtime.agent-model-catalog.v4"
 _MAX_PAGES = 64
@@ -139,6 +146,7 @@ async def read_codex_model_catalog(
     client: GenericAsyncRpc,
     *,
     now: Callable[[], datetime] | None = None,
+    neon: bool = False,
 ) -> AgentModelCatalog:
     """Read every visible page and normalize it without convenience APIs."""
     cursor: str | None = None
@@ -183,7 +191,9 @@ async def read_codex_model_catalog(
 
     if len(native_revisions) > 1:
         raise ProtocolDefect("Codex model/list changed native revision during pagination")
-    observed = tuple(_normalize_row(row) for row in rows)
+    if neon and (len(rows) != 1 or rows[0].get("model") != NEON_MODEL):
+        raise ProtocolDefect("Neon host must advertise exactly its pinned generation model")
+    observed = tuple(_normalize_row(row, neon=neon) for row in rows)
     _validate_observed_rows(observed)
     facts, diagnostics = _resolve_upgrades(observed)
     observed_at = (now or (lambda: datetime.now(UTC)))()
@@ -193,23 +203,31 @@ async def read_codex_model_catalog(
         b"provider-runtime.agent-model-catalog.v4",
         {
             "row_fingerprints": tuple(row.row_fingerprint for row in facts),
-            "native_containment_revision": CODEX_CONTAINMENT_CATALOG_REVISION,
+            "native_containment_revision": NEON_CATALOG_REVISION
+            if neon
+            else CODEX_CONTAINMENT_CATALOG_REVISION,
         },
     )
     return AgentModelCatalog(
         backend_contract_revision=AGENT_BACKEND_CONTRACT_REVISION,
         definition_revision=definition_revision,
-        native_revision=Present(next(iter(native_revisions))) if native_revisions else Absent(),
+        native_revision=(
+            Present(NEON_CATALOG_REVISION)
+            if neon
+            else Present(next(iter(native_revisions)))
+            if native_revisions
+            else Absent()
+        ),
         observed_at=observed_at,
         models=facts,
         diagnostics=diagnostics,
     )
 
 
-def _normalize_row(row: Mapping[str, object]) -> _ObservedModel:
+def _normalize_row(row: Mapping[str, object], *, neon: bool) -> _ObservedModel:
     key = _required_string(row, "id")
     dispatch_model = _required_string(row, "model")
-    if dispatch_model not in _CODEX_OFFERED_MODELS:
+    if dispatch_model not in (_CODEX_OFFERED_MODELS if not neon else {NEON_MODEL}):
         raise ProtocolDefect(
             f"Codex model {dispatch_model!r} has unclassified publication membership"
         )
@@ -267,16 +285,24 @@ def _normalize_row(row: Mapping[str, object]) -> _ObservedModel:
         upgrade_info = _object_mapping(upgrade_info_value, f"Codex model {key!r} upgradeInfo")
         upgrades.append(_required_string(upgrade_info, "model"))
 
+    if neon and (
+        key != NEON_MODEL
+        or tuple(r.key for r in reasoning) != NEON_EFFORTS
+        or source_default != Present("high")
+        or modalities != ["text", "image"]
+        or upgrades
+    ):
+        raise ProtocolDefect("Neon host catalog differs from the pinned capability contract")
     return _ObservedModel(
         key=key,
         dispatch_model=dispatch_model,
         label=label,
-        offered=_CODEX_OFFERED_MODELS[dispatch_model],
+        offered=neon or _CODEX_OFFERED_MODELS[dispatch_model],
         # The pinned public SDK's Model row exposes neither capacity. Do not
         # infer private cache/debug fields into the source contract; a future
         # SDK addition must be adopted here deliberately with conformance.
-        source_context_window=Absent(),
-        source_max_output_tokens=Absent(),
+        source_context_window=Present(NEON_CONTEXT_WINDOW) if neon else Absent(),
+        source_max_output_tokens=Present(NEON_MAX_OUTPUT_TOKENS) if neon else Absent(),
         input_modalities=tuple(modalities),
         reasoning=tuple(reasoning),
         source_default_reasoning=source_default,
