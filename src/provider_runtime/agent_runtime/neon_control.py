@@ -108,7 +108,7 @@ class NeonLease:
         sdk_turn_id: str | None = None,
     ) -> None:
         self._writer = writer
-        self._write_lock = asyncio.Lock()
+        self._disarm_requested = False
         self._fence = fence
         self._refusal: NeonFirstSampleRefusal | None = None
         self._sdk_turn_id = sdk_turn_id
@@ -225,9 +225,10 @@ class NeonLease:
                 raise NeonControlError("Neon control did not identify the native turn")
             essence = {"turn_id": turn_id, **identity}
             if notice == {"type": "may_have_delivered", **essence} and delivered_turn is None:
-                await on_delivery(turn_id)
                 delivered_turn = turn_id
-                async with self._write_lock:
+                if not self._disarm_requested:
+                    await on_delivery(turn_id)
+                if not self._disarm_requested:
                     await _write(self._writer, {"type": "delivery_recorded", **essence})
                 continue
             reason = notice.get("reason")
@@ -254,11 +255,9 @@ class NeonLease:
     async def close(self) -> None:
         try:
             async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
-                if not self._result.done():
-                    async with self._write_lock:
-                        await _write(self._writer, {"type": "disarm"})
+                self.request_disarm()
                 self._refusal = await self._result
-        except (OSError, NeonControlError):
+        except (OSError, TimeoutError, NeonControlError):
             self._refusal = None
             self._sdk_upstream_entries = None
             self._capacity = None
@@ -267,9 +266,15 @@ class NeonLease:
             if not self._result.done():
                 self._result.cancel()
 
-    def revoke(self) -> None:
-        """Cut the gateway lease without claiming its close receipt."""
-        self._writer.close()
+    def request_disarm(self) -> None:
+        """Revoke sampling now; close collects the original fenced receipt."""
+        if self._disarm_requested or self._result.done() or self._writer.is_closing():
+            return
+        self._disarm_requested = True
+        try:
+            self._writer.write(b'{"type":"disarm"}\n')
+        except OSError:
+            self._writer.close()
 
 
 @dataclass(frozen=True, slots=True)
