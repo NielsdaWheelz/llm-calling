@@ -77,10 +77,8 @@ from .types import (
 )
 
 if TYPE_CHECKING:
+    import google.antigravity.conversation.conversation as sdk_conversation  # pyright: ignore[reportMissingImports]
     from google.antigravity import types as sdk  # pyright: ignore[reportMissingImports]
-    from google.antigravity.conversation.conversation import (
-        Conversation,  # pyright: ignore[reportMissingImports]
-    )
 
 _SDK_VERSION = "0.1.24"
 _BINDING_FIELD = "jarvis_binding"
@@ -190,7 +188,7 @@ class AntigravitySdkTurn:
         self._accepted: asyncio.Future[AgentSubmission] | None = None
         self._terminal: AgentTerminal | None = None
         self._runner: asyncio.Task[None] | None = None
-        self._conversation: Conversation | None = None
+        self._conversation: sdk_conversation.Conversation | None = None
         self._events: asyncio.Queue[AgentEvent | None] = asyncio.Queue()
         self._event_count = 0
         self._event_bytes = 0
@@ -356,13 +354,9 @@ class AntigravitySdkTurn:
     async def _run_sdk(self, accepted: asyncio.Future[AgentSubmission]) -> None:
         import google.antigravity as agy  # pyright: ignore[reportMissingImports]
         from google.antigravity import types  # pyright: ignore[reportMissingImports]
-        from google.antigravity.connections.local import (
-            RunCommandResult,  # pyright: ignore[reportMissingImports]
-        )
+        from google.antigravity.connections import local  # pyright: ignore[reportMissingImports]
         from google.antigravity.hooks import hooks, policy  # pyright: ignore[reportMissingImports]
-        from google.antigravity.tools.tool_runner import (
-            ToolWithSchema,  # pyright: ignore[reportMissingImports]
-        )
+        from google.antigravity.tools import tool_runner  # pyright: ignore[reportMissingImports]
 
         denial = "Antigravity tool authority was not established."
         options = self._options
@@ -457,7 +451,7 @@ class AntigravitySdkTurn:
             value = result.error if result.error is not None else result.result
             size = bounded_payload_size(value, _MAX_EVENT_TEXT_BYTES, max_items=_MAX_MESSAGE_ITEMS)
             stock = StockToolObservation()
-            if isinstance(value, RunCommandResult):
+            if isinstance(value, local.RunCommandResult):
                 # The SDK reports shell output text. It exposes no typed shell exit code.
                 value = value.output
                 stock = StockToolObservation(shell_output="reported")
@@ -476,7 +470,7 @@ class AntigravitySdkTurn:
             )
             del observations[step_id]
 
-        def register(tool: CanonicalTool) -> ToolWithSchema:
+        def register(tool: CanonicalTool) -> tool_runner.ToolWithSchema:
             tool_schema = cast(
                 dict[str, object], thaw_json_value(freeze_json_object(tool.parameters))
             )
@@ -522,7 +516,7 @@ class AntigravitySdkTurn:
 
             invoke.__name__ = tool.name
             invoke.__doc__ = tool.description
-            return ToolWithSchema(invoke, tool_schema)
+            return tool_runner.ToolWithSchema(invoke, tool_schema)
 
         status: AgentTerminalStatus = "failed"
         cause: AgentFailureCause | None = "backend_failed"
