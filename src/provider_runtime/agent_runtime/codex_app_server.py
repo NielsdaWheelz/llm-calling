@@ -107,18 +107,21 @@ class NativeRequestFit:
     max_bytes: ClassVar[int] = _MAX_MESSAGE_BYTES
 
     @property
+    def overflow(self) -> tuple[int, int, str] | None:
+        if self.actual_chars > self.max_chars:
+            return self.actual_chars, self.max_chars, "characters"
+        if self.wire_bytes > self.max_bytes:
+            return self.wire_bytes, self.max_bytes, "wire bytes"
+        return None
+
+    @property
     def fits(self) -> bool:
-        return self.actual_chars <= self.max_chars and self.wire_bytes <= self.max_bytes
+        return self.overflow is None
 
     def require_fit(self) -> None:
-        if self.actual_chars > self.max_chars:
-            raise InvalidAgentRequest(
-                f"Codex input uses {self.actual_chars}/{self.max_chars} characters"
-            )
-        if self.wire_bytes > self.max_bytes:
-            raise InvalidAgentRequest(
-                f"Codex request uses {self.wire_bytes}/{self.max_bytes} wire bytes"
-            )
+        if self.overflow is not None:
+            actual, limit, unit = self.overflow
+            raise InvalidAgentRequest(f"native request uses {actual}/{limit} {unit}")
 
 
 def codex_wire_request_fit(submitted: Mapping[str, object]) -> NativeRequestFit:

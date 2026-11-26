@@ -20,6 +20,7 @@ from .turn import (
     AgentTurnRef,
     AgentUncertain,
     LocalStopEvidence,
+    NativeSealRevision,
     NativeTerminalEvidence,
     RawAgentOutput,
 )
@@ -41,8 +42,15 @@ class _Attempt(_Document):
     request_digest: str
 
 
+_NATIVE_REF_KIND = {
+    "codex": "codex_turn",
+    "claude": "claude_result",
+    "antigravity": "antigravity_sdk_turn",
+}
+
+
 class _NativeRef(_Document):
-    kind: Literal["codex_turn", "claude_result"]
+    kind: Literal["codex_turn", "claude_result", "antigravity_sdk_turn"]
     session_ref: dict[str, object]
     native_id: str | None
 
@@ -67,7 +75,7 @@ class _NativeEvidence(_Document):
     origin: Literal["native"]
     attempt: _Attempt
     native_ref: _NativeRef
-    seal_revision: Literal["codex-turn-completed.v1", "claude-result.v1"]
+    seal_revision: NativeSealRevision
 
 
 class _LocalEvidence(_Document):
@@ -112,7 +120,7 @@ def attempt_from_json(value: Mapping[str, object]) -> AgentAttempt:
 
 def _native_ref_json(ref: AgentTurnRef | AgentResultRef) -> dict[str, object]:
     return {
-        "kind": "codex_turn" if isinstance(ref, AgentTurnRef) else "claude_result",
+        "kind": _NATIVE_REF_KIND[ref.session_ref.backend],
         "session_ref": thaw_json_value(ref_to_json(ref.session_ref)),
         "native_id": ref.native_turn_id if isinstance(ref, AgentTurnRef) else ref.native_result_id,
     }
@@ -120,9 +128,11 @@ def _native_ref_json(ref: AgentTurnRef | AgentResultRef) -> dict[str, object]:
 
 def _native_ref(value: _NativeRef) -> AgentTurnRef | AgentResultRef:
     ref = ref_from_json(value.session_ref)
-    if value.kind == "codex_turn":
+    if value.kind != _NATIVE_REF_KIND[ref.backend]:
+        raise ValueError("native reference kind differs from its backend")
+    if value.kind != "claude_result":
         if value.native_id is None:
-            raise ValueError("a Codex terminal requires its actual native turn identity")
+            raise ValueError("native terminal requires its actual turn identity")
         return AgentTurnRef(ref, value.native_id)
     return AgentResultRef(ref, value.native_id)
 

@@ -111,6 +111,13 @@ compute or billing cessation is not part of this contract.
    reject changed replay. written replies and completed callbacks retire pending
    request state; input ids retire only after their native recording. unresolved
    writer-entered input and callback requests remain bounded and tracked.
+
+   antigravity emits one `AgentChildObserved` per child after a typed model
+   response. sdk trajectory and parent ids bind it to the accepted root turn.
+   the provider bounds the parent chain at depth two. the paid gateway verifies
+   the served model version and high effort before releasing response bytes.
+   the child frame contains identity and model facts only.
+
 5. `reply(call, AgentToolReply(...))` accepts only a fresh opaque token issued
    by that handle. each delivery needs its own reply. repeated call ids retain
    identical native name and arguments; durable replay belongs to the host.

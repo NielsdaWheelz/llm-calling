@@ -30,23 +30,19 @@ from .errors import InvalidAgentRequest, UnsupportedCapability
 from .model_catalog import AgentReasoningKey
 from .policy import PermissionPolicy, PermissionPolicyPatch
 
-type Backend = Literal["codex", "claude"]
-type AgentTransport = Literal["sdk"]
+type Backend = Literal["codex", "claude", "antigravity"]
+type AgentTransport = Literal["sdk", "antigravity_sdk"]
 type CredentialKind = Literal[
     "local_account", "host_managed", "api_key_environment", "secret_reference"
 ]
 type ApprovalDecision = Literal["allow", "deny", "abort"]
 
-_BACKENDS: tuple[Backend, ...] = ("codex", "claude")
-_TRANSPORTS: tuple[AgentTransport, ...] = ("sdk",)
-# The closed routing table has exactly one owner in the package; runtime.py and the adapters
-# read this name instead of re-listing. One transport per backend is not an invariant this
-# table asserts — it is what the two shipped lanes happen to be. Consumers key off the pair,
-# never off the backend alone.
+# Runtime routing and serialized session references use the same closed pairs.
 AGENT_ROUTES: frozenset[tuple[Backend, AgentTransport]] = frozenset(
     {
         ("codex", "sdk"),
         ("claude", "sdk"),
+        ("antigravity", "antigravity_sdk"),
     }
 )
 _PROFILE_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
@@ -537,6 +533,28 @@ class _SessionRequestBase:
             raise InvalidAgentRequest(f"{owner}.output is invalid")
 
 
+def _owned_native_tools(value: tuple[CanonicalTool, ...], owner: str) -> tuple[CanonicalTool, ...]:
+    require_tuple(value, f"{owner}.tools")
+    if any(not isinstance(tool, CanonicalTool) for tool in value):
+        raise InvalidAgentRequest(f"{owner}.tools must contain CanonicalTool")
+    if len({tool.name for tool in value}) != len(value):
+        raise InvalidAgentRequest(f"{owner}.tools has duplicate names")
+    owned: list[CanonicalTool] = []
+    for tool in value:
+        if type(tool.name) is not str or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", tool.name) is None:
+            raise InvalidAgentRequest(f"{owner} native tool name violates the common grammar")
+        if type(tool.description) is not str:
+            raise InvalidAgentRequest(f"{owner} native tool description must be text")
+        owned.append(
+            CanonicalTool(
+                tool.name,
+                tool.description,
+                freeze_json_object(tool.parameters, context=f"tool {tool.name} schema"),
+            )
+        )
+    return tuple(owned)
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CodexCatalogSessionRequest(_SessionRequestBase):
     model_key: str
@@ -552,28 +570,9 @@ class CodexCatalogSessionRequest(_SessionRequestBase):
         self._validate_common("CodexCatalogSessionRequest")
         if isinstance(self.output, JsonSchemaAgentOutput):
             _validate_codex_output_schema(cast(JsonObject, self.output.schema))
-        require_tuple(self.tools, "CodexCatalogSessionRequest.tools")
-        if any(not isinstance(tool, CanonicalTool) for tool in self.tools):
-            raise InvalidAgentRequest("CodexCatalogSessionRequest.tools must contain CanonicalTool")
-        if len({tool.name for tool in self.tools}) != len(self.tools):
-            raise InvalidAgentRequest("CodexCatalogSessionRequest.tools has duplicate names")
-        owned_tools: list[CanonicalTool] = []
-        for tool in self.tools:
-            if (
-                type(tool.name) is not str
-                or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", tool.name) is None
-            ):
-                raise InvalidAgentRequest("Codex native tool name violates the common grammar")
-            if type(tool.description) is not str:
-                raise InvalidAgentRequest("Codex native tool description must be text")
-            owned_tools.append(
-                CanonicalTool(
-                    tool.name,
-                    tool.description,
-                    freeze_json_object(tool.parameters, context=f"tool {tool.name} schema"),
-                )
-            )
-        object.__setattr__(self, "tools", tuple(owned_tools))
+        object.__setattr__(
+            self, "tools", _owned_native_tools(self.tools, "CodexCatalogSessionRequest")
+        )
         _require_non_empty(self.model_key, "CodexCatalogSessionRequest.model_key")
         _require_non_empty(self.reasoning, "CodexCatalogSessionRequest.reasoning")
         _require_non_empty(
@@ -618,7 +617,38 @@ class ClaudeNativeSessionRequest(_SessionRequestBase):
             )
 
 
-type AgentSessionRequest = CodexCatalogSessionRequest | ClaudeNativeSessionRequest
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AntigravitySdkSessionRequest(_SessionRequestBase):
+    model_key: str
+    reasoning: Literal["high"]
+    agent_definition_revision: str
+    workspace_tools: bool = False
+    tools: tuple[CanonicalTool, ...] = ()
+    backend: Literal["antigravity"] = field(default="antigravity", init=False)
+    transport: Literal["antigravity_sdk"] = field(default="antigravity_sdk", init=False)
+
+    def __post_init__(self) -> None:
+        from .neon_config import AGY_CAPABILITY_REVISION, AGY_PROFILE, NEON_MODEL
+
+        self._validate_common("AntigravitySdkSessionRequest")
+        if self.auth != CredentialRef("host_managed", AGY_PROFILE):
+            raise InvalidAgentRequest("Antigravity requires the contained agy_neon profile")
+        if not isinstance(self.open, NewSession) or self.mcp_servers:
+            raise InvalidAgentRequest("Antigravity requires a fresh session with direct callbacks")
+        if self.model_key != NEON_MODEL or self.reasoning != "high":
+            raise InvalidAgentRequest("Antigravity requires the pinned Neon model at high effort")
+        if type(self.workspace_tools) is not bool:
+            raise InvalidAgentRequest("Antigravity workspace_tools must be a bool")
+        if self.agent_definition_revision != AGY_CAPABILITY_REVISION:
+            raise InvalidAgentRequest("Antigravity requires its enrolled capability revision")
+        object.__setattr__(
+            self, "tools", _owned_native_tools(self.tools, "AntigravitySdkSessionRequest")
+        )
+
+
+type AgentSessionRequest = (
+    CodexCatalogSessionRequest | ClaudeNativeSessionRequest | AntigravitySdkSessionRequest
+)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -721,18 +751,18 @@ def ref_from_json(value: Mapping[str, object]) -> AgentSessionRef:
             "cwd_fingerprint",
         )
     }
-    if backend_value not in _BACKENDS or type(backend_value) is not str:
-        raise InvalidAgentRequest("agent session ref backend is invalid")
-    if transport_value not in _TRANSPORTS or type(transport_value) is not str:
-        raise InvalidAgentRequest("agent session ref transport is invalid")
+    if (
+        type(backend_value) is not str
+        or type(transport_value) is not str
+        or (backend_value, transport_value) not in AGENT_ROUTES
+    ):
+        raise InvalidAgentRequest("agent session ref backend/transport pair is invalid")
     if any(type(item) is not str for item in string_fields.values()):
         raise InvalidAgentRequest("agent session ref JSON fields have invalid types")
-    backend: Backend = backend_value
-    transport: AgentTransport = transport_value
     return AgentSessionRef(
         schema_version="agent-session-ref.v1",
-        backend=backend,
-        transport=transport,
+        backend=cast(Backend, backend_value),
+        transport=cast(AgentTransport, transport_value),
         native_session_id=str(string_fields["native_session_id"]),
         profile_key=str(string_fields["profile_key"]),
         state_root_fingerprint=str(string_fields["state_root_fingerprint"]),

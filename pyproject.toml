@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 provider-runtime-control = "provider_runtime.agent_runtime.native_control_cli:main"
+provider-runtime-antigravity-host = "provider_runtime.agent_runtime.antigravity_host:main"
 provider-runtime-worker = "provider_runtime.agent_runtime.worker:main"
 
 # Claude SDK and the managed terminal editor remain optional; Codex uses a

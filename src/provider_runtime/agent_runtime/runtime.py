@@ -25,6 +25,7 @@ from provider_runtime.types import (
     canonical_json_bytes,
 )
 
+from .antigravity_host import AntigravityLease, AntigravitySdkAdapter
 from .auth import (
     AuthEnvironmentRequest,
     build_child_environment,
@@ -88,6 +89,7 @@ from .types import (
     AgentSessionRef,
     AgentSessionRequest,
     AgentTransport,
+    AntigravitySdkSessionRequest,
     ApprovalHandler,
     Backend,
     ClaudeNativeSessionRequest,
@@ -128,8 +130,15 @@ class AgentRuntimeConfig:
     max_turn_seconds: float = 3_600.0
     codex_sandbox: CodexSandboxControls | None = None
     secret_resolver: SecretResolver | None = field(default=None, repr=False, compare=False)
+    antigravity_endpoint: Path | None = None
 
     def __post_init__(self) -> None:
+        if self.antigravity_endpoint is not None and (
+            not isinstance(self.antigravity_endpoint, Path)
+            or not self.antigravity_endpoint.is_absolute()
+            or os.path.normpath(str(self.antigravity_endpoint)) != str(self.antigravity_endpoint)
+        ):
+            raise InvalidAgentRequest("Antigravity endpoint must be a normalized absolute path")
         if self.codex_neon_origin is not None:
             _origin(self.codex_neon_origin)
             if not isinstance(self.codex_endpoints.get(NEON_PROFILE), CodexUnixEndpoint):
@@ -373,11 +382,27 @@ class AgentRuntime:
         return await adapter.read_session(ref, options, environment=environment)
 
     async def open_session(self, request: AgentSessionRequest) -> AgentSession:
-        if not isinstance(request, CodexCatalogSessionRequest | ClaudeNativeSessionRequest):
+        if not isinstance(
+            request,
+            CodexCatalogSessionRequest | ClaudeNativeSessionRequest | AntigravitySdkSessionRequest,
+        ):
             raise InvalidAgentRequest(
-                "open_session requires CodexCatalogSessionRequest or ClaudeNativeSessionRequest"
+                "open_session requires CodexCatalogSessionRequest, ClaudeNativeSessionRequest, "
+                "or AntigravitySdkSessionRequest"
             )
         return await self._run_owned_operation(lambda: self._open_session_locked(request))
+
+    async def antigravity_ready(self) -> bool:
+        self._require_open()
+        adapter = self._adapters.get(("antigravity", "antigravity_sdk"))
+        return isinstance(adapter, AntigravitySdkAdapter) and await adapter.ready()
+
+    def antigravity_lease(self, session: AgentSession) -> AntigravityLease:
+        self._require_open()
+        binding = self._sessions.get(session)
+        if binding is None or not isinstance(binding.adapter, AntigravitySdkAdapter):
+            raise SessionMismatch("Antigravity session does not belong to this AgentRuntime")
+        return binding.adapter.lease(session)
 
     async def _run_owned_operation(self, operation: Callable[[], Awaitable[Any]]) -> Any:
         async with self._lifecycle_lock:
@@ -570,8 +595,8 @@ class AgentRuntime:
         adapter = binding.adapter
         if binding.invalidated:
             raise SessionUnavailable("AgentSession is no longer usable")
-        if not isinstance(adapter, CodexSdkAdapter):
-            raise UnsupportedCapability("controlled prepared turns currently support Codex only")
+        if not isinstance(adapter, CodexSdkAdapter | AntigravitySdkAdapter):
+            raise UnsupportedCapability("adapter does not support controlled prepared turns")
         if (
             not controlled
             and isinstance(binding.request, CodexCatalogSessionRequest)
@@ -614,6 +639,8 @@ class AgentRuntime:
     def session_usable(self, session: AgentSession) -> bool:
         binding = self._sessions.get(session)
         if self._closed or binding is None or binding.invalidated or binding.turn_active:
+            return False
+        if isinstance(binding.adapter, AntigravitySdkAdapter):
             return False
         return not isinstance(binding.adapter, CodexSdkAdapter) or binding.adapter.session_usable(
             session
@@ -1121,6 +1148,13 @@ class AgentRuntime:
         credential: CredentialRef,
         allowed_environment: tuple[str, ...],
     ) -> tuple[dict[str, str], str]:
+        if backend == "antigravity":
+            endpoint = self._config.antigravity_endpoint
+            if endpoint is None:
+                raise CredentialUnavailable("Antigravity has no configured external endpoint")
+            if allowed_environment:
+                raise UnsupportedCapability("Antigravity does not inherit client environment")
+            return {}, fingerprint_path(endpoint)
         if backend == "codex":
             endpoint = self._config.codex_endpoints.get(credential.profile_key)
             if endpoint is None:
@@ -1573,7 +1607,7 @@ def _default_adapters(config: AgentRuntimeConfig) -> tuple[AgentAdapter, ...]:
     from .claude_sdk import ClaudeSdkAdapter
     from .codex_sdk import CodexSdkAdapter
 
-    return (
+    adapters: tuple[AgentAdapter, ...] = (
         CodexSdkAdapter(
             endpoints=config.codex_endpoints,
             sandbox_controls=config.codex_sandbox,
@@ -1581,6 +1615,9 @@ def _default_adapters(config: AgentRuntimeConfig) -> tuple[AgentAdapter, ...]:
         ),
         ClaudeSdkAdapter(executable=_resolve_executable(config.claude_executable)),
     )
+    if config.antigravity_endpoint is not None:
+        return (*adapters, AntigravitySdkAdapter(config.antigravity_endpoint))
+    return adapters
 
 
 def _resolve_executable(configured: str) -> str:

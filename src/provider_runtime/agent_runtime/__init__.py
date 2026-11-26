@@ -8,6 +8,8 @@ surface.
 from provider_runtime.types import JsonScalar, thaw_json_value
 
 from ._structured_output import OutputSchemaMismatch, decode_agent_output
+from .antigravity_host import AGY_WORKSPACE_POLICY, AntigravityLease
+from .antigravity_sdk import antigravity_native_request_fit
 from .codex_app_server import CodexConnectionUnavailable, NativeRequestFit, codex_wire_request_fit
 from .codex_containment import (
     CODEX_CONTAINMENT_CATALOG_FILENAME,
@@ -97,6 +99,7 @@ from .model_catalog import (
     UpgradeTargetAmbiguous,
     UpgradeTargetUnresolved,
 )
+from .neon_config import AGY_CAPABILITY_REVISION
 from .policy import (
     ApprovalMode,
     FilesystemMode,
@@ -138,6 +141,7 @@ from .testing import (
 from .turn import (
     AgentAccepted,
     AgentAttempt,
+    AgentChildObserved,
     AgentCloseResult,
     AgentControlReceipt,
     AgentInputRecorded,
@@ -161,6 +165,7 @@ from .types import (
     AgentSessionRef,
     AgentSessionRequest,
     AgentTransport,
+    AntigravitySdkSessionRequest,
     ApprovalDecision,
     ApprovalHandler,
     ApprovalRequest,
@@ -200,9 +205,12 @@ from .types import (
 
 __all__ = [
     "AGENT_BACKEND_CONTRACT_REVISION",
+    "AGY_CAPABILITY_REVISION",
+    "AGY_WORKSPACE_POLICY",
     "AgentAccepted",
     "AgentAttempt",
     "AgentCatalogDiagnostic",
+    "AgentChildObserved",
     "AgentCloseResult",
     "AgentControlReceipt",
     "AgentEvent",
@@ -245,6 +253,8 @@ __all__ = [
     "AgentUncertain",
     "AgentUpgradeFacts",
     "AgentUsage",
+    "AntigravityLease",
+    "AntigravitySdkSessionRequest",
     "ApprovalDecision",
     "ApprovalHandler",
     "ApprovalMode",
@@ -355,6 +365,7 @@ __all__ = [
     "UpgradeSourceConflict",
     "UpgradeTargetAmbiguous",
     "UpgradeTargetUnresolved",
+    "antigravity_native_request_fit",
     "attempt_from_json",
     "attempt_to_json",
     "codex_native_request_fit",

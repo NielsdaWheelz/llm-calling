@@ -14,7 +14,6 @@ from provider_runtime.agent_runtime.policy import PermissionPolicy
 from provider_runtime.agent_runtime.types import (
     AGENT_ROUTES,
     AgentSessionRef,
-    AgentSessionRequest,
     AgentTransport,
     ApprovalRequest,
     Backend,
@@ -59,7 +58,7 @@ def _ref() -> AgentSessionRef:
     )
 
 
-def _request() -> AgentSessionRequest:
+def _request() -> CodexCatalogSessionRequest:
     return CodexCatalogSessionRequest(
         auth=_credential(),
         open=NewSession(),
@@ -376,7 +375,9 @@ def test_absolute_paths_are_validated_lexically_without_touching_the_filesystem(
 def test_closed_route_and_failure_vocabularies_have_exactly_one_owner() -> None:
     assert set(AGENT_FAILURE_CAUSES) == set(get_args(AgentFailureCause.__value__))
     assert len(AGENT_FAILURE_CAUSES) == len(set(AGENT_FAILURE_CAUSES))
-    assert AGENT_ROUTES == frozenset({("codex", "sdk"), ("claude", "sdk")})
+    assert AGENT_ROUTES == frozenset(
+        {("codex", "sdk"), ("claude", "sdk"), ("antigravity", "antigravity_sdk")}
+    )
     # A transport the type admits but no route reaches is exactly the stale state that let
     # unreachable branches survive here before: every declared member must be routable, and
     # every routed member must be declared.
