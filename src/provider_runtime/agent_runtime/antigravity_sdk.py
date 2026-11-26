@@ -44,7 +44,7 @@ from .events import (
     AgentToolUse,
     StockToolObservation,
 )
-from .neon_config import NEON_MAX_OUTPUT_TOKENS, NEON_MODEL
+from .neon_config import AGY_SDK_VERSION, NEON_MAX_OUTPUT_TOKENS, NEON_MODEL
 from .turn import (
     AgentAccepted,
     AgentAttempt,
@@ -80,7 +80,6 @@ if TYPE_CHECKING:
     import google.antigravity.conversation.conversation as sdk_conversation  # pyright: ignore[reportMissingImports]
     from google.antigravity import types as sdk  # pyright: ignore[reportMissingImports]
 
-_SDK_VERSION = "0.1.24"
 _BINDING_FIELD = "jarvis_binding"
 # The pinned SDK rewrites these before protobuf encoding. Reject loss of exact input.
 _SANITIZED_BY_SDK = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff]")
@@ -313,7 +312,7 @@ class AntigravitySdkTurn:
 
     async def _run(self, accepted: asyncio.Future[AgentSubmission]) -> None:
         try:
-            if version("google-antigravity") != _SDK_VERSION:
+            if version("google-antigravity") != AGY_SDK_VERSION:
                 return
             await self._run_sdk(accepted)
         except asyncio.CancelledError:

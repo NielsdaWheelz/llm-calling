@@ -21,6 +21,9 @@ if TYPE_CHECKING:
 
 NEON_MODEL = "gemini-4-neon"
 NEON_PROFILE = "google_neon"
+AGY_PROFILE = "agy_neon"
+AGY_CAPABILITY_REVISION = "antigravity-sdk-neon-v1"
+AGY_SDK_VERSION = "0.1.24"
 NEON_PROVIDER = "jarvis_neon"
 NEON_STOCK_BEARER_ENV = "CODEX_NEON_STOCK_AUTHORIZATION"
 NEON_EFFORTS = ("low", "medium", "high", "xhigh")

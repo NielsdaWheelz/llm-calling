@@ -628,10 +628,10 @@ class AntigravitySdkSessionRequest(_SessionRequestBase):
     transport: Literal["antigravity_sdk"] = field(default="antigravity_sdk", init=False)
 
     def __post_init__(self) -> None:
-        from .neon_config import NEON_MODEL
+        from .neon_config import AGY_CAPABILITY_REVISION, AGY_PROFILE, NEON_MODEL
 
         self._validate_common("AntigravitySdkSessionRequest")
-        if self.auth != CredentialRef("host_managed", "agy_neon"):
+        if self.auth != CredentialRef("host_managed", AGY_PROFILE):
             raise InvalidAgentRequest("Antigravity requires the contained agy_neon profile")
         if not isinstance(self.open, NewSession) or self.mcp_servers:
             raise InvalidAgentRequest("Antigravity requires a fresh session with direct callbacks")
@@ -639,10 +639,8 @@ class AntigravitySdkSessionRequest(_SessionRequestBase):
             raise InvalidAgentRequest("Antigravity requires the pinned Neon model at high effort")
         if type(self.workspace_tools) is not bool:
             raise InvalidAgentRequest("Antigravity workspace_tools must be a bool")
-        _require_non_empty(
-            self.agent_definition_revision,
-            "AntigravitySdkSessionRequest.agent_definition_revision",
-        )
+        if self.agent_definition_revision != AGY_CAPABILITY_REVISION:
+            raise InvalidAgentRequest("Antigravity requires its enrolled capability revision")
         object.__setattr__(
             self, "tools", _owned_native_tools(self.tools, "AntigravitySdkSessionRequest")
         )

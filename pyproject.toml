@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 provider-runtime-control = "provider_runtime.agent_runtime.native_control_cli:main"
+provider-runtime-antigravity-host = "provider_runtime.agent_runtime.antigravity_host:main"
 
 # Claude's SDK remains optional. Codex is a core WebSocket client of a
 # host-owned service; it carries no Python SDK or executable.

@@ -99,6 +99,7 @@ from .model_catalog import (
     UpgradeTargetAmbiguous,
     UpgradeTargetUnresolved,
 )
+from .neon_config import AGY_CAPABILITY_REVISION
 from .policy import (
     ApprovalMode,
     FilesystemMode,
@@ -267,6 +268,7 @@ __all__ = [
     "AntigravitySdkSessionRequest",
     "AntigravityLease",
     "AGY_WORKSPACE_POLICY",
+    "AGY_CAPABILITY_REVISION",
     "antigravity_native_request_fit",
     "CodexComplete",
     "CodexConnectionUnavailable",

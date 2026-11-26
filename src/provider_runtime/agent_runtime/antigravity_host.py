@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from hashlib import sha256
+from importlib.metadata import version
 from pathlib import Path
 from secrets import token_hex
 from typing import Any, Literal
@@ -16,6 +18,7 @@ from uuid import UUID, uuid4
 from provider_runtime.types import CanonicalTool, canonical_json_bytes
 
 from ._limits import _MAX_EVENT_COUNT, _OPERATION_TIMEOUT_SECONDS
+from .antigravity_sdk import antigravity_native_request_fit
 from .errors import (
     AgentRuntimeError,
     InvalidAgentRequest,
@@ -24,6 +27,7 @@ from .errors import (
     UnsupportedCapability,
 )
 from .events import AgentEvent, AgentTerminal, AgentToolUse, StockToolObservation
+from .neon_config import AGY_CAPABILITY_REVISION, AGY_PROFILE, AGY_SDK_VERSION, _origin
 from .policy import PermissionPolicy
 from .sessions import AgentSession, SessionQuery, SessionReadOptions, fingerprint_path
 from .terminal_codec import (
@@ -48,6 +52,7 @@ from .turn import (
     AgentUncertain,
 )
 from .types import (
+    AgentOutputSpec,
     AgentSessionRef,
     AgentSessionRequest,
     AntigravitySdkSessionRequest,
@@ -62,7 +67,6 @@ from .types import (
     freeze_json_value,
 )
 
-AGY_PROFILE = "agy_neon"
 AGY_AUTH = CredentialRef("host_managed", AGY_PROFILE)
 AGY_WORKSPACE_POLICY = PermissionPolicy(filesystem="workspace_write", allowed_tools=("*",))
 _PROTOCOL = "antigravity-sdk-host.v1"
@@ -73,6 +77,13 @@ _FRAME_BYTES = 8 * 1024 * 1024
 class AntigravityLease:
     turn: AgentTurnRef
     bearer: str = field(repr=False)
+    _joined: asyncio.Event = field(
+        default_factory=asyncio.Event, init=False, repr=False, compare=False
+    )
+
+    @property
+    def joined(self) -> bool:
+        return self._joined.is_set()
 
 
 def _send(writer: asyncio.StreamWriter, frame: str, **payload: Any) -> None:
@@ -103,11 +114,13 @@ class _Session(AgentSession):
         self,
         lease: AntigravityLease,
         binding: str,
+        output: AgentOutputSpec,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
         super().__init__(lease.turn.session_ref)
-        self.lease, self.binding, self.reader, self.writer = lease, binding, reader, writer
+        self.lease, self.binding, self.output = lease, binding, output
+        self.reader, self.writer = reader, writer
 
 
 class AntigravitySdkAdapter:
@@ -198,7 +211,11 @@ class AntigravitySdkAdapter:
                     fingerprint_path(request.cwd),
                 )
                 return _Session(
-                    AntigravityLease(AgentTurnRef(ref, turn), bearer), binding, reader, writer
+                    AntigravityLease(AgentTurnRef(ref, turn), bearer),
+                    binding,
+                    request.output,
+                    reader,
+                    writer,
                 )
         except BaseException as error:
             if writer is not None:
@@ -246,12 +263,10 @@ class AntigravitySdkAdapter:
     ) -> Any:
         raise UnsupportedCapability("Antigravity sessions are disposable")
 
-    async def stream_turn(
+    def stream_turn(
         self, session: AgentSession, request: TurnRequest, *, approvals: ApprovalHandler | None
-    ) -> AsyncIterator[AgentEvent]:
-        await asyncio.sleep(0)
+    ) -> AsyncGenerator[AgentEvent, None]:
         raise UnsupportedCapability("Antigravity requires a prepared turn")
-        yield  # pragma: no cover
 
     async def interrupt(self, session: AgentSession) -> None:
         await self.close_session(session)
@@ -276,6 +291,10 @@ class _RemoteTurn:
     ) -> None:
         (content,) = request.input
         assert isinstance(content, TextContent)
+        if not antigravity_native_request_fit(
+            content.text, output=session.output, input_id=input_id
+        ).fits:
+            raise InvalidAgentRequest("Antigravity input does not fit before submission")
         self._session = session
         self._turn = session.lease.turn
         self._controls = controls
@@ -345,6 +364,8 @@ class _RemoteTurn:
                     self._closed = AgentCloseResult(
                         payload["local_closed"], tuple(payload["diagnostics"])
                     )
+                    if self._closed.local_closed:
+                        self._session.lease._joined.set()
                     return
                 if not isinstance(receipt, AgentAccepted):
                     raise ProtocolDefect("Antigravity produced an event without accepted input")
@@ -546,6 +567,8 @@ async def _serve_session(
             return
         if kind != "open":
             raise ProtocolDefect("Antigravity host expected an open request")
+        if opened["revision"] != AGY_CAPABILITY_REVISION:
+            raise ProtocolDefect("Antigravity host capability revision mismatch")
         cwd = Path(opened["cwd"])
         if not cwd.is_absolute() or not cwd.is_dir():
             raise InvalidAgentRequest("Antigravity working directory was unavailable")
@@ -654,3 +677,24 @@ async def _serve_session(
         result = await turn.close()
     _send(writer, "closed", **asdict(result))
     await writer.drain()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--socket", required=True, type=Path)
+    parser.add_argument("--state-root", required=True, type=Path)
+    parser.add_argument("--upstream", required=True, type=_origin)
+    options = parser.parse_args()
+    if not options.socket.is_absolute() or not options.state_root.is_absolute():
+        parser.error("socket and state root must be absolute")
+    if not options.state_root.is_dir() or version("google-antigravity") != AGY_SDK_VERSION:
+        parser.error("contained state or pinned SDK is unavailable")
+
+    async def run() -> None:
+        server = await serve_antigravity(
+            options.socket, state_root=options.state_root, endpoint_url=options.upstream
+        )
+        async with server:
+            await server.serve_forever()
+
+    asyncio.run(run())

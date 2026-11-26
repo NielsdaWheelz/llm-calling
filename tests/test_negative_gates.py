@@ -101,6 +101,7 @@ def test_provider_sdk_imports_are_confined_to_engines_and_embeddings() -> None:
 # module name anywhere, not just an import statement, because a name in a string can still
 # be a real lazy dependency.
 _AGENT_DEPENDENCY_ALLOWLIST: dict[str, frozenset[Path]] = {
+    r"google\.antigravity": frozenset({AGENT_RUNTIME / "antigravity_sdk.py"}),
     # Isolated cognition and external persisted-history reading are separate adapters.
     "claude_agent_sdk": frozenset(
         {AGENT_RUNTIME / "claude_sdk.py", AGENT_RUNTIME / "claude_control.py"}

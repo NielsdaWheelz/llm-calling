@@ -126,11 +126,11 @@ class AgentRuntimeConfig:
     state_root_base: Path
     codex_endpoints: Mapping[str, CodexEndpoint] = field(default_factory=dict)
     codex_neon_origin: str | None = None
-    antigravity_endpoint: Path | None = None
     claude_executable: str = "claude"
     max_turn_seconds: float = 3_600.0
     codex_sandbox: CodexSandboxControls | None = None
     secret_resolver: SecretResolver | None = field(default=None, repr=False, compare=False)
+    antigravity_endpoint: Path | None = None
 
     def __post_init__(self) -> None:
         if self.antigravity_endpoint is not None and (
