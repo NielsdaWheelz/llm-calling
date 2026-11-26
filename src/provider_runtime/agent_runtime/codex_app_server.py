@@ -1,4 +1,4 @@
-"""Correlated Codex JSON-RPC over WebSocket/UDS; owns only its connection."""
+"""Correlated Codex JSON-RPC on one app-server connection."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import logging
 from collections.abc import AsyncGenerator, Callable, Mapping
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 if TYPE_CHECKING:
@@ -141,9 +142,43 @@ def _request_fit(submitted: Mapping[str, object], wire_bytes: int) -> NativeRequ
 
 
 @dataclass(frozen=True, slots=True)
+class CodexStdioEndpoint:
+    executable: Path
+    environment: Mapping[str, str]
+
+
+class _StdioConnection:
+    def __init__(self, process: asyncio.subprocess.Process) -> None:
+        self.process = process
+        assert process.stdin is not None and process.stdout is not None
+        self.stdin = process.stdin
+        self.stdout = process.stdout
+
+    async def send(self, frame: str) -> None:
+        self.stdin.write(frame.encode("utf-8") + b"\n")
+        await self.stdin.drain()
+
+    async def __aiter__(self) -> AsyncGenerator[str, None]:
+        while line := await self.stdout.readline():
+            yield line.removesuffix(b"\n").decode("utf-8")
+
+    async def close(self) -> None:
+        self.stdin.close()
+        try:
+            async with asyncio.timeout(2):
+                await self.process.wait()
+        except TimeoutError:
+            try:
+                self.process.kill()
+            except ProcessLookupError:
+                pass
+            await self.process.wait()
+
+
+@dataclass(frozen=True, slots=True)
 class CodexAppServerConfig:
-    endpoint: CodexEndpoint
-    request_policy: Literal["deny_owned", "observe_only"] = "deny_owned"
+    endpoint: CodexEndpoint | CodexStdioEndpoint
+    request_policy: Literal["deny_owned", "ask_owned", "observe_only"] = "deny_owned"
     client_name: str = "provider_runtime"
     client_title: str = "provider-runtime"
     client_version: str = "0.1.0"
@@ -156,9 +191,11 @@ class CodexAppServerConfig:
         return STOCK_FRAME_BYTES if self.stock_observations else _MAX_MESSAGE_BYTES
 
     def __post_init__(self) -> None:
-        if not isinstance(self.endpoint, CodexUnixEndpoint | CodexWebSocketEndpoint):
+        if not isinstance(
+            self.endpoint, CodexUnixEndpoint | CodexWebSocketEndpoint | CodexStdioEndpoint
+        ):
             raise ValueError("Codex app-server requires an explicit endpoint")
-        if self.request_policy not in ("deny_owned", "observe_only"):
+        if self.request_policy not in ("deny_owned", "ask_owned", "observe_only"):
             raise ValueError("Codex app-server request policy is invalid")
         if type(self.experimental_api) is not bool:
             raise ValueError("Codex experimental API selection must be boolean")
@@ -270,7 +307,7 @@ class CodexAppServerClient:
         self.buffer_attempt_id: str | None = None
         self.buffer_decoder_waiting = False
         self.on_raw_queue_loss: Callable[[CodexRawQueueLimit], None] | None = None
-        self._connection: ClientConnection | None = None
+        self._connection: ClientConnection | _StdioConnection | None = None
         self._thread_id: str | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._write_lock = asyncio.Lock()
@@ -316,7 +353,21 @@ class CodexAppServerClient:
                 "compression": None,
                 "proxy": None,
             }
-            if isinstance(endpoint, CodexUnixEndpoint):
+            if isinstance(endpoint, CodexStdioEndpoint):
+                self._connection = _StdioConnection(
+                    await asyncio.create_subprocess_exec(
+                        endpoint.executable,
+                        "app-server",
+                        "--listen",
+                        "stdio://",
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                        limit=self.config.frame_bytes + 1,
+                        env=endpoint.environment,
+                    )
+                )
+            elif isinstance(endpoint, CodexUnixEndpoint):
                 self._connection = await unix_connect(
                     str(endpoint.path.resolve(strict=True)), uri="ws://localhost", **options
                 )
@@ -548,7 +599,8 @@ class CodexAppServerClient:
         except ConnectionClosed as error:
             if not self._closing:
                 if (
-                    error.sent is not None
+                    not isinstance(connection, _StdioConnection)
+                    and error.sent is not None
                     and error.sent.code == 1009
                     and error.rcvd_then_sent is not True
                 ):
@@ -584,7 +636,12 @@ class CodexAppServerClient:
             raise ProtocolDefect("Codex app-server emitted malformed JSON") from None
         limit = _MAX_MESSAGE_BYTES
         if self.config.stock_observations and isinstance(message, dict) and "id" not in message:
-            limit = stock_notification_limit(message.get("method"), message.get("params"))
+            method, params = message.get("method"), message.get("params")
+            limit = stock_notification_limit(method, params)
+            if self.config.request_policy == "ask_owned" and method == "item/completed":
+                item = params.get("item") if isinstance(params, dict) else None
+                if isinstance(item, dict) and item.get("type") == "agentMessage":
+                    limit = STOCK_FRAME_BYTES
         try:
             if len(line) > limit:
                 raise OutputLimitExceeded(limit, unit="bytes", incoming=len(line))
@@ -670,7 +727,10 @@ class CodexAppServerClient:
         denial = _SERVER_REQUEST_DENIALS.get(method)
         if denial is not None:
             kind, result = denial
-            await self._write({"id": request_id, "result": result})
+            if kind == "permission" and self.config.request_policy == "ask_owned":
+                self._dynamic_requests[identity] = params
+            else:
+                await self._write({"id": request_id, "result": result})
             self._enqueue(
                 CodexServerRequest(
                     request_id=cast(CodexRequestId, request_id),
