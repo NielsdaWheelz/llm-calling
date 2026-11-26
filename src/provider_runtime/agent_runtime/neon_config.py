@@ -27,6 +27,7 @@ NEON_EFFORTS = ("low", "medium", "high", "xhigh")
 NEON_CONTEXT_WINDOW = 1_048_576
 NEON_MAX_OUTPUT_TOKENS = 65_536
 NEON_AUTO_COMPACT_TOKENS = 900_000
+_NEON_MAX_AGENT_DEPTH = 2
 NEON_TOOL_ENVIRONMENT = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "TERM")
 
 
@@ -132,6 +133,7 @@ def neon_stock_overrides(origin: str) -> tuple[str, ...]:
         f"shell_environment_policy.include_only={json.dumps(NEON_TOOL_ENVIRONMENT)}",
         f'agents.default_subagent_model="{NEON_MODEL}"',
         'agents.default_subagent_reasoning_effort="high"',
+        f"agents.max_depth={_NEON_MAX_AGENT_DEPTH}",
         "features.multi_agent_v2=true",
         *(f"features.{feature}=false" for feature in _NO_PRE_SAMPLE_FEATURES),
         *(
@@ -186,6 +188,7 @@ def validate_neon_startup(snapshot: object, metadata: dict[str, object], origin:
         not isinstance(agents, dict)
         or agents.get("default_subagent_model") != NEON_MODEL
         or agents.get("default_subagent_reasoning_effort") != "high"
+        or agents.get("max_depth") != _NEON_MAX_AGENT_DEPTH
         or not isinstance(features, dict)
         or features.get("multi_agent_v2") is not True
         or any(features.get(feature) is not False for feature in _NO_PRE_SAMPLE_FEATURES)
